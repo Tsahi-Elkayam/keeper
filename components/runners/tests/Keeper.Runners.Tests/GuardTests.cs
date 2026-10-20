@@ -128,6 +128,18 @@ public sealed class GuardTests
     }
 
     [Fact]
+    public void Plain_values_in_an_answer_become_rows_so_a_count_over_them_is_real()
+    {
+        var list = RowValues.ItemsOf(System.Text.Json.Nodes.JsonNode.Parse("""["ntp1.example.org", "ntp2.example.org"]"""), null);
+        var single = RowValues.ItemsOf(System.Text.Json.Nodes.JsonNode.Parse("\"GREEN\""), null);
+
+        Assert.Equal(new[] { "ntp1.example.org", "ntp2.example.org" }, list.Select(r => r["value"]!.ToString()));
+        Assert.Equal("GREEN", Assert.Single(single)["value"]!.ToString());
+        Assert.True(Keeper.Runners.Ldap.LdapValues.IsBinary("objectSid"));
+        Assert.False(Keeper.Runners.Ldap.LdapValues.IsBinary("sAMAccountName"));
+    }
+
+    [Fact]
     public void Secret_attributes_are_known()
     {
         Assert.True(SecretAttributes.IsSecret("ms-Mcs-AdmPwd"));

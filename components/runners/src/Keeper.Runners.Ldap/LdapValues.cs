@@ -39,6 +39,13 @@ public static class LdapValues
         "maxPwdAge", "minPwdAge", "lockoutDuration", "lockOutObservationWindow",
     };
 
+    /// <summary>
+    /// Attributes whose values are bytes. The LDAP client hands back any value that happens to be valid
+    /// UTF-8 as a string, so these are always asked for as bytes - a SID must never arrive as text noise.
+    /// </summary>
+    public static bool IsBinary(string attribute) =>
+        SidAttributes.Contains(attribute) || DescriptorAttributes.Contains(attribute) || attribute.Equals("objectGUID", StringComparison.OrdinalIgnoreCase);
+
     public static JsonNode? Convert(string attribute, IReadOnlyList<object> values)
     {
         var converted = values.Select(v => One(attribute, v)).Where(v => v is not null).ToList();

@@ -157,8 +157,8 @@ public sealed class LdapRunner : IRunner
         var row = new JsonObject { ["distinguishedName"] = entry.DistinguishedName };
         foreach (DirectoryAttribute attribute in entry.Attributes.Values)
         {
-            var values = Values(attribute);
             var name = attribute.Name;
+            var values = Values(attribute, LdapValues.IsBinary(RangeOf(name)?.Attribute ?? name));
             // A value list longer than the server's limit (1,500 members in AD) comes back as
             // member;range=0-1499. Reading only that page would make a member rule pass on a partial list.
             if (RangeOf(name) is { } range)
@@ -173,8 +173,10 @@ public sealed class LdapRunner : IRunner
         return row;
     }
 
-    private static List<object> Values(DirectoryAttribute attribute)
+    private static List<object> Values(DirectoryAttribute attribute, bool binary = false)
     {
+        if (binary)
+            return [.. attribute.GetValues(typeof(byte[]))];
         var values = new List<object>();
         for (var i = 0; i < attribute.Count; i++)
             values.Add(attribute[i]);
@@ -206,7 +208,7 @@ public sealed class LdapRunner : IRunner
                 .FirstOrDefault(a => RangeOf(a.Name)?.Attribute.Equals(range.Attribute, StringComparison.OrdinalIgnoreCase) == true);
             if (next is null)
                 throw new FormatException($"{dn}: the server stopped returning {range.Attribute} after value {high}");
-            foreach (var value in Values(next))
+            foreach (var value in Values(next, LdapValues.IsBinary(range.Attribute)))
                 yield return value;
             range = RangeOf(next.Name)!;
         }

@@ -36,10 +36,14 @@ public static class RowValues
         else if (body is JsonObject o && o["value"] is JsonArray odata)
             node = odata;
 
+        // A list of plain values ("GREEN", or ["ntp1", "ntp2"]) becomes one row per value as { value: ... },
+        // so a count over it is a real count - dropped, it would always look like a pass.
         return node switch
         {
-            JsonArray array => array.OfType<JsonObject>().Select(Detach).ToList(),
+            JsonArray array => array.Where(e => e is not null)
+                .Select(e => e is JsonObject o ? Detach(o) : new JsonObject { ["value"] = e!.DeepClone() }).ToList(),
             JsonObject single => [Detach(single)],
+            JsonValue scalar => [new JsonObject { ["value"] = scalar.DeepClone() }],
             _ => [],
         };
     }
