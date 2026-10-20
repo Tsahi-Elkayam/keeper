@@ -327,6 +327,21 @@ public static partial class RuleLoader
         var value = fields.TryGetValue("value", out var valueNode) ? YamlReader.ToJson(valueNode) : null;
         if (value is null && !Evaluator.OpsWithoutValue.Contains(op))
             reader.Error(node, $"{what}: op '{op}' needs a value.");
+
+        // value: { field: other } compares two fields of the same row; times / plus scale it (90% of the total).
+        if (value is JsonObject reference)
+        {
+            foreach (var key in reference.Select(p => p.Key).Where(k => k is not ("field" or "times" or "plus")))
+                reader.Error(node, $"{what}: value: {{ {key}: ... }} - a field reference takes field, times and plus only.");
+            if (Values.Text(reference["field"]) is not { Length: > 0 })
+                reader.Error(node, $"{what}: value: {{ field: <name> }} needs the field to compare with.");
+            foreach (var key in new[] { "times", "plus" })
+            {
+                if (reference[key] is { } n && !Values.TryNumber(Values.Text(n), out _))
+                    reader.Error(node, $"{what}: value.{key} must be a number.");
+            }
+            return new LeafCondition(field, op, value, reader.Text(fields, "threshold", what));
+        }
         if (op is "match" or "notmatch" && Values.Text(value) is { } pattern)
         {
             try

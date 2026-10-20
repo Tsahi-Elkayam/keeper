@@ -101,6 +101,17 @@ public sealed class EvaluatorTests
     }
 
     [Theory]
+    [InlineData(95, 100, true)]       // 95 used of 100: over 90%
+    [InlineData(80, 100, false)]
+    public void A_field_compares_with_another_field_of_the_same_row(int used, int total, bool fails)
+    {
+        var rule = new LeafCondition("used", "gt", new JsonObject { ["field"] = "total", ["times"] = 0.9 }, null);
+
+        Assert.Equal(fails, Engine().Each(rule, new JsonObject { ["used"] = used, ["total"] = total }).Fails);
+        Assert.Null(Engine().Each(rule, new JsonObject { ["used"] = used }).Fails);      // the other field missing: n/a
+    }
+
+    [Theory]
     [InlineData("CIS-CSC-v8:5.3", "CIS-Controls-v8:5.3")]
     [InlineData("cis-controls-8: 5.3 ", "CIS-Controls-v8:5.3")]
     [InlineData("CIS-M365-5.2.3.5", "CIS-M365:5.2.3.5")]

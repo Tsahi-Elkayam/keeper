@@ -83,6 +83,11 @@ each:
 
 `threshold:` names a tenant setting (`threshold.<name>`) that replaces `value` when it is set.
 
+`value: { field: <other> }` compares with another field of the same row, optionally scaled with
+`times` and `plus` - "more than 90% of the seats used" is
+`{ field: consumedUnits, op: gt, value: { field: prepaidUnits.enabled, times: 0.9 } }`. A row without
+the other field is n/a.
+
 | Op | Fails when |
 |---|---|
 | `eq` `ne` | Text equal / not equal, case-insensitive (numbers compare as numbers) |

@@ -114,7 +114,28 @@ public sealed class Evaluator(Func<string, string?> threshold, DateTimeOffset no
         if (present.Count == 0)
             return new Verdict(null, null, null, $"{leaf.Field} not present");
 
-        var operandText = Operand(leaf.Threshold, Values.Text(leaf.Value));
+        string? literal;
+        if (leaf.Value is JsonObject reference)
+        {
+            // Another field of the same row, optionally scaled: a missing or non-numeric one cannot be judged.
+            var other = Values.Text(FieldPath.First(row, Values.Text(reference["field"])!));
+            if (other is null)
+                return new Verdict(null, Values.Text(present[0]), null, $"{Values.Text(reference["field"])} not present");
+            if (reference["times"] is not null || reference["plus"] is not null)
+            {
+                if (!Values.TryNumber(other, out var number))
+                    return new Verdict(null, Values.Text(present[0]), other, $"{Values.Text(reference["field"])} is not a number");
+                Values.TryNumber(Values.Text(reference["times"]) ?? "1", out var times);
+                Values.TryNumber(Values.Text(reference["plus"]) ?? "0", out var plus);
+                other = (number * times + plus).ToString(CultureInfo.InvariantCulture);
+            }
+            literal = other;
+        }
+        else
+        {
+            literal = Values.Text(leaf.Value);
+        }
+        var operandText = Operand(leaf.Threshold, literal);
 
         if (leaf.Op is "size-gt" or "size-lt" or "size-eq")
         {

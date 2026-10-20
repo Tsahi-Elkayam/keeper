@@ -144,6 +144,37 @@ rules:
     each: { field: failing, op: gt, value: 0 }
     evidence: "{system} via {instance}: {failing} rules could not run"
 
+  - id: KEEPER-TARGETS-UNREADABLE
+    title: Hosts a scan could not read
+    kind: broken
+    category: MON
+    severity:
+      field: failed
+      ranges: [ { min: 50, value: medium } ]
+      default: low
+    entity: scan
+    why: >-
+      Every check on a host Keeper could not reach - closed port, access denied, WinRM off, no TLS on
+      the port - is unknown, not passed. A domain controller without LDAPS, or a server that refuses
+      WinRM, would otherwise be invisible.
+    fix: >-
+      keeper blind-spots lists each host and its reason. Fix the access (firewall rule, WinRM, the read
+      account's rights) or remove the host from the targets if it is gone.
+    refs: [NIST-800-53:CA-7]
+    query:
+      protocol: store
+      text: >
+        SELECT r.instance || '/' || r.system AS id, r.instance, r.system, COUNT(DISTINCT substr(c.item, instr(c.item, '@') + 1)) AS failed,
+               (SELECT GROUP_CONCAT(h, ', ') FROM (
+                    SELECT DISTINCT substr(c2.item, instr(c2.item, '@') + 1) AS h FROM coverage c2
+                    WHERE c2.run_id = r.run_id AND c2.scope = 'target' AND c2.state = 'failed' LIMIT 10)) AS sample
+        FROM latest_run r JOIN coverage c ON c.run_id = r.run_id
+        WHERE c.scope = 'target' AND c.state = 'failed'
+        GROUP BY r.run_id
+      key: id
+    each: { field: failed, op: gt, value: 0 }
+    evidence: "{system} via {instance}: {failed} hosts could not be read, e.g. {sample}"
+
   - id: KEEPER-SYSTEM-NEVER-SCANNED
     title: Keeper has rules for a system type that has never been scanned
     kind: missing
