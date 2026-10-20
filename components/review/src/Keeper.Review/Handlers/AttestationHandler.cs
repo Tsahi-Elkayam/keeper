@@ -1,33 +1,34 @@
-namespace Keeper.Queue.Handlers;
+using Keeper.Queue;
+
+namespace Keeper.Review.Handlers;
 
 /// <summary>
-/// attestation: a person states evidence no machine has - a restore test was done, a DR drill ran.
-/// { "obligationId" | "controlId", "entityKey", "state": "yes|no|na", "doneOn", "evidence", "expiresOn" }
+/// review.attestation: a person states evidence no machine has - a restore test was done, a DR drill ran.
+/// { "obligation": "backup.restore-test", "target", "state": "yes|no|na", "doneOn", "evidence", "expiresOn" }.
+/// Obligations are rules over these rows (rules/obligations.yaml), so a missing or expired one is a finding.
 /// </summary>
 public sealed class AttestationHandler : IRequestHandler
 {
-    public string Kind => "attestation";
+    public string Kind => "review.attestation";
 
     public void Apply(RequestContext context)
     {
         var payload = context.Request.Payload;
-        var obligation = Payload.Text(payload, "obligationId");
-        var control = Payload.Text(payload, "controlId");
-        if ((obligation is null) == (control is null))
-            throw new RequestException("payload needs exactly one of obligationId or controlId.");
+        var obligation = Payload.Required(payload, "obligation");
+        if (!Identifiers.IsValid(obligation))
+            throw new RequestException("payload.obligation must be lower-case letters, digits, dots and dashes.");
 
-        using var insert = context.Command(
+        context.Execute(
             """
-            INSERT INTO attestation (obligation_id, control_id, entity_key, state, done_on, evidence, expires_on, actor, recorded_at)
-            VALUES (:obligation, :control, :entity, :state, :doneOn, :evidence, :expiresOn, :actor, :at);
+            INSERT INTO attestation (obligation, target, state, done_on, evidence, expires_on, actor, recorded_at)
+            VALUES (:obligation, :target, :state, :doneOn, :evidence, :expiresOn, :actor, :at);
             """,
-            (":obligation", obligation), (":control", control),
-            (":entity", Payload.Text(payload, "entityKey") ?? "-"),
+            (":obligation", obligation),
+            (":target", Payload.Text(payload, "target") ?? "-"),
             (":state", Payload.OneOf(payload, "state", "yes", "no", "na")),
-            (":doneOn", Payload.Text(payload, "doneOn")),
+            (":doneOn", Payload.Date(payload, "doneOn")),
             (":evidence", Payload.Required(payload, "evidence")),
-            (":expiresOn", Payload.Text(payload, "expiresOn")),
+            (":expiresOn", Payload.Date(payload, "expiresOn")),
             (":actor", context.Request.SubmittedBy), (":at", context.NowText));
-        insert.ExecuteNonQuery();
     }
 }

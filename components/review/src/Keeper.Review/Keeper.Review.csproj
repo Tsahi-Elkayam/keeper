@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <ItemGroup>
+    <ProjectReference Include="..\..\..\common\src\Keeper.Common\Keeper.Common.csproj" />
+    <ProjectReference Include="..\..\..\contracts\src\Keeper.Contracts\Keeper.Contracts.csproj" />
+    <ProjectReference Include="..\..\..\store\src\Keeper.Store\Keeper.Store.csproj" />
+    <ProjectReference Include="..\..\..\queue\src\Keeper.Queue\Keeper.Queue.csproj" />
+    <ProjectReference Include="..\..\..\query\src\Keeper.Query\Keeper.Query.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <EmbeddedResource Include="Migrations\*.sql" LogicalName="review/%(Filename)%(Extension)" />
+    <EmbeddedResource Include="Questions\*.sql" LogicalName="review-questions/%(Filename)%(Extension)" />
+  </ItemGroup>
+</Project>

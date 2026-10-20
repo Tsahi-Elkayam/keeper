@@ -19,6 +19,12 @@
     <Project Path="components/query/src/Keeper.Query/Keeper.Query.csproj" />
     <Project Path="components/query/tests/Keeper.Query.Tests/Keeper.Query.Tests.csproj" />
   </Folder>
+  <Folder Name="/review/">
+    <Project Path="components/review/src/Keeper.Review/Keeper.Review.csproj" />
+    <Project Path="components/review/src/keeper-load/keeper-load.csproj" />
+    <Project Path="components/review/src/keeper-track/keeper-track.csproj" />
+    <Project Path="components/review/tests/Keeper.Review.Tests/Keeper.Review.Tests.csproj" />
+  </Folder>
   <Folder Name="/home/">
     <Project Path="components/home/src/Keeper.Home/Keeper.Home.csproj" />
     <Project Path="components/home/tests/Keeper.Home.Tests/Keeper.Home.Tests.csproj" />
