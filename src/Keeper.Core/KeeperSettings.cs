@@ -4,8 +4,9 @@ using System.Text.Json.Serialization;
 namespace Keeper.Core;
 
 /// <summary>
-/// One tenant's settings. Lives in the Keeper home (settings\settings.json) - never in the repo and
-/// never beside the binaries. Holds pointers to credentials, never the credentials themselves.
+/// One tenant's bootstrap settings: which tenant this Keeper home belongs to and where its data lives.
+/// Lives in the Keeper home (settings\settings.json) - never in the repo and never beside the binaries.
+/// Integrations and their credentials are not configured here; they live in the store.
 /// </summary>
 public sealed record KeeperSettings
 {
@@ -13,18 +14,6 @@ public sealed record KeeperSettings
 
     /// <summary>Relative paths resolve against the settings file's folder.</summary>
     public string DataPath { get; init; } = "../data";
-
-    public IReadOnlyList<ConnectorSettings> Connectors { get; init; } = [];
-}
-
-public sealed record ConnectorSettings
-{
-    public string Type { get; init; } = "";
-    public bool Enabled { get; init; }
-    public string BaseUrl { get; init; } = "";
-
-    /// <summary>Name of a Windows Credential Manager entry. Empty = interactive sign-in.</summary>
-    public string CredentialName { get; init; } = "";
 }
 
 public sealed class SettingsException(string message) : Exception(message);
@@ -36,7 +25,7 @@ public static class SettingsLoader
         PropertyNameCaseInsensitive = true,
         ReadCommentHandling = JsonCommentHandling.Skip,
         AllowTrailingCommas = true,
-        // Unknown fields fail loudly - a typo or a pasted secret must not be silently ignored.
+        // Unknown fields fail loudly: anything beyond the bootstrap does not belong in this file.
         UnmappedMemberHandling = JsonUnmappedMemberHandling.Disallow,
     };
 
@@ -59,8 +48,6 @@ public static class SettingsLoader
             throw new SettingsException($"Settings file is empty: {path}");
         if (string.IsNullOrWhiteSpace(settings.TenantName))
             throw new SettingsException($"tenantName is required: {path}");
-        if (settings.Connectors.Any(c => string.IsNullOrWhiteSpace(c.Type)))
-            throw new SettingsException($"Every connector needs a type: {path}");
 
         return settings;
     }

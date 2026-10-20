@@ -20,24 +20,20 @@ public sealed class KeeperSettingsTests : IDisposable
             {
               // comments are allowed
               "tenantName": "example",
-              "connectors": [
-                { "type": "sccm", "enabled": true, "baseUrl": "https://sccm.example.org/AdminService", "credentialName": "keeper-sccm" }
-              ]
+              "dataPath": "../data"
             }
             """);
 
         var settings = SettingsLoader.Load(path);
 
         Assert.Equal("example", settings.TenantName);
-        var connector = Assert.Single(settings.Connectors);
-        Assert.True(connector.Enabled);
-        Assert.Equal("keeper-sccm", connector.CredentialName);
+        Assert.Equal("../data", settings.DataPath);
     }
 
     [Fact]
-    public void Rejects_unknown_fields_so_a_pasted_secret_stops_startup()
+    public void Rejects_anything_beyond_the_bootstrap()
     {
-        var path = WriteSettings("""{ "tenantName": "example", "connectors": [ { "type": "sccm", "password": "x" } ] }""");
+        var path = WriteSettings("""{ "tenantName": "example", "integrations": [ { "type": "sccm" } ] }""");
 
         Assert.Throws<SettingsException>(() => SettingsLoader.Load(path));
     }
@@ -45,15 +41,7 @@ public sealed class KeeperSettingsTests : IDisposable
     [Fact]
     public void Requires_tenant_name()
     {
-        var path = WriteSettings("""{ "connectors": [] }""");
-
-        Assert.Throws<SettingsException>(() => SettingsLoader.Load(path));
-    }
-
-    [Fact]
-    public void Requires_connector_type()
-    {
-        var path = WriteSettings("""{ "tenantName": "example", "connectors": [ { "enabled": true } ] }""");
+        var path = WriteSettings("""{ "dataPath": "../data" }""");
 
         Assert.Throws<SettingsException>(() => SettingsLoader.Load(path));
     }

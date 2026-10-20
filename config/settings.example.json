@@ -1,13 +1,6 @@
 {
-  // Copy to settings.json in this folder and edit it. settings.json is never committed.
-  // No secrets here: credentialName is the name of an entry in Windows Credential Manager.
-  // Unknown fields are rejected, so a pasted "password" field stops Keeper from starting.
+  // Bootstrap only: which tenant this Keeper home belongs to, and where its data lives.
+  // Integrations are not configured here - they live in the store. Unknown fields are rejected.
   "tenantName": "example",
-  "dataPath": "../data",
-  "connectors": [
-    { "type": "sccm",       "enabled": false, "baseUrl": "https://sccm.example.org/AdminService", "credentialName": "keeper-sccm" },
-    { "type": "servicenow", "enabled": false, "baseUrl": "https://servicenow.example.org",        "credentialName": "keeper-servicenow" },
-    { "type": "monday",     "enabled": false, "baseUrl": "https://api.monday.com/v2",             "credentialName": "keeper-monday" },
-    { "type": "graph",      "enabled": false, "baseUrl": "https://graph.microsoft.com",           "credentialName": "" }
-  ]
+  "dataPath": "../data"
 }
