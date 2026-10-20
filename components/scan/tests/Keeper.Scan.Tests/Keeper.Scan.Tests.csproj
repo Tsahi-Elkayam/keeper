@@ -1,0 +1,5 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\Keeper.Scan\Keeper.Scan.csproj" />
+  </ItemGroup>
+</Project>

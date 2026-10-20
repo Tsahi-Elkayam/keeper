@@ -7,6 +7,7 @@ namespace Keeper.Common;
 public sealed class CliArgs
 {
     private readonly Dictionary<string, string?> _options = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, List<string>> _repeated = new(StringComparer.OrdinalIgnoreCase);
     private readonly List<string> _positional = [];
 
     public CliArgs(IReadOnlyList<string> args, IReadOnlyCollection<string>? flags = null)
@@ -23,16 +24,31 @@ public sealed class CliArgs
 
             var name = arg[2..];
             var equals = name.IndexOf('=', StringComparison.Ordinal);
+            string? value;
             if (equals >= 0)
-                _options[name[..equals]] = name[(equals + 1)..];
+            {
+                value = name[(equals + 1)..];
+                name = name[..equals];
+            }
             else if (flags.Contains(name, StringComparer.OrdinalIgnoreCase))
-                _options[name] = null;
+                value = null;
             else if (i + 1 < args.Count)
-                _options[name] = args[++i];
+                value = args[++i];
             else
                 throw new ArgumentException($"--{name} needs a value.");
+
+            _options[name] = value;
+            if (value is not null)
+            {
+                if (!_repeated.TryGetValue(name, out var list))
+                    _repeated[name] = list = [];
+                list.Add(value);
+            }
         }
     }
+
+    /// <summary>Every value of an option given more than once (--option a=1 --option b=2).</summary>
+    public IReadOnlyList<string> All(string name) => _repeated.TryGetValue(name, out var list) ? list : [];
 
     public IReadOnlyList<string> Positional => _positional;
 

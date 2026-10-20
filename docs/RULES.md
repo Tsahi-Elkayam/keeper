@@ -95,18 +95,66 @@ A missing field gives **n/a** for comparisons and is never a pass by default. A 
 
 ## Queries by protocol
 
-| Protocol | Query fields | Notes |
-|---|---|---|
-| `ldap` | `base` (domain, config, schema or a DN), `scope`, `filter`, `attributes`, `pageSize` | Kerberos/NTLM with signing and sealing. FILETIME and generalized-time attributes become ISO dates, SIDs and GUIDs become text. |
-| `graph` | `path`, `version` (v1.0, beta), `select`, `filter`, `expand`, `top`, `consistency` | GET only; follows `@odata.nextLink`. |
-| `http` | `path`, `params`, `items`, `paging` (odata, link, offset, none) | GET only; the path is relative to the integration's endpoint. |
-| `graphql` | `document`, `variables`, `items`, `paging` | Queries only - a mutation or subscription is refused. |
-| `sql` | `database`, `text` | One read-only SELECT/WITH statement, inside a transaction that is rolled back. |
-| `cim` | `namespace`, `wql` | Per target host. WQL SELECT only. |
-| `tls` | `port` | Per target host. Returns subject, issuer, notAfter, protocol, key size, chain validity. |
-| `file` | `path`, `format` (json, xml, csv), `items` | Scanner reports dropped in the Keeper home's `imports\`. The newest matching file wins. |
+Every query has `protocol:`, `key:` (the row field that identifies the entity) and optionally `name:`
+(a display name field). The other fields depend on the protocol:
 
-Every query ends with `key:` and, optionally, `name:` - the row fields that identify the entity.
+| Protocol | Fields | Rows |
+|---|---|---|
+| `ldap` | `base`: domain (default), config, schema, root, or a DN (macros allowed). `scope`: subtree (default), onelevel, base. `filter` (required, macros below). `attributes`: list. `pageSize`. | One per entry, plus `distinguishedName`. FILETIME attributes (pwdLastSet, lastLogonTimestamp, accountExpires, LAPS expiry...) become ISO dates; 0 and never-expires stay as they are. whenCreated/whenChanged become ISO. maxPwdAge-style durations become days. objectSid/objectGUID become text. Multi-valued attributes are arrays. |
+| `graph` | `path` (required, e.g. /users), `version`: v1.0 (default) or beta, `select`: list, `filter`, `expand`, `top`, `search`, `consistency`: eventual, `items` (default value), `maxPages`. | One per item. |
+| `http` | `path` (required, relative to the endpoint's own path), `params`: mapping, `items`: path to the array (default: OData value, or the root), `paging`: auto (default), odata, link, offset, none; `pageSize`, `offsetParam`, `limitParam` (offset paging, defaults sysparm_offset/sysparm_limit), `maxPages`, `headers` (never credentials). | One per item. |
+| `graphql` | `document` (required, a query), `path` (default /graphql), `variables`: mapping, `items`: path to the array, `paging`: { cursor, hasNext, variable }, `maxPages`. | One per item. |
+| `sql` | `text` (required, one SELECT/WITH), `database` (default master). Per target instance. | One per result row, plus `instance`. |
+| `cim` | `wql` (required, one SELECT), `namespace` (default root/cimv2). Per target host. | One per instance, plus `host`. Dates are ISO. |
+| `tls` | `port` (default 443; a target may also be host:port). Per target. | endpoint, host, port, subject, issuer, notBefore, notAfter, daysLeft, serial, thumbprint, keyAlgorithm, keySize, signatureAlgorithm, protocol, cipherSuite, chainValid, nameMatches, chainErrors, selfSigned, sans. |
+| `file` | `path` (required, relative to imports\, wildcards in the file name), `format`: json (default), xml, csv; `items`: JSON path (json) or XPath (xml, required); `delimiter` (csv). | One per item, plus `_file` and `_modified`. XML elements become objects: attributes and child elements by name, repeated children as arrays. |
+| `store` | `text` (required, one SELECT; `:now` and `:today` are bound). | One per result row. Readable: the review and register tables (licence, contract, key_date, vendor, initiative, attestation, latest_attestation, system, entity, finding, active_finding). Never: integration_secret, vault_key, request. |
+
+LDAP filter macros (the earlier LDAP rules use them): `{USER}`, `{COMPUTER}`, `{ENABLED}`, `{UAC:n}`
+(bit n set), `{FT:n}` (FILETIME n days ago), `{GT:n}` (generalized time n days ago), `{DOMAINDN}`,
+`{CONFIGDN}`, `{SCHEMADN}`, `{ROOTDN}`, `{IFATTR:attribute|clause}` (the clause only if the schema has
+the attribute).
+
+## Integration types
+
+A file's `integration:` names the kind of integration it reads through; the tenant binds an instance
+(for example two forests are two `ldap` integrations).
+
+| Type | Protocols | For |
+|---|---|---|
+| `ldap` | ldap | Active Directory, AD CS (configuration partition) |
+| `graph` | graph | Entra ID, Intune, Microsoft 365 |
+| `azure` | http | Azure Resource Manager |
+| `sccm` | http, sql | SCCM AdminService, or the site database read-only |
+| `cim` | cim | Windows servers and workstations |
+| `sql` | sql | SQL Server instances |
+| `tls` | tls | Any TLS endpoint |
+| `vcenter`, `veeam`, `prtg`, `dynatrace`, `servicenow` | http | Those products' REST APIs |
+| `monday`, `wiz`, `rubrik` | graphql | Those products' GraphQL APIs |
+| `files` | file | Reports other tools wrote into imports\ |
+| `keeper` | store | Keeper's own registers |
+| `http` | http | Any other JSON API |
+
+## Expiry rules
+
+Anything that expires gets a deadline and a severity that rises as the date nears:
+
+```yaml
+  - id: TLS-CERT-EXPIRY
+    title: Certificate expires soon
+    kind: broken
+    category: PKI
+    entity: endpoint
+    severity:
+      daysLeft: notAfter
+      ranges: [ { max: 0, value: critical }, { max: 14, value: high }, { max: 30, value: medium } ]
+      default: low
+    deadline: notAfter
+    query: { protocol: tls, key: endpoint }
+    each: { field: notAfter, op: until-lt, value: 60, threshold: tls.notice-days }
+```
+
+`deadline:` names a date field; the finding carries it, and ranking puts deadlines first.
 
 ## Imported scanner results
 

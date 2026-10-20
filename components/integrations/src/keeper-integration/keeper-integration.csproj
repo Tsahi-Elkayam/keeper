@@ -1,0 +1,11 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <AssemblyName>keeper-integration</AssemblyName>
+    <RootNamespace>Keeper.Cli.Integration</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\Keeper.Integrations\Keeper.Integrations.csproj" />
+    <ProjectReference Include="..\..\..\home\src\Keeper.Home\Keeper.Home.csproj" />
+  </ItemGroup>
+</Project>

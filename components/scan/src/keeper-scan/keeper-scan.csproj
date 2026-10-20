@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <AssemblyName>keeper-scan</AssemblyName>
+    <RootNamespace>Keeper.Cli.Scan</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\Keeper.Scan\Keeper.Scan.csproj" />
+    <ProjectReference Include="..\..\..\integrations\src\Keeper.Integrations\Keeper.Integrations.csproj" />
+    <ProjectReference Include="..\..\..\home\src\Keeper.Home\Keeper.Home.csproj" />
+    <ProjectReference Include="..\..\..\review\src\Keeper.Review\Keeper.Review.csproj" />
+  </ItemGroup>
+</Project>

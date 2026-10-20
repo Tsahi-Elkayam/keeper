@@ -39,6 +39,20 @@
     <Project Path="components/runners/src/Keeper.Runners.Tls/Keeper.Runners.Tls.csproj" />
     <Project Path="components/runners/tests/Keeper.Runners.Tests/Keeper.Runners.Tests.csproj" />
   </Folder>
+  <Folder Name="/scan/">
+    <Project Path="components/scan/src/Keeper.Scan/Keeper.Scan.csproj" />
+    <Project Path="components/scan/src/keeper-rules/keeper-rules.csproj" />
+    <Project Path="components/scan/src/keeper-scan/keeper-scan.csproj" />
+    <Project Path="components/scan/tests/Keeper.Scan.Tests/Keeper.Scan.Tests.csproj" />
+  </Folder>
+  <Folder Name="/vault/">
+    <Project Path="components/vault/src/Keeper.Vault/Keeper.Vault.csproj" />
+  </Folder>
+  <Folder Name="/integrations/">
+    <Project Path="components/integrations/src/Keeper.Integrations/Keeper.Integrations.csproj" />
+    <Project Path="components/integrations/src/keeper-integration/keeper-integration.csproj" />
+    <Project Path="components/integrations/tests/Keeper.Integrations.Tests/Keeper.Integrations.Tests.csproj" />
+  </Folder>
   <Folder Name="/home/">
     <Project Path="components/home/src/Keeper.Home/Keeper.Home.csproj" />
     <Project Path="components/home/tests/Keeper.Home.Tests/Keeper.Home.Tests.csproj" />

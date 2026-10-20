@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <ItemGroup>
+    <PackageReference Include="System.Security.Cryptography.ProtectedData" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\..\..\common\src\Keeper.Common\Keeper.Common.csproj" />
+    <ProjectReference Include="..\..\..\store\src\Keeper.Store\Keeper.Store.csproj" />
+    <ProjectReference Include="..\..\..\queue\src\Keeper.Queue\Keeper.Queue.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <EmbeddedResource Include="Migrations\*.sql" LogicalName="vault/%(Filename)%(Extension)" />
+  </ItemGroup>
+</Project>

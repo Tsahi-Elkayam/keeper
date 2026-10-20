@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Identity.Client" />
+    <PackageReference Include="Microsoft.Identity.Client.Broker" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\..\..\runners\src\Keeper.Runners\Keeper.Runners.csproj" />
+    <ProjectReference Include="..\..\..\vault\src\Keeper.Vault\Keeper.Vault.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <EmbeddedResource Include="Migrations\*.sql" LogicalName="integrations/%(Filename)%(Extension)" />
+  </ItemGroup>
+</Project>
