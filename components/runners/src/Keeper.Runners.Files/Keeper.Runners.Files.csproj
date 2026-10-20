@@ -1,0 +1,6 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <ItemGroup>
+    <ProjectReference Include="..\Keeper.Runners\Keeper.Runners.csproj" />
+    <ProjectReference Include="..\..\..\store\src\Keeper.Store\Keeper.Store.csproj" />
+  </ItemGroup>
+</Project>

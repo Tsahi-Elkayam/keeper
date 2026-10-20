@@ -25,6 +25,20 @@
     <Project Path="components/review/src/keeper-track/keeper-track.csproj" />
     <Project Path="components/review/tests/Keeper.Review.Tests/Keeper.Review.Tests.csproj" />
   </Folder>
+  <Folder Name="/rules/">
+    <Project Path="components/rules/src/Keeper.Rules/Keeper.Rules.csproj" />
+    <Project Path="components/rules/tests/Keeper.Rules.Tests/Keeper.Rules.Tests.csproj" />
+  </Folder>
+  <Folder Name="/runners/">
+    <Project Path="components/runners/src/Keeper.Runners/Keeper.Runners.csproj" />
+    <Project Path="components/runners/src/Keeper.Runners.Files/Keeper.Runners.Files.csproj" />
+    <Project Path="components/runners/src/Keeper.Runners.Http/Keeper.Runners.Http.csproj" />
+    <Project Path="components/runners/src/Keeper.Runners.Ldap/Keeper.Runners.Ldap.csproj" />
+    <Project Path="components/runners/src/Keeper.Runners.Sql/Keeper.Runners.Sql.csproj" />
+    <Project Path="components/runners/src/Keeper.Runners.Cim/Keeper.Runners.Cim.csproj" />
+    <Project Path="components/runners/src/Keeper.Runners.Tls/Keeper.Runners.Tls.csproj" />
+    <Project Path="components/runners/tests/Keeper.Runners.Tests/Keeper.Runners.Tests.csproj" />
+  </Folder>
   <Folder Name="/home/">
     <Project Path="components/home/src/Keeper.Home/Keeper.Home.csproj" />
     <Project Path="components/home/tests/Keeper.Home.Tests/Keeper.Home.Tests.csproj" />

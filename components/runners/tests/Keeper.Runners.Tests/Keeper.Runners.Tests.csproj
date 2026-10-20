@@ -1,0 +1,10 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\Keeper.Runners.Files\Keeper.Runners.Files.csproj" />
+    <ProjectReference Include="..\..\src\Keeper.Runners.Http\Keeper.Runners.Http.csproj" />
+    <ProjectReference Include="..\..\src\Keeper.Runners.Ldap\Keeper.Runners.Ldap.csproj" />
+    <ProjectReference Include="..\..\src\Keeper.Runners.Sql\Keeper.Runners.Sql.csproj" />
+    <ProjectReference Include="..\..\src\Keeper.Runners.Tls\Keeper.Runners.Tls.csproj" />
+    <ProjectReference Include="..\..\src\Keeper.Runners.Cim\Keeper.Runners.Cim.csproj" />
+  </ItemGroup>
+</Project>

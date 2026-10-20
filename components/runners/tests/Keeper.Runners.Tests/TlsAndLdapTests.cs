@@ -1,0 +1,137 @@
+using System.Net;
+using System.Net.Security;
+using System.Net.Sockets;
+using System.Security.Cryptography;
+using System.Security.Cryptography.X509Certificates;
+using Keeper.Runners.Ldap;
+using Keeper.Runners.Sql;
+using Keeper.Runners.Tls;
+using Microsoft.Data.SqlClient;
+
+namespace Keeper.Runners.Tests;
+
+public sealed class TlsTests
+{
+    [Fact]
+    public async Task Reads_the_certificate_of_a_live_endpoint_without_trusting_it()
+    {
+        using var key = RSA.Create(2048);
+        var request = new CertificateRequest("CN=localhost", key, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
+        var notAfter = DateTimeOffset.UtcNow.AddDays(20);
+        using var generated = request.CreateSelfSigned(DateTimeOffset.UtcNow.AddDays(-1), notAfter);
+        using var certificate = X509CertificateLoader.LoadPkcs12(generated.Export(X509ContentType.Pfx), null);
+
+        var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        var port = ((IPEndPoint)listener.LocalEndpoint).Port;
+        var server = Task.Run(async () =>
+        {
+            using var client = await listener.AcceptTcpClientAsync();
+            await using var ssl = new SslStream(client.GetStream());
+            await ssl.AuthenticateAsServerAsync(certificate);
+        });
+
+        var result = await new TlsRunner().RunAsync(Context.Query("tls", "endpoint"),
+            Context.For(new FakeConnection(""), target: $"localhost:{port}") with { Now = DateTimeOffset.UtcNow }, CancellationToken.None);
+        await server;
+        listener.Stop();
+
+        Assert.Equal("ok", result.State);
+        var row = Assert.Single(result.Rows);
+        Assert.True(row["selfSigned"]!.GetValue<bool>());
+        Assert.False(row["chainValid"]!.GetValue<bool>());
+        Assert.Equal(2048, row["keySize"]!.GetValue<int>());
+        Assert.InRange(row["daysLeft"]!.GetValue<double>(), 18, 20);
+    }
+
+    [Fact]
+    public async Task A_closed_port_is_a_failure_for_that_target()
+    {
+        var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        var port = ((IPEndPoint)listener.LocalEndpoint).Port;
+        listener.Stop();
+
+        var result = await new TlsRunner().RunAsync(Context.Query("tls", "endpoint"), Context.For(new FakeConnection(""), target: $"127.0.0.1:{port}"), CancellationToken.None);
+
+        Assert.Equal("failed", result.State);
+    }
+}
+
+public sealed class LdapTests
+{
+    [Fact]
+    public void Filetime_and_generalized_time_become_iso_dates_and_never_stays_never()
+    {
+        Assert.Equal("2022-06-18T04:26:40Z", LdapValues.Convert("lastLogonTimestamp", ["133000000000000000"])!.ToString());
+        Assert.Equal("0", LdapValues.Convert("pwdLastSet", ["0"])!.ToString());
+        Assert.Equal("9223372036854775807", LdapValues.Convert("accountExpires", ["9223372036854775807"])!.ToString());
+        Assert.Equal("2024-01-02T03:04:05Z", LdapValues.Convert("whenCreated", ["20240102030405.0Z"])!.ToString());
+        Assert.Equal("42", LdapValues.Convert("maxPwdAge", ["-36288000000000"])!.ToString());
+    }
+
+    [Fact]
+    public void Sids_parse_without_windows_apis()
+    {
+        byte[] sid = [1, 5, 0, 0, 0, 0, 0, 5, 21, 0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0, 0xF4, 1, 0, 0];
+
+        Assert.Equal("S-1-5-21-1-2-3-500", LdapValues.Sid(sid));
+    }
+
+    [Fact]
+    public void Multi_valued_attributes_are_arrays()
+    {
+        var node = LdapValues.Convert("memberOf", ["CN=Admins,DC=example,DC=org"]);
+
+        Assert.IsType<System.Text.Json.Nodes.JsonArray>(node);
+    }
+
+    [Fact]
+    public void Earlier_filter_macros_expand()
+    {
+        var contexts = new Dictionary<string, string> { ["domain"] = "DC=example,DC=org", ["config"] = "CN=Configuration,DC=example,DC=org" };
+        var now = new DateTimeOffset(2026, 10, 20, 0, 0, 0, TimeSpan.Zero);
+
+        var filter = LdapMacros.Expand("(&{USER}{ENABLED}{UAC:65536}(lastLogonTimestamp<={FT:90}){IFATTR:msLAPS-PasswordExpirationTime|(x=1)})",
+            now, contexts, _ => false);
+
+        Assert.Equal(
+            "(&(&(objectCategory=person)(objectClass=user))(!(userAccountControl:1.2.840.113556.1.4.803:=2))" +
+            $"(userAccountControl:1.2.840.113556.1.4.803:=65536)(lastLogonTimestamp<={now.AddDays(-90).UtcDateTime.ToFileTimeUtc()}))",
+            filter);
+        Assert.Equal("CN=x,DC=example,DC=org", LdapMacros.Expand("CN=x,{DOMAINDN}", now, contexts, _ => true));
+        Assert.Throws<FormatException>(() => LdapMacros.Expand("({NOPE})", now, contexts, _ => true));
+    }
+
+    [Theory]
+    [InlineData("ldaps://dc1.example.org", "dc1.example.org", 636, true)]
+    [InlineData("ldap://dc1.example.org:3268", "dc1.example.org", 3268, false)]
+    [InlineData("example.org", "example.org", 389, false)]
+    public void Endpoints_parse(string endpoint, string server, int port, bool ssl)
+    {
+        Assert.Equal((server, port, ssl), LdapRunner.Endpoint(endpoint));
+    }
+
+    [Fact]
+    public void Secret_attributes_are_refused_at_load_time()
+    {
+        var problems = new LdapRunner().Validate(Context.Query("ldap", "cn",
+            ("filter", "(objectCategory=computer)"), ("attributes", new System.Text.Json.Nodes.JsonArray("cn", "ms-Mcs-AdmPwd")))).ToList();
+
+        Assert.Contains(problems, p => p.Contains("ms-Mcs-AdmPwd", StringComparison.Ordinal));
+    }
+}
+
+public sealed class SqlTests
+{
+    [Fact]
+    public void Connections_are_read_only_encrypted_and_checked()
+    {
+        var builder = new SqlConnectionStringBuilder(SqlRunner.ConnectionString("sql1.example.org", "master", Context.For(new FakeConnection(""))));
+
+        Assert.Equal(ApplicationIntent.ReadOnly, builder.ApplicationIntent);
+        Assert.Equal(SqlConnectionEncryptOption.Mandatory, builder.Encrypt);
+        Assert.False(builder.TrustServerCertificate);
+        Assert.True(builder.IntegratedSecurity);
+    }
+}

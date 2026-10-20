@@ -16,7 +16,10 @@
     <PackageVersion Include="Microsoft.Identity.Client" Version="4.91.1" />
     <PackageVersion Include="Microsoft.Identity.Client.Broker" Version="4.91.1" />
     <PackageVersion Include="Microsoft.Data.SqlClient" Version="7.1.1" />
-    <PackageVersion Include="Microsoft.Management.Infrastructure" Version="4.0.0" />
+    <!-- SqlClient 7.1.1 pulls Pkcs 9.0.18 (CVE-2026-84008 / GHSA-846f-f764-76mx); 10.0.13 is patched. -->
+    <PackageVersion Include="System.Security.Cryptography.Pkcs" Version="10.0.13" />
+    <!-- 4.x targets .NET Framework only; 3.0.0 is the line PowerShell 7 runs on. -->
+    <PackageVersion Include="Microsoft.Management.Infrastructure" Version="3.0.0" />
 
     <PackageVersion Include="Microsoft.NET.Test.Sdk" Version="17.11.1" />
     <PackageVersion Include="xunit" Version="2.9.2" />
