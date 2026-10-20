@@ -1378,4 +1378,148 @@ SELECT host, sources, source_list FROM per_host
 - Refs: NIST-800-53:AU-6, NIST-800-53:AC-6(9).
 - Fix: rerun with the integration's identity; review why a personal account was used.
 
-<!-- continue -->
+## Priority 3 - useful, but waiting on an attribute, a convention or a register
+
+### XS-SYSTEM-CRITICAL-UNMONITORED
+
+- Joins: `system` (criticality 1) -> `entity` (its computers and VMs, by `system_rule` mapping) ->
+  PRTG / Dynatrace by name. Catches: a host of a criticality-1 system watched by no monitor.
+  Why: XS-SERVER-NOT-MONITORED ranks by DC/server; this ranks by what the organisation said stops
+  when it is down. Severity: high. kind: missing, lens: both, category: MON, entity: computer.
+- Attributes: none new; depends on the tenant having mapped entities to systems (`keeper system map`)
+  and set `criticality`. Without mappings the rule returns no rows - a coverage note, not a pass.
+- SQL: `entity e JOIN system sy ON sy.system_id = e.system_id WHERE sy.criticality = 1 AND e.gone_since IS NULL AND e.entity_type IN ('computer','vm')` anti-joined to B11/B12 on the normalised `entity_key`.
+- Refs: NIST-800-53:SI-4, NIST-800-53:CP-2, CIS-Controls-v8:13.1.
+- Fix: monitor it; or lower the criticality with a reason.
+
+### XS-SYSTEM-CRITICAL-NO-BACKUP
+
+- Same shape against B10 (Veeam objects). Severity: critical. Category BCK.
+  Refs: NIST-800-53:CP-9, CIS-Controls-v8:11.2.
+
+### XS-DC-IMAGE-ONLY-BACKUP
+
+- Joins: AD domain controllers (uac 8192) x Veeam objects (VM image present) x
+  `latest_attestation` for `ad.system-state-backup`. Catches: a DC that has an image-level backup
+  and no attested directory-aware system-state backup - the image looks like protection but is not
+  a supported directory restore path (OBL-AD-SYSTEM-STATE-BACKUP explains why).
+- Severity: high. kind: missing, lens: both, category: BCK, entity: computer.
+- SQL: `ad_computers a JOIN veeam_objects o ON o.short_name = a.short_name WHERE (a.uac & 8192) = 8192 AND NOT EXISTS (SELECT 1 FROM latest_attestation la WHERE la.obligation = 'ad.system-state-backup' AND la.state = 'yes' AND (la.target = '-' OR UPPER(la.target) = a.short_name OR LOWER(la.target) = LOWER(substr(a.dns_name, instr(a.dns_name, '.') + 1))))`.
+- Refs: NIST-800-53:CP-9, NIST-800-53:CP-10.
+- Fix: schedule a system-state backup (or a backup product's application-aware DC processing) and attest it.
+
+### XS-LICENCE-REGISTER-DRIFT
+
+- Joins: `licence` register x M365 `subscribedSkus` (`skuPartNumber`, `prepaidUnits.enabled`,
+  `consumedUnits`) on `licence.product` = `skuPartNumber` (convention: the register row's product
+  is the SKU part number, or `notes` contains `sku:<PART_NUMBER>`).
+- Catches: `seats` or `seats_used` in the register differ from the tenant's real numbers by more
+  than N - the register is behind, so every REG-LIC-* finding is suspect. Severity: low.
+  kind: misconfigured, lens: maintenance, category: CST, entity: licence.
+- Attributes: m365 SKU query (requested); register columns.
+- SQL: `licence l JOIN skus k ON UPPER(k.part) = UPPER(l.product) OR instr(UPPER(l.notes), 'SKU:' || UPPER(k.part)) > 0` with `ABS(l.seats - k.enabled) > tol OR ABS(l.seats_used - k.consumed) > tol`.
+- Refs: NIST-800-53:CM-10, NIST-800-53:CM-8.
+- Fix: update the register (or automate it from the tenant: an engine feature, "registers fed by scans").
+
+### XS-HOST-EOL-EXPOSED
+
+- Joins: AD computer with a legacy OS (`operatingSystem` matching `threshold.cross.eol-os-pattern`,
+  default `2008|2012|Windows 7|Windows 8`) x Wiz asset with `hasWideInternetExposure` (B13).
+  Catches: an end-of-life machine reachable from the internet. Severity: critical.
+  kind: broken, lens: security, category: LCM, entity: computer.
+- Caveat: Wiz asset rows exist only for assets with KEV / critical / exploitable findings (the Wiz
+  pack has no plain asset inventory query); a `cloudResources` or `graphSearch` query listing VMs
+  with exposure would make this complete - attribute gap for the wiz pack.
+- Refs: NIST-800-53:SA-22, NIST-800-53:SC-7, CIS-Controls-v8:2.2.
+
+### XS-SCCM-LAST-USER-LEAVER
+
+- Joins: SCCM `SMS_R_System.LastLogonUserName` / `LastLogonUserDomain` x AD user. Catches: a
+  workstation whose last logged-on user is disabled or in a leavers OU (`windows-estate.md` line 29).
+  Severity: medium. Blocked: the sccm pack requests neither attribute - add
+  `LastLogonUserName,LastLogonUserDomain,LastLogonTimestamp` to the SMS_R_System select (one query
+  shared by SCCM-SERVER-NO-CLIENT and WSF-NO-AD-SITE would do).
+- Refs: NIST-800-53:AC-2(3), CIS-Controls-v8:5.3.
+
+### XS-VEEAM-REPOSITORY-HOST-UNMANAGED
+
+- Joins: Veeam repository `hostName` (requested in VEEAM-REPOSITORY-*) x AD computer x PRTG/Dynatrace
+  x Windows-server findings. Catches: a repository host that is not a domain member known to AD
+  (fine, often deliberate - hardened repository) *and* not monitored, or one that is domain-joined
+  and fails WINSRV-* hardening rules (a domain-joined repository is the ransomware target).
+  Severity: high. kind: misconfigured, lens: security, category: BCK, entity: repository.
+- SQL sketch: `repos AS (SELECT MAX(json_extract(attrs,'$.hostName')) ...)` LEFT JOIN B2, B11, B12, and
+  `active_finding` on host; evidence names what was found.
+- Refs: NIST-800-53:CP-9(8), CIS-Controls-v8:11.3, CIS-Controls-v8:11.4.
+
+## Engine gaps (what the store protocol cannot do for these rules today)
+
+1. **Opaque query ids.** `row_seen.query` is a fingerprint; a store rule cannot say "rows of the
+   adminCount=1 query". Either rules declare a stable `query.id:` that is stored alongside the
+   fingerprint, or the loader records which rule ids share each fingerprint (`rule_query(rule_id,
+   query)`), so a join can filter `query IN (SELECT query FROM rule_query WHERE rule_id = 'AD-PRIV-COUNT')`.
+2. **List settings in SQL.** `threshold.*` values that are lists (free SKU ids, tier-0 role ids,
+   patterns) are opaque text in `setting.value`; document the stored format as a JSON array so
+   `json_each((SELECT value FROM setting WHERE key = ...))` works, or expose a `setting_item(key,
+   value)` view. Until then the XS rules inline the defaults and cannot honour the override.
+3. **No per-entity "unknown" from a store rule.** When a join side is missing, a rule can only emit
+   nothing or an info row. A rule-level `unknown-when:` (a condition over `latest_run`) that writes a
+   `coverage` row with reason would record the blind spot where blind spots belong, instead of as a
+   finding (XS-COVERAGE-JOIN-UNAVAILABLE is the workaround).
+4. **Two fields of one row.** `secret_set_at < pwd_set`, `seats <> consumedUnits` must be computed in
+   SQL as a 0/1 column; a `field`/`other` form on conditions would keep the comparison in the rule.
+5. **One severity field.** Severity maps read one field; "DC or criticality-1" needs a computed
+   `sev_class` column. A map over several fields (first match) or ranges on a computed expression
+   would avoid that.
+6. **Hostname normalisation.** Every rule repeats `UPPER(substr(... instr ...))`; a registered SQL
+   function `shortname(x)` (like `regexp`) would remove the most error-prone text in this pack.
+7. **Rule tags.** XS-HOST-COMPOUND-RISK and XS-HOST-THREAT-MULTI-SOURCE hard-code rule-id patterns.
+   A `tags:` list on rules, stored in `rule`, lets findings-level rules group by tag and lets tenant
+   rules join in.
+8. **System ownership of a cross-system finding.** A store rule's findings land on instance `keeper`;
+   `system_rule` mapping by name may or may not claim them. A row column `system_id` (or
+   `entity_ref: instance|type|key`) that the tracker honours would route "host X is unprotected" to
+   host X's system and owner.
+9. **Fan-out queries.** The SCIM joins and several Entra joins need `/servicePrincipals/{id}/...` and
+   `/groups/{id}/transitiveMembers` per object (`docs\backlog\README.md` "Per-object calls"); until
+   then they run on tenant copies with the ids in the path.
+10. **AD computers: enabled only.** The AD inventory filter `(&{COMPUTER}{ENABLED})` hides disabled
+    computers, so "gone" and "disabled" are one state across systems. `entity.gone_since` partly
+    compensates; a second computer query without `{ENABLED}` (or `userAccountControl` kept on a
+    disabled-computers query) would be exact.
+11. **Verification.** None of the SQL above has been run; it is written against the schema in
+    `components\review\src\Keeper.Review\Migrations\*.sql` and
+    `components\integrations\src\Keeper.Integrations\Migrations\001-integrations.sql`, and the
+    `ShippedRulesTests` empty-store test will catch syntax errors but not wrong attribute paths.
+
+## Attributes other packs must add
+
+| Pack / query | Add | Needed by |
+|---|---|---|
+| active-directory, user inventory `(&{USER}(!{UAC:2048}))` | `adminCount`, `memberOf`, `mail`, `displayName` | XS-KEEPER-IDENTITY-PRIVILEGED, XS-ONBOARDING-NOT-IN-APP-GROUPS (AD form), XS-OWNER-ACCOUNT-LEFT |
+| active-directory, computers | a query that includes disabled computers (or keep `userAccountControl` on all) | XS-COMPUTER-SCCM-AD-GONE, XS-DEVICE-*-AD-GONE (to tell disabled from deleted) |
+| active-directory, groups | `member` of Domain Admins / Enterprise Admins / the tenant's admin groups (today only builtin groups by SID return `member`) | XS-SCCM-ADMIN-AD-DISABLED (group grants), XS-KEEPER-IDENTITY-PRIVILEGED (explicit group path) |
+| entra, `/users` inventory | `mail`, `employeeHireDate`, `onPremisesLastSyncDateTime` | XS-SCIM-*, XS-OWNER-ACCOUNT-LEFT, dating AD/Entra drift |
+| entra, new | `/servicePrincipals/{id}/appRoleAssignedTo` (`principalId,principalType,principalDisplayName,resourceDisplayName,createdDateTime`) per provisioned app | XS-SCIM-ASSIGNED-NOT-PROVISIONED, XS-ONBOARDING-NOT-IN-APP-GROUPS |
+| entra, new | `/groups/{id}/transitiveMembers?$select=id,userPrincipalName,accountEnabled` per assigned group | same |
+| entra, new (single-system) | `/servicePrincipals/{id}/synchronization/jobs` status and quarantine | explains the SCIM findings |
+| entra, `/devices` | `deviceId`, `onPremisesSyncEnabled`, `isManaged` kept | XS-DEVICE-ENTRA-HYBRID-AD-GONE (exact match on deviceId with Intune `azureADDeviceId`) |
+| servicenow, new | `/api/now/table/sys_user`: `sys_id,user_name,email,active,first_name,last_name,source,sys_created_on,sys_updated_on,last_login_time,locked_out` | XS-SCIM-* (all four) |
+| servicenow, existing | `assigned_to` and `caller_id` as display values (today sys_ids only) | a future "ticket assigned to a leaver" join |
+| sccm, SMS_R_System | `LastLogonUserName`, `LastLogonUserDomain`, `SMSUniqueIdentifier`, `ResourceDomainORWorkgroup` | XS-SCCM-LAST-USER-LEAVER; exact device matching |
+| sccm, SMS_Admin | `AdminSid` | XS-SCCM-ADMIN-AD-DISABLED by SID instead of name |
+| intune, managedDevices | `azureADDeviceId`, `joinType`, `userId` | XS-DEVICE-INTUNE-AD-GONE (hybrid vs Entra-only), XS-INTUNE-PRIMARY-USER-LEAVER by id |
+| prtg, table.json | `host` column (the device address), `parentid`/`tags` | XS-SERVER-NOT-MONITORED, XS-MONITOR-TARGET-AD-GONE (match on FQDN/IP, not display name) |
+| dynatrace, oneagents | rely on `hostInfo.ipAddresses`, `hostInfo.osType` (returned, not selected) | same |
+| vmware, `/api/vcenter/vm` | `instance_uuid` and `guest_OS` (per-VM fan-out) | XS-VM-NO-BACKUP by UUID; Windows-only filters |
+| veeam, backupObjects | keep `objectId`, `viType`, `platformId` (returned by the API) | XS-VM-NO-BACKUP by instance UUID |
+| wiz | an asset inventory query (VMs with `hasWideInternetExposure`, `providerUniqueId`, IPs) beyond the KEV-filtered findings | XS-HOST-EOL-EXPOSED, XS-HOST-KEV-COMPOUND (complete coverage) |
+| m365 | none (skuPartNumber, consumedUnits, prepaidUnits already requested) | XS-LICENCE-REGISTER-DRIFT needs only the register convention |
+
+## Count
+
+- Priority 1: 19 proposals (20 with the XS-KEEPER-SECRET-STALE sibling).
+- Priority 2: 18 proposals.
+- Priority 3: 7 proposals.
+- Total: 44 (45).
+

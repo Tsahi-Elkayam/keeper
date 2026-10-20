@@ -118,6 +118,7 @@ rules:
       all:
         - { field: selfSigned, op: eq, value: false }
         - { field: chainErrors, op: contains, value: UntrustedRoot }
+        - { field: chainErrors, op: notcontains, value: ExplicitDistrust }
     evidence: "{endpoint}: {subject} issued by {issuer}; chain: {chainErrors}"
 
   - id: TLS-CHAIN-INCOMPLETE
@@ -170,15 +171,16 @@ rules:
     severity: high
     entity: endpoint
     why: >-
-      Validation failed for a reason other than an untrusted root, a missing intermediate or an
-      expired certificate - for example a bad signature, a wrong key usage or a name constraint.
-      Clients that validate properly will refuse the connection.
+      Validation failed for a reason none of the specific chain rules cover - for example a bad
+      signature, a name constraint or a broken policy. Clients that validate properly will refuse
+      the connection.
     fix: >-
       Read the chain errors in the evidence, then reissue the certificate with the right usage and
       install the issuer's current chain.
     refs: [NIST-800-53:SC-17, RFC-5280]
     refresh: 1d
     query: { protocol: tls, key: endpoint, name: subject }
+    # Errors with a rule of their own are left to it, so one endpoint is reported once.
     each:
       all:
         - { field: chainValid, op: eq, value: false }
@@ -186,7 +188,83 @@ rules:
         - { field: chainErrors, op: notcontains, value: UntrustedRoot }
         - { field: chainErrors, op: notcontains, value: PartialChain }
         - { field: chainErrors, op: notcontains, value: NotTimeValid }
+        - { field: chainErrors, op: notcontains, value: HasWeakSignature }
+        - { field: chainErrors, op: notcontains, value: NotValidForUsage }
+        - { field: chainErrors, op: notcontains, value: ExplicitDistrust }
     evidence: "{endpoint}: {subject}; chain errors: {chainErrors}"
+
+  - id: TLS-CHAIN-WEAK-SIGNATURE
+    title: A CA certificate in the chain has a weak signature
+    kind: misconfigured
+    lens: security
+    category: PKI
+    severity: high
+    entity: endpoint
+    why: >-
+      The endpoint's own certificate is signed with a current hash, but a certificate above it
+      (usually an old intermediate) is signed with an algorithm the platform no longer accepts.
+      TLS-WEAK-SIGNATURE looks at the leaf only and passes, while clients reject the chain.
+    fix: >-
+      Install the issuer's current intermediate (public CAs re-signed theirs with SHA-256 long ago).
+      If the issuing CA itself still signs with SHA-1 or MD5, reissue the leaf from a current CA and
+      plan the old CA's replacement.
+    refs: [NIST-800-53:SC-17, NIST-800-53:SC-13, NIST-SP-800-131A]
+    refresh: 1d
+    query: { protocol: tls, key: endpoint, name: subject }
+    # A leaf with a weak signature is TLS-WEAK-SIGNATURE's finding.
+    each:
+      all:
+        - { field: chainErrors, op: contains, value: HasWeakSignature }
+        - { field: signatureAlgorithm, op: notmatch, value: '^(md2|md4|md5|sha1)' }
+    evidence: "{endpoint}: {subject} is signed with {signatureAlgorithm}, but the chain reports {chainErrors} (issuer {issuer})"
+
+  - id: TLS-CHAIN-NOT-VALID-FOR-USAGE
+    title: A certificate in the chain is not valid for server authentication
+    kind: misconfigured
+    lens: security
+    category: PKI
+    severity: high
+    entity: endpoint
+    why: >-
+      The platform's chain check found a usage restriction that forbids this use, although the
+      leaf itself allows server authentication: a key usage on the leaf, or an issuing CA whose own
+      certificate is restricted to other purposes. Clients that validate refuse the connection.
+    fix: >-
+      Find which certificate in the chain carries the restriction (start with the issuer in the
+      evidence). Reissue the leaf from a CA whose certificate allows server authentication, or have
+      the subordinate CA's certificate reissued with the right purposes.
+    refs: [NIST-800-53:SC-17, RFC-5280:4.2.1.3, RFC-5280:4.2.1.12]
+    refresh: 1d
+    query: { protocol: tls, key: endpoint, name: subject }
+    # A leaf whose own purposes exclude server authentication is TLS-EKU-NO-SERVER-AUTH's finding.
+    each:
+      all:
+        - { field: chainErrors, op: contains, value: NotValidForUsage }
+        - any:
+            - { field: eku, op: empty }
+            - { field: eku, op: contains, value: "1.3.6.1.5.5.7.3.1" }
+            - { field: eku, op: contains, value: "2.5.29.37.0" }
+    evidence: "{endpoint}: {subject} (issuer {issuer}, purposes {eku}); chain: {chainErrors}"
+
+  - id: TLS-CHAIN-EXPLICIT-DISTRUST
+    title: Certificate chains to a root that is explicitly distrusted
+    kind: broken
+    lens: security
+    category: PKI
+    severity: high
+    entity: endpoint
+    why: >-
+      The chain ends at a root the platform has marked as distrusted - typically a CA removed from
+      the trust programmes after failing their requirements. Clients already refuse it; nothing
+      short of a certificate from another CA will fix it.
+    fix: >-
+      Buy or issue a replacement from a CA that is trusted, install it with its chain, and check
+      every other certificate from the same CA.
+    refs: [NIST-800-53:SC-17, NIST-800-53:SC-8]
+    refresh: 1d
+    query: { protocol: tls, key: endpoint, name: subject }
+    each: { field: chainErrors, op: contains, value: ExplicitDistrust }
+    evidence: "{endpoint}: {subject} issued by {issuer}; chain: {chainErrors}"
 
   - id: TLS-NAME-MISMATCH
     title: Certificate does not match the endpoint's name
@@ -244,6 +322,109 @@ rules:
     query: { protocol: tls, key: endpoint, name: subject }
     each: { field: sans, op: match, value: '^\*\.' }
     evidence: "{endpoint}: names {sans}"
+
+  # Extended key usage: eku is the leaf's list of purpose OIDs, an empty list when the extension is absent.
+  - id: TLS-EKU-NO-SERVER-AUTH
+    title: Certificate on a TLS endpoint is not issued for server authentication
+    kind: misconfigured
+    lens: security
+    category: PKI
+    severity: high
+    entity: endpoint
+    why: >-
+      The certificate names the purposes it may be used for, and server authentication is not one
+      of them. Clients that check the purpose refuse it, so the service works only for clients that
+      do not validate at all. It is usually a certificate requested from the wrong template - client
+      authentication, code signing or a CA profile.
+    fix: >-
+      Request a new certificate from a template or CA profile that includes Server Authentication
+      (on an enterprise CA, the web server template or a copy of it), install it everywhere the old
+      one is bound, then revoke the old one.
+    refs: [NIST-800-53:SC-17, CABF-BR:7.1.2.7.10, RFC-5280:4.2.1.12]
+    refresh: 1d
+    query: { protocol: tls, key: endpoint, name: subject }
+    # An empty list means "any purpose" and is TLS-EKU-MISSING's finding; any-purpose itself allows it.
+    each:
+      all:
+        - { field: eku, op: notempty }
+        - { field: eku, op: notcontains, value: "1.3.6.1.5.5.7.3.1" }
+        - { field: eku, op: notcontains, value: "2.5.29.37.0" }
+    evidence: "{endpoint}: {subject} (issuer {issuer}) is valid for {eku}, not server authentication"
+
+  - id: TLS-EKU-MISSING
+    title: Certificate on a TLS endpoint has no extended key usage
+    kind: misconfigured
+    lens: security
+    category: PKI
+    severity: low
+    entity: endpoint
+    why: >-
+      Without the extended key usage extension a certificate is valid for every purpose. Public CAs
+      must state server authentication explicitly and browser root programmes reject server
+      certificates without it, so a private CA template that leaves it out produces certificates
+      that will fail as clients tighten their checks - and that could be used for other purposes.
+    fix: >-
+      Add Server Authentication to the template or CA profile and reissue the certificate.
+    refs: [NIST-800-53:SC-17, CABF-BR:7.1.2.7.10, RFC-5280:4.2.1.12]
+    refresh: 1d
+    query: { protocol: tls, key: endpoint, name: subject }
+    # Self-signed certificates are TLS-SELF-SIGNED's finding already.
+    each:
+      all:
+        - { field: eku, op: empty }
+        - { field: selfSigned, op: eq, value: false }
+    evidence: "{endpoint}: {subject} (issuer {issuer}) carries no extended key usage"
+
+  - id: TLS-EKU-OVERBROAD
+    title: Server certificate also allows signing purposes a server never needs
+    kind: misconfigured
+    lens: security
+    category: PKI
+    severity: medium
+    entity: endpoint
+    why: >-
+      Besides server authentication the certificate allows any purpose, code signing, OCSP signing
+      or time stamping. Whoever steals the web server's key can then sign software, revocation
+      answers or time stamps that other systems trust.
+    fix: >-
+      Reissue with Server Authentication only (plus Client Authentication where the host really
+      acts as a client), and remove the extra purposes from the template.
+    refs: [NIST-800-53:SC-12, NIST-800-53:SC-17, CABF-BR:7.1.2.7.10, RFC-5280:4.2.1.12]
+    refresh: 1d
+    query: { protocol: tls, key: endpoint, name: subject }
+    each:
+      any:
+        - { field: eku, op: contains, value: "2.5.29.37.0" }
+        - { field: eku, op: contains, value: "1.3.6.1.5.5.7.3.3" }
+        - { field: eku, op: contains, value: "1.3.6.1.5.5.7.3.9" }
+        - { field: eku, op: contains, value: "1.3.6.1.5.5.7.3.8" }
+    evidence: "{endpoint}: {subject} (issuer {issuer}) is valid for {eku}"
+
+  # Dormant until the tenant sets threshold tls.expected-issuer-pattern: a .NET regular expression
+  # that matches the issuer of every certificate the organisation expects (its own CAs and the public
+  # CAs it buys from). The default '.' matches every issuer, so nothing fails. A lab tls integration
+  # can carry its own pattern as a threshold override on this rule.
+  - id: TLS-ISSUER-UNEXPECTED
+    title: Certificate issued by a CA outside the expected list
+    kind: misconfigured
+    lens: security
+    category: PKI
+    severity: high
+    entity: endpoint
+    why: >-
+      Only the organisation's own CAs and the public CAs it buys from should issue its endpoint
+      certificates. Anything else is a TLS-inspecting proxy in the path (agents that pin their
+      certificates then fail quietly), a test or rogue CA, or a certificate bought outside the
+      process. When the scanning host trusts that other CA, the chain rules see nothing wrong.
+    fix: >-
+      Identify the issuer in the evidence. For an inspection proxy, exempt the service's destinations
+      (and agents that pin certificates) from inspection; for an unknown CA, handle it as a security
+      incident and replace the certificate; for a CA that is legitimately new, add it to the pattern.
+    refs: [NIST-800-53:SC-17, NIST-800-53:SC-8, CIS-Controls-v8:3.10]
+    refresh: 1d
+    query: { protocol: tls, key: endpoint, name: subject }
+    each: { field: issuer, op: notmatch, value: '.', threshold: tls.expected-issuer-pattern }
+    evidence: "{endpoint}: {subject} issued by {issuer} (thumbprint {thumbprint})"
 
   - id: TLS-WEAK-RSA-KEY
     title: Certificate has a short RSA key
@@ -364,6 +545,34 @@ rules:
     each: { field: cipherSuite, op: match, value: '^TLS_(RSA|DH|ECDH)_' }
     evidence: "{endpoint}: {protocol} {cipherSuite}"
 
+  - id: TLS-CIPHER-NOT-AEAD
+    title: Endpoint negotiates a TLS 1.2 suite without authenticated encryption
+    kind: misconfigured
+    lens: security
+    category: PKI
+    severity: low
+    entity: endpoint
+    why: >-
+      The connection settled on a CBC suite with a separate MAC. These suites are not broken, but
+      they are the ones padding-oracle and timing attacks keep finding ways into, and current
+      guidance prefers AES-GCM, AES-CCM or ChaCha20-Poly1305 whenever TLS 1.2 is used.
+    fix: >-
+      Put AEAD suites with ECDHE key exchange first in the server's suite order (or remove the CBC
+      suites), and enable TLS 1.3, which only has AEAD suites.
+    refs: [NIST-800-53:SC-8, NIST-800-53:SC-13, NIST-SP-800-52r2, RFC-7525]
+    refresh: 1d
+    query: { protocol: tls, key: endpoint, name: subject }
+    # Broken suites and suites without forward secrecy are reported by the two rules above instead;
+    # a suite name the platform could not translate (a number) is not judged.
+    each:
+      all:
+        - { field: protocol, op: eq, value: Tls12 }
+        - { field: cipherSuite, op: match, value: '^TLS_' }
+        - { field: cipherSuite, op: notmatch, value: '(_GCM_|_CCM|_CHACHA20_POLY1305)' }
+        - { field: cipherSuite, op: notmatch, value: '(_RC4_|_DES_|3DES|_NULL_|_EXPORT|_anon_|_MD5$)' }
+        - { field: cipherSuite, op: notmatch, value: '^TLS_(RSA|DH|ECDH)_' }
+    evidence: "{endpoint}: {protocol} {cipherSuite}"
+
   - id: TLS-VALIDITY-TOO-LONG
     title: Certificate validity is longer than allowed
     kind: misconfigured
@@ -391,3 +600,29 @@ rules:
             - { field: notBefore, op: age-gt, value: 398, threshold: tls.max-validity-days }
             - not: { field: notAfter, op: until-lt, value: 0 }
     evidence: "{endpoint}: valid from {notBefore} to {notAfter} ({daysLeft} days left)"
+
+  - id: TLS-SERIAL-SHORT
+    title: Certificate serial number is too short to be random
+    kind: misconfigured
+    lens: security
+    category: PKI
+    severity: low
+    entity: endpoint
+    why: >-
+      CAs must put at least 64 bits of random output into every serial number; that randomness is
+      what defeated the hash-collision forgeries against CAs that numbered certificates in order. A
+      serial of 48 bits or fewer cannot hold it, which marks a CA that counts its certificates - an
+      old or home-made issuing setup. (The rule stops at 48 bits so that a random 64-bit serial with
+      leading zeros never fires.)
+    fix: >-
+      Nothing changes on the endpoint itself. Raise it with whoever runs the issuing CA (or the
+      appliance vendor): move issuance to a CA that generates random serials, then reissue.
+    refs: [CABF-BR:7.1, NIST-800-53:SC-17, RFC-5280:4.1.2.2]
+    refresh: 1d
+    query: { protocol: tls, key: endpoint, name: subject }
+    # serial is hex text; leading zero bytes (kept for positive numbers) are ignored.
+    each:
+      all:
+        - { field: selfSigned, op: eq, value: false }
+        - { field: serial, op: match, value: '^0*[0-9A-F]{1,12}$' }
+    evidence: "{endpoint}: {subject} has serial {serial} (issuer {issuer})"

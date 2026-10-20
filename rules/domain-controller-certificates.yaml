@@ -72,9 +72,120 @@ rules:
     fix: >-
       Issue the DC's certificate from the enterprise CA that domain members trust, with the DC's DNS
       name in the subject alternative names.
+    refs: [NIST-800-53:SC-17, NIST-800-53:SC-8]
     query: { protocol: tls, port: 636, key: endpoint, name: subject }
     each:
       any:
         - { field: chainValid, op: eq, value: false }
         - { field: nameMatches, op: eq, value: false }
     evidence: "{endpoint}: chain valid {chainValid}, name matches {nameMatches} ({chainErrors})"
+
+  # The TLS hygiene rules in certificates.yaml run only on that file's targets, never on domain
+  # controllers, so the checks that matter for LDAPS and Kerberos are repeated here.
+  - id: DC-CERT-NO-SERVER-AUTH-EKU
+    title: Domain controller certificate does not name Server Authentication
+    kind: misconfigured
+    category: PKI
+    severity: high
+    entity: domain-controller
+    why: >-
+      The documented requirements for an LDAPS certificate include the Server Authentication purpose
+      (1.3.6.1.5.5.7.3.1). A DC certificate without it - or without the extension at all - is
+      rejected by clients that check purposes, and Schannel may stop choosing it, leaving LDAPS on
+      that DC to whichever other certificate happens to be in the store.
+    fix: >-
+      Enrol the DC from the Kerberos Authentication template (Server Authentication, Client
+      Authentication, Smart Card Logon and KDC Authentication), confirm the new certificate is the
+      one served on 636, then remove the old one so Schannel cannot pick it.
+    refs: [NIST-800-53:SC-17, NIST-800-53:SC-8, MS-PKCA]
+    query: { protocol: tls, port: 636, key: endpoint, name: subject }
+    each:
+      all:
+        - { field: eku, op: notcontains, value: "1.3.6.1.5.5.7.3.1" }
+        - { field: eku, op: notcontains, value: "2.5.29.37.0" }
+    evidence: "{endpoint}: {subject} (issuer {issuer}) has purposes {eku}, not Server Authentication"
+
+  - id: DC-CERT-LEGACY-PROTOCOL
+    title: Domain controller negotiates SSL, TLS 1.0 or TLS 1.1
+    kind: misconfigured
+    category: PKI
+    severity: high
+    entity: domain-controller
+    why: >-
+      The best protocol the DC offered on the LDAPS port was a deprecated one. The same Schannel
+      settings serve RDP, WinRM over HTTPS and every other TLS service on the DC, so this is the whole
+      domain controller's protocol policy, not only LDAPS.
+    fix: >-
+      Before disabling anything, find the clients that still use the old versions (the DC's Schannel
+      events show them). Then enable TLS 1.2 and 1.3 and disable SSL, TLS 1.0 and TLS 1.1 server-side
+      on the DCs through group policy or the Schannel registry settings.
+    refs: [NIST-800-53:SC-8, NIST-800-53:SC-13, CIS-Controls-v8:3.10, RFC-8996, NIST-SP-800-52r2]
+    query: { protocol: tls, port: 636, key: endpoint, name: subject }
+    each: { field: protocol, op: in, value: [Ssl2, Ssl3, Tls, Tls11] }
+    evidence: "{endpoint}: negotiated {protocol} with {cipherSuite}"
+
+  - id: DC-CERT-WEAK-KEY-OR-SIGNATURE
+    title: Domain controller certificate has a short key or a SHA-1 or MD5 signature
+    kind: misconfigured
+    category: PKI
+    severity: high
+    entity: domain-controller
+    why: >-
+      Certificates from the old Domain Controller template, issued when the DC was promoted years
+      ago, often still carry 1024-bit keys or SHA-1 signatures. Clients increasingly refuse them, and
+      they protect the LDAPS and certificate sign-in traffic of the whole domain.
+    fix: >-
+      Supersede the old DC templates with Kerberos Authentication (2048-bit RSA or P-256 minimum,
+      SHA-256), make sure the CA itself signs with SHA-256, re-enrol every DC and remove the old
+      certificates.
+    refs: [NIST-800-53:SC-17, NIST-800-53:SC-13, NIST-SP-800-131A]
+    query: { protocol: tls, port: 636, key: endpoint, name: subject }
+    each:
+      any:
+        - all:
+            - { field: keyAlgorithm, op: match, value: '^RSA' }
+            - { field: keySize, op: lt, value: 2048, threshold: tls.min-rsa-key-bits }
+        - all:
+            - { field: keyAlgorithm, op: match, value: '^EC' }
+            - { field: keySize, op: lt, value: 256, threshold: tls.min-ec-key-bits }
+        - { field: signatureAlgorithm, op: match, value: '^(md2|md4|md5|sha1)' }
+    evidence: "{endpoint}: {keyAlgorithm} {keySize}-bit key, signature {signatureAlgorithm} (issuer {issuer})"
+
+  - id: DC-CERT-NO-SAN
+    title: Domain controller certificate has no DNS subject alternative name
+    kind: misconfigured
+    category: PKI
+    severity: medium
+    entity: domain-controller
+    why: >-
+      Strict LDAPS and KDC validation compare the DC's DNS name with the subject alternative names
+      only. A certificate from a hand-made request that carries the name in the subject alone passes
+      older clients and fails current ones - a failure that appears client by client.
+    fix: >-
+      Enrol the DC from the Kerberos Authentication template, which builds the subject alternative
+      name from the DC's DNS name, and remove the hand-made certificate.
+    refs: [NIST-800-53:SC-17, RFC-9525]
+    query: { protocol: tls, port: 636, key: endpoint, name: subject }
+    each: { field: sans, op: empty }
+    evidence: "{endpoint}: {subject} (issuer {issuer}) carries no DNS names"
+
+  # Dormant until the tenant sets threshold dc.expected-issuer-pattern: a .NET regular expression
+  # matching the issuer of the enterprise CA(s) that should issue DC certificates. The default '.'
+  # matches every issuer.
+  - id: DC-CERT-ISSUER-UNEXPECTED
+    title: Domain controller certificate issued by a CA other than the expected one
+    kind: misconfigured
+    category: PKI
+    severity: medium
+    entity: domain-controller
+    why: >-
+      A DC certificate should come from the enterprise CA that domain members trust for sign-in. One
+      from a public CA puts the DC's key under another party's lifecycle; one from a decommissioned or
+      unknown CA means someone enrolled the DC outside the process, or the key was replaced.
+    fix: >-
+      Reissue the certificate from the enterprise CA, remove the other one, and find out how it was
+      installed.
+    refs: [NIST-800-53:SC-17, NIST-800-53:IA-5(2)]
+    query: { protocol: tls, port: 636, key: endpoint, name: subject }
+    each: { field: issuer, op: notmatch, value: '.', threshold: dc.expected-issuer-pattern }
+    evidence: "{endpoint}: {subject} issued by {issuer} (thumbprint {thumbprint})"

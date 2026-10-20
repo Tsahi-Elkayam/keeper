@@ -215,7 +215,7 @@ rules:
     query:
       protocol: graph
       path: /users
-      select: [id, userPrincipalName, accountEnabled, userType, createdDateTime, onPremisesSyncEnabled, onPremisesSecurityIdentifier, signInActivity, assignedLicenses]
+      select: [id, userPrincipalName, accountEnabled, userType, createdDateTime, onPremisesSyncEnabled, onPremisesSecurityIdentifier, signInActivity, assignedLicenses, mail, onPremisesSamAccountName]
       top: 500
       key: id
       name: userPrincipalName
@@ -247,7 +247,7 @@ rules:
     query:
       protocol: graph
       path: /users
-      select: [id, userPrincipalName, accountEnabled, userType, createdDateTime, onPremisesSyncEnabled, onPremisesSecurityIdentifier, signInActivity, assignedLicenses]
+      select: [id, userPrincipalName, accountEnabled, userType, createdDateTime, onPremisesSyncEnabled, onPremisesSecurityIdentifier, signInActivity, assignedLicenses, mail, onPremisesSamAccountName]
       top: 500
       key: id
       name: userPrincipalName
@@ -273,7 +273,7 @@ rules:
     query:
       protocol: graph
       path: /users
-      select: [id, userPrincipalName, accountEnabled, userType, createdDateTime, onPremisesSyncEnabled, onPremisesSecurityIdentifier, signInActivity, assignedLicenses]
+      select: [id, userPrincipalName, accountEnabled, userType, createdDateTime, onPremisesSyncEnabled, onPremisesSecurityIdentifier, signInActivity, assignedLicenses, mail, onPremisesSamAccountName]
       top: 500
       key: id
       name: userPrincipalName
@@ -295,7 +295,7 @@ rules:
     query:
       protocol: graph
       path: /users
-      select: [id, userPrincipalName, accountEnabled, userType, createdDateTime, onPremisesSyncEnabled, onPremisesSecurityIdentifier, signInActivity, assignedLicenses]
+      select: [id, userPrincipalName, accountEnabled, userType, createdDateTime, onPremisesSyncEnabled, onPremisesSecurityIdentifier, signInActivity, assignedLicenses, mail, onPremisesSamAccountName]
       top: 500
       key: id
       name: userPrincipalName
@@ -323,7 +323,7 @@ rules:
     query:
       protocol: graph
       path: /users
-      select: [id, userPrincipalName, accountEnabled, userType, createdDateTime, onPremisesSyncEnabled, onPremisesSecurityIdentifier, signInActivity, assignedLicenses]
+      select: [id, userPrincipalName, accountEnabled, userType, createdDateTime, onPremisesSyncEnabled, onPremisesSecurityIdentifier, signInActivity, assignedLicenses, mail, onPremisesSamAccountName]
       top: 500
       key: id
       name: userPrincipalName
@@ -351,7 +351,7 @@ rules:
     query:
       protocol: graph
       path: /users
-      select: [id, userPrincipalName, accountEnabled, userType, createdDateTime, onPremisesSyncEnabled, onPremisesSecurityIdentifier, signInActivity, assignedLicenses]
+      select: [id, userPrincipalName, accountEnabled, userType, createdDateTime, onPremisesSyncEnabled, onPremisesSecurityIdentifier, signInActivity, assignedLicenses, mail, onPremisesSamAccountName]
       top: 500
       key: id
       name: userPrincipalName

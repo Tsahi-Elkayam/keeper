@@ -855,8 +855,16 @@ rules:
         backup.restore-test: high
         dr.drill: high
         change.code-review: high
+        ir.exercise: high
+        vuln.scan-external: high
+        backup.offline-copy-verified: high
+        iam.break-glass-test: high
+        pki.ca-key-backup: high
+        pki.template-review: high
         iam.stale-account-cleanup: low
         licence.review: low
+        sec.awareness-training: low
+        gov.policy-review: low
       default: medium
     entity: attestation
     why: >-
@@ -877,7 +885,9 @@ rules:
                NULLIF(TRIM(la.done_on), '') AS done_on,
                NULLIF(TRIM(la.expires_on), '') AS expires_on,
                la.actor,
-               la.recorded_at
+               la.recorded_at,
+               TRIM(la.evidence) AS evidence,
+               LENGTH(TRIM(la.evidence)) AS evidence_length
         FROM latest_attestation la
     each: { field: expires_on, op: until-lt, value: 0 }
     deadline: expires_on
@@ -913,7 +923,9 @@ rules:
                NULLIF(TRIM(la.done_on), '') AS done_on,
                NULLIF(TRIM(la.expires_on), '') AS expires_on,
                la.actor,
-               la.recorded_at
+               la.recorded_at,
+               TRIM(la.evidence) AS evidence,
+               LENGTH(TRIM(la.evidence)) AS evidence_length
         FROM latest_attestation la
     each:
       all:
@@ -936,8 +948,16 @@ rules:
         backup.restore-test: high
         dr.drill: high
         change.code-review: high
+        ir.exercise: high
+        vuln.scan-external: high
+        backup.offline-copy-verified: high
+        iam.break-glass-test: high
+        pki.ca-key-backup: high
+        pki.template-review: high
         iam.stale-account-cleanup: low
         licence.review: low
+        sec.awareness-training: low
+        gov.policy-review: low
       default: medium
     entity: attestation
     why: >-
@@ -958,7 +978,9 @@ rules:
                NULLIF(TRIM(la.done_on), '') AS done_on,
                NULLIF(TRIM(la.expires_on), '') AS expires_on,
                la.actor,
-               la.recorded_at
+               la.recorded_at,
+               TRIM(la.evidence) AS evidence,
+               LENGTH(TRIM(la.evidence)) AS evidence_length
         FROM latest_attestation la
     each: { field: state, op: eq, value: "no" }
     evidence: "{item}: attested 'no' by {actor} on {recorded_at}"
@@ -988,7 +1010,9 @@ rules:
                NULLIF(TRIM(la.done_on), '') AS done_on,
                NULLIF(TRIM(la.expires_on), '') AS expires_on,
                la.actor,
-               la.recorded_at
+               la.recorded_at,
+               TRIM(la.evidence) AS evidence,
+               LENGTH(TRIM(la.evidence)) AS evidence_length
         FROM latest_attestation la
     each:
       all:
@@ -1021,7 +1045,9 @@ rules:
                NULLIF(TRIM(la.done_on), '') AS done_on,
                NULLIF(TRIM(la.expires_on), '') AS expires_on,
                la.actor,
-               la.recorded_at
+               la.recorded_at,
+               TRIM(la.evidence) AS evidence,
+               LENGTH(TRIM(la.evidence)) AS evidence_length
         FROM latest_attestation la
     each:
       all:

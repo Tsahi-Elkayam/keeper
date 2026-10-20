@@ -36,8 +36,8 @@ public sealed partial class RegistryRunner : IRunner
     {
         if (query.Text("hive") is { } hive && !Hives.ContainsKey(hive))
             yield return "hive must be HKLM or HKU";
-        if (query.Text("key") is not { } key || !KeyPath().IsMatch(key))
-            yield return @"key is required: a path such as SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System";
+        if (query.Text("path") is not { } path || !KeyPath().IsMatch(path))
+            yield return @"path is required: a key such as SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System (query key: names the entity field, as everywhere)";
         foreach (var value in query.List("values"))
         {
             if (value.Length is 0 or > 255 || value.Contains('\\', StringComparison.Ordinal))
@@ -59,7 +59,7 @@ public sealed partial class RegistryRunner : IRunner
     {
         var host = context.Target!;
         var hive = Hives[query.Text("hive") ?? "HKLM"];
-        var key = query.Text("key")!;
+        var key = query.Text("path")!;
         try
         {
             using var session = CimSessions.Open(host, context);

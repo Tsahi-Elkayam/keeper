@@ -122,8 +122,8 @@ public sealed class GuardTests
     public void Registry_keys_must_be_plain_paths_and_credentials_are_never_read()
     {
         Assert.Empty(new RegistryRunner().Validate(Context.Query("registry", "host",
-            ("key", @"SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System"), ("values", new System.Text.Json.Nodes.JsonArray("EnableLUA")))));
-        Assert.NotEmpty(new RegistryRunner().Validate(Context.Query("registry", "host", ("key", @"SOFTWARE\..\SAM"), ("hive", "HKCR"))));
+            ("path", @"SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System"), ("values", new System.Text.Json.Nodes.JsonArray("EnableLUA")))));
+        Assert.NotEmpty(new RegistryRunner().Validate(Context.Query("registry", "host", ("path", @"SOFTWARE\..\SAM"), ("hive", "HKCR"))));
         Assert.Contains("DefaultPassword", RegistryRunner.SecretValues);
     }
 

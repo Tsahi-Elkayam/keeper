@@ -29,7 +29,7 @@ rules:
     query:
       protocol: ldap
       filter: '(&{USER}(!{UAC:2048}))'
-      attributes: [sAMAccountName, userPrincipalName, objectSid, userAccountControl, lastLogonTimestamp, pwdLastSet, whenCreated, accountExpires, msExchRecipientTypeDetails, servicePrincipalName, givenName, sn]
+      attributes: [sAMAccountName, userPrincipalName, objectSid, userAccountControl, lastLogonTimestamp, pwdLastSet, whenCreated, accountExpires, msExchRecipientTypeDetails, servicePrincipalName, givenName, sn, adminCount, memberOf, whenChanged]
       key: sAMAccountName
       name: userPrincipalName
     count: none
@@ -47,7 +47,7 @@ rules:
     query:
       protocol: ldap
       filter: '(&{COMPUTER}{ENABLED})'
-      attributes: [sAMAccountName, dNSHostName, operatingSystem, operatingSystemVersion, lastLogonTimestamp, userAccountControl, pwdLastSet, whenCreated, adminCount, servicePrincipalName, msDS-SupportedEncryptionTypes, msDS-AllowedToDelegateTo, msDS-AllowedToActOnBehalfOfOtherIdentity, ms-Mcs-AdmPwdExpirationTime, msLAPS-PasswordExpirationTime]
+      attributes: [sAMAccountName, dNSHostName, operatingSystem, operatingSystemVersion, lastLogonTimestamp, userAccountControl, pwdLastSet, whenCreated, adminCount, servicePrincipalName, msDS-SupportedEncryptionTypes, msDS-AllowedToDelegateTo, msDS-AllowedToActOnBehalfOfOtherIdentity, ms-Mcs-AdmPwdExpirationTime, msLAPS-PasswordExpirationTime, objectSid]
       key: sAMAccountName
       name: dNSHostName
     count: none
@@ -79,7 +79,7 @@ rules:
     query:
       protocol: ldap
       filter: '(&{USER}(!{UAC:2048}))'
-      attributes: [sAMAccountName, userPrincipalName, objectSid, userAccountControl, lastLogonTimestamp, pwdLastSet, whenCreated, accountExpires, msExchRecipientTypeDetails, servicePrincipalName, givenName, sn]
+      attributes: [sAMAccountName, userPrincipalName, objectSid, userAccountControl, lastLogonTimestamp, pwdLastSet, whenCreated, accountExpires, msExchRecipientTypeDetails, servicePrincipalName, givenName, sn, adminCount, memberOf, whenChanged]
       key: sAMAccountName
       name: userPrincipalName
     each:
@@ -112,7 +112,7 @@ rules:
     query:
       protocol: ldap
       filter: '(&{USER}(!{UAC:2048}))'
-      attributes: [sAMAccountName, userPrincipalName, objectSid, userAccountControl, lastLogonTimestamp, pwdLastSet, whenCreated, accountExpires, msExchRecipientTypeDetails, servicePrincipalName, givenName, sn]
+      attributes: [sAMAccountName, userPrincipalName, objectSid, userAccountControl, lastLogonTimestamp, pwdLastSet, whenCreated, accountExpires, msExchRecipientTypeDetails, servicePrincipalName, givenName, sn, adminCount, memberOf, whenChanged]
       key: sAMAccountName
       name: userPrincipalName
     each:
@@ -144,7 +144,7 @@ rules:
     query:
       protocol: ldap
       filter: '(&{USER}(!{UAC:2048}))'
-      attributes: [sAMAccountName, userPrincipalName, objectSid, userAccountControl, lastLogonTimestamp, pwdLastSet, whenCreated, accountExpires, msExchRecipientTypeDetails, servicePrincipalName, givenName, sn]
+      attributes: [sAMAccountName, userPrincipalName, objectSid, userAccountControl, lastLogonTimestamp, pwdLastSet, whenCreated, accountExpires, msExchRecipientTypeDetails, servicePrincipalName, givenName, sn, adminCount, memberOf, whenChanged]
       key: sAMAccountName
       name: userPrincipalName
     each:
@@ -176,7 +176,7 @@ rules:
     query:
       protocol: ldap
       filter: '(&{USER}(!{UAC:2048}))'
-      attributes: [sAMAccountName, userPrincipalName, objectSid, userAccountControl, lastLogonTimestamp, pwdLastSet, whenCreated, accountExpires, msExchRecipientTypeDetails, servicePrincipalName, givenName, sn]
+      attributes: [sAMAccountName, userPrincipalName, objectSid, userAccountControl, lastLogonTimestamp, pwdLastSet, whenCreated, accountExpires, msExchRecipientTypeDetails, servicePrincipalName, givenName, sn, adminCount, memberOf, whenChanged]
       key: sAMAccountName
       name: userPrincipalName
     each:
@@ -199,7 +199,7 @@ rules:
     query:
       protocol: ldap
       filter: '(&{USER}(!{UAC:2048}))'
-      attributes: [sAMAccountName, userPrincipalName, objectSid, userAccountControl, lastLogonTimestamp, pwdLastSet, whenCreated, accountExpires, msExchRecipientTypeDetails, servicePrincipalName, givenName, sn]
+      attributes: [sAMAccountName, userPrincipalName, objectSid, userAccountControl, lastLogonTimestamp, pwdLastSet, whenCreated, accountExpires, msExchRecipientTypeDetails, servicePrincipalName, givenName, sn, adminCount, memberOf, whenChanged]
       key: sAMAccountName
       name: userPrincipalName
     each:
@@ -221,7 +221,7 @@ rules:
     query:
       protocol: ldap
       filter: '(&{USER}(!{UAC:2048}))'
-      attributes: [sAMAccountName, userPrincipalName, objectSid, userAccountControl, lastLogonTimestamp, pwdLastSet, whenCreated, accountExpires, msExchRecipientTypeDetails, servicePrincipalName, givenName, sn]
+      attributes: [sAMAccountName, userPrincipalName, objectSid, userAccountControl, lastLogonTimestamp, pwdLastSet, whenCreated, accountExpires, msExchRecipientTypeDetails, servicePrincipalName, givenName, sn, adminCount, memberOf, whenChanged]
       key: sAMAccountName
       name: userPrincipalName
     each:
@@ -245,7 +245,7 @@ rules:
     query:
       protocol: ldap
       filter: '(&{USER}(!{UAC:2048}))'
-      attributes: [sAMAccountName, userPrincipalName, objectSid, userAccountControl, lastLogonTimestamp, pwdLastSet, whenCreated, accountExpires, msExchRecipientTypeDetails, servicePrincipalName, givenName, sn]
+      attributes: [sAMAccountName, userPrincipalName, objectSid, userAccountControl, lastLogonTimestamp, pwdLastSet, whenCreated, accountExpires, msExchRecipientTypeDetails, servicePrincipalName, givenName, sn, adminCount, memberOf, whenChanged]
       key: sAMAccountName
       name: userPrincipalName
     each:
@@ -266,7 +266,7 @@ rules:
     query:
       protocol: ldap
       filter: '(&{USER}(!{UAC:2048}))'
-      attributes: [sAMAccountName, userPrincipalName, objectSid, userAccountControl, lastLogonTimestamp, pwdLastSet, whenCreated, accountExpires, msExchRecipientTypeDetails, servicePrincipalName, givenName, sn]
+      attributes: [sAMAccountName, userPrincipalName, objectSid, userAccountControl, lastLogonTimestamp, pwdLastSet, whenCreated, accountExpires, msExchRecipientTypeDetails, servicePrincipalName, givenName, sn, adminCount, memberOf, whenChanged]
       key: sAMAccountName
       name: userPrincipalName
     each:
@@ -288,7 +288,7 @@ rules:
     query:
       protocol: ldap
       filter: '(&{USER}(!{UAC:2048}))'
-      attributes: [sAMAccountName, userPrincipalName, objectSid, userAccountControl, lastLogonTimestamp, pwdLastSet, whenCreated, accountExpires, msExchRecipientTypeDetails, servicePrincipalName, givenName, sn]
+      attributes: [sAMAccountName, userPrincipalName, objectSid, userAccountControl, lastLogonTimestamp, pwdLastSet, whenCreated, accountExpires, msExchRecipientTypeDetails, servicePrincipalName, givenName, sn, adminCount, memberOf, whenChanged]
       key: sAMAccountName
       name: userPrincipalName
     each:
@@ -309,7 +309,7 @@ rules:
     query:
       protocol: ldap
       filter: '(&{USER}(!{UAC:2048}))'
-      attributes: [sAMAccountName, userPrincipalName, objectSid, userAccountControl, lastLogonTimestamp, pwdLastSet, whenCreated, accountExpires, msExchRecipientTypeDetails, servicePrincipalName, givenName, sn]
+      attributes: [sAMAccountName, userPrincipalName, objectSid, userAccountControl, lastLogonTimestamp, pwdLastSet, whenCreated, accountExpires, msExchRecipientTypeDetails, servicePrincipalName, givenName, sn, adminCount, memberOf, whenChanged]
       key: sAMAccountName
       name: userPrincipalName
     each:
@@ -1486,7 +1486,7 @@ rules:
     query:
       protocol: ldap
       filter: '(&{COMPUTER}{ENABLED})'
-      attributes: [sAMAccountName, dNSHostName, operatingSystem, operatingSystemVersion, lastLogonTimestamp, userAccountControl, pwdLastSet, whenCreated, adminCount, servicePrincipalName, msDS-SupportedEncryptionTypes, msDS-AllowedToDelegateTo, msDS-AllowedToActOnBehalfOfOtherIdentity, ms-Mcs-AdmPwdExpirationTime, msLAPS-PasswordExpirationTime]
+      attributes: [sAMAccountName, dNSHostName, operatingSystem, operatingSystemVersion, lastLogonTimestamp, userAccountControl, pwdLastSet, whenCreated, adminCount, servicePrincipalName, msDS-SupportedEncryptionTypes, msDS-AllowedToDelegateTo, msDS-AllowedToActOnBehalfOfOtherIdentity, ms-Mcs-AdmPwdExpirationTime, msLAPS-PasswordExpirationTime, objectSid]
       key: sAMAccountName
       name: dNSHostName
     each:
@@ -1514,7 +1514,7 @@ rules:
     query:
       protocol: ldap
       filter: '(&{COMPUTER}{ENABLED})'
-      attributes: [sAMAccountName, dNSHostName, operatingSystem, operatingSystemVersion, lastLogonTimestamp, userAccountControl, pwdLastSet, whenCreated, adminCount, servicePrincipalName, msDS-SupportedEncryptionTypes, msDS-AllowedToDelegateTo, msDS-AllowedToActOnBehalfOfOtherIdentity, ms-Mcs-AdmPwdExpirationTime, msLAPS-PasswordExpirationTime]
+      attributes: [sAMAccountName, dNSHostName, operatingSystem, operatingSystemVersion, lastLogonTimestamp, userAccountControl, pwdLastSet, whenCreated, adminCount, servicePrincipalName, msDS-SupportedEncryptionTypes, msDS-AllowedToDelegateTo, msDS-AllowedToActOnBehalfOfOtherIdentity, ms-Mcs-AdmPwdExpirationTime, msLAPS-PasswordExpirationTime, objectSid]
       key: sAMAccountName
       name: dNSHostName
     each:
@@ -1535,7 +1535,7 @@ rules:
     query:
       protocol: ldap
       filter: '(&{COMPUTER}{ENABLED})'
-      attributes: [sAMAccountName, dNSHostName, operatingSystem, operatingSystemVersion, lastLogonTimestamp, userAccountControl, pwdLastSet, whenCreated, adminCount, servicePrincipalName, msDS-SupportedEncryptionTypes, msDS-AllowedToDelegateTo, msDS-AllowedToActOnBehalfOfOtherIdentity, ms-Mcs-AdmPwdExpirationTime, msLAPS-PasswordExpirationTime]
+      attributes: [sAMAccountName, dNSHostName, operatingSystem, operatingSystemVersion, lastLogonTimestamp, userAccountControl, pwdLastSet, whenCreated, adminCount, servicePrincipalName, msDS-SupportedEncryptionTypes, msDS-AllowedToDelegateTo, msDS-AllowedToActOnBehalfOfOtherIdentity, ms-Mcs-AdmPwdExpirationTime, msLAPS-PasswordExpirationTime, objectSid]
       key: sAMAccountName
       name: dNSHostName
     each:
@@ -1561,7 +1561,7 @@ rules:
     query:
       protocol: ldap
       filter: '(&{COMPUTER}{ENABLED})'
-      attributes: [sAMAccountName, dNSHostName, operatingSystem, operatingSystemVersion, lastLogonTimestamp, userAccountControl, pwdLastSet, whenCreated, adminCount, servicePrincipalName, msDS-SupportedEncryptionTypes, msDS-AllowedToDelegateTo, msDS-AllowedToActOnBehalfOfOtherIdentity, ms-Mcs-AdmPwdExpirationTime, msLAPS-PasswordExpirationTime]
+      attributes: [sAMAccountName, dNSHostName, operatingSystem, operatingSystemVersion, lastLogonTimestamp, userAccountControl, pwdLastSet, whenCreated, adminCount, servicePrincipalName, msDS-SupportedEncryptionTypes, msDS-AllowedToDelegateTo, msDS-AllowedToActOnBehalfOfOtherIdentity, ms-Mcs-AdmPwdExpirationTime, msLAPS-PasswordExpirationTime, objectSid]
       key: sAMAccountName
       name: dNSHostName
     each:
@@ -1585,7 +1585,7 @@ rules:
     query:
       protocol: ldap
       filter: '(&{COMPUTER}{ENABLED})'
-      attributes: [sAMAccountName, dNSHostName, operatingSystem, operatingSystemVersion, lastLogonTimestamp, userAccountControl, pwdLastSet, whenCreated, adminCount, servicePrincipalName, msDS-SupportedEncryptionTypes, msDS-AllowedToDelegateTo, msDS-AllowedToActOnBehalfOfOtherIdentity, ms-Mcs-AdmPwdExpirationTime, msLAPS-PasswordExpirationTime]
+      attributes: [sAMAccountName, dNSHostName, operatingSystem, operatingSystemVersion, lastLogonTimestamp, userAccountControl, pwdLastSet, whenCreated, adminCount, servicePrincipalName, msDS-SupportedEncryptionTypes, msDS-AllowedToDelegateTo, msDS-AllowedToActOnBehalfOfOtherIdentity, ms-Mcs-AdmPwdExpirationTime, msLAPS-PasswordExpirationTime, objectSid]
       key: sAMAccountName
       name: dNSHostName
     each:
@@ -1611,7 +1611,7 @@ rules:
     query:
       protocol: ldap
       filter: '(&{COMPUTER}{ENABLED})'
-      attributes: [sAMAccountName, dNSHostName, operatingSystem, operatingSystemVersion, lastLogonTimestamp, userAccountControl, pwdLastSet, whenCreated, adminCount, servicePrincipalName, msDS-SupportedEncryptionTypes, msDS-AllowedToDelegateTo, msDS-AllowedToActOnBehalfOfOtherIdentity, ms-Mcs-AdmPwdExpirationTime, msLAPS-PasswordExpirationTime]
+      attributes: [sAMAccountName, dNSHostName, operatingSystem, operatingSystemVersion, lastLogonTimestamp, userAccountControl, pwdLastSet, whenCreated, adminCount, servicePrincipalName, msDS-SupportedEncryptionTypes, msDS-AllowedToDelegateTo, msDS-AllowedToActOnBehalfOfOtherIdentity, ms-Mcs-AdmPwdExpirationTime, msLAPS-PasswordExpirationTime, objectSid]
       key: sAMAccountName
       name: dNSHostName
     each:
@@ -1631,7 +1631,7 @@ rules:
     query:
       protocol: ldap
       filter: '(&{COMPUTER}{ENABLED})'
-      attributes: [sAMAccountName, dNSHostName, operatingSystem, operatingSystemVersion, lastLogonTimestamp, userAccountControl, pwdLastSet, whenCreated, adminCount, servicePrincipalName, msDS-SupportedEncryptionTypes, msDS-AllowedToDelegateTo, msDS-AllowedToActOnBehalfOfOtherIdentity, ms-Mcs-AdmPwdExpirationTime, msLAPS-PasswordExpirationTime]
+      attributes: [sAMAccountName, dNSHostName, operatingSystem, operatingSystemVersion, lastLogonTimestamp, userAccountControl, pwdLastSet, whenCreated, adminCount, servicePrincipalName, msDS-SupportedEncryptionTypes, msDS-AllowedToDelegateTo, msDS-AllowedToActOnBehalfOfOtherIdentity, ms-Mcs-AdmPwdExpirationTime, msLAPS-PasswordExpirationTime, objectSid]
       key: sAMAccountName
       name: dNSHostName
     each:
@@ -1651,7 +1651,7 @@ rules:
     query:
       protocol: ldap
       filter: '(&{COMPUTER}{ENABLED})'
-      attributes: [sAMAccountName, dNSHostName, operatingSystem, operatingSystemVersion, lastLogonTimestamp, userAccountControl, pwdLastSet, whenCreated, adminCount, servicePrincipalName, msDS-SupportedEncryptionTypes, msDS-AllowedToDelegateTo, msDS-AllowedToActOnBehalfOfOtherIdentity, ms-Mcs-AdmPwdExpirationTime, msLAPS-PasswordExpirationTime]
+      attributes: [sAMAccountName, dNSHostName, operatingSystem, operatingSystemVersion, lastLogonTimestamp, userAccountControl, pwdLastSet, whenCreated, adminCount, servicePrincipalName, msDS-SupportedEncryptionTypes, msDS-AllowedToDelegateTo, msDS-AllowedToActOnBehalfOfOtherIdentity, ms-Mcs-AdmPwdExpirationTime, msLAPS-PasswordExpirationTime, objectSid]
       key: sAMAccountName
       name: dNSHostName
     each:
@@ -1671,7 +1671,7 @@ rules:
     query:
       protocol: ldap
       filter: '(&{COMPUTER}{ENABLED})'
-      attributes: [sAMAccountName, dNSHostName, operatingSystem, operatingSystemVersion, lastLogonTimestamp, userAccountControl, pwdLastSet, whenCreated, adminCount, servicePrincipalName, msDS-SupportedEncryptionTypes, msDS-AllowedToDelegateTo, msDS-AllowedToActOnBehalfOfOtherIdentity, ms-Mcs-AdmPwdExpirationTime, msLAPS-PasswordExpirationTime]
+      attributes: [sAMAccountName, dNSHostName, operatingSystem, operatingSystemVersion, lastLogonTimestamp, userAccountControl, pwdLastSet, whenCreated, adminCount, servicePrincipalName, msDS-SupportedEncryptionTypes, msDS-AllowedToDelegateTo, msDS-AllowedToActOnBehalfOfOtherIdentity, ms-Mcs-AdmPwdExpirationTime, msLAPS-PasswordExpirationTime, objectSid]
       key: sAMAccountName
       name: dNSHostName
     each: { field: msDS-AllowedToDelegateTo, op: match, value: '^(ldap|gc|krbtgt)/' }
@@ -1688,7 +1688,7 @@ rules:
     query:
       protocol: ldap
       filter: '(&{COMPUTER}{ENABLED})'
-      attributes: [sAMAccountName, dNSHostName, operatingSystem, operatingSystemVersion, lastLogonTimestamp, userAccountControl, pwdLastSet, whenCreated, adminCount, servicePrincipalName, msDS-SupportedEncryptionTypes, msDS-AllowedToDelegateTo, msDS-AllowedToActOnBehalfOfOtherIdentity, ms-Mcs-AdmPwdExpirationTime, msLAPS-PasswordExpirationTime]
+      attributes: [sAMAccountName, dNSHostName, operatingSystem, operatingSystemVersion, lastLogonTimestamp, userAccountControl, pwdLastSet, whenCreated, adminCount, servicePrincipalName, msDS-SupportedEncryptionTypes, msDS-AllowedToDelegateTo, msDS-AllowedToActOnBehalfOfOtherIdentity, ms-Mcs-AdmPwdExpirationTime, msLAPS-PasswordExpirationTime, objectSid]
       key: sAMAccountName
       name: dNSHostName
     each:
@@ -1713,7 +1713,7 @@ rules:
     query:
       protocol: ldap
       filter: '(&{COMPUTER}{ENABLED})'
-      attributes: [sAMAccountName, dNSHostName, operatingSystem, operatingSystemVersion, lastLogonTimestamp, userAccountControl, pwdLastSet, whenCreated, adminCount, servicePrincipalName, msDS-SupportedEncryptionTypes, msDS-AllowedToDelegateTo, msDS-AllowedToActOnBehalfOfOtherIdentity, ms-Mcs-AdmPwdExpirationTime, msLAPS-PasswordExpirationTime]
+      attributes: [sAMAccountName, dNSHostName, operatingSystem, operatingSystemVersion, lastLogonTimestamp, userAccountControl, pwdLastSet, whenCreated, adminCount, servicePrincipalName, msDS-SupportedEncryptionTypes, msDS-AllowedToDelegateTo, msDS-AllowedToActOnBehalfOfOtherIdentity, ms-Mcs-AdmPwdExpirationTime, msLAPS-PasswordExpirationTime, objectSid]
       key: sAMAccountName
       name: dNSHostName
     each:
@@ -1740,7 +1740,7 @@ rules:
     query:
       protocol: ldap
       filter: '(&{COMPUTER}{ENABLED})'
-      attributes: [sAMAccountName, dNSHostName, operatingSystem, operatingSystemVersion, lastLogonTimestamp, userAccountControl, pwdLastSet, whenCreated, adminCount, servicePrincipalName, msDS-SupportedEncryptionTypes, msDS-AllowedToDelegateTo, msDS-AllowedToActOnBehalfOfOtherIdentity, ms-Mcs-AdmPwdExpirationTime, msLAPS-PasswordExpirationTime]
+      attributes: [sAMAccountName, dNSHostName, operatingSystem, operatingSystemVersion, lastLogonTimestamp, userAccountControl, pwdLastSet, whenCreated, adminCount, servicePrincipalName, msDS-SupportedEncryptionTypes, msDS-AllowedToDelegateTo, msDS-AllowedToActOnBehalfOfOtherIdentity, ms-Mcs-AdmPwdExpirationTime, msLAPS-PasswordExpirationTime, objectSid]
       key: sAMAccountName
       name: dNSHostName
     each:
@@ -1765,7 +1765,7 @@ rules:
     query:
       protocol: ldap
       filter: '(&{COMPUTER}{ENABLED})'
-      attributes: [sAMAccountName, dNSHostName, operatingSystem, operatingSystemVersion, lastLogonTimestamp, userAccountControl, pwdLastSet, whenCreated, adminCount, servicePrincipalName, msDS-SupportedEncryptionTypes, msDS-AllowedToDelegateTo, msDS-AllowedToActOnBehalfOfOtherIdentity, ms-Mcs-AdmPwdExpirationTime, msLAPS-PasswordExpirationTime]
+      attributes: [sAMAccountName, dNSHostName, operatingSystem, operatingSystemVersion, lastLogonTimestamp, userAccountControl, pwdLastSet, whenCreated, adminCount, servicePrincipalName, msDS-SupportedEncryptionTypes, msDS-AllowedToDelegateTo, msDS-AllowedToActOnBehalfOfOtherIdentity, ms-Mcs-AdmPwdExpirationTime, msLAPS-PasswordExpirationTime, objectSid]
       key: sAMAccountName
       name: dNSHostName
     each:
@@ -1788,7 +1788,7 @@ rules:
     query:
       protocol: ldap
       filter: '(&{COMPUTER}{ENABLED})'
-      attributes: [sAMAccountName, dNSHostName, operatingSystem, operatingSystemVersion, lastLogonTimestamp, userAccountControl, pwdLastSet, whenCreated, adminCount, servicePrincipalName, msDS-SupportedEncryptionTypes, msDS-AllowedToDelegateTo, msDS-AllowedToActOnBehalfOfOtherIdentity, ms-Mcs-AdmPwdExpirationTime, msLAPS-PasswordExpirationTime]
+      attributes: [sAMAccountName, dNSHostName, operatingSystem, operatingSystemVersion, lastLogonTimestamp, userAccountControl, pwdLastSet, whenCreated, adminCount, servicePrincipalName, msDS-SupportedEncryptionTypes, msDS-AllowedToDelegateTo, msDS-AllowedToActOnBehalfOfOtherIdentity, ms-Mcs-AdmPwdExpirationTime, msLAPS-PasswordExpirationTime, objectSid]
       key: sAMAccountName
       name: dNSHostName
     each:
@@ -1809,7 +1809,7 @@ rules:
     query:
       protocol: ldap
       filter: '(&{COMPUTER}{ENABLED})'
-      attributes: [sAMAccountName, dNSHostName, operatingSystem, operatingSystemVersion, lastLogonTimestamp, userAccountControl, pwdLastSet, whenCreated, adminCount, servicePrincipalName, msDS-SupportedEncryptionTypes, msDS-AllowedToDelegateTo, msDS-AllowedToActOnBehalfOfOtherIdentity, ms-Mcs-AdmPwdExpirationTime, msLAPS-PasswordExpirationTime]
+      attributes: [sAMAccountName, dNSHostName, operatingSystem, operatingSystemVersion, lastLogonTimestamp, userAccountControl, pwdLastSet, whenCreated, adminCount, servicePrincipalName, msDS-SupportedEncryptionTypes, msDS-AllowedToDelegateTo, msDS-AllowedToActOnBehalfOfOtherIdentity, ms-Mcs-AdmPwdExpirationTime, msLAPS-PasswordExpirationTime, objectSid]
       key: sAMAccountName
       name: dNSHostName
     each:
@@ -1830,7 +1830,7 @@ rules:
     query:
       protocol: ldap
       filter: '(&{COMPUTER}{ENABLED})'
-      attributes: [sAMAccountName, dNSHostName, operatingSystem, operatingSystemVersion, lastLogonTimestamp, userAccountControl, pwdLastSet, whenCreated, adminCount, servicePrincipalName, msDS-SupportedEncryptionTypes, msDS-AllowedToDelegateTo, msDS-AllowedToActOnBehalfOfOtherIdentity, ms-Mcs-AdmPwdExpirationTime, msLAPS-PasswordExpirationTime]
+      attributes: [sAMAccountName, dNSHostName, operatingSystem, operatingSystemVersion, lastLogonTimestamp, userAccountControl, pwdLastSet, whenCreated, adminCount, servicePrincipalName, msDS-SupportedEncryptionTypes, msDS-AllowedToDelegateTo, msDS-AllowedToActOnBehalfOfOtherIdentity, ms-Mcs-AdmPwdExpirationTime, msLAPS-PasswordExpirationTime, objectSid]
       key: sAMAccountName
       name: dNSHostName
     each:
@@ -1890,7 +1890,7 @@ rules:
     query:
       protocol: ldap
       filter: '(&{COMPUTER}{ENABLED})'
-      attributes: [sAMAccountName, dNSHostName, operatingSystem, operatingSystemVersion, lastLogonTimestamp, userAccountControl, pwdLastSet, whenCreated, adminCount, servicePrincipalName, msDS-SupportedEncryptionTypes, msDS-AllowedToDelegateTo, msDS-AllowedToActOnBehalfOfOtherIdentity, ms-Mcs-AdmPwdExpirationTime, msLAPS-PasswordExpirationTime]
+      attributes: [sAMAccountName, dNSHostName, operatingSystem, operatingSystemVersion, lastLogonTimestamp, userAccountControl, pwdLastSet, whenCreated, adminCount, servicePrincipalName, msDS-SupportedEncryptionTypes, msDS-AllowedToDelegateTo, msDS-AllowedToActOnBehalfOfOtherIdentity, ms-Mcs-AdmPwdExpirationTime, msLAPS-PasswordExpirationTime, objectSid]
       key: sAMAccountName
       name: dNSHostName
     each:
@@ -1914,7 +1914,7 @@ rules:
     query:
       protocol: ldap
       filter: '(&{COMPUTER}{ENABLED})'
-      attributes: [sAMAccountName, dNSHostName, operatingSystem, operatingSystemVersion, lastLogonTimestamp, userAccountControl, pwdLastSet, whenCreated, adminCount, servicePrincipalName, msDS-SupportedEncryptionTypes, msDS-AllowedToDelegateTo, msDS-AllowedToActOnBehalfOfOtherIdentity, ms-Mcs-AdmPwdExpirationTime, msLAPS-PasswordExpirationTime]
+      attributes: [sAMAccountName, dNSHostName, operatingSystem, operatingSystemVersion, lastLogonTimestamp, userAccountControl, pwdLastSet, whenCreated, adminCount, servicePrincipalName, msDS-SupportedEncryptionTypes, msDS-AllowedToDelegateTo, msDS-AllowedToActOnBehalfOfOtherIdentity, ms-Mcs-AdmPwdExpirationTime, msLAPS-PasswordExpirationTime, objectSid]
       key: sAMAccountName
       name: dNSHostName
     each:
@@ -1938,7 +1938,7 @@ rules:
     query:
       protocol: ldap
       filter: '(&{COMPUTER}{ENABLED})'
-      attributes: [sAMAccountName, dNSHostName, operatingSystem, operatingSystemVersion, lastLogonTimestamp, userAccountControl, pwdLastSet, whenCreated, adminCount, servicePrincipalName, msDS-SupportedEncryptionTypes, msDS-AllowedToDelegateTo, msDS-AllowedToActOnBehalfOfOtherIdentity, ms-Mcs-AdmPwdExpirationTime, msLAPS-PasswordExpirationTime]
+      attributes: [sAMAccountName, dNSHostName, operatingSystem, operatingSystemVersion, lastLogonTimestamp, userAccountControl, pwdLastSet, whenCreated, adminCount, servicePrincipalName, msDS-SupportedEncryptionTypes, msDS-AllowedToDelegateTo, msDS-AllowedToActOnBehalfOfOtherIdentity, ms-Mcs-AdmPwdExpirationTime, msLAPS-PasswordExpirationTime, objectSid]
       key: sAMAccountName
       name: dNSHostName
     each:

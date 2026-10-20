@@ -9,8 +9,11 @@ using Keeper.Scan;
 // keeper-rules: validate, list and explain rule files, and load the catalogue into the store.
 try
 {
-    var cli = new CliArgs(args, flags: ["no-tenant"]);
+    var cli = new CliArgs(args, flags: ["no-tenant", "apply"]);
     var command = cli.At(0) ?? "list";
+
+    if (command == "import-baseline")
+        return ImportBaseline(cli);
 
     if (command == "validate" && cli.Positional.Count > 1)
     {
@@ -121,6 +124,56 @@ static int Load(RuleSet set, CliArgs cli)
     return ExitCodes.Ok;
 }
 
+// A baseline list (CIS via HardeningKitty, Microsoft SCT) -> a tenant rule file of registry rules.
+// Dry run unless --apply; the file goes to the Keeper home's settings\rules, never the repo.
+static int ImportBaseline(CliArgs cli)
+{
+    var csv = cli.At(1) ?? throw new ArgumentException("import-baseline needs the baseline CSV.");
+    var settings = BaselineImporter.ReadCsv(csv);
+    if (settings.Count == 0)
+        throw new ArgumentException($"{csv} has no settings.");
+    var baselineId = settings[0].BaselineId.Length > 0 ? settings[0].BaselineId : Path.GetFileNameWithoutExtension(csv);
+    var name = cli.Get("name") ?? baselineId;
+    var target = cli.Get("targets") ?? BaselineImporter.TargetFor(baselineId);
+    var framework = cli.Get("framework") ?? (baselineId.Contains("cis", StringComparison.OrdinalIgnoreCase) ? "CIS" : "MS-Baseline");
+    var import = BaselineImporter.Convert(settings, name, target, framework);
+
+    Console.WriteLine($"{csv}: {settings.Count} settings -> {import.Rules} registry rules on {target}, {import.Queries} reads per host.");
+    foreach (var group in import.Skipped.GroupBy(s => s.Reason).OrderByDescending(g => g.Count()))
+        Console.WriteLine($"  skipped {group.Count(),5}: {group.Key}");
+
+    if (import.Rules == 0)
+    {
+        Console.WriteLine("Nothing to import: no setting here is one the registry runner can read.");
+        return ExitCodes.NoData;
+    }
+    var (_, paths) = KeeperContext.Load(cli);
+    var file = cli.Get("out") ?? Path.Combine(paths.TenantRules, $"baseline-{string.Concat(name.ToLowerInvariant().Select(c => char.IsAsciiLetterOrDigit(c) ? c : '-')).Trim('-')}.yaml");
+    KeeperHome.EnsureOutsideCode(file, "The generated baseline");
+
+    // The generated file must load like any rule file before it is kept.
+    var tmp = file + ".tmp";
+    Directory.CreateDirectory(Path.GetDirectoryName(file)!);
+    File.WriteAllText(tmp, import.Yaml);
+    try
+    {
+        var loaded = RuleLoader.LoadFile(tmp, "tenant", Runners.Registry().Validators);
+        if (!cli.Has("apply"))
+        {
+            Console.WriteLine($"Dry run: {loaded.Rules.Count} rules load cleanly. Re-run with --apply to write {file}.");
+            return ExitCodes.Ok;
+        }
+        File.Move(tmp, file, overwrite: true);
+        Console.WriteLine($"Wrote {file}. 'keeper scan {loaded.System}' (or keeper run) checks it on every target host.");
+        return ExitCodes.Ok;
+    }
+    finally
+    {
+        if (File.Exists(tmp))
+            File.Delete(tmp);
+    }
+}
+
 static int Usage()
 {
     Console.Error.WriteLine("""
@@ -130,6 +183,9 @@ static int Usage()
           keeper-rules list [--system <s>]      every rule, one line each
           keeper-rules explain <rule-id>        what a rule reads and when it fails
           keeper-rules load                     queue the catalogue for the store
+          keeper-rules import-baseline <csv> [--name n] [--targets workstations|servers|members|dcs]
+                                        [--framework CIS] [--out file] [--apply]
+                                                a baseline list -> registry rules in the Keeper home
 
           --no-tenant                           built-in rules only
         """);
