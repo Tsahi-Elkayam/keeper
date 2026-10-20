@@ -64,7 +64,7 @@ public static class Registers
     public static readonly RegisterSpec KeyDate = new("review.key-date", "key_date", "key_date_id", "keyDateId",
     [
         new("kind", "kind", FieldType.Choice, Required: true,
-            Choices: ["contract", "renewal", "licence", "certificate", "report", "maintenance", "price-change", "other"]),
+            Choices: ["contract", "renewal", "licence", "certificate", "report", "maintenance", "price-change", "support-end", "payment", "other"]),
         new("title", "title", FieldType.Text, Required: true),
         new("dueOn", "due_on", FieldType.Date, Required: true),
         new("noticeDays", "notice_days", FieldType.Int, Default: 14L),
