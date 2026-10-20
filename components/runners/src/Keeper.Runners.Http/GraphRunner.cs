@@ -64,7 +64,10 @@ public sealed class GraphRunner : IRunner
                 {
                     ["path"] = "/" + (query.Text("version") ?? "v1.0") + query.Text("path"),
                     ["paging"] = "odata",
-                    ["items"] = query.Text("items") ?? "value",
+                    // No items path unless the rule names one: a list answer is read from "value", and an
+                    // endpoint that returns one object (authorizationPolicy, /deviceManagement) is one row.
+                    // Forcing "value" made those answers empty - and an empty answer looks like a pass.
+                    ["items"] = query.Text("items"),
                     ["maxPages"] = query.Text("maxPages"),
                 },
                 query.Key, query.Name);

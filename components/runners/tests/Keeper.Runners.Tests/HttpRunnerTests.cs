@@ -30,6 +30,16 @@ public sealed class HttpRunnerTests
     }
 
     [Fact]
+    public async Task A_graph_endpoint_that_returns_one_object_is_one_row_not_an_empty_answer()
+    {
+        var (result, _) = await Run(new GraphRunner(), "https://graph.microsoft.com", _ =>
+            StubHandler.Json("""{ "id": "authorizationPolicy", "allowInvitesFrom": "everyone" }"""),
+            null, ("path", "/policies/authorizationPolicy"));
+
+        Assert.Equal("everyone", Assert.Single(result.Rows)["allowInvitesFrom"]!.ToString());
+    }
+
+    [Fact]
     public async Task A_next_page_on_another_host_is_refused()
     {
         var (result, stub) = await Run(new HttpRunner(), "https://api.example.org", _ =>
