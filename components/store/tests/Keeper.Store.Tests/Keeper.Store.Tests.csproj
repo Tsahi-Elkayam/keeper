@@ -1,0 +1,9 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\Keeper.Store\Keeper.Store.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <EmbeddedResource Include="TestSchemas\alpha\*.sql" LogicalName="alpha/%(Filename)%(Extension)" />
+    <EmbeddedResource Include="TestSchemas\beta\*.sql" LogicalName="beta/%(Filename)%(Extension)" />
+  </ItemGroup>
+</Project>

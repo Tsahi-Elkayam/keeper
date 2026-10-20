@@ -1,0 +1,9 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <ItemGroup>
+    <ProjectReference Include="..\..\..\common\src\Keeper.Common\Keeper.Common.csproj" />
+    <ProjectReference Include="..\..\..\store\src\Keeper.Store\Keeper.Store.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <EmbeddedResource Include="Migrations\*.sql" LogicalName="queue/%(Filename)%(Extension)" />
+  </ItemGroup>
+</Project>

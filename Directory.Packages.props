@@ -1,0 +1,25 @@
+<Project>
+  <!-- Every package version in one place. Transitive pinning lets a fixed version here override a
+       vulnerable one a dependency brings in. -->
+  <PropertyGroup>
+    <ManagePackageVersionsCentrally>true</ManagePackageVersionsCentrally>
+    <CentralPackageTransitivePinningEnabled>true</CentralPackageTransitivePinningEnabled>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageVersion Include="Microsoft.Data.Sqlite" Version="10.0.13" />
+    <!-- Microsoft.Data.Sqlite 10 still pulls SQLitePCLRaw 2.1.11 (SQLite 3.49.1, CVE-2025-6965 / GHSA-2m69-gcr7-jv3q).
+         2.1.12+ bundles SQLite 3.53.3 and stays on the 2.1 line Microsoft.Data.Sqlite 10 is built against. -->
+    <PackageVersion Include="SQLitePCLRaw.bundle_e_sqlite3" Version="2.1.14" />
+    <PackageVersion Include="YamlDotNet" Version="18.1.0" />
+    <PackageVersion Include="System.Security.Cryptography.ProtectedData" Version="10.0.13" />
+    <PackageVersion Include="System.DirectoryServices.Protocols" Version="10.0.13" />
+    <PackageVersion Include="Microsoft.Identity.Client" Version="4.91.1" />
+    <PackageVersion Include="Microsoft.Identity.Client.Broker" Version="4.91.1" />
+    <PackageVersion Include="Microsoft.Data.SqlClient" Version="7.1.1" />
+    <PackageVersion Include="Microsoft.Management.Infrastructure" Version="4.0.0" />
+
+    <PackageVersion Include="Microsoft.NET.Test.Sdk" Version="17.11.1" />
+    <PackageVersion Include="xunit" Version="2.9.2" />
+    <PackageVersion Include="xunit.runner.visualstudio" Version="2.8.2" />
+  </ItemGroup>
+</Project>

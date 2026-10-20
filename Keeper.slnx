@@ -1,18 +1,26 @@
 <Solution>
-  <Folder Name="/src/">
-    <Project Path="src/Keeper.Core/Keeper.Core.csproj" />
-    <Project Path="src/Keeper.Store/Keeper.Store.csproj" />
-    <Project Path="src/Keeper.Queue/Keeper.Queue.csproj" />
-    <Project Path="src/Keeper.Query/Keeper.Query.csproj" />
-    <Project Path="src/keeper-db/keeper-db.csproj" />
-    <Project Path="src/keeper-qm/keeper-qm.csproj" />
-    <Project Path="src/keeper-query/keeper-query.csproj" />
+  <Folder Name="/common/">
+    <Project Path="components/common/src/Keeper.Common/Keeper.Common.csproj" />
+    <Project Path="components/common/tests/Keeper.Common.Tests/Keeper.Common.Tests.csproj" />
   </Folder>
-  <Folder Name="/tests/">
-    <Project Path="tests/Keeper.Testing/Keeper.Testing.csproj" />
-    <Project Path="tests/Keeper.Core.Tests/Keeper.Core.Tests.csproj" />
-    <Project Path="tests/Keeper.Store.Tests/Keeper.Store.Tests.csproj" />
-    <Project Path="tests/Keeper.Queue.Tests/Keeper.Queue.Tests.csproj" />
-    <Project Path="tests/Keeper.Query.Tests/Keeper.Query.Tests.csproj" />
+  <Folder Name="/contracts/">
+    <Project Path="components/contracts/src/Keeper.Contracts/Keeper.Contracts.csproj" />
+    <Project Path="components/contracts/tests/Keeper.Contracts.Tests/Keeper.Contracts.Tests.csproj" />
+  </Folder>
+  <Folder Name="/store/">
+    <Project Path="components/store/src/Keeper.Store/Keeper.Store.csproj" />
+    <Project Path="components/store/tests/Keeper.Store.Tests/Keeper.Store.Tests.csproj" />
+  </Folder>
+  <Folder Name="/queue/">
+    <Project Path="components/queue/src/Keeper.Queue/Keeper.Queue.csproj" />
+    <Project Path="components/queue/tests/Keeper.Queue.Tests/Keeper.Queue.Tests.csproj" />
+  </Folder>
+  <Folder Name="/query/">
+    <Project Path="components/query/src/Keeper.Query/Keeper.Query.csproj" />
+    <Project Path="components/query/tests/Keeper.Query.Tests/Keeper.Query.Tests.csproj" />
+  </Folder>
+  <Folder Name="/home/">
+    <Project Path="components/home/src/Keeper.Home/Keeper.Home.csproj" />
+    <Project Path="components/home/tests/Keeper.Home.Tests/Keeper.Home.Tests.csproj" />
   </Folder>
 </Solution>

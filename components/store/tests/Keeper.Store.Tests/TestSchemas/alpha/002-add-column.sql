@@ -1,0 +1,1 @@
+ALTER TABLE alpha ADD COLUMN size INTEGER;

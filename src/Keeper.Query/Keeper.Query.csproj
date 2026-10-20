@@ -1,8 +1,0 @@
-<Project Sdk="Microsoft.NET.Sdk">
-  <ItemGroup>
-    <ProjectReference Include="..\Keeper.Store\Keeper.Store.csproj" />
-  </ItemGroup>
-  <ItemGroup>
-    <EmbeddedResource Include="Queries\*.sql" LogicalName="Queries/%(Filename)%(Extension)" />
-  </ItemGroup>
-</Project>

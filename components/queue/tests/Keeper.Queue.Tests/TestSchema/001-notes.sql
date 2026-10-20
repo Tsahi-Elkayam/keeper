@@ -1,0 +1,1 @@
+CREATE TABLE note (note_id INTEGER PRIMARY KEY, text TEXT NOT NULL, actor TEXT NOT NULL, from_file TEXT) STRICT;

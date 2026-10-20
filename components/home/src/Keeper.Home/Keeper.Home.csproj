@@ -1,0 +1,5 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <ItemGroup>
+    <ProjectReference Include="..\..\..\common\src\Keeper.Common\Keeper.Common.csproj" />
+  </ItemGroup>
+</Project>
