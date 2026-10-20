@@ -19,6 +19,8 @@ public static class Runners
         new GraphQlRunner(),
         new SqlRunner(),
         new CimRunner(),
+        new EventLogRunner(),
+        new RegistryRunner(),
         new TlsRunner(),
         new FileRunner(),
         new StoreRunner(),

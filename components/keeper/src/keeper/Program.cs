@@ -11,6 +11,7 @@ var verbs = new Dictionary<string, string>(StringComparer.Ordinal)
     ["run"] = "the daily pipeline: scan, load, track, rank, then today's list",
     ["today"] = "what to do today",
     ["scan"] = "scan one system through its integration (read-only towards it)",
+    ["certs"] = "which certificates a server presents, valid or not, until when (you start it)",
     ["load"] = "queue the scans the store has not taken in",
     ["track"] = "turn the newest scans into the findings register",
     ["rank"] = "order the open findings into today's list",

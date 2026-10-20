@@ -51,7 +51,7 @@ public static partial class IntegrationTypes
         new("azure", "Azure Resource Manager", ["http"], Entra,
             ["management.azure.com", "management.usgovcloudapi.net", "management.chinacloudapi.cn"], "https://management.azure.com"),
         new("sccm", "SCCM AdminService (or the site database)", ["http", "sql"], [.. Windows, "basic"], []),
-        new("cim", "Windows hosts over WinRM (CIM)", ["cim"], Windows, []),
+        new("cim", "Windows hosts: WMI over WinRM, the registry (read-only) and event logs", ["cim", "registry", "eventlog"], Windows, []),
         new("sql", "SQL Server instances", ["sql"], ["negotiate", "basic"], []),
         new("tls", "TLS endpoints", ["tls"], ["none"], []),
         new("vcenter", "VMware vCenter REST API", ["http"], ["vcenter-session"], []),

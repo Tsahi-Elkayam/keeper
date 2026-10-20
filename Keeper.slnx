@@ -47,6 +47,7 @@
     <Project Path="components/scan/src/Keeper.Scan/Keeper.Scan.csproj" />
     <Project Path="components/scan/src/keeper-rules/keeper-rules.csproj" />
     <Project Path="components/scan/src/keeper-scan/keeper-scan.csproj" />
+    <Project Path="components/scan/src/keeper-certs/keeper-certs.csproj" />
     <Project Path="components/scan/tests/Keeper.Scan.Tests/Keeper.Scan.Tests.csproj" />
   </Folder>
   <Folder Name="/vault/">

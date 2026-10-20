@@ -83,6 +83,51 @@ public sealed class GuardTests
     }
 
     [Fact]
+    public void Event_log_queries_filter_on_the_host_by_id_provider_and_window()
+    {
+        var query = Context.Query("eventlog", "recordId", ("log", "System"), ("ids", new System.Text.Json.Nodes.JsonArray("41", "6008")),
+            ("providers", new System.Text.Json.Nodes.JsonArray("EventLog")), ("days", "3"));
+
+        Assert.Empty(new EventLogRunner().Validate(query));
+        Assert.Equal("*[System[(EventID=41 or EventID=6008) and Provider[@Name='EventLog'] and TimeCreated[timediff(@SystemTime) <= 259200000]]]",
+            EventLogRunner.XPath(query));
+    }
+
+    [Theory]
+    [InlineData("System", "x' or 1=1", "providers")]
+    [InlineData("System]]", null, "log")]
+    public void Event_log_names_that_could_change_the_query_are_refused(string log, string? provider, string field)
+    {
+        var fields = new List<(string, System.Text.Json.Nodes.JsonNode?)> { ("log", log) };
+        if (provider is not null)
+            fields.Add(("providers", new System.Text.Json.Nodes.JsonArray(provider)));
+
+        Assert.Contains(new EventLogRunner().Validate(Context.Query("eventlog", "recordId", [.. fields])), p => p.StartsWith(field, StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void Event_data_comes_back_by_name()
+    {
+        const string xml = """
+            <Event xmlns="http://schemas.microsoft.com/win/2004/08/events/event">
+              <System><EventID>7031</EventID></System>
+              <EventData><Data Name="param1">Example Service</Data><Data Name="param2">1</Data><Data>unnamed</Data></EventData>
+            </Event>
+            """;
+
+        Assert.Equal(new[] { ("param1", "Example Service"), ("param2", "1") }, EventLogRunner.EventData(xml));
+    }
+
+    [Fact]
+    public void Registry_keys_must_be_plain_paths_and_credentials_are_never_read()
+    {
+        Assert.Empty(new RegistryRunner().Validate(Context.Query("registry", "host",
+            ("key", @"SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System"), ("values", new System.Text.Json.Nodes.JsonArray("EnableLUA")))));
+        Assert.NotEmpty(new RegistryRunner().Validate(Context.Query("registry", "host", ("key", @"SOFTWARE\..\SAM"), ("hive", "HKCR"))));
+        Assert.Contains("DefaultPassword", RegistryRunner.SecretValues);
+    }
+
+    [Fact]
     public void Secret_attributes_are_known()
     {
         Assert.True(SecretAttributes.IsSecret("ms-Mcs-AdmPwd"));

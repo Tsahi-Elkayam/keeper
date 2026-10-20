@@ -28,10 +28,14 @@ public sealed class HttpRunner : IRunner
             yield return "params must be a mapping";
         if (query.Fields["headers"] is JsonObject headers && headers.Any(h => h.Key.Contains("auth", StringComparison.OrdinalIgnoreCase) || h.Key.Contains("cookie", StringComparison.OrdinalIgnoreCase)))
             yield return "headers must not carry credentials; the integration adds them";
+        foreach (var perObject in PerObject.Validate(query))
+            yield return perObject;
     }
 
     public async Task<RunnerResult> RunAsync(QuerySpec query, RunnerContext context, CancellationToken cancellationToken)
     {
+        if (query.Fields["for_each"] is JsonObject)
+            return await PerObject.RunAsync(this, query, context, cancellationToken).ConfigureAwait(false);
         try
         {
             using var engine = HttpEngine.Open(context);
@@ -52,7 +56,10 @@ public sealed class HttpRunner : IRunner
         var headers = (query.Fields["headers"] as JsonObject)?.ToDictionary(h => h.Key, h => Values.Text(h.Value) ?? "") ?? [];
         foreach (var (name, value) in extraHeaders ?? new Dictionary<string, string>())
             headers[name] = value;
-        var parameters = HttpEngine.Parameters(query.Fields["params"]).Concat(extraParams ?? []).ToList();
+        var parameters = HttpEngine.Parameters(query.Fields["params"]).Concat(extraParams ?? [])
+            .Select(p => KeyValuePair.Create(p.Key, RequestMacros.Expand(p.Value, context.Now)))
+            .ToList();
+        var path = RequestMacros.Expand(query.Text("path")!, context.Now);
 
         var offsetParam = query.Text("offsetParam") ?? "sysparm_offset";
         var limitParam = query.Text("limitParam") ?? "sysparm_limit";
@@ -61,7 +68,7 @@ public sealed class HttpRunner : IRunner
             parameters.Add(KeyValuePair.Create(limitParam, pageSize.ToString(CultureInfo.InvariantCulture)));
 
         var rows = new List<JsonObject>();
-        Uri? next = engine.Build(query.Text("path")!, paging == "offset"
+        Uri? next = engine.Build(path, paging == "offset"
             ? parameters.Append(KeyValuePair.Create(offsetParam, "0"))
             : parameters);
         for (var page = 1; next is not null; page++)
@@ -81,7 +88,7 @@ public sealed class HttpRunner : IRunner
             {
                 "none" => null,
                 "link" => HttpEngine.NextLink(responseHeaders),
-                "offset" => pageRows.Count < pageSize ? null : engine.Build(query.Text("path")!,
+                "offset" => pageRows.Count < pageSize ? null : engine.Build(path,
                     parameters.Append(KeyValuePair.Create(offsetParam, (page * pageSize).ToString(CultureInfo.InvariantCulture)))),
                 _ => body is JsonObject o && Values.Text(o["@odata.nextLink"]) is { } link && Uri.TryCreate(link, UriKind.Absolute, out var u) ? u : null,
             };

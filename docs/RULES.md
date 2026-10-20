@@ -117,9 +117,29 @@ Every query has `protocol:`, `key:` (the row field that identifies the entity) a
 | `graphql` | `document` (required, a query), `path` (default /graphql), `variables`: mapping, `items`: path to the array, `paging`: { cursor, hasNext, variable }, `maxPages`. | One per item. |
 | `sql` | `text` (required, one SELECT/WITH), `database` (default master). Per target instance. | One per result row, plus `instance`. |
 | `cim` | `wql` (required, one SELECT; `{HOST}` stands for the target's computer name, upper case - e.g. `Win32_Group.Domain='{HOST}',Name='Administrators'`), `namespace` (default root/cimv2). Per target host. Never `Win32_Product`: reading it makes Windows Installer re-check (and repair) every package. | One per instance, plus `host`. Dates are ISO. |
+| `eventlog` | `log` (required: System, Application, or a channel such as Microsoft-Windows-GroupPolicy/Operational), `ids` (list), `providers` (list of names), `days` (window, default 7, at most 90), `max` (cap per host, default 500). Filtered on the host. Per target. | One per event: host, log, id, provider, level, recordId, time, plus each named event data field (param1, ServerName, ...). A channel the host does not have returns no rows. Over the cap the result is partial. |
+| `registry` | `key` (required), `hive` (HKLM default, or HKU), `values` (list; all values when absent), or `subkeys: true`. Read-only: only StdRegProv's Enum and Get methods are ever called. Per target. | One row per host: host, key, exists, and one field per value; with `subkeys`, one row per subkey. Credentials such as an automatic-logon password come back as "set", never as the value. |
 | `tls` | `port` (default 443; a target may also be host:port). Per target. | endpoint, host, port, subject, issuer, notBefore, notAfter, daysLeft, serial, thumbprint, keyAlgorithm, keySize, signatureAlgorithm, protocol, cipherSuite, chainValid, nameMatches, chainErrors, selfSigned, sans, eku (OIDs: 1.3.6.1.5.5.7.3.1 server authentication, 1.3.6.1.5.2.3.5 KDC authentication, ...). |
 | `file` | `path` (required, relative to imports\, wildcards in the file name), `format`: json (default), xml, csv; `items`: JSON path (json) or XPath (xml, required); `delimiter` (csv). | One per item, plus `_file` and `_modified`. XML elements become objects: attributes and child elements by name, repeated children as arrays. |
 | `store` | `text` (required, one SELECT or WITH; `:now` and `:today` are bound). | One per result row. Readable: the registers (licence, contract, key_date, vendor, initiative, attestation, latest_attestation), the review tables (system, entity, finding, active_finding, override, setting, rule, run, latest_run, coverage, row_seen) and integration_status / integration_test. Never: integration_secret, vault_key, request, schema_version. |
+
+**One request per object** (`http`, `graph`): `for_each` names the list to walk and the field that
+goes into the path. The list is fetched first through the same integration, and each row it returns
+carries its object as `parent`:
+
+```yaml
+    query:
+      protocol: graph
+      path: /servicePrincipals/{id}/synchronization/jobs
+      for_each: { path: /servicePrincipals, select: [id, appDisplayName], field: id, max: 500 }
+      key: "{parent.id}|{id}"
+```
+
+Only plain ids (letters, digits, `. _ : -`) are put into a path; a failed object makes the result
+partial, never a pass. One level only; `max` defaults to 200 (at most 2000).
+
+**Dates relative to the scan** in `http` and `graph` paths, params and filters: `{NOW}`, `{TODAY}`,
+`{DAYS_AGO:n}`, `{DAYS_AHEAD:n}` - e.g. `filter: "activityDateTime ge {DAYS_AGO:7}"`.
 
 LDAP filter macros (the earlier LDAP rules use them): `{USER}`, `{COMPUTER}`, `{ENABLED}`, `{UAC:n}`
 (bit n set), `{FT:n}` (FILETIME n days ago), `{GT:n}` (generalized time n days ago), `{DOMAINDN}`,

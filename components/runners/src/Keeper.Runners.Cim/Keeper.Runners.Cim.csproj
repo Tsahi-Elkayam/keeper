@@ -1,6 +1,7 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <ItemGroup>
     <PackageReference Include="Microsoft.Management.Infrastructure" />
+    <PackageReference Include="System.Diagnostics.EventLog" />
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\Keeper.Runners\Keeper.Runners.csproj" />

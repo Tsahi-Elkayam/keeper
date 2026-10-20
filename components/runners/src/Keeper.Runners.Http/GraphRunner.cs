@@ -27,10 +27,14 @@ public sealed class GraphRunner : IRunner
             yield return "consistency can only be eventual";
         if (query.Text("search") is not null && query.Text("consistency") is null)
             yield return "search needs consistency: eventual";
+        foreach (var perObject in PerObject.Validate(query))
+            yield return perObject;
     }
 
     public async Task<RunnerResult> RunAsync(QuerySpec query, RunnerContext context, CancellationToken cancellationToken)
     {
+        if (query.Fields["for_each"] is JsonObject)
+            return await PerObject.RunAsync(this, query, context, cancellationToken).ConfigureAwait(false);
         try
         {
             using var engine = HttpEngine.Open(context, DefaultEndpoint);
@@ -43,7 +47,7 @@ public sealed class GraphRunner : IRunner
 
             var select = query.List("select");
             Add("$select", select.Count > 0 ? string.Join(",", select) : null);
-            Add("$filter", query.Text("filter"));
+            Add("$filter", query.Text("filter") is { } filter ? RequestMacros.Expand(filter, context.Now) : null);
             Add("$expand", query.Text("expand"));
             // Only when the rule asks: some Graph endpoints refuse $top outright.
             Add("$top", query.Int("top")?.ToString(CultureInfo.InvariantCulture));

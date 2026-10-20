@@ -53,20 +53,10 @@ public sealed partial class CimRunner : IRunner
         var host = context.Target!;
         try
         {
-            using var options = new WSManSessionOptions { Timeout = context.Timeout };
-            var credential = context.Connection.WindowsCredential();
-            if (credential is not null)
-            {
-                using var password = new SecureString();
-                foreach (var c in credential.Password)
-                    password.AppendChar(c);
-                options.AddDestinationCredentials(new CimCredential(PasswordAuthenticationMechanism.Kerberos, credential.Domain, credential.UserName, password));
-            }
-
             if (Expand(query.Text("wql")!, host) is not { } wql)
                 return RunnerResult.Failed($"{host}: not a host name {{HOST}} can stand for");
 
-            using var session = CimSession.Create(host, options);
+            using var session = CimSessions.Open(host, context);
             var rows = new List<JsonObject>();
             foreach (var instance in session.QueryInstances(query.Text("namespace") ?? "root/cimv2", "WQL", wql))
             {
