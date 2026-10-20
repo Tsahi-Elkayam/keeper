@@ -117,6 +117,7 @@ public static class TodayBuilder
             .OrderBy(r => r.Left)
             .Select(r => new DueItem(r.What, r.Id, r.Title, r.Due, r.Left))
             .ToList();
+        due = GroupFindingsByDay(due);
 
         var neverScanned = Sql.Rows(connection,
                 "SELECT system, COUNT(*) AS rules FROM rule WHERE system NOT IN (SELECT DISTINCT system FROM run) GROUP BY system ORDER BY system;")
@@ -126,5 +127,25 @@ public static class TodayBuilder
         var rankedAt = Sql.Scalar(connection, "SELECT at FROM rank_build ORDER BY build_id DESC LIMIT 1;") as string;
         return new TodayReport(Iso.Utc(now), rankedAt, Setting("rank.daily-minutes", 120), today, waiting, fresh.Count,
             fresh.Take(5).Select(f => (string)f["title"]!).ToList(), blind, stale, due) { NeverScanned = neverScanned };
+    }
+
+    /// <summary>
+    /// Licences, contracts and key dates stay one line each. Findings that fall due on the same day - a new
+    /// tenant's never-attested duties all do - become one line, so the dates that matter are not buried.
+    /// </summary>
+    public static List<DueItem> GroupFindingsByDay(List<DueItem> due)
+    {
+        const int MaxPerDay = 3;
+        var crowded = due.Where(d => d.What == "finding").GroupBy(d => d.DueOn).Where(g => g.Count() > MaxPerDay)
+            .ToDictionary(g => g.Key, g => g.ToList(), StringComparer.Ordinal);
+        var result = new List<DueItem>();
+        foreach (var d in due)
+        {
+            if (d.What != "finding" || !crowded.TryGetValue(d.DueOn, out var group))
+                result.Add(d);
+            else if (ReferenceEquals(group[0], d))
+                result.Add(new DueItem("findings", d.DueOn, $"{group.Count} findings, e.g. {string.Join("; ", group.Take(2).Select(g => g.Title))}", d.DueOn, d.DaysLeft));
+        }
+        return result;
     }
 }

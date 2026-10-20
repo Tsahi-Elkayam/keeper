@@ -20,6 +20,8 @@ public static class QueueHost
         try
         {
             var cli = new CliArgs(args);
+            if (cli.Help)
+                return Usage(name, asked: true);
             var location = locate(cli);
             return (cli.At(0) ?? "status") switch
             {
@@ -81,16 +83,13 @@ public static class QueueHost
         return ExitCodes.Ok;
     }
 
-    private static int Usage(string name)
-    {
-        Console.Error.WriteLine($"""
+    private static int Usage(string name, bool asked = false) =>
+        CliUsage.Print($"""
             {name} - the queue manager, the only writer of the store
 
               {name} status                                         files waiting in each spool folder
               {name} run                                            apply every queued request once
               {name} submit <kind> --reason "<why>" --payload <f>   queue a request
               {name} kinds                                          the request kinds this build handles
-            """);
-        return ExitCodes.Usage;
-    }
+            """, asked);
 }

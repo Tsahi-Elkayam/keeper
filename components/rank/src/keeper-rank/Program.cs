@@ -11,6 +11,14 @@ using Microsoft.Data.Sqlite;
 try
 {
     var cli = new CliArgs(args, flags: ["dry-run"]);
+    if (cli.Help)
+        return CliUsage.Print("""
+            keeper-rank - order the open findings into today's list, within the daily minutes (rank.daily-minutes)
+
+              keeper rank              rank and queue the result; 'keeper qm run' applies it
+              keeper rank --dry-run    show the counts and queue nothing
+              --build <id>             the build id to record (default: now)
+            """, asked: true);
     var (_, paths) = KeeperContext.Load(cli);
     var buildId = cli.Get("build") ?? Iso.Stamp(DateTimeOffset.UtcNow);
 

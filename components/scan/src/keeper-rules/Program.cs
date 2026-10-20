@@ -10,6 +10,8 @@ using Keeper.Scan;
 try
 {
     var cli = new CliArgs(args, flags: ["no-tenant", "apply"]);
+    if (cli.Help)
+        return Usage(asked: true);
     var command = cli.At(0) ?? "list";
 
     if (command == "import-baseline")
@@ -174,9 +176,8 @@ static int ImportBaseline(CliArgs cli)
     }
 }
 
-static int Usage()
-{
-    Console.Error.WriteLine("""
+static int Usage(bool asked = false) =>
+    CliUsage.Print("""
         keeper-rules - rule files
 
           keeper-rules validate [<folder>...]   check rule files (with folders: no Keeper home needed)
@@ -188,6 +189,4 @@ static int Usage()
                                                 a baseline list -> registry rules in the Keeper home
 
           --no-tenant                           built-in rules only
-        """);
-    return ExitCodes.Usage;
-}
+        """, asked);

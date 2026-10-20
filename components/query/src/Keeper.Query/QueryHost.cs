@@ -32,6 +32,11 @@ public static class QueryHost
                 Console.Error.WriteLine($"No question named '{question}'. '{name} list' shows them.");
                 return ExitCodes.Usage;
             }
+            if (cli.Help)
+            {
+                Console.WriteLine($"{query.Name}: {query.Description}\n  parameters: {QueryRunner.Describe(query)}\n  --format table|jsonl   --out <file> (jsonl)");
+                return ExitCodes.Ok;
+            }
 
             var arguments = cli.Options
                 .Where(o => !Reserved.Contains(o.Key, StringComparer.OrdinalIgnoreCase))

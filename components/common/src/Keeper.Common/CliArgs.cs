@@ -2,7 +2,7 @@ namespace Keeper.Common;
 
 /// <summary>
 /// The argument parser every keeper binary shares: positional words, --name value, --name=value,
-/// and declared flags (--name with no value).
+/// and declared flags (--name with no value). --help, -h and /? are always a request for usage.
 /// </summary>
 public sealed class CliArgs
 {
@@ -16,6 +16,11 @@ public sealed class CliArgs
         for (var i = 0; i < args.Count; i++)
         {
             var arg = args[i];
+            if (arg is "--help" or "-h" or "/?")
+            {
+                Help = true;
+                continue;
+            }
             if (!arg.StartsWith("--", StringComparison.Ordinal) || arg.Length == 2)
             {
                 _positional.Add(arg);
@@ -46,6 +51,9 @@ public sealed class CliArgs
             }
         }
     }
+
+    /// <summary>The caller asked for usage (--help, -h or /?).</summary>
+    public bool Help { get; }
 
     /// <summary>Every value of an option given more than once (--option a=1 --option b=2).</summary>
     public IReadOnlyList<string> All(string name) => _repeated.TryGetValue(name, out var list) ? list : [];

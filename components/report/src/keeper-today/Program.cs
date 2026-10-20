@@ -11,6 +11,14 @@ using Microsoft.Data.Sqlite;
 try
 {
     var cli = new CliArgs(args);
+    if (cli.Help)
+        return CliUsage.Print("""
+            keeper-today - what to do today (read-only)
+
+              keeper today                         the ranked list, what waits on others, what falls due, blind spots
+              keeper today --format markdown|html  another format (text by default)
+              keeper today --out today.html        write it to a file; .html picks html
+            """, asked: true);
     var (_, paths) = KeeperContext.Load(cli);
     TodayReport report;
     using (var connection = new Database(paths.Database).OpenReadOnly())

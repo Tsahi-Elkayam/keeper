@@ -225,7 +225,7 @@ rules:
       protocol: store
       text: >
         SELECT system_id, name FROM system
-        WHERE active = 1 AND system_id NOT IN ('KEEPER', 'UNMAPPED')
+        WHERE active = 1 AND system_id NOT IN ('KEEPER', 'ORG', 'UNMAPPED')
           AND COALESCE(team, '') = '' AND COALESCE(owner_person, '') = ''
       key: system_id
       name: name

@@ -8,6 +8,8 @@ using Microsoft.Data.Sqlite;
 try
 {
     var cli = new CliArgs(args, flags: ["apply"]);
+    if (cli.Help)
+        return Usage(asked: true);
     var command = cli.At(0) ?? "status";
     var (paths, db) = Composition.Locate(cli);
     var schemas = Composition.Schemas;
@@ -101,15 +103,12 @@ static int Backup(Database db, KeeperPaths paths)
     return ExitCodes.Ok;
 }
 
-static int Usage()
-{
-    Console.Error.WriteLine("""
+static int Usage(bool asked = false) =>
+    CliUsage.Print("""
         keeper-db - the store's lifecycle
 
           keeper-db status               every component's schema version
           keeper-db init [--apply]       create the store (dry run without --apply)
           keeper-db migrate [--apply]    apply pending migrations, backing up first
           keeper-db backup               copy the store into data\backups\
-        """);
-    return ExitCodes.Usage;
-}
+        """, asked);

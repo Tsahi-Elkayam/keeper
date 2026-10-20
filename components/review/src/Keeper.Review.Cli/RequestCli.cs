@@ -22,13 +22,16 @@ public sealed class RequestCli
 
     public KeeperPaths Paths { get; }
 
-    public static int Run(string name, string[] args, string[] flags, Func<RequestCli, int> body, Func<int> usage)
+    /// <param name="usage">Prints the binary's usage; true when it was asked for, false when the arguments were wrong.</param>
+    public static int Run(string name, string[] args, string[] flags, Func<RequestCli, int> body, Func<bool, int> usage)
     {
         try
         {
             var cli = new CliArgs(args, flags: [.. flags, "now"]);
-            if (cli.At(0) is null or "help")
-                return usage();
+            if (cli.Help || cli.At(0) is "help")
+                return usage(true);
+            if (cli.At(0) is null)
+                return usage(false);
             var (_, paths) = KeeperContext.Load(cli);
             return body(new RequestCli(cli, paths));
         }

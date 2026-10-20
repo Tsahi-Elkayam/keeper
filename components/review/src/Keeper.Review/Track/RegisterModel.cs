@@ -54,4 +54,6 @@ public sealed record EntityRow
     public required string FirstSeen { get; init; }
     public required string LastSeen { get; init; }
     public string? GoneSince { get; init; }
+    /// <summary>The rule system of the newest scan that returned it; only that system's scans can mark it gone.</summary>
+    public string? SeenBy { get; init; }
 }

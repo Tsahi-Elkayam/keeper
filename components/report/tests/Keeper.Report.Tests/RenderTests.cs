@@ -48,6 +48,25 @@ public sealed class RenderTests
     }
 
     [Fact]
+    public void Findings_due_the_same_day_fold_into_one_line_but_register_dates_never_do()
+    {
+        List<DueItem> due =
+        [
+            .. Enumerable.Range(1, 5).Select(i => new DueItem("finding", $"k{i}", $"Duty {i} not attested", "2026-10-20", 0)),
+            new DueItem("finding", "k9", "Certificate expires", "2026-10-25", 5),
+            .. Enumerable.Range(1, 4).Select(i => new DueItem("licence", $"lic{i}", $"Licence {i}", "2026-10-20", 0)),
+        ];
+
+        var grouped = TodayBuilder.GroupFindingsByDay(due);
+
+        var folded = Assert.Single(grouped, d => d.What == "findings");
+        Assert.StartsWith("5 findings, e.g. Duty 1 not attested; Duty 2 not attested", folded.Title, StringComparison.Ordinal);
+        Assert.Contains(grouped, d => d.Title == "Certificate expires");
+        Assert.Equal(4, grouped.Count(d => d.What == "licence"));
+        Assert.Equal(6, grouped.Count);
+    }
+
+    [Fact]
     public void An_unknown_format_is_refused()
     {
         Assert.Throws<ArgumentException>(() => Render.As(TodayDocument.From(Report("x")), "pdf"));

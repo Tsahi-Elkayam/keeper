@@ -62,11 +62,25 @@ public sealed class Tracker(SqliteConnection connection, TimeProvider? clock = n
                 (string)r["system_id"]!))
             .ToList();
 
-    /// <summary>Keeper's own rules (system 'keeper') are about Keeper; anything else no rule claims is unmapped.</summary>
-    private static (string SystemId, string MappedBy) Unclaimed(string ruleSystem) =>
-        ruleSystem.Equals("keeper", StringComparison.OrdinalIgnoreCase) ? ("KEEPER", "builtin") : ("UNMAPPED", "unmapped");
+    /// <summary>
+    /// Keeper's own rules (system 'keeper') are about Keeper. Other rules over Keeper's registers (instance
+    /// 'keeper') belong to the system the register row names, or else to the organisation. Anything else no
+    /// rule claims is unmapped.
+    /// </summary>
+    private (string SystemId, string MappedBy) Unclaimed(string instance, string ruleSystem, JsonObject? attrs)
+    {
+        if (ruleSystem.Equals("keeper", StringComparison.OrdinalIgnoreCase))
+            return ("KEEPER", "builtin");
+        if (!instance.Equals("keeper", StringComparison.OrdinalIgnoreCase))
+            return ("UNMAPPED", "unmapped");
+        var named = attrs is null ? null : Lookup(attrs, "system_id");
+        _systems ??= Sql.Rows(connection, "SELECT system_id FROM system;").Select(r => (string)r["system_id"]!).ToHashSet(StringComparer.Ordinal);
+        return named is not null && _systems.Contains(named) && named != "UNMAPPED" ? (named, "register") : ("ORG", "builtin");
+    }
 
-    private static (string SystemId, string MappedBy) MapSystem(IEnumerable<SystemRule> rules, string instance, string entityType,
+    private HashSet<string>? _systems;
+
+    private (string SystemId, string MappedBy) MapSystem(IEnumerable<SystemRule> rules, string instance, string entityType,
         string key, string? name, JsonObject? attrs, string ruleSystem)
     {
         foreach (var rule in rules)
@@ -93,7 +107,7 @@ public sealed class Tracker(SqliteConnection connection, TimeProvider? clock = n
                 // A pathological pattern never maps anything; the entity stays unmapped.
             }
         }
-        return Unclaimed(ruleSystem);
+        return Unclaimed(instance, ruleSystem, attrs);
     }
 
     private static string? Lookup(JsonObject attrs, string path)
@@ -114,22 +128,21 @@ public sealed class Tracker(SqliteConnection connection, TimeProvider? clock = n
             .ToDictionary(r => ((string)r["instance"]!, (string)r["entity_type"]!, (string)r["entity_key"]!), r => r);
         var result = new Dictionary<(string, string, string), EntityRow>();
 
+        // Every run's rows first: an entity any of these scans returned is not gone, whatever the run order.
         foreach (var run in runs)
         {
             var runId = (string)run["run_id"]!;
             var instance = (string)run["instance"]!;
-            var complete = (string)run["status"]! == "ok";
-            var seen = new HashSet<(string, string, string)>();
+            var system = (string)run["system"]!;
 
             foreach (var row in Sql.Rows(connection,
                          "SELECT entity_type, entity_key, MAX(entity_name) AS entity_name, MAX(attrs) AS attrs FROM row_seen WHERE run_id = :r GROUP BY entity_type, entity_key;",
                          null, (":r", runId)))
             {
                 var key = (instance, (string)row["entity_type"]!, (string)row["entity_key"]!);
-                seen.Add(key);
                 var attrs = JsonNode.Parse((string)row["attrs"]!) as JsonObject;
                 var name = row["entity_name"] as string;
-                var (systemId, mappedBy) = MapSystem(systemRules, instance, key.Item2, key.Item3, name, attrs, (string)run["system"]!);
+                var (systemId, mappedBy) = MapSystem(systemRules, instance, key.Item2, key.Item3, name, attrs, system);
                 existing.TryGetValue(key, out var before);
                 result[key] = new EntityRow
                 {
@@ -142,13 +155,20 @@ public sealed class Tracker(SqliteConnection connection, TimeProvider? clock = n
                     FirstSeen = before?["first_seen"] as string ?? now,
                     LastSeen = now,
                     GoneSince = null,
+                    SeenBy = system,
                 };
             }
+        }
 
-            // Only a complete scan can say an entity is gone.
-            if (!complete)
+        foreach (var run in runs)
+        {
+            // Only a complete scan can say an entity is gone, and only of entities its own rule system returned.
+            if ((string)run["status"]! != "ok")
                 continue;
-            foreach (var (key, before) in existing.Where(e => e.Key.Item1 == instance && !seen.Contains(e.Key)))
+            var instance = (string)run["instance"]!;
+            var system = (string)run["system"]!;
+            foreach (var (key, before) in existing.Where(e => e.Key.Item1 == instance && !result.ContainsKey(e.Key)
+                         && (e.Value["seen_by"] as string ?? system) == system))
             {
                 result[key] = new EntityRow
                 {
@@ -161,6 +181,7 @@ public sealed class Tracker(SqliteConnection connection, TimeProvider? clock = n
                     FirstSeen = (string)before["first_seen"]!,
                     LastSeen = (string)before["last_seen"]!,
                     GoneSince = before["gone_since"] as string ?? now,
+                    SeenBy = system,
                 };
             }
         }
@@ -188,13 +209,11 @@ public sealed class Tracker(SqliteConnection connection, TimeProvider? clock = n
         var existing = Sql.Rows(connection, "SELECT * FROM finding;").ToDictionary(r => (string)r["finding_key"]!, r => r);
         var touched = new Dictionary<string, FindingRow>();
 
+        // Every run's reports first, so no other run's silence can overwrite them.
+        var reportedKeys = new HashSet<string>();
         foreach (var run in runs)
         {
             var runId = (string)run["run_id"]!;
-            var instance = (string)run["instance"]!;
-            var startedAt = (string)run["started_at"]!;
-            var reportedKeys = new HashSet<string>();
-
             foreach (var raw in Sql.Rows(connection, "SELECT record FROM reported WHERE run_id = :r;", null, (":r", runId)))
             {
                 var record = JsonSerializer.Deserialize<FindingRecord>((string)raw["record"]!, JsonLines.Options)!;
@@ -202,10 +221,19 @@ public sealed class Tracker(SqliteConnection connection, TimeProvider? clock = n
                 existing.TryGetValue(record.FindingKey, out var before);
                 touched[record.FindingKey] = Present(record, before, entities, systemRules, overrides, runId, events, now);
             }
+        }
 
-            // Open findings of this instance that the newest scan did not report.
+        foreach (var run in runs)
+        {
+            var instance = (string)run["instance"]!;
+            var system = (string)run["system"]!;
+            var startedAt = (string)run["started_at"]!;
+
+            // Open findings of this instance and rule system that the newest scan did not report. Another rule
+            // system reading through the same integration says nothing about them.
             foreach (var (key, before) in existing.Where(e =>
-                         (string)e.Value["instance"]! == instance && (string)e.Value["status"]! == "open" && !reportedKeys.Contains(e.Key)))
+                         (string)e.Value["instance"]! == instance && (string)e.Value["system"]! == system
+                         && (string)e.Value["status"]! == "open" && !reportedKeys.Contains(e.Key)))
             {
                 if (string.CompareOrdinal((string)before["last_seen"]!, startedAt) > 0)
                     continue;   // seen by something newer than this run
@@ -267,7 +295,7 @@ public sealed class Tracker(SqliteConnection connection, TimeProvider? clock = n
 
         var systemId = r.Target == "-"
             ? MapSystem(systemRules, r.Instance, "instance", r.Instance, null, null, r.System).SystemId
-            : entities.TryGetValue((r.Instance, r.EntityType, r.Target), out var entity) ? entity.SystemId : Unclaimed(r.System).SystemId;
+            : entities.TryGetValue((r.Instance, r.EntityType, r.Target), out var entity) ? entity.SystemId : Unclaimed(r.Instance, r.System, null).SystemId;
 
         return new FindingRow
         {

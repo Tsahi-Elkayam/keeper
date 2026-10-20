@@ -17,7 +17,7 @@ var verbs = new Dictionary<string, string>(StringComparer.Ordinal)
     ["rank"] = "order the open findings into today's list",
     ["qm"] = "the queue manager, the only writer of the store",
     ["query"] = "answer a named question (keeper query list)",
-    ["report"] = "summary, security, expiring and changes reports",
+    ["report"] = "summary, security, expiring, changes, trends, finance and evidence reports",
     ["decide"] = "snooze, delegate, accept or disable a finding; set a threshold",
     ["system"] = "the systems Keeper knows and what maps to them",
     ["register"] = "vendors, contracts, licences, key dates, initiatives",
@@ -90,6 +90,15 @@ static int Help(Dictionary<string, string> verbs)
 
 static int Setup(CliArgs cli)
 {
+    if (cli.Help)
+        return CliUsage.Print("""
+            keeper setup - create the Keeper home: settings, tenant rules and queries, data; private to you
+
+              keeper setup --tenant <name>           show what it would create; nothing changes
+              keeper setup --tenant <name> --apply   create it; a second run only fills in what is missing
+              then keeper db init --apply            create the store
+              The home is KEEPER_HOME, else the per-user application data folder, and never inside the code folder.
+            """, asked: true);
     var apply = cli.Has("apply");
     var home = KeeperHome.Resolve();
     KeeperHome.EnsureOutsideCode(home, "The Keeper home");

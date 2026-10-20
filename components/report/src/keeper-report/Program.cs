@@ -12,6 +12,16 @@ using Microsoft.Data.Sqlite;
 try
 {
     var cli = new CliArgs(args, flags: ["pack"]);
+    if (cli.Help)
+        return CliUsage.Print($"""
+            keeper-report - reports for people who read rather than act (read-only; writes under data\reports\)
+
+              keeper report <{string.Join("|", Reports.Names)}> [--format markdown|html|text] [--out <file>]
+                --days <n>        how far back trends and finance look (default 90)
+                --since <date>    changes since this date
+              keeper report evidence [--framework <id>] [--pack [--out <folder>]]
+                                  controls the rules cite and how each stands; --pack adds the scan evidence and SHA256SUMS.txt
+            """, asked: true);
     var name = cli.At(0) ?? throw new ArgumentException($"Which report? {string.Join(", ", Reports.Names)}, evidence.");
     var (_, paths) = KeeperContext.Load(cli);
     var now = DateTimeOffset.UtcNow;

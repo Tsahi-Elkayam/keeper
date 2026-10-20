@@ -10,6 +10,13 @@ using Microsoft.Data.Sqlite;
 try
 {
     var cli = new CliArgs(args, flags: ["dry-run"]);
+    if (cli.Help)
+        return CliUsage.Print("""
+            keeper-load - queue every complete scan folder the store has not taken in (each one's hashes checked first)
+
+              keeper load              queue them; 'keeper qm run' applies them
+              keeper load --dry-run    list them and queue nothing
+            """, asked: true);
     var (_, paths) = KeeperContext.Load(cli);
     using var connection = new Database(paths.Database).OpenReadOnly();
     SchemaManager.EnsureCurrent(connection, [ReviewComponent.Schema]);

@@ -14,6 +14,8 @@ using Microsoft.Data.Sqlite;
 try
 {
     var cli = new CliArgs(args);
+    if (cli.Help)
+        return Usage(asked: true);
     var command = cli.At(0) ?? "plan";
     var tracker = cli.Get("tracker") ?? "servicenow";
     var (_, paths) = KeeperContext.Load(cli);
@@ -95,14 +97,7 @@ try
             return ExitCodes.Ok;
 
         default:
-            Console.Error.WriteLine("""
-                keeper-push - tickets for findings handed off to someone
-
-                  keeper-push plan  [--tracker servicenow|monday] [--finding <key-prefix> ...]   what would be opened (default)
-                  keeper-push apply [--tracker ...] [--finding ...]                              open them, after you confirm
-                  keeper-push sync  [--tracker ...]                                              read ticket states back
-                """);
-            return ExitCodes.Usage;
+            return Usage();
     }
 }
 catch (Exception ex) when (ex is ArgumentException or SettingsException or IntegrationException or VaultException)
@@ -115,6 +110,18 @@ catch (Exception ex) when (ex is StoreException or SqliteException or IOExceptio
     Console.Error.WriteLine(Redactor.Clean(ex.Message));
     return ExitCodes.Failed;
 }
+
+static int Usage(bool asked = false) =>
+    CliUsage.Print("""
+        keeper-push - tickets for findings handed off to someone (the only binary that changes anything outside Keeper)
+
+          keeper-push plan  [--tracker servicenow|monday] [--finding <key-prefix> ...]   what would be opened (default)
+          keeper-push apply [--tracker ...] [--finding ...]                              open them, after you confirm
+          keeper-push sync  [--tracker ...]                                              read ticket states back: a closed
+                                                                                         ticket marks its finding claimed-fixed;
+                                                                                         only a passing check resolves it
+          --integration <id>   which integration, when there are several of the tracker's type
+        """, asked);
 
 static void Print(IReadOnlyList<PushItem> plan, string tracker, string integration)
 {

@@ -19,11 +19,15 @@ public sealed class RunWriter : IDisposable
         Instance = instance;
         System = system;
         StartedAt = startedAt;
-        RunId = $"{Iso.Stamp(startedAt)}-{Slug(instance)}";
+        // Instance and system both: Keeper's own systems all read through the one implicit instance, and
+        // scans started in the same second must not collide. A rerun within the second gets -2, -3, ...
+        var name = Slug(instance) == Slug(system) ? Slug(instance) : $"{Slug(instance)}-{Slug(system)}";
+        var id = $"{Iso.Stamp(startedAt)}-{name}";
+        for (var n = 2; Directory.Exists(Path.Combine(runsDir, id)) || Directory.Exists(Path.Combine(runsDir, id + ".tmp")); n++)
+            id = $"{Iso.Stamp(startedAt)}-{name}-{n}";
+        RunId = id;
         _final = Path.Combine(runsDir, RunId);
         _tmp = _final + ".tmp";
-        if (Directory.Exists(_final) || Directory.Exists(_tmp))
-            throw new IOException($"Run folder {RunId} already exists.");
         Directory.CreateDirectory(_tmp);
     }
 

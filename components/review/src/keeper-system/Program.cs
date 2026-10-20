@@ -97,9 +97,8 @@ static int List(RequestCli r)
     return ExitCodes.Ok;
 }
 
-static int Usage()
-{
-    Console.Error.WriteLine("""
+static int Usage(bool asked = false) =>
+    CliUsage.Print("""
         keeper-system - the systems Keeper groups findings by; changes need --reason
 
           keeper system list
@@ -112,6 +111,4 @@ static int Usage()
           keeper system unmap <map-id>
 
           --now applies the change straight away.
-        """);
-    return ExitCodes.Usage;
-}
+        """, asked);

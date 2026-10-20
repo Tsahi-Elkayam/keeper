@@ -20,6 +20,19 @@ public sealed class CliArgsTests
         Assert.Equal("SYS1", cli.Get("SYSTEM"));
     }
 
+    [Theory]
+    [InlineData("--help")]
+    [InlineData("-h")]
+    [InlineData("/?")]
+    public void Help_is_always_a_request_for_usage_never_an_option_needing_a_value(string word)
+    {
+        var cli = new CliArgs(["migrate", word]);
+
+        Assert.True(cli.Help);
+        Assert.Equal(new[] { "migrate" }, cli.Positional);
+        Assert.False(new CliArgs(["migrate"]).Help);
+    }
+
     [Fact]
     public void Option_without_a_value_is_refused()
     {

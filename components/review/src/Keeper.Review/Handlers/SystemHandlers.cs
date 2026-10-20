@@ -9,7 +9,7 @@ namespace Keeper.Review.Handlers;
 /// </summary>
 public sealed class SystemHandler : IRequestHandler
 {
-    private static readonly string[] Synthetic = ["KEEPER", "UNMAPPED"];
+    private static readonly string[] Synthetic = ["KEEPER", "ORG", "UNMAPPED"];
 
     public string Kind => "review.system";
 

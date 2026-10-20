@@ -139,9 +139,8 @@ static int List(RequestCli r, RegisterSpec spec)
     return ExitCodes.Ok;
 }
 
-static int Usage()
-{
-    Console.Error.WriteLine($"""
+static int Usage(bool asked = false) =>
+    CliUsage.Print($"""
         keeper-register - the registers rules read; changes need --reason
 
           keeper register list                          every register and its size
@@ -152,6 +151,4 @@ static int Usage()
 
           registers: {string.Join(", ", Registers.All.Select(Name))}
           e.g. keeper register licence set backup-suite --product "Backup suite" --expires-on 2027-03-31 --seats 50 --reason "PO 2026"
-        """);
-    return ExitCodes.Usage;
-}
+        """, asked);

@@ -85,6 +85,21 @@ public sealed class RunFolderTests : IDisposable
     }
 
     [Fact]
+    public void Runs_started_in_the_same_second_get_their_own_folders()
+    {
+        // Keeper's own systems all scan through the one "keeper" instance, often within the same second.
+        using var registers = new RunWriter(_runs, "keeper", "registers", Now);
+        using var obligations = new RunWriter(_runs, "keeper", "obligations", Now);
+        using var again = new RunWriter(_runs, "keeper", "registers", Now);
+        using var plain = new RunWriter(_runs, "keeper", "keeper", Now);
+
+        Assert.Equal(4, new[] { registers.RunId, obligations.RunId, again.RunId, plain.RunId }.Distinct().Count());
+        Assert.EndsWith("-keeper-registers", registers.RunId, StringComparison.Ordinal);
+        Assert.EndsWith("-keeper-registers-2", again.RunId, StringComparison.Ordinal);
+        Assert.EndsWith("-keeper", plain.RunId, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void An_unfinished_run_is_not_complete()
     {
         using var run = new RunWriter(_runs, "ad-main", "active-directory", Now);

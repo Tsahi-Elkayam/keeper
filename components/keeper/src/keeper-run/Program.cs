@@ -13,6 +13,15 @@ using Microsoft.Data.Sqlite;
 try
 {
     var cli = new CliArgs(args, flags: ["scan-all", "no-scan", "dry-run"]);
+    if (cli.Help)
+        return CliUsage.Print("""
+            keeper-run - the daily pipeline: load rules, scan, load, track, rank, then today's list
+
+              keeper run                      scan every system that has an enabled integration (and Keeper's own registers)
+              keeper run --scan entra,intune  only these systems; each needs an enabled integration
+              keeper run --no-scan            no scans: load, track and rank what is already there
+              keeper run --dry-run            show which scans would run, and run nothing
+            """, asked: true);
     var (_, paths) = KeeperContext.Load(cli);
     var passSettings = cli.Get("settings") is { } s ? new[] { "--settings", Path.GetFullPath(s) } : [];
     var build = Iso.Stamp(DateTimeOffset.UtcNow);

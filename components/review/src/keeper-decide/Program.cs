@@ -87,9 +87,8 @@ static FindingRef Find(RequestCli r, int index)
     return RequestCli.Finding(connection, r.Positional(index, "the finding key"));
 }
 
-static int Usage()
-{
-    Console.Error.WriteLine("""
+static int Usage(bool asked = false) =>
+    CliUsage.Print("""
         keeper-decide - decisions about findings and rules; each needs --reason and is kept on record
 
           keeper decide snooze <key> --until <yyyy-MM-dd|2w>      out of today's list until then
@@ -104,6 +103,4 @@ static int Usage()
                                [--done-on <date>] [--expires-on <date|52w>]
 
           <key> is a finding key or its first 6+ characters. --now applies it straight away.
-        """);
-    return ExitCodes.Usage;
-}
+        """, asked);

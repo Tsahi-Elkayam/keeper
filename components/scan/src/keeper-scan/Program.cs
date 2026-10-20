@@ -15,6 +15,17 @@ using Microsoft.Data.Sqlite;
 try
 {
     var cli = new CliArgs(args, flags: ["test", "list"]);
+    if (cli.Help)
+        return CliUsage.Print("""
+            keeper-scan - run one system's rules through its integration and write a run folder (read-only towards the system)
+
+              keeper scan --list                    the systems there are rules for, and the integration each needs
+              keeper scan <system>                  scan it through its enabled integration
+              keeper scan <system> --test           connection test: the first rule only, no run kept; the result is
+                                                    recorded on the integration ('keeper integrations' shows it)
+                --integration <id>   which one, when there are several of the type
+                --timeout 60         seconds per request     --parallel 8   requests at once
+            """, asked: true);
     var (_, paths) = KeeperContext.Load(cli);
     var rules = RuleSources.Load(paths.TenantRules);
 

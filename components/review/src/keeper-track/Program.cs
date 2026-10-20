@@ -11,6 +11,14 @@ using Microsoft.Data.Sqlite;
 try
 {
     var cli = new CliArgs(args, flags: ["dry-run"]);
+    if (cli.Help)
+        return CliUsage.Print("""
+            keeper-track - turn the newest scans into the findings register: new, open, resolved, stale
+
+              keeper track             compute and queue the register; 'keeper qm run' applies it
+              keeper track --dry-run   show the counts and queue nothing
+              --build <id>             the build id to record (default: now)
+            """, asked: true);
     var (_, paths) = KeeperContext.Load(cli);
     var buildId = cli.Get("build") ?? Iso.Stamp(DateTimeOffset.UtcNow);
 

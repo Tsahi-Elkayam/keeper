@@ -48,14 +48,15 @@ public sealed class RegisterHandler : IRequestHandler
     private static void UpsertEntity(RequestContext context, EntityRow e) =>
         context.Execute(
             """
-            INSERT INTO entity (instance, entity_type, entity_key, entity_name, system_id, mapped_by, first_seen, last_seen, gone_since)
-            VALUES (:instance, :type, :key, :name, :system, :mapped, :first, :last, :gone)
+            INSERT INTO entity (instance, entity_type, entity_key, entity_name, system_id, mapped_by, first_seen, last_seen, gone_since, seen_by)
+            VALUES (:instance, :type, :key, :name, :system, :mapped, :first, :last, :gone, :seenBy)
             ON CONFLICT (instance, entity_type, entity_key) DO UPDATE SET
                 entity_name = excluded.entity_name, system_id = excluded.system_id, mapped_by = excluded.mapped_by,
-                last_seen = excluded.last_seen, gone_since = excluded.gone_since;
+                last_seen = excluded.last_seen, gone_since = excluded.gone_since, seen_by = excluded.seen_by;
             """,
             (":instance", e.Instance), (":type", e.EntityType), (":key", e.EntityKey), (":name", e.EntityName),
-            (":system", e.SystemId), (":mapped", e.MappedBy), (":first", e.FirstSeen), (":last", e.LastSeen), (":gone", e.GoneSince));
+            (":system", e.SystemId), (":mapped", e.MappedBy), (":first", e.FirstSeen), (":last", e.LastSeen), (":gone", e.GoneSince),
+            (":seenBy", e.SeenBy));
 
     private static void UpsertFinding(RequestContext context, FindingRow f) =>
         context.Execute(

@@ -17,7 +17,7 @@ public sealed class SchemaTests : IDisposable
         Assert.Equal(ReviewComponent.Schema.Latest, SchemaManager.VersionOf(connection, "review"));
         Assert.Equal(5L, Sql.Scalar(connection, "SELECT COUNT(*) FROM severity"));
         Assert.Equal(12L, Sql.Scalar(connection, "SELECT COUNT(*) FROM category"));
-        Assert.Equal(2L, Sql.Scalar(connection, "SELECT COUNT(*) FROM system WHERE system_id IN ('KEEPER', 'UNMAPPED')"));
+        Assert.Equal(3L, Sql.Scalar(connection, "SELECT COUNT(*) FROM system WHERE system_id IN ('KEEPER', 'ORG', 'UNMAPPED')"));
     }
 
     [Fact]

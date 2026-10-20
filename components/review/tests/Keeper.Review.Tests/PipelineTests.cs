@@ -162,6 +162,57 @@ public sealed class PipelineTests : IDisposable
         Assert.Equal("rule:hr-users", _store.Scalar("SELECT mapped_by FROM entity WHERE entity_key = 'u1'"));
     }
 
+    /// <summary>One complete scan of rule system <paramref name="system"/> through <paramref name="instance"/>, returning these rows.</summary>
+    private void ScanAs(string instance, string system, params (string Key, JsonObject Attrs)[] rows) => ScanAs("ok", instance, system, rows);
+
+    private void ScanAs(string status, string instance, string system, params (string Key, JsonObject Attrs)[] rows)
+    {
+        var at = Iso.Utc(_clock.Now);
+        using var run = new RunWriter(_store.Runs, instance, system, _clock.Now);
+        foreach (var (key, attrs) in rows)
+            run.Row(new RowRecord { Instance = instance, System = system, Query = "q1", EntityType = "item", EntityKey = key, Attrs = attrs, ObservedAt = at });
+        run.Complete(status, _clock.Now, null, []);
+    }
+
+    [Fact]
+    public void A_scan_of_one_rule_system_never_marks_another_systems_entities_gone()
+    {
+        // Two rule files reading through one integration, e.g. Entra and Intune through one Graph integration.
+        ScanAs(Instance, "alpha", ("a1", []));
+        ScanAs(Instance, "beta", ("b1", []));
+        Cycle();
+
+        // alpha's newest scan fails, so only beta's complete scan is usable: it must not call a1 gone.
+        ScanAs("failed", Instance, "alpha");
+        ScanAs(Instance, "beta", ("b1", []));
+        Cycle();
+
+        Assert.Null(_store.Scalar("SELECT gone_since FROM entity WHERE entity_key = 'a1'"));
+        Assert.Equal("alpha", _store.Scalar("SELECT seen_by FROM entity WHERE entity_key = 'a1'"));
+
+        ScanAs(Instance, "alpha");   // a complete alpha scan that no longer returns a1
+        Cycle();
+
+        Assert.NotNull(_store.Scalar("SELECT gone_since FROM entity WHERE entity_key = 'a1'"));
+        Assert.Null(_store.Scalar("SELECT gone_since FROM entity WHERE entity_key = 'b1'"));
+    }
+
+    [Fact]
+    public void Register_rows_belong_to_the_system_they_name_or_else_to_the_organisation()
+    {
+        _store.Submit("review.system", """{ "op": "upsert", "systemId": "HR", "name": "HR" }""");
+        Assert.Equal(1, _store.Manager().DrainOnce().Done);
+
+        ScanAs("keeper", "registers", ("lic-hr", new JsonObject { ["system_id"] = "HR" }), ("lic-none", []), ("lic-typo", new JsonObject { ["system_id"] = "NOPE" }));
+        ScanAs("keeper", "keeper", ("integration-x", []));
+        Cycle();
+
+        Assert.Equal("HR", _store.Scalar("SELECT system_id FROM entity WHERE entity_key = 'lic-hr'"));
+        Assert.Equal("ORG", _store.Scalar("SELECT system_id FROM entity WHERE entity_key = 'lic-none'"));
+        Assert.Equal("ORG", _store.Scalar("SELECT system_id FROM entity WHERE entity_key = 'lic-typo'"));
+        Assert.Equal("KEEPER", _store.Scalar("SELECT system_id FROM entity WHERE entity_key = 'integration-x'"));
+    }
+
     [Fact]
     public void A_disabled_rule_keeps_its_findings_as_disabled_not_resolved()
     {

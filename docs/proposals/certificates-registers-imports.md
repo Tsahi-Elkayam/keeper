@@ -684,7 +684,7 @@ POWERPLATFORM)
            WHERE l.system_id = s.system_id
              AND COALESCE(NULLIF(TRIM(l.expires_on), ''), '9999-12-31') >= :today) AS current_licences
   FROM system s
-  WHERE s.active = 1 AND s.system_id NOT IN ('KEEPER', 'UNMAPPED')
+  WHERE s.active = 1 AND s.system_id NOT IN ('KEEPER', 'ORG', 'UNMAPPED')
   ```
   `key: system_id`, `name: name`.
 - Condition: `criticality` eq 1 AND `current_contracts` eq 0 AND `current_licences` eq 0.

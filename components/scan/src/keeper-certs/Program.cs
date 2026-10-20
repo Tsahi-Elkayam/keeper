@@ -16,8 +16,8 @@ try
 {
     var cli = new CliArgs(args, flags: ["from-ad", "save"]);
     var hosts = cli.Positional.ToList();
-    if (hosts.Count == 0 && !cli.Has("from-ad"))
-        return Usage();
+    if (cli.Help || (hosts.Count == 0 && !cli.Has("from-ad")))
+        return Usage(cli.Help);
 
     var needsHome = cli.Has("from-ad") || cli.Has("save");
     KeeperPaths? paths = null;
@@ -188,15 +188,12 @@ static string Cn(string? distinguishedName) =>
 
 static int Rank(string severity) => severity switch { "critical" => 0, "high" => 1, "medium" => 2, "low" => 3, _ => 4 };
 
-static int Usage()
-{
-    Console.Error.WriteLine("""
+static int Usage(bool asked = false) =>
+    CliUsage.Print("""
         keeper-certs - which certificates a server presents, and until when (you start it; nothing runs on its own)
 
           keeper certs <host> [<host:port> ...]   each host on --ports (default 443,636,3269,5986,8443)
           keeper certs --from-ad                  every server the newest Active Directory scan saw
             --ports 443,8443   --days 30 (counts as "expires soon")   --timeout 5   --parallel 16
             --save             keep the result, so expiries become findings with deadlines
-        """);
-    return ExitCodes.Usage;
-}
+        """, asked);

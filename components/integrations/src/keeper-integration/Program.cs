@@ -12,6 +12,8 @@ using Microsoft.Data.Sqlite;
 try
 {
     var cli = new CliArgs(args, flags: ["enable", "disable", "disabled"]);
+    if (cli.Help)
+        return Usage(asked: true);
     var command = cli.At(0) ?? "list";
     if (command == "types")
         return Types();
@@ -214,9 +216,8 @@ static int Remove(RequestWriter writer, CliArgs cli)
     return ExitCodes.Ok;
 }
 
-static int Usage()
-{
-    Console.Error.WriteLine("""
+static int Usage(bool asked = false) =>
+    CliUsage.Print("""
         keeper-integration - how Keeper reaches each system
 
           keeper-integration types
@@ -231,6 +232,4 @@ static int Usage()
 
           Options: targets=a,b,c  scopes=x,y  clientId=..  tenantId=..  tokenUrl=https://..  header=..  prefix=..
                    param=..  headers.<name>=..  tls=trust (sql)  allowHttp=true (only if you accept cleartext)
-        """);
-    return ExitCodes.Usage;
-}
+        """, asked);
