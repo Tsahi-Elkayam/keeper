@@ -1,0 +1,80 @@
+schema: keeper.rules/1
+system: dc-certificates
+name: Domain controller certificates (LDAPS)
+integration: tls
+# Every domain controller the newest Active Directory scan saw (computer accounts with the
+# SERVER_TRUST_ACCOUNT flag that logged on within 30 days), on the LDAPS port. Inspect-only handshake:
+# Keeper reads the certificate the DC presents and checks nothing else.
+targets:
+  entity: computer
+  field: dNSHostName
+  where:
+    all:
+      - { field: userAccountControl, op: flag, value: 8192 }
+      - { field: lastLogonTimestamp, op: age-lt, value: 30 }
+defaults:
+  lens: both
+  refresh: 1d
+rules:
+  - id: DC-CERT-NO-KDC-EKU
+    title: Domain controller certificate lacks the KDC Authentication purpose
+    kind: misconfigured
+    category: PKI
+    severity: medium
+    entity: domain-controller
+    why: >-
+      Certificate sign-ins (smart cards, Windows Hello for Business certificate trust) and clients that
+      validate the KDC strictly need the domain controller's certificate to carry KDC Authentication
+      (1.3.6.1.5.2.3.5). A DC certificate from an older template without it makes those sign-ins fail
+      on that DC, and the KDC logs errors until it is replaced.
+    fix: >-
+      Enrol the DC from the Kerberos Authentication template (or a copy that includes KDC
+      Authentication and Server Authentication), confirm the new certificate is in use, then revoke
+      and remove the old one. Supersede the old template so it is not issued again.
+    refs: [MS-PKCA]
+    query: { protocol: tls, port: 636, key: endpoint, name: subject }
+    each: { field: eku, op: notcontains, value: 1.3.6.1.5.2.3.5 }
+    evidence: "{endpoint}: {subject} (issuer {issuer}) has purposes {eku}, not KDC Authentication"
+
+  - id: DC-CERT-EXPIRING
+    title: Domain controller certificate expires soon
+    kind: broken
+    category: PKI
+    severity:
+      daysLeft: notAfter
+      ranges:
+        - { max: 0, value: critical }
+        - { max: 7, value: high }
+        - { max: 30, value: medium }
+      default: low
+    entity: domain-controller
+    why: >-
+      When a domain controller's certificate lapses, LDAPS clients and certificate sign-ins against that
+      DC fail. Auto-enrolment usually renews it; when it does not, nobody notices until it breaks.
+    fix: >-
+      Check that the DC can auto-enrol (template permissions, CA reachable), renew the certificate,
+      and find why auto-enrolment did not.
+    refs: [NIST-800-53:SC-17]
+    query: { protocol: tls, port: 636, key: endpoint, name: subject }
+    each: { field: notAfter, op: until-lt, value: 45, threshold: dc.cert-notice-days }
+    deadline: notAfter
+    evidence: "{endpoint}: {subject} expires {notAfter} ({daysLeft} days left)"
+
+  - id: DC-CERT-UNTRUSTED
+    title: Domain controller certificate does not chain to a trusted root, or names another host
+    kind: misconfigured
+    category: PKI
+    severity: medium
+    entity: domain-controller
+    why: >-
+      Clients that validate LDAPS refuse a DC certificate they cannot chain or whose name does not match,
+      so applications either fail or are configured to skip validation - which makes LDAPS pointless.
+    fix: >-
+      Issue the DC's certificate from the enterprise CA that domain members trust, with the DC's DNS
+      name in the subject alternative names.
+    query: { protocol: tls, port: 636, key: endpoint, name: subject }
+    each:
+      any:
+        - { field: chainValid, op: eq, value: false }
+        - { field: nameMatches, op: eq, value: false }
+    evidence: "{endpoint}: chain valid {chainValid}, name matches {nameMatches} ({chainErrors})"

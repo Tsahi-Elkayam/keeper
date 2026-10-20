@@ -6,8 +6,10 @@ using Microsoft.Data.Sqlite;
 
 namespace Keeper.Report;
 
+/// <summary>One task: a check and every target it fails on today (Targets = 1 for a single finding).</summary>
 public sealed record TodayItem(long Position, string Severity, string Title, string SystemId, string Target, string? Deadline,
-    long? DaysLeft, long Minutes, IReadOnlyList<string> Reasons, string? Fix, string FindingKey);
+    long? DaysLeft, long Minutes, IReadOnlyList<string> Reasons, string? Fix, string FindingKey,
+    int Targets = 1, int Systems = 1, IReadOnlyList<string>? Examples = null);
 
 public sealed record WaitingItem(string Owner, string Severity, string Title, string SystemId, long DaysWaiting, string FindingKey);
 
@@ -25,7 +27,11 @@ public sealed record TodayReport(
     IReadOnlyList<string> NewTitles,
     IReadOnlyList<BlindSpot> BlindSpots,
     IReadOnlyList<string> StaleScans,
-    IReadOnlyList<DueItem> DueSoon);
+    IReadOnlyList<DueItem> DueSoon)
+{
+    /// <summary>System types Keeper has rules for that have never been scanned: none of their checks has run.</summary>
+    public IReadOnlyList<string> NeverScanned { get; init; } = [];
+}
 
 /// <summary>Builds today's page from the store (read-only): the ranked list and what the ranking cannot show.</summary>
 public static class TodayBuilder
@@ -37,15 +43,26 @@ public static class TodayBuilder
         long Setting(string key, long fallback) =>
             settings.TryGetValue(key, out var v) && long.TryParse(v, CultureInfo.InvariantCulture, out var n) && n > 0 ? n : fallback;
 
+        // The ranker lists every finding of a check together, behind the one it ranked; each check is one line here.
         var today = Sql.Rows(connection,
             """
-            SELECT r.position, f.severity, f.title, f.system_id, f.target, f.deadline, f.days_left, r.minutes, r.reasons, f.fix, f.finding_key
+            SELECT r.position, f.check_id, f.severity, f.title, f.system_id, f.target, f.entity_name, f.deadline, f.days_left,
+                   r.minutes, r.reasons, f.fix, f.finding_key
             FROM latest_ranking r JOIN active_finding f ON f.finding_key = r.finding_key
             WHERE r.list = 'today' ORDER BY r.position;
             """)
-            .Select(r => new TodayItem((long)r["position"]!, (string)r["severity"]!, (string)r["title"]!, (string)r["system_id"]!,
-                (string)r["target"]!, r["deadline"] as string, r["days_left"] as long?, (long)r["minutes"]!,
-                JsonSerializer.Deserialize<List<string>>((string)r["reasons"]!) ?? [], r["fix"] as string, (string)r["finding_key"]!))
+            .GroupBy(r => (string)r["check_id"]!, StringComparer.OrdinalIgnoreCase)
+            .Select(g =>
+            {
+                var r = g.First();
+                var systems = g.Select(m => (string)m["system_id"]!).Distinct(StringComparer.OrdinalIgnoreCase).Count();
+                return new TodayItem((long)r["position"]!, (string)r["severity"]!, (string)r["title"]!, (string)r["system_id"]!,
+                    (string)r["target"]!, r["deadline"] as string, r["days_left"] as long?, (long)r["minutes"]!,
+                    JsonSerializer.Deserialize<List<string>>((string)r["reasons"]!) ?? [], r["fix"] as string, (string)r["finding_key"]!,
+                    g.Count(), systems, g.Take(3).Select(m => m["entity_name"] as string ?? (string)m["target"]!).ToList());
+            })
+            .OrderBy(t => t.Position)
+            .Select((t, i) => t with { Position = i + 1 })
             .ToList();
 
         var waiting = Sql.Rows(connection,
@@ -84,7 +101,8 @@ public static class TodayBuilder
             .ToList();
 
         var dueDays = Setting("report.due-soon-days", 14);
-        var inToday = today.Select(t => t.FindingKey).ToHashSet(StringComparer.Ordinal);
+        var inToday = Sql.Rows(connection, "SELECT finding_key FROM latest_ranking WHERE list = 'today';")
+            .Select(r => (string)r["finding_key"]!).ToHashSet(StringComparer.Ordinal);
         var due = Sql.Rows(connection,
             """
             SELECT 'licence' AS what, licence_id AS id, product AS title, expires_on AS due_on FROM licence WHERE expires_on IS NOT NULL
@@ -100,8 +118,13 @@ public static class TodayBuilder
             .Select(r => new DueItem(r.What, r.Id, r.Title, r.Due, r.Left))
             .ToList();
 
+        var neverScanned = Sql.Rows(connection,
+                "SELECT system, COUNT(*) AS rules FROM rule WHERE system NOT IN (SELECT DISTINCT system FROM run) GROUP BY system ORDER BY system;")
+            .Select(r => $"{r["system"]} ({r["rules"]} rules)")
+            .ToList();
+
         var rankedAt = Sql.Scalar(connection, "SELECT at FROM rank_build ORDER BY build_id DESC LIMIT 1;") as string;
         return new TodayReport(Iso.Utc(now), rankedAt, Setting("rank.daily-minutes", 120), today, waiting, fresh.Count,
-            fresh.Take(5).Select(f => (string)f["title"]!).ToList(), blind, stale, due);
+            fresh.Take(5).Select(f => (string)f["title"]!).ToList(), blind, stale, due) { NeverScanned = neverScanned };
     }
 }

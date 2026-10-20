@@ -1,0 +1,378 @@
+schema: keeper.rules/1
+system: servicenow
+name: ServiceNow work queue
+integration: servicenow
+# Endpoint: the instance URL (https://example.service-now.com). The integration adds the credentials;
+# rules only name Table API GET paths and page with sysparm_offset/sysparm_limit.
+# These rules are work inputs for "what to do today", not configuration checks.
+# Most queries ask for database values (sysparm_display_value=false): choice fields are their stored
+# codes, references are sys_ids (sysparm_exclude_reference_link=true makes them plain strings) and
+# date-times are UTC. The SLA queries ask for both (sysparm_display_value=all), which turns every field
+# into {display_value, value}, so their paths end in .value or .display_value.
+# Note: the Table API ignores an unknown field or query term instead of failing, so a typo here widens
+# a query silently.
+defaults:
+  lens: maintenance
+  refresh: 30m
+rules:
+
+  # ---- incidents ---------------------------------------------------------------------------
+
+  - id: SNOW-INCIDENT-HIGH-PRIORITY-OPEN
+    title: Open priority 1 or 2 incident
+    kind: broken
+    category: AVL
+    severity:
+      field: priority
+      map: { "1": critical, "2": high }
+      default: high
+    entity: incident
+    why: A P1 or P2 incident is a service people cannot use right now; it outranks planned work.
+    fix: Make sure it has an owner, a group and a current update; escalate per the major-incident process.
+    refs: [NIST-800-53:IR-4]
+    query:
+      protocol: http
+      path: /api/now/table/incident
+      params:
+        sysparm_query: active=true^priorityIN1,2^ORDERBYpriority
+        sysparm_fields: sys_id,number,short_description,priority,state,assigned_to,assignment_group,opened_at,sys_updated_on
+        sysparm_display_value: "false"
+        sysparm_exclude_reference_link: "true"
+      paging: offset
+      pageSize: 1000
+      items: result
+      key: number
+      name: short_description
+    each: any
+    evidence: "{number} P{priority} opened {opened_at}: {short_description}"
+
+  - id: SNOW-INCIDENT-HIGH-PRIORITY-UNASSIGNED
+    title: Priority 1 or 2 incident has no assignee
+    kind: missing
+    category: AVL
+    severity: high
+    entity: incident
+    why: An urgent incident nobody owns waits in a queue while everyone assumes someone else has it.
+    fix: Assign a named engineer now.
+    refs: [NIST-800-53:IR-4]
+    query:
+      protocol: http
+      path: /api/now/table/incident
+      params:
+        sysparm_query: active=true^priorityIN1,2^ORDERBYpriority
+        sysparm_fields: sys_id,number,short_description,priority,state,assigned_to,assignment_group,opened_at,sys_updated_on
+        sysparm_display_value: "false"
+        sysparm_exclude_reference_link: "true"
+      paging: offset
+      pageSize: 1000
+      items: result
+      key: number
+      name: short_description
+    each: { field: assigned_to, op: empty }
+    evidence: "{number} P{priority} opened {opened_at} has no assignee: {short_description}"
+
+  - id: SNOW-INCIDENT-HIGH-PRIORITY-NO-GROUP
+    title: Priority 1 or 2 incident has no assignment group
+    kind: missing
+    category: AVL
+    severity: medium
+    entity: incident
+    why: Without a group the incident never appears in any team's queue.
+    fix: Route the incident to the owning group.
+    query:
+      protocol: http
+      path: /api/now/table/incident
+      params:
+        sysparm_query: active=true^priorityIN1,2^ORDERBYpriority
+        sysparm_fields: sys_id,number,short_description,priority,state,assigned_to,assignment_group,opened_at,sys_updated_on
+        sysparm_display_value: "false"
+        sysparm_exclude_reference_link: "true"
+      paging: offset
+      pageSize: 1000
+      items: result
+      key: number
+      name: short_description
+    each: { field: assignment_group, op: empty }
+    evidence: "{number} P{priority} has no assignment group: {short_description}"
+
+  - id: SNOW-INCIDENT-HIGH-PRIORITY-STALE
+    title: Priority 1 or 2 incident has not been updated recently
+    kind: broken
+    category: AVL
+    severity: medium
+    entity: incident
+    why: An urgent incident with no update for a day is either solved and not closed, or stuck with nobody saying so.
+    fix: Update the incident with the current status, or close it if the service is back.
+    query:
+      protocol: http
+      path: /api/now/table/incident
+      params:
+        sysparm_query: active=true^priorityIN1,2^ORDERBYpriority
+        sysparm_fields: sys_id,number,short_description,priority,state,assigned_to,assignment_group,opened_at,sys_updated_on
+        sysparm_display_value: "false"
+        sysparm_exclude_reference_link: "true"
+      paging: offset
+      pageSize: 1000
+      items: result
+      key: number
+      name: short_description
+    each: { field: sys_updated_on, op: age-gt, value: 1, threshold: servicenow.urgent-incident-stale-days }
+    evidence: "{number} P{priority} last updated {sys_updated_on}: {short_description}"
+
+  # ---- SLAs ----------------------------------------------------------------------------------
+
+  - id: SNOW-SLA-BREACHED
+    title: Active task SLA has breached
+    kind: broken
+    category: AVL
+    severity: high
+    entity: task-sla
+    refresh: 30m
+    why: A breached SLA is a commitment already missed; the task behind it still needs finishing and the breach usually needs a note.
+    fix: Finish or escalate the task and record the breach reason.
+    deadline: planned_end_time.value
+    query:
+      protocol: http
+      path: /api/now/table/task_sla
+      params:
+        sysparm_query: active=true^has_breached=true
+        sysparm_fields: sys_id,task,sla,stage,has_breached,planned_end_time,percentage
+        sysparm_display_value: all
+        sysparm_exclude_reference_link: "true"
+      paging: offset
+      pageSize: 1000
+      items: result
+      key: sys_id.value
+      name: task.display_value
+    each: any
+    evidence: "{task.display_value}: SLA {sla.display_value} breached at {planned_end_time.display_value} ({percentage.display_value}%)"
+
+  - id: SNOW-SLA-AT-RISK
+    title: Task SLA is close to breaching
+    kind: broken
+    category: AVL
+    severity:
+      daysLeft: planned_end_time.value
+      ranges: [ { max: 0.125, value: critical }, { max: 0.5, value: high } ]
+      default: medium
+    entity: task-sla
+    refresh: 30m
+    why: Most of the SLA time has elapsed; acting now is the difference between a near miss and a breach.
+    fix: Pick up or escalate the task before its breach time.
+    deadline: planned_end_time.value
+    query:
+      protocol: http
+      path: /api/now/table/task_sla
+      params:
+        sysparm_query: active=true^has_breached=false^stage=in_progress
+        sysparm_fields: sys_id,task,sla,stage,has_breached,planned_end_time,percentage
+        sysparm_display_value: all
+        sysparm_exclude_reference_link: "true"
+      paging: offset
+      pageSize: 1000
+      items: result
+      key: sys_id.value
+      name: task.display_value
+    each: { field: percentage.value, op: ge, value: 75, threshold: servicenow.sla-risk-percent }
+    evidence: "{task.display_value}: SLA {sla.display_value} at {percentage.display_value}%, breaches {planned_end_time.display_value}"
+
+  # ---- changes -------------------------------------------------------------------------------
+  # Change states (database values): -5 new, -4 assess, -3 authorize, -2 scheduled, -1 implement,
+  # 0 review, 3 closed, 4 canceled.
+
+  - id: SNOW-CHANGE-STARTING-SOON
+    title: Change scheduled to start in the next days
+    kind: missing
+    category: CFG
+    severity: info
+    entity: change
+    refresh: 6h
+    why: Upcoming changes are today's preparation list - notices, backups, rollback plans and people on call.
+    fix: Confirm the implementer, the rollback plan and the user notice for each change in the window.
+    deadline: start_date
+    query:
+      protocol: http
+      path: /api/now/table/change_request
+      params:
+        sysparm_query: active=true^stateIN-4,-3,-2,-1
+        sysparm_fields: sys_id,number,short_description,state,approval,type,risk,start_date,end_date,assignment_group,assigned_to
+        sysparm_display_value: "false"
+        sysparm_exclude_reference_link: "true"
+      paging: offset
+      pageSize: 1000
+      items: result
+      key: number
+      name: short_description
+    each:
+      all:
+        - { field: start_date, op: until-lt, value: 7, threshold: servicenow.change-lookahead-days }
+        - { field: start_date, op: age-lt, value: 0 }
+    evidence: "{number} ({type}) starts {start_date}: {short_description}"
+
+  - id: SNOW-CHANGE-UNAPPROVED-SOON
+    title: Change starts soon but is not approved
+    kind: missing
+    category: CFG
+    severity: high
+    entity: change
+    refresh: 6h
+    why: A change that reaches its window unapproved is either run without approval or cancelled at the last minute.
+    fix: Chase the approvers now, or move the change window.
+    deadline: start_date
+    query:
+      protocol: http
+      path: /api/now/table/change_request
+      params:
+        sysparm_query: active=true^stateIN-4,-3,-2,-1
+        sysparm_fields: sys_id,number,short_description,state,approval,type,risk,start_date,end_date,assignment_group,assigned_to
+        sysparm_display_value: "false"
+        sysparm_exclude_reference_link: "true"
+      paging: offset
+      pageSize: 1000
+      items: result
+      key: number
+      name: short_description
+    each:
+      all:
+        - { field: approval, op: ne, value: approved }
+        - { field: type, op: ne, value: standard }
+        - { field: start_date, op: until-lt, value: 3, threshold: servicenow.change-approval-lead-days }
+    evidence: "{number} ({type}) starts {start_date}, approval {approval}: {short_description}"
+
+  - id: SNOW-CHANGE-WINDOW-OVERRUN
+    title: Change is still being implemented after its planned end
+    kind: broken
+    category: CFG
+    severity: high
+    entity: change
+    refresh: 1h
+    why: A change running past its window is where outages start - the rollback point may already be gone.
+    fix: Decide now - finish, roll back or extend the window with approval - and record it in the change.
+    deadline: end_date
+    query:
+      protocol: http
+      path: /api/now/table/change_request
+      params:
+        sysparm_query: active=true^stateIN-4,-3,-2,-1
+        sysparm_fields: sys_id,number,short_description,state,approval,type,risk,start_date,end_date,assignment_group,assigned_to
+        sysparm_display_value: "false"
+        sysparm_exclude_reference_link: "true"
+      paging: offset
+      pageSize: 1000
+      items: result
+      key: number
+      name: short_description
+    each:
+      all:
+        - { field: state, op: eq, value: -1 }
+        - { field: end_date, op: until-lt, value: 0 }
+    evidence: "{number} in implement, planned end {end_date}: {short_description}"
+
+  - id: SNOW-CHANGE-NOT-CLOSED
+    title: Scheduled change whose window has passed
+    kind: misconfigured
+    category: CFG
+    severity: medium
+    entity: change
+    refresh: 6h
+    why: A scheduled change left open after its window either happened unrecorded or never happened - the change record no longer says which.
+    fix: Close it with the real outcome, or reschedule it.
+    deadline: end_date
+    query:
+      protocol: http
+      path: /api/now/table/change_request
+      params:
+        sysparm_query: active=true^stateIN-4,-3,-2,-1
+        sysparm_fields: sys_id,number,short_description,state,approval,type,risk,start_date,end_date,assignment_group,assigned_to
+        sysparm_display_value: "false"
+        sysparm_exclude_reference_link: "true"
+      paging: offset
+      pageSize: 1000
+      items: result
+      key: number
+      name: short_description
+    each:
+      all:
+        - { field: state, op: eq, value: -2 }
+        - { field: end_date, op: age-gt, value: 1, threshold: servicenow.change-close-grace-days }
+    evidence: "{number} still scheduled, window ended {end_date}: {short_description}"
+
+  # ---- catalog tasks -------------------------------------------------------------------------
+
+  - id: SNOW-CATALOG-TASK-OVERDUE
+    title: Catalog task is past its due date
+    kind: broken
+    category: CFG
+    severity:
+      daysLeft: due_date
+      ranges: [ { max: -7, value: high } ]
+      default: medium
+    entity: catalog-task
+    refresh: 6h
+    why: An overdue fulfilment task is a request someone is waiting on - access, equipment, a change to their service.
+    fix: Finish the task or update the requester with a new date.
+    deadline: due_date
+    query:
+      protocol: http
+      path: /api/now/table/sc_task
+      params:
+        sysparm_query: active=true^due_dateISNOTEMPTY
+        sysparm_fields: sys_id,number,short_description,state,due_date,assignment_group,assigned_to,request_item
+        sysparm_display_value: "false"
+        sysparm_exclude_reference_link: "true"
+      paging: offset
+      pageSize: 1000
+      items: result
+      key: number
+      name: short_description
+    each: { field: due_date, op: until-lt, value: 0, threshold: servicenow.task-due-notice-days }
+    evidence: "{number} due {due_date}: {short_description}"
+
+  # ---- platform ------------------------------------------------------------------------------
+
+  - id: SNOW-MID-SERVER-DOWN
+    title: MID Server is not up
+    kind: broken
+    category: MON
+    severity: high
+    entity: mid-server
+    refresh: 1h
+    why: Discovery, orchestration and integrations that run through a MID Server stop when it is down, and the CMDB quietly goes stale.
+    fix: Check the MID Server service on its host and its connection to the instance; restart it.
+    refs: [NIST-800-53:SI-4]
+    query:
+      protocol: http
+      path: /api/now/table/ecc_agent
+      params:
+        sysparm_fields: sys_id,name,status,validated,last_refreshed,version,host_name
+        sysparm_display_value: "false"
+      paging: offset
+      pageSize: 1000
+      items: result
+      key: sys_id
+      name: name
+    each: { field: status, op: ne, value: Up }
+    evidence: "{name}: status {status}, last refreshed {last_refreshed}"
+
+  - id: SNOW-MID-SERVER-NOT-VALIDATED
+    title: MID Server is not validated
+    kind: misconfigured
+    category: MON
+    severity: medium
+    entity: mid-server
+    refresh: 1d
+    why: An unvalidated MID Server connects but does not run jobs, so whatever depends on it waits forever.
+    fix: Validate the MID Server in the instance, or retire it.
+    query:
+      protocol: http
+      path: /api/now/table/ecc_agent
+      params:
+        sysparm_fields: sys_id,name,status,validated,last_refreshed,version,host_name
+        sysparm_display_value: "false"
+      paging: offset
+      pageSize: 1000
+      items: result
+      key: sys_id
+      name: name
+    each: { field: validated, op: ne, value: "true" }
+    evidence: "{name}: validated {validated}, status {status}"

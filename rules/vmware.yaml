@@ -1,0 +1,601 @@
+schema: keeper.rules/1
+system: vmware
+name: VMware vCenter and vCenter Server Appliance
+integration: vcenter
+# Endpoint: the vCenter base URL (https://vcenter.example.org). The integration creates the API session
+# (POST /api/session) and adds the vmware-api-session-id header; rules only name GET paths.
+#
+# Two base paths are used on purpose:
+#   /api/...   vSphere Automation API (7.0 U2 and later). Lists come back as a JSON array of objects.
+#   /rest/...  the older, deprecated base path, still served by 7.x and 8.x. It wraps every answer in
+#              {"value": ...} and renders maps as [{key, value}] lists. It is used only where /api returns a
+#              bare string, boolean or map (appliance health colours, SSH, time sync, backup schedules and
+#              job details), because a bare value cannot become a row. The session id is the same for both.
+# Field names follow the vSphere Automation API reference (8.0.3 data structures).
+defaults:
+  lens: maintenance
+  refresh: 1d
+rules:
+
+  # ---- hosts ---------------------------------------------------------------------------------
+
+  - id: VMW-HOST-CONNECTION
+    title: ESXi host is not connected to vCenter
+    kind: broken
+    category: AVL
+    severity:
+      field: connection_state
+      map: { NOT_RESPONDING: critical, DISCONNECTED: high }
+      default: high
+    entity: host
+    refresh: 6h
+    why: A host that is not responding keeps running its VMs, but vCenter can no longer manage, migrate or back them up, and HA cannot protect them.
+    fix: Check the host's management network and the vpxa/hostd agents; reconnect the host from vCenter once it answers.
+    refs: [NIST-800-53:CP-10]
+    query:
+      protocol: http
+      path: /api/vcenter/host
+      paging: none
+      key: host
+      name: name
+    each: { field: connection_state, op: ne, value: CONNECTED }
+    evidence: "{name}: connection state {connection_state}"
+
+  - id: VMW-HOST-NOT-POWERED-ON
+    title: Connected ESXi host is in standby or powered off
+    kind: broken
+    category: AVL
+    severity: low
+    entity: host
+    why: A host in standby (power management) or powered off is capacity the cluster counts on for failover but cannot use until it wakes.
+    fix: Confirm the standby is intended by the power-management policy; otherwise power the host on and exit standby.
+    query:
+      protocol: http
+      path: /api/vcenter/host
+      paging: none
+      key: host
+      name: name
+    each:
+      all:
+        - { field: connection_state, op: eq, value: CONNECTED }
+        - { field: power_state, op: ne, value: POWERED_ON }
+    evidence: "{name}: power state {power_state}"
+
+  # ---- virtual machines ----------------------------------------------------------------------
+
+  - id: VMW-VM-CONFIG-UNAVAILABLE
+    title: VM whose configuration vCenter cannot read
+    kind: broken
+    category: AVL
+    severity: medium
+    entity: vm
+    why: The VM list leaves CPU and memory unset when the VM configuration is unavailable - the usual sign of an orphaned or inaccessible VM. Such VMs cannot be backed up and distort capacity figures.
+    fix: Find why the .vmx is unreadable (datastore lost, files moved); re-register the VM from its files or remove the stale inventory entry.
+    query:
+      protocol: http
+      path: /api/vcenter/vm
+      paging: none
+      key: vm
+      name: name
+    each: { field: cpu_count, op: absent }
+    evidence: "{name} ({vm}): no CPU/memory configuration returned, power state {power_state}"
+
+  - id: VMW-VM-SUSPENDED
+    title: VM is suspended
+    kind: misconfigured
+    category: HYG
+    severity: low
+    entity: vm
+    why: A suspended VM is neither running nor cleanly off; its memory image sits on the datastore and backups capture a frozen state.
+    fix: Resume or shut the VM down properly, or remove it if it is no longer needed.
+    query:
+      protocol: http
+      path: /api/vcenter/vm
+      paging: none
+      key: vm
+      name: name
+    each: { field: power_state, op: eq, value: SUSPENDED }
+    evidence: "{name}: suspended"
+
+  # ---- datastores ----------------------------------------------------------------------------
+
+  - id: VMW-DATASTORE-FREE-SPACE
+    title: Datastore is low on free space
+    kind: broken
+    category: HLT
+    severity:
+      field: free_space
+      ranges: [ { max: 21474836480, value: critical }, { max: 53687091200, value: high } ]
+      default: medium
+    entity: datastore
+    why: A full datastore pauses every thin-provisioned VM that tries to write and blocks snapshots, so backups fail at the same moment.
+    fix: Remove orphaned snapshots and old files, move VMs to another datastore, or grow the volume. The threshold is in bytes because the engine cannot compute a percentage.
+    refs: [NIST-800-53:SC-5]
+    query:
+      protocol: http
+      path: /api/vcenter/datastore
+      paging: none
+      key: datastore
+      name: name
+    each: { field: free_space, op: lt, value: 107374182400, threshold: vmware.datastore-free-bytes-min }
+    evidence: "{name} ({type}): {free_space} bytes free of {capacity}"
+
+  - id: VMW-DATASTORE-CAPACITY-UNKNOWN
+    title: Datastore reports no capacity
+    kind: broken
+    category: HLT
+    severity: medium
+    entity: datastore
+    why: vCenter leaves capacity unset when it cannot read the datastore - usually an inaccessible or all-paths-down volume, which nothing else in the list reveals.
+    fix: Check the storage paths and the datastore's accessibility on each host; rescan storage.
+    query:
+      protocol: http
+      path: /api/vcenter/datastore
+      paging: none
+      key: datastore
+      name: name
+    each: { field: capacity, op: absent }
+    evidence: "{name} ({type}): capacity unknown"
+
+  # ---- clusters ------------------------------------------------------------------------------
+
+  - id: VMW-CLUSTER-HA-OFF
+    title: Cluster has vSphere HA turned off
+    kind: misconfigured
+    category: AVL
+    severity: medium
+    entity: cluster
+    why: Without HA a host failure leaves its VMs down until someone restarts them by hand, and nothing warns that failover is off.
+    fix: Enable vSphere HA with admission control, or record why the cluster runs without it.
+    refs: [NIST-800-53:CP-10]
+    query:
+      protocol: http
+      path: /api/vcenter/cluster
+      paging: none
+      key: cluster
+      name: name
+    each: { field: ha_enabled, op: eq, value: false }
+    evidence: "{name}: HA disabled"
+
+  - id: VMW-CLUSTER-DRS-OFF
+    title: Cluster has DRS turned off
+    kind: misconfigured
+    category: AVL
+    severity: low
+    entity: cluster
+    why: Without DRS load is never rebalanced and maintenance mode cannot evacuate hosts automatically, so patching slips.
+    fix: Enable DRS (at least partially automated), or record why the cluster runs without it.
+    query:
+      protocol: http
+      path: /api/vcenter/cluster
+      paging: none
+      key: cluster
+      name: name
+    each: { field: drs_enabled, op: eq, value: false }
+    evidence: "{name}: DRS disabled"
+
+  # ---- vCenter Server Appliance health -------------------------------------------------------
+
+  - id: VMW-VCSA-HEALTH-SYSTEM
+    title: Appliance overall health is not green
+    kind: broken
+    category: HLT
+    severity:
+      field: value
+      map: { red: critical, orange: high, yellow: medium, gray: medium }
+      default: medium
+    entity: appliance
+    refresh: 6h
+    why: The overall colour rolls up every appliance subsystem. Gray means the appliance could not tell - no data, not health.
+    fix: Open the appliance management interface (port 5480) and fix the subsystem that is not green.
+    query:
+      protocol: http
+      path: /rest/appliance/health/system
+      paging: none
+      key: "-"
+    each: { field: value, op: ne, value: green }
+    evidence: "appliance overall health: {value}"
+
+  - id: VMW-VCSA-HEALTH-STORAGE
+    title: Appliance storage health is not green
+    kind: broken
+    category: HLT
+    severity:
+      field: value
+      map: { red: critical, orange: high, yellow: medium, gray: medium }
+      default: medium
+    entity: appliance
+    refresh: 6h
+    why: A full appliance partition (logs, database, core dumps) stops vCenter services, and every backup that goes through vCenter stops with it.
+    fix: Find the full partition in the appliance shell or management interface, clear it or grow the disk.
+    refs: [NIST-800-53:SC-5]
+    query:
+      protocol: http
+      path: /rest/appliance/health/storage
+      paging: none
+      key: "-"
+    each: { field: value, op: ne, value: green }
+    evidence: "appliance storage health: {value}"
+
+  - id: VMW-VCSA-HEALTH-DATABASE-STORAGE
+    title: Appliance database storage health is not green
+    kind: broken
+    category: HLT
+    severity:
+      field: value
+      map: { red: critical, orange: high, yellow: medium, gray: medium }
+      default: medium
+    entity: appliance
+    refresh: 6h
+    why: When the vCenter database volume fills, vpxd stops and vCenter goes down.
+    fix: Purge old events and tasks per the vendor guidance or grow the database disk.
+    query:
+      protocol: http
+      path: /rest/appliance/health/database-storage
+      paging: none
+      key: "-"
+    each: { field: value, op: ne, value: green }
+    evidence: "appliance database storage health: {value}"
+
+  - id: VMW-VCSA-HEALTH-MEMORY
+    title: Appliance memory health is not green
+    kind: broken
+    category: HLT
+    severity:
+      field: value
+      map: { red: critical, orange: high, yellow: medium, gray: medium }
+      default: medium
+    entity: appliance
+    refresh: 6h
+    why: Memory pressure makes vCenter services slow or crash; it usually means the inventory outgrew the deployment size.
+    fix: Check which service grows; resize the appliance to the next deployment size if the inventory has grown.
+    query:
+      protocol: http
+      path: /rest/appliance/health/mem
+      paging: none
+      key: "-"
+    each: { field: value, op: ne, value: green }
+    evidence: "appliance memory health: {value}"
+
+  - id: VMW-VCSA-HEALTH-LOAD
+    title: Appliance CPU load health is not green
+    kind: broken
+    category: HLT
+    severity:
+      field: value
+      map: { red: critical, orange: high, yellow: medium, gray: medium }
+      default: medium
+    entity: appliance
+    refresh: 6h
+    why: Sustained CPU load delays tasks, DRS and API calls, including the ones backup products make.
+    fix: Find the busy service; add vCPUs or resize the appliance.
+    query:
+      protocol: http
+      path: /rest/appliance/health/load
+      paging: none
+      key: "-"
+    each: { field: value, op: ne, value: green }
+    evidence: "appliance load health: {value}"
+
+  - id: VMW-VCSA-HEALTH-SWAP
+    title: Appliance swap health is not green
+    kind: broken
+    category: HLT
+    severity:
+      field: value
+      map: { red: critical, orange: high, yellow: medium, gray: medium }
+      default: medium
+    entity: appliance
+    refresh: 6h
+    why: A swapping appliance is short of memory; services slow down long before they fail.
+    fix: Add memory or resize the appliance; check for a leaking service.
+    query:
+      protocol: http
+      path: /rest/appliance/health/swap
+      paging: none
+      key: "-"
+    each: { field: value, op: ne, value: green }
+    evidence: "appliance swap health: {value}"
+
+  - id: VMW-VCSA-HEALTH-APPLMGMT
+    title: Appliance management service health is not green
+    kind: broken
+    category: HLT
+    severity:
+      field: value
+      map: { red: critical, orange: high, yellow: medium, gray: medium }
+      default: medium
+    entity: appliance
+    refresh: 6h
+    why: The appliance management service runs backups, patching and the health checks themselves; when it is unhealthy those stop quietly.
+    fix: Restart the applmgmt service and check its log.
+    query:
+      protocol: http
+      path: /rest/appliance/health/applmgmt
+      paging: none
+      key: "-"
+    each: { field: value, op: ne, value: green }
+    evidence: "appliance management service health: {value}"
+
+  - id: VMW-VCSA-HEALTH-PACKAGES
+    title: Appliance has pending software updates
+    kind: broken
+    lens: both
+    category: LCM
+    severity:
+      field: value
+      map: { red: high, orange: medium, yellow: low, gray: medium }
+      default: medium
+    entity: appliance
+    refresh: 7d
+    why: The software-packages colour turns red when security updates are available and orange for other updates; an unpatched vCenter is a prime target because it controls every VM.
+    fix: Stage and install the latest appliance patch in a change window, after a file-based backup.
+    refs: [NIST-800-53:SI-2]
+    query:
+      protocol: http
+      path: /rest/appliance/health/software-packages
+      paging: none
+      key: "-"
+    each: { field: value, op: ne, value: green }
+    evidence: "appliance software-packages health: {value}"
+
+  - id: VMW-VCSA-DATABASE
+    title: vCenter database reports degraded or unhealthy
+    kind: broken
+    category: HLT
+    severity:
+      field: status
+      map: { UNHEALTHY: critical, DEGRADED: medium }
+      default: medium
+    entity: appliance
+    refresh: 6h
+    why: An unhealthy database means corruption that will impact vCenter; degraded means issues with low impact today.
+    fix: Read the messages returned with the status, take a file-based backup, and open a vendor case for an unhealthy database.
+    query:
+      protocol: http
+      path: /api/appliance/health/database
+      paging: none
+      key: "-"
+    each: { field: status, op: ne, value: HEALTHY }
+    evidence: "database status {status}: {messages[].message.default_message}"
+
+  # ---- lifecycle -----------------------------------------------------------------------------
+
+  - id: VMW-VCSA-VERSION-UNSUPPORTED
+    title: vCenter runs a major version past end of general support
+    kind: broken
+    lens: both
+    category: LCM
+    severity: high
+    entity: appliance
+    refresh: 7d
+    why: Past end of general support a vCenter gets no security patches, and it holds administrative control over every host and VM.
+    fix: Plan the upgrade to a supported major version. Widen the pattern when the next major version leaves support.
+    refs: [NIST-800-53:SA-22, NIST-800-53:SI-2]
+    query:
+      protocol: http
+      path: /api/appliance/system/version
+      paging: none
+      key: "-"
+    each: { field: version, op: match, value: '^(5|6|7)\.', threshold: vmware.unsupported-version-pattern }
+    evidence: "{product} {version} build {build}"
+
+  - id: VMW-VCSA-UPDATE-FAILED
+    title: Appliance update failed or is rolling back
+    kind: broken
+    category: LCM
+    severity: high
+    entity: appliance
+    refresh: 6h
+    why: A failed update leaves the appliance between versions; the vendor state says it cannot recover by itself.
+    fix: Read the update task error, restore from the pre-update backup or snapshot if services are down, and retry the update.
+    query:
+      protocol: http
+      path: /api/appliance/update
+      paging: none
+      key: "-"
+    each: { field: state, op: in, value: [INSTALL_FAILED, ROLLBACK_IN_PROGRESS] }
+    evidence: "update state {state} for version {version}"
+
+  - id: VMW-VCSA-UPDATE-CHECK-STALE
+    title: Appliance has not checked for updates recently
+    kind: missing
+    category: LCM
+    severity: low
+    entity: appliance
+    refresh: 7d
+    why: If the appliance never queries its update repository, the software-packages health stays green while patches pile up.
+    fix: Check the update policy and repository URL (or proxy) and run a check for updates.
+    query:
+      protocol: http
+      path: /api/appliance/update
+      paging: none
+      key: "-"
+    each:
+      any:
+        - { field: latest_query_time, op: absent }
+        - { field: latest_query_time, op: age-gt, value: 30, threshold: vmware.update-check-max-age-days }
+    evidence: "last update check {latest_query_time}"
+
+  # ---- certificates and accounts -------------------------------------------------------------
+
+  - id: VMW-VC-TLS-CERT-EXPIRY
+    title: vCenter machine TLS certificate expires soon
+    kind: broken
+    lens: both
+    category: PKI
+    severity:
+      daysLeft: valid_to
+      ranges: [ { max: 0, value: critical }, { max: 14, value: high }, { max: 30, value: medium } ]
+      default: low
+    entity: certificate
+    refresh: 1d
+    why: When the machine SSL certificate expires, clients, backup products and linked services refuse to connect to vCenter.
+    fix: Renew the certificate through Certificate Management (VMCA or a CA-signed replacement) in a change window.
+    refs: [NIST-800-53:SC-17]
+    deadline: valid_to
+    query:
+      protocol: http
+      path: /api/vcenter/certificate-management/vcenter/tls
+      paging: none
+      key: serial_number
+      name: subject_dn
+    each: { field: valid_to, op: until-lt, value: 60, threshold: vmware.cert-notice-days }
+    evidence: "{subject_dn} issued by {issuer_dn} expires {valid_to}"
+
+  - id: VMW-VCSA-ROOT-PASSWORD-EXPIRY
+    title: Appliance root password expires soon
+    kind: broken
+    lens: both
+    category: IAM
+    severity:
+      daysLeft: password_expires_at
+      ranges: [ { max: 0, value: critical }, { max: 7, value: high }, { max: 14, value: medium } ]
+      default: low
+    entity: account
+    why: An expired root password locks administrators out of the appliance shell and management interface, which turns a routine fix into a recovery procedure.
+    fix: Change the root password before it expires and store it in the privileged-access vault; align the expiry policy with the vault's rotation.
+    refs: [NIST-800-53:IA-5]
+    deadline: password_expires_at
+    query:
+      protocol: http
+      path: /api/appliance/local-accounts/root
+      paging: none
+      key: "-"
+    each:
+      all:
+        - { field: password_expires_at, op: exists }
+        - { field: password_expires_at, op: until-lt, value: 30, threshold: vmware.root-password-notice-days }
+    evidence: "root password expires {password_expires_at} (last changed {last_password_change})"
+
+  - id: VMW-VCSA-SSH-ENABLED
+    title: SSH is enabled on the appliance
+    kind: misconfigured
+    lens: security
+    category: CFG
+    severity: medium
+    entity: appliance
+    why: An always-on root shell over SSH widens the attack surface of the system that controls every VM; hardening guidance keeps it off except during maintenance.
+    fix: Disable SSH in the appliance management interface and enable it only for the duration of a support task.
+    refs: [NIST-800-53:CM-7]
+    query:
+      protocol: http
+      path: /rest/appliance/access/ssh
+      paging: none
+      key: "-"
+    each: { field: value, op: eq, value: true }
+    evidence: "SSH access enabled"
+
+  - id: VMW-VCSA-SHELL-ENABLED
+    title: The appliance Bash shell is enabled
+    kind: misconfigured
+    lens: security
+    category: CFG
+    severity: medium
+    entity: appliance
+    why: The Bash shell gives unrestricted root access on the appliance; it should only be switched on, with a timeout, for a support task.
+    fix: Disable the shell, or set a short timeout when it is needed.
+    refs: [NIST-800-53:CM-7]
+    query:
+      protocol: http
+      path: /api/appliance/access/shell
+      paging: none
+      key: "-"
+    each: { field: enabled, op: eq, value: true }
+    evidence: "shell enabled, timeout {timeout} s"
+
+  - id: VMW-VCSA-TIMESYNC-DISABLED
+    title: Appliance time synchronisation is off
+    kind: misconfigured
+    lens: both
+    category: CFG
+    severity: medium
+    entity: appliance
+    why: Clock drift on vCenter breaks single sign-on token validation and makes log times useless for investigations.
+    fix: Configure NTP (or host time sync) on the appliance and point it at the same sources the directory uses.
+    refs: [NIST-800-53:AU-8]
+    query:
+      protocol: http
+      path: /rest/appliance/timesync
+      paging: none
+      key: "-"
+    each: { field: value, op: eq, value: DISABLED }
+    evidence: "time synchronisation mode {value}"
+
+  # ---- appliance file-based backup -----------------------------------------------------------
+
+  - id: VMW-VCSA-BACKUP-SCHEDULE-MISSING
+    title: No file-based backup schedule on the appliance
+    kind: missing
+    category: BCK
+    severity: high
+    entity: appliance
+    why: Image-level VM backups of vCenter are not a supported restore path for its database; the file-based backup is the one the vendor restore procedure uses.
+    fix: Create a daily file-based backup schedule to a location outside the appliance, with retention and an encryption password.
+    refs: [NIST-800-53:CP-9]
+    query:
+      protocol: http
+      path: /rest/appliance/recovery/backup/schedules
+      paging: none
+      key: key
+    count: none
+    evidence: "no backup schedule is defined"
+
+  - id: VMW-VCSA-BACKUP-SCHEDULE-DISABLED
+    title: Appliance backup schedule is disabled
+    kind: misconfigured
+    category: BCK
+    severity: high
+    entity: backup-schedule
+    why: A disabled schedule produces no backups and no failures - the appliance looks protected while it is not.
+    fix: Re-enable the schedule, or replace it with a working one.
+    refs: [NIST-800-53:CP-9]
+    query:
+      protocol: http
+      path: /rest/appliance/recovery/backup/schedules
+      paging: none
+      key: key
+    each: { field: value.enable, op: eq, value: false }
+    evidence: "schedule {key} to {value.location} is disabled"
+
+  - id: VMW-VCSA-BACKUP-FAILED
+    title: Appliance file-based backup failed recently
+    kind: broken
+    category: BCK
+    severity: high
+    entity: backup-job
+    refresh: 6h
+    why: A failed vCenter backup means the next restore would start from an older configuration - or from nothing.
+    fix: Read the job's error messages (location credentials, free space, network) and run a manual backup once fixed.
+    refs: [NIST-800-53:CP-9]
+    query:
+      protocol: http
+      path: /rest/appliance/recovery/backup/job/details
+      paging: none
+      key: key
+    each:
+      all:
+        - { field: value.status, op: eq, value: FAILED }
+        - { field: value.end_time, op: age-lt, value: 7, threshold: vmware.backup-failure-window-days }
+    evidence: "{value.type} backup {key} to {value.location} failed at {value.end_time}"
+
+  - id: VMW-VCSA-BACKUP-STUCK
+    title: Appliance backup job has been running for too long
+    kind: broken
+    category: BCK
+    severity: medium
+    entity: backup-job
+    refresh: 6h
+    why: A backup job that never finishes blocks the next scheduled run, so the appliance silently stops getting backups.
+    fix: Check the job progress and the target location; cancel and rerun the job if it is hung.
+    refs: [NIST-800-53:CP-9]
+    query:
+      protocol: http
+      path: /rest/appliance/recovery/backup/job/details
+      paging: none
+      key: key
+    each:
+      all:
+        - { field: value.status, op: in, value: [RUNNING, BLOCKED, PENDING] }
+        - { field: value.start_time, op: age-gt, value: 0.5, threshold: vmware.backup-max-run-days }
+    evidence: "backup {key} {value.status} since {value.start_time}"

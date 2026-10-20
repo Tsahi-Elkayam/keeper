@@ -1,3 +1,5 @@
+using System.Collections.Concurrent;
+using System.Text.RegularExpressions;
 using Microsoft.Data.Sqlite;
 
 namespace Keeper.Store;
@@ -61,7 +63,21 @@ public sealed class Database
         }.ToString());
         connection.Open();
         Sql.Execute(connection, "PRAGMA busy_timeout = 5000;");
+        // SQLite has the REGEXP operator but no function behind it; .NET's, with a timeout, so a store rule
+        // or a question can use a tenant's pattern setting (x REGEXP pattern).
+        connection.CreateFunction("regexp", (string? pattern, string? input) => Regexp(pattern, input), isDeterministic: true);
         return connection;
+    }
+
+    private static readonly ConcurrentDictionary<string, Regex> Patterns = new(StringComparer.Ordinal);
+
+    private static bool Regexp(string? pattern, string? input)
+    {
+        if (pattern is null || input is null)
+            return false;
+        if (Patterns.Count > 256)
+            Patterns.Clear();
+        return Patterns.GetOrAdd(pattern, p => new Regex(p, RegexOptions.CultureInvariant, TimeSpan.FromSeconds(1))).IsMatch(input);
     }
 }
 

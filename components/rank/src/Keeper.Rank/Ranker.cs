@@ -14,8 +14,9 @@ public sealed record RankingFile(string BuildId, string At, int BudgetMinutes, I
 
 /// <summary>
 /// Orders the open findings into what to do today. Severity first; then deadline pressure, a reopened or new
-/// problem, the security tier and the system's criticality. Delegated findings wait on someone else; snoozed
-/// ones stay out until their date. Today's list is cut to the time budget (setting rank.daily-minutes).
+/// problem, the security tier, the system's criticality and how many targets share the problem. Findings of
+/// one check are one task. Delegated findings wait on someone else; snoozed ones stay out until their date.
+/// Today's list is cut to the time budget (setting rank.daily-minutes).
 /// </summary>
 public sealed class Ranker(SqliteConnection connection, TimeProvider? clock = null)
 {
@@ -48,7 +49,7 @@ public sealed class Ranker(SqliteConnection connection, TimeProvider? clock = nu
 
         var rows = Sql.Rows(connection,
             """
-            SELECT f.finding_key, f.severity, f.security, f.lifecycle, f.deadline, f.days_left, f.first_seen,
+            SELECT f.finding_key, f.check_id, f.severity, f.security, f.lifecycle, f.deadline, f.days_left, f.first_seen,
                    f.snoozed_until, f.delegated_to, s.criticality
             FROM active_finding f
             LEFT JOIN system s ON s.system_id = f.system_id;
@@ -57,13 +58,34 @@ public sealed class Ranker(SqliteConnection connection, TimeProvider? clock = nu
         var scored = rows.Select(r => Score(r, now, Setting)).ToList();
         var items = new List<RankedItem>();
         var used = 0;
+        var tasks = 0;
         var position = 0;
-        foreach (var item in scored.Where(s => s.List == "open").OrderByDescending(s => s.Score).ThenBy(s => s.Key, StringComparer.Ordinal))
+
+        // One check failing on many targets is one task with a wide reach, not many tasks: it is ranked
+        // once, by its worst instance plus its spread, and its time counts against the budget once.
+        var groups = scored.Where(s => s.List == "open")
+            .GroupBy(s => s.Check, StringComparer.OrdinalIgnoreCase)
+            .Select(g =>
+            {
+                var members = g.OrderByDescending(m => m.Score).ThenBy(m => m.Key, StringComparer.Ordinal).ToList();
+                return (Members: members, Score: Math.Round(members[0].Score + Spread(members.Count), 1));
+            })
+            .OrderByDescending(g => g.Score).ThenBy(g => g.Members[0].Key, StringComparer.Ordinal);
+        foreach (var (members, score) in groups)
         {
-            var fits = items.Count(i => i.List == "today") < maxItems && (used + item.Minutes <= budget || items.All(i => i.List != "today"));
+            var minutes = members[0].Minutes;
+            var fits = tasks < maxItems && (used + minutes <= budget || tasks == 0);
             if (fits)
-                used += item.Minutes;
-            items.Add(new RankedItem(item.Key, fits ? "today" : "later", ++position, item.Score, item.Minutes, item.Reasons));
+            {
+                used += minutes;
+                tasks++;
+            }
+            var lead = members[0];
+            var reasons = members.Count > 1 ? [.. lead.Reasons, $"{members.Count} targets"] : lead.Reasons;
+            items.Add(new RankedItem(lead.Key, fits ? "today" : "later", ++position, score, minutes, reasons));
+            var leadPosition = position;
+            foreach (var member in members.Skip(1))
+                items.Add(new RankedItem(member.Key, fits ? "today" : "later", ++position, member.Score, 0, [.. member.Reasons, $"same check as #{leadPosition}"]));
         }
         foreach (var item in scored.Where(s => s.List is "waiting" or "snoozed").OrderByDescending(s => s.Score))
             items.Add(new RankedItem(item.Key, item.List, ++position, item.Score, item.Minutes, item.Reasons));
@@ -71,7 +93,10 @@ public sealed class Ranker(SqliteConnection connection, TimeProvider? clock = nu
         return new RankingFile(buildId, Iso.Utc(now), budget, items);
     }
 
-    private sealed record Scored(string Key, string List, double Score, int Minutes, List<string> Reasons);
+    private sealed record Scored(string Key, string Check, string List, double Score, int Minutes, List<string> Reasons);
+
+    /// <summary>How much a problem's reach adds: 10 targets +15, 100 targets +30 (the most).</summary>
+    public static double Spread(int targets) => targets <= 1 ? 0 : Math.Min(30, 15 * Math.Log10(targets));
 
     private static Scored Score(Dictionary<string, object?> r, DateTimeOffset now, Func<string, int, int> setting)
     {
@@ -141,7 +166,7 @@ public sealed class Ranker(SqliteConnection connection, TimeProvider? clock = nu
             list = "waiting";
             reasons.Add($"with {owner}");
         }
-        return new Scored((string)r["finding_key"]!, list, Math.Round(score, 1), minutes, reasons);
+        return new Scored((string)r["finding_key"]!, (string)r["check_id"]!, list, Math.Round(score, 1), minutes, reasons);
     }
 }
 

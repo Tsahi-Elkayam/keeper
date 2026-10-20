@@ -195,6 +195,11 @@ public sealed class Evaluator(Func<string, string?> threshold, DateTimeOffset no
                 {
                     return new Verdict(null, value, operand, "the pattern timed out");
                 }
+                catch (ArgumentException)
+                {
+                    // A tenant's pattern setting that is not a valid expression: the row cannot be judged.
+                    return new Verdict(null, value, operand, $"'{operand}' is not a valid regular expression (check the threshold setting)");
+                }
                 break;
             case "age-gt":
             case "age-lt":

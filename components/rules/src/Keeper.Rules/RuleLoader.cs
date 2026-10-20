@@ -248,7 +248,7 @@ public static partial class RuleLoader
             EntityType = entity,
             Why = reader.Text(fields, "why", what),
             Fix = reader.Text(fields, "fix", what),
-            Refs = reader.Strings(fields, "refs", what),
+            Refs = Refs.Normalize(reader.Strings(fields, "refs", what)),
             Refresh = refresh,
             Query = query ?? new QuerySpec("invalid", new JsonObject(), "-", null),
             Each = each,
@@ -353,9 +353,10 @@ public static partial class RuleLoader
         if (node is YamlScalarNode { Value: "none" or "some" } mode)
             return new CountCondition(mode.Value!, null, 0, null);
 
-        var fields = reader.Fields(node, $"{what}.count", ["op", "value", "threshold"]);
+        var fields = reader.Fields(node, $"{what}.count", ["op", "value", "threshold", "where"]);
         if (fields is null)
             return null;
+        var where = fields.TryGetValue("where", out var whereNode) ? ReadCondition(reader, whereNode, $"{what}.count.where") : null;
         var op = reader.Text(fields, "op", $"{what}.count", required: true) ?? "";
         if (op is not ("gt" or "ge" or "lt" or "le" or "eq" or "ne"))
             reader.Error(node, $"{what}.count: op must be gt, ge, lt, le, eq or ne.");
@@ -365,7 +366,7 @@ public static partial class RuleLoader
         var threshold = reader.Text(fields, "threshold", $"{what}.count");
         if (threshold is not null && !ThresholdName().IsMatch(threshold))
             reader.Error(node, $"{what}.count: threshold '{threshold}' must be lower-case letters, digits, dots and dashes.");
-        return new CountCondition("compare", op, value, threshold);
+        return new CountCondition("compare", op, value, threshold, where);
     }
 
     private static SeverityMap? ReadSeverityMap(YamlReader reader, YamlNode node, string what)

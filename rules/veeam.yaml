@@ -1,0 +1,603 @@
+schema: keeper.rules/1
+system: veeam
+name: Veeam Backup & Replication
+integration: veeam
+# Endpoint: the backup server's REST API (https://backup.example.org:9419). The integration obtains the
+# OAuth2 token (POST /api/oauth2/token) and adds the bearer header; rules only name GET paths.
+# Every rule pins x-api-version 1.2-rev0 (Veeam Backup & Replication 12.2 and later): the field names
+# below are taken from that revision of the REST API reference, and newer revisions move some of them
+# (the licence expiry, for one). The integration must not add a second x-api-version header.
+# Lists answer {data: [...], pagination: {...}} and page with skip/limit.
+defaults:
+  lens: maintenance
+  refresh: 1d
+rules:
+
+  # ---- jobs ----------------------------------------------------------------------------------
+
+  - id: VEEAM-JOB-LAST-FAILED
+    title: Backup job's last run failed
+    kind: broken
+    category: BCK
+    severity: critical
+    entity: job
+    refresh: 6h
+    why: Until the job succeeds again, every object in it is only as recent as its last good restore point.
+    fix: Open the job's last session, fix the failing objects (credentials, snapshots, repository space) and retry the job.
+    refs: [NIST-800-53:CP-9]
+    query:
+      protocol: http
+      path: /api/v1/jobs/states
+      headers: { x-api-version: 1.2-rev0 }
+      paging: offset
+      offsetParam: skip
+      limitParam: limit
+      pageSize: 200
+      items: data
+      key: id
+      name: name
+    each: { field: lastResult, op: eq, value: Failed }
+    evidence: "{name} ({type}): last run {lastRun} failed, repository {repositoryName}"
+
+  - id: VEEAM-JOB-LAST-WARNING
+    title: Backup job's last run ended with a warning
+    kind: broken
+    category: BCK
+    severity: medium
+    entity: job
+    refresh: 6h
+    why: Warnings such as processing without quiescing or untruncated logs mean restore points that are crash-consistent or incomplete, while the job still looks green.
+    fix: Read the warning in the session log and fix its cause; do not let a recurring warning become normal.
+    refs: [NIST-800-53:CP-9]
+    query:
+      protocol: http
+      path: /api/v1/jobs/states
+      headers: { x-api-version: 1.2-rev0 }
+      paging: offset
+      offsetParam: skip
+      limitParam: limit
+      pageSize: 200
+      items: data
+      key: id
+      name: name
+    each: { field: lastResult, op: eq, value: Warning }
+    evidence: "{name} ({type}): last run {lastRun} ended with a warning"
+
+  - id: VEEAM-JOB-DISABLED
+    title: Backup job is disabled
+    kind: misconfigured
+    category: BCK
+    severity: high
+    entity: job
+    why: A disabled job produces no sessions, no failures and no restore points - it is indistinguishable from "no problems" on every dashboard.
+    fix: Re-enable the job, or delete it and confirm its objects are protected elsewhere.
+    refs: [NIST-800-53:CP-9]
+    query:
+      protocol: http
+      path: /api/v1/jobs/states
+      headers: { x-api-version: 1.2-rev0 }
+      paging: offset
+      offsetParam: skip
+      limitParam: limit
+      pageSize: 200
+      items: data
+      key: id
+      name: name
+    each: { field: status, op: eq, value: Disabled }
+    evidence: "{name} ({type}) is disabled; last run {lastRun}"
+
+  - id: VEEAM-JOB-STALE
+    title: Enabled backup job has not run recently
+    kind: broken
+    category: BCK
+    severity: high
+    entity: job
+    why: A job that stopped running raises no alarm; its restore points just get older. Weekly or monthly jobs need a higher threshold (per-job override).
+    fix: Check the job's schedule and whether it is chained to a job that no longer runs; start it manually and watch the result.
+    refs: [NIST-800-53:CP-9]
+    query:
+      protocol: http
+      path: /api/v1/jobs/states
+      headers: { x-api-version: 1.2-rev0 }
+      paging: offset
+      offsetParam: skip
+      limitParam: limit
+      pageSize: 200
+      items: data
+      key: id
+      name: name
+    each:
+      all:
+        - { field: status, op: ne, value: Disabled }
+        - { field: lastRun, op: age-gt, value: 2, threshold: veeam.job-max-age-days }
+    evidence: "{name} ({type}): last run {lastRun}, next run {nextRun}"
+
+  - id: VEEAM-JOB-NEVER-RAN
+    title: Enabled backup job has never run
+    kind: missing
+    category: BCK
+    severity: high
+    entity: job
+    why: A job with no run at all is the quietest gap of all - nothing is red because nothing ever happened.
+    fix: Give the job a schedule or chain it to one that runs, then run it once and check the result.
+    refs: [NIST-800-53:CP-9]
+    query:
+      protocol: http
+      path: /api/v1/jobs/states
+      headers: { x-api-version: 1.2-rev0 }
+      paging: offset
+      offsetParam: skip
+      limitParam: limit
+      pageSize: 200
+      items: data
+      key: id
+      name: name
+    each:
+      all:
+        - { field: status, op: notin, value: [Disabled, Running, Starting] }
+        - { field: lastRun, op: absent }
+    evidence: "{name} ({type}): no run recorded, status {status}"
+
+  # ---- sessions ------------------------------------------------------------------------------
+
+  - id: VEEAM-SESSION-FAILED
+    title: Backup session failed in the last day
+    kind: broken
+    category: BCK
+    severity: high
+    entity: session
+    refresh: 6h
+    why: Each failed session is an object set that missed its restore point; the message says which kind of failure it was.
+    fix: Read the session log, fix the cause (space, credentials, snapshot, network) and retry.
+    refs: [NIST-800-53:CP-9]
+    query:
+      protocol: http
+      path: /api/v1/sessions
+      headers: { x-api-version: 1.2-rev0 }
+      params: { resultFilter: Failed, orderColumn: CreationTime, orderAsc: "false" }
+      paging: offset
+      offsetParam: skip
+      limitParam: limit
+      pageSize: 200
+      maxPages: 5
+      items: data
+      key: id
+      name: name
+    each:
+      all:
+        - { field: result.result, op: eq, value: Failed }
+        - { field: creationTime, op: age-lt, value: 1, threshold: veeam.session-window-days }
+    evidence: "{name} ({sessionType}) failed at {endTime}: {result.message}"
+
+  - id: VEEAM-SESSION-LONG-RUNNING
+    title: Backup session has been running for too long
+    kind: broken
+    category: BCK
+    severity: medium
+    entity: session
+    refresh: 6h
+    why: A session still working after the backup window competes with production I/O (reported as "the system is slow") and blocks the next run; a stuck job looks busy, not broken.
+    fix: Check the bottleneck and progress of the session; stop and rerun it if it is hung, and find why it ran long.
+    refs: [NIST-800-53:CP-9]
+    query:
+      protocol: http
+      path: /api/v1/sessions
+      headers: { x-api-version: 1.2-rev0 }
+      params: { stateFilter: Working, orderColumn: CreationTime, orderAsc: "true" }
+      paging: offset
+      offsetParam: skip
+      limitParam: limit
+      pageSize: 200
+      maxPages: 5
+      items: data
+      key: id
+      name: name
+    each: { field: creationTime, op: age-gt, value: 0.5, threshold: veeam.session-max-run-days }
+    evidence: "{name} ({sessionType}) working since {creationTime}, {progressPercent}% done"
+
+  # ---- repositories --------------------------------------------------------------------------
+
+  - id: VEEAM-REPOSITORY-OFFLINE
+    title: Backup repository is offline
+    kind: broken
+    category: BCK
+    severity: critical
+    entity: repository
+    refresh: 6h
+    why: Jobs that target an offline repository fail, and restores from it are impossible until it returns.
+    fix: Check the repository host, its share or bucket credentials and the network path; rescan the repository.
+    refs: [NIST-800-53:CP-9]
+    query:
+      protocol: http
+      path: /api/v1/backupInfrastructure/repositories/states
+      headers: { x-api-version: 1.2-rev0 }
+      paging: offset
+      offsetParam: skip
+      limitParam: limit
+      pageSize: 200
+      items: data
+      key: id
+      name: name
+    each: { field: isOnline, op: eq, value: false }
+    evidence: "{name} ({type}) on {hostName} is offline"
+
+  - id: VEEAM-REPOSITORY-OUT-OF-DATE
+    title: Backup repository components are out of date
+    kind: broken
+    category: LCM
+    severity: medium
+    entity: repository
+    why: Out-of-date transport components on a repository host block jobs after a server upgrade and miss fixes.
+    fix: Upgrade the components from the console (Upgrade on the managed server).
+    refs: [NIST-800-53:SI-2]
+    query:
+      protocol: http
+      path: /api/v1/backupInfrastructure/repositories/states
+      headers: { x-api-version: 1.2-rev0 }
+      paging: offset
+      offsetParam: skip
+      limitParam: limit
+      pageSize: 200
+      items: data
+      key: id
+      name: name
+    each: { field: isOutOfDate, op: eq, value: true }
+    evidence: "{name} ({type}) on {hostName} needs a component upgrade"
+
+  - id: VEEAM-REPOSITORY-FREE-SPACE
+    title: Backup repository is low on free space
+    kind: broken
+    category: BCK
+    severity:
+      field: freeGB
+      ranges: [ { max: 50, value: critical }, { max: 100, value: high } ]
+      default: medium
+    entity: repository
+    why: Jobs start failing when the next full or merge does not fit - tomorrow, not today. Free space is judged per repository and per extent, because an aggregate hides the full one.
+    fix: Extend the repository, add an extent, or shorten retention. The threshold is in GB because the engine cannot compute a percentage.
+    refs: [NIST-800-53:CP-9]
+    query:
+      protocol: http
+      path: /api/v1/backupInfrastructure/repositories/states
+      headers: { x-api-version: 1.2-rev0 }
+      paging: offset
+      offsetParam: skip
+      limitParam: limit
+      pageSize: 200
+      items: data
+      key: id
+      name: name
+    each:
+      all:
+        - { field: capacityGB, op: gt, value: 0 }
+        - { field: freeGB, op: lt, value: 200, threshold: veeam.repository-free-gb-min }
+    evidence: "{name} ({type}): {freeGB} GB free of {capacityGB} GB"
+
+  # ---- licence -------------------------------------------------------------------------------
+
+  - id: VEEAM-LICENSE-STATUS
+    title: Installed licence is not valid
+    kind: broken
+    category: LCM
+    severity: critical
+    entity: license
+    refresh: 1d
+    why: With an invalid or expired licence, jobs stop processing new restore points.
+    fix: Install a valid licence file or renew the subscription with the vendor.
+    query:
+      protocol: http
+      path: /api/v1/license
+      headers: { x-api-version: 1.2-rev0 }
+      paging: none
+      key: "-"
+    each: { field: status, op: ne, value: Valid }
+    evidence: "licence status {status}, edition {edition}, type {type}"
+
+  - id: VEEAM-LICENSE-EXPIRY
+    title: Backup licence expires soon
+    kind: broken
+    category: LCM
+    severity:
+      daysLeft: expirationDate
+      ranges: [ { max: 0, value: critical }, { max: 14, value: high }, { max: 30, value: medium } ]
+      default: low
+    entity: license
+    why: A lapsed licence does not degrade gracefully - jobs stop. Procurement lead time is usually weeks.
+    fix: Start the renewal now and install the new licence before the expiry date.
+    deadline: expirationDate
+    query:
+      protocol: http
+      path: /api/v1/license
+      headers: { x-api-version: 1.2-rev0 }
+      paging: none
+      key: "-"
+    each:
+      all:
+        - { field: expirationDate, op: exists }
+        - { field: expirationDate, op: until-lt, value: 60, threshold: veeam.license-notice-days }
+    evidence: "{edition} {type} licence expires {expirationDate}"
+
+  - id: VEEAM-SUPPORT-EXPIRY
+    title: Backup support contract expires soon
+    kind: broken
+    category: LCM
+    severity:
+      daysLeft: supportExpirationDate
+      ranges: [ { max: 0, value: high }, { max: 30, value: medium } ]
+      default: low
+    entity: license
+    why: Without support there are no new versions to install when a security fix ships, and no vendor help during a restore.
+    fix: Renew the support contract before it lapses.
+    deadline: supportExpirationDate
+    query:
+      protocol: http
+      path: /api/v1/license
+      headers: { x-api-version: 1.2-rev0 }
+      paging: none
+      key: "-"
+    each:
+      all:
+        - { field: supportExpirationDate, op: exists }
+        - { field: supportExpirationDate, op: until-lt, value: 90, threshold: veeam.support-notice-days }
+    evidence: "support {supportId} expires {supportExpirationDate}"
+
+  - id: VEEAM-LICENSE-SOCKETS-EXHAUSTED
+    title: All licensed sockets are in use
+    kind: broken
+    category: LCM
+    severity: medium
+    entity: license
+    why: With no sockets left, a new or replaced host cannot be protected, and nothing fails loudly - its VMs simply stay out of the backups.
+    fix: Free sockets from retired hosts or extend the licence before adding hosts.
+    query:
+      protocol: http
+      path: /api/v1/license
+      headers: { x-api-version: 1.2-rev0 }
+      paging: none
+      key: "-"
+    each:
+      all:
+        - { field: socketLicenseSummary.licensedSocketsNumber, op: gt, value: 0 }
+        - { field: socketLicenseSummary.remainingSocketsNumber, op: le, value: 0, threshold: veeam.license-min-free-sockets }
+    evidence: "{socketLicenseSummary.usedSocketsNumber} of {socketLicenseSummary.licensedSocketsNumber} sockets used"
+
+  # ---- configuration backup ------------------------------------------------------------------
+
+  - id: VEEAM-CONFIG-BACKUP-DISABLED
+    title: Configuration backup is disabled
+    kind: missing
+    category: BCK
+    severity: high
+    entity: backup-server
+    why: Losing the backup server without a configuration backup loses the catalogue, jobs and credentials - the restore points survive but rebuilding access to them takes days.
+    fix: Enable the configuration backup to a repository that is not on the backup server itself.
+    refs: [NIST-800-53:CP-9]
+    query:
+      protocol: http
+      path: /api/v1/configBackup
+      headers: { x-api-version: 1.2-rev0 }
+      paging: none
+      key: "-"
+    each: { field: isEnabled, op: eq, value: false }
+    evidence: "configuration backup disabled"
+
+  - id: VEEAM-CONFIG-BACKUP-UNSCHEDULED
+    title: Configuration backup has no active schedule
+    kind: misconfigured
+    category: BCK
+    severity: medium
+    entity: backup-server
+    why: An enabled configuration backup without a schedule only runs when someone remembers to start it.
+    fix: Enable a daily schedule for the configuration backup.
+    refs: [NIST-800-53:CP-9]
+    query:
+      protocol: http
+      path: /api/v1/configBackup
+      headers: { x-api-version: 1.2-rev0 }
+      paging: none
+      key: "-"
+    each:
+      all:
+        - { field: isEnabled, op: eq, value: true }
+        - { field: schedule.isEnabled, op: eq, value: false }
+    evidence: "configuration backup enabled but its schedule is off"
+
+  - id: VEEAM-CONFIG-BACKUP-STALE
+    title: No recent successful configuration backup
+    kind: broken
+    category: BCK
+    severity: high
+    entity: backup-server
+    why: A configuration backup that stopped succeeding is as bad as none once the server is lost.
+    fix: Check the configuration backup session log and its target repository; run it manually.
+    refs: [NIST-800-53:CP-9]
+    query:
+      protocol: http
+      path: /api/v1/configBackup
+      headers: { x-api-version: 1.2-rev0 }
+      paging: none
+      key: "-"
+    each:
+      any:
+        - { field: lastSuccessfulBackup.lastSuccessfulTime, op: absent }
+        - { field: lastSuccessfulBackup.lastSuccessfulTime, op: age-gt, value: 2, threshold: veeam.config-backup-max-age-days }
+    evidence: "last successful configuration backup {lastSuccessfulBackup.lastSuccessfulTime}"
+
+  - id: VEEAM-CONFIG-BACKUP-UNENCRYPTED
+    title: Configuration backup is not encrypted
+    kind: misconfigured
+    lens: security
+    category: BCK
+    severity: high
+    entity: backup-server
+    why: Without encryption the configuration backup leaves out every stored credential, so a restore after losing the server means re-entering each one by hand; the unencrypted file is still a readable map of the whole backup estate.
+    fix: Enable encryption on the configuration backup with a password kept in the privileged-access vault.
+    refs: [NIST-800-53:SC-28, NIST-800-53:CP-9]
+    query:
+      protocol: http
+      path: /api/v1/configBackup
+      headers: { x-api-version: 1.2-rev0 }
+      paging: none
+      key: "-"
+    each: { field: encryption.isEnabled, op: eq, value: false }
+    evidence: "configuration backup encryption is off"
+
+  # ---- malware detection and security analyzer -----------------------------------------------
+
+  - id: VEEAM-MALWARE-INFECTED
+    title: Backup marked infected by malware detection
+    kind: broken
+    lens: security
+    category: BCK
+    severity: critical
+    entity: malware-event
+    refresh: 6h
+    why: An infected restore point is the one an attacker hopes you restore; the machine it came from may still be compromised.
+    fix: Treat it as a security incident - confirm on the source machine, pick a clean earlier restore point, and use secure restore with an antivirus scan.
+    refs: [NIST-800-53:SI-3, NIST-800-53:IR-4]
+    query:
+      protocol: http
+      path: /api/v1/malwareDetection/events
+      headers: { x-api-version: 1.2-rev0 }
+      params: { severityFilter: Infected, orderColumn: DetectionTimeUtc, orderAsc: "false" }
+      paging: offset
+      offsetParam: skip
+      limitParam: limit
+      pageSize: 200
+      maxPages: 5
+      items: data
+      key: id
+      name: machine.displayName
+    each:
+      all:
+        - { field: state, op: ne, value: FalsePositive }
+        - { field: detectionTimeUtc, op: age-lt, value: 30, threshold: veeam.malware-window-days }
+    evidence: "{machine.displayName}: {type} by {engine} at {detectionTimeUtc} - {details}"
+
+  - id: VEEAM-MALWARE-SUSPICIOUS
+    title: Backup marked suspicious by malware detection
+    kind: broken
+    lens: security
+    category: BCK
+    severity: high
+    entity: malware-event
+    refresh: 6h
+    why: Suspicious activity (encrypted data, ransom notes, renamed files) in a backup is often the first sign of ransomware on the source.
+    fix: Investigate the source machine; mark the event as a false positive only with evidence.
+    refs: [NIST-800-53:SI-3, NIST-800-53:IR-4]
+    query:
+      protocol: http
+      path: /api/v1/malwareDetection/events
+      headers: { x-api-version: 1.2-rev0 }
+      params: { severityFilter: Suspicious, orderColumn: DetectionTimeUtc, orderAsc: "false" }
+      paging: offset
+      offsetParam: skip
+      limitParam: limit
+      pageSize: 200
+      maxPages: 5
+      items: data
+      key: id
+      name: machine.displayName
+    each:
+      all:
+        - { field: state, op: ne, value: FalsePositive }
+        - { field: detectionTimeUtc, op: age-lt, value: 30, threshold: veeam.malware-window-days }
+    evidence: "{machine.displayName}: {type} by {engine} at {detectionTimeUtc} - {details}"
+
+  - id: VEEAM-ANALYZER-FINDING
+    title: Security & Compliance Analyzer reports a best practice not met
+    kind: misconfigured
+    lens: security
+    category: CFG
+    severity:
+      field: status
+      map: { Violation: high, UnableToCheck: medium }
+      default: medium
+    entity: best-practice
+    refresh: 7d
+    why: The vendor's own analyzer checks the backup server hardening (immutability, MFA, encryption, exposed services); a failed item is a known weakness.
+    fix: Implement the best practice, or suppress it in the console with a written reason. Status words assumed from the product's enum (Ok, Violation, UnableToCheck, Suppressed); confirm on the first run.
+    refs: [NIST-800-53:CM-6]
+    query:
+      protocol: http
+      path: /api/v1/securityAnalyzer/bestPractices
+      headers: { x-api-version: 1.2-rev0 }
+      paging: none
+      items: items
+      key: id
+      name: bestPractice
+    each: { field: status, op: notin, value: [Ok, Suppressed, Analyzing] }
+    evidence: "{bestPractice}: {status} {note}"
+
+  - id: VEEAM-ANALYZER-STALE
+    title: Security & Compliance Analyzer has not run recently
+    kind: missing
+    lens: security
+    category: CFG
+    severity: low
+    entity: backup-server
+    refresh: 7d
+    why: The analyzer's results are only as current as its last run; a configuration drift after that run is invisible.
+    fix: Schedule the analyzer to run daily.
+    query:
+      protocol: http
+      path: /api/v1/securityAnalyzer/lastRun
+      headers: { x-api-version: 1.2-rev0 }
+      paging: none
+      key: "-"
+    each:
+      any:
+        - { field: creationTime, op: absent }
+        - { field: creationTime, op: age-gt, value: 30, threshold: veeam.analyzer-max-age-days }
+    evidence: "last analyzer run {creationTime}, result {result.result}"
+
+  # ---- infrastructure and protected objects --------------------------------------------------
+
+  - id: VEEAM-SERVER-UNAVAILABLE
+    title: Managed server is unavailable to the backup server
+    kind: broken
+    category: AVL
+    severity: high
+    entity: managed-server
+    refresh: 6h
+    why: Jobs that use an unavailable proxy, repository host or hypervisor fail or fall back to slower paths.
+    fix: Check the server, its credentials and the ports the backup components use; rescan it from the console.
+    query:
+      protocol: http
+      path: /api/v1/backupInfrastructure/managedServers
+      headers: { x-api-version: 1.2-rev0 }
+      paging: offset
+      offsetParam: skip
+      limitParam: limit
+      pageSize: 200
+      items: data
+      key: id
+      name: name
+    each: { field: status, op: eq, value: Unavailable }
+    evidence: "{name} ({type}) is unavailable"
+
+  - id: VEEAM-OBJECT-FEW-RESTORE-POINTS
+    title: Protected object has too few restore points
+    kind: missing
+    category: BCK
+    severity:
+      field: restorePointsCount
+      ranges: [ { max: 0, value: high } ]
+      default: medium
+    entity: backup-object
+    why: With a single restore point there is no fallback if it turns out to be bad; with none the object is covered on paper only.
+    fix: Check the object's job results and retention; run the job and confirm a second point appears.
+    refs: [NIST-800-53:CP-9]
+    query:
+      protocol: http
+      path: /api/v1/backupObjects
+      headers: { x-api-version: 1.2-rev0 }
+      paging: offset
+      offsetParam: skip
+      limitParam: limit
+      pageSize: 200
+      items: data
+      key: id
+      name: name
+    each: { field: restorePointsCount, op: lt, value: 2, threshold: veeam.min-restore-points }
+    evidence: "{name} ({type}, {platformName}): {restorePointsCount} restore points"

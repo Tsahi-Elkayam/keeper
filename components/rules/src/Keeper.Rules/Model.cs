@@ -58,7 +58,10 @@ public sealed record AlwaysCondition : Condition
 }
 
 /// <summary>A rule over the number of rows: compare, "none" (no rows is the problem) or "some".</summary>
-public sealed record CountCondition(string Mode, string? Op, double Value, string? Threshold);
+/// <param name="Where">Counts only the rows this holds for: "at least one enforced policy must exist" is
+/// count lt 1 where enforced. A row the condition cannot judge (n/a) is not counted, so an unreadable
+/// policy never satisfies a must-exist rule.</param>
+public sealed record CountCondition(string Mode, string? Op, double Value, string? Threshold, Condition? Where = null);
 
 public sealed record SeverityRange(double? Min, double? Max, string Value);
 

@@ -1,0 +1,491 @@
+schema: keeper.rules/1
+system: wiz
+name: Wiz cloud security
+integration: wiz
+# Endpoint: the tenant's API host (https://api.<region>.app.wiz.io); queries go to the default path
+# /graphql. The integration obtains the service-account token (read scopes for issues, vulnerabilities,
+# cloud accounts, connectors, controls and system health); rules only send read-only queries.
+#
+# Schema: Wiz publishes its GraphQL schema only inside the tenant's API explorer. The queries below use
+# the field and filter names of the current schema as used by public integrations (issuesV2 with
+# filterBy status/type/severity; vulnerabilityFindings with status, severity, hasExploit, hasFix and
+# hasCisaKevExploit filters) and as answered by a live tenant's API in 2026 (systemHealthIssues,
+# cloudAccounts, connectors, controls). If Wiz renames a field the query fails with a GraphQL error and
+# the rule reports unknown - never a silent pass.
+# Rule values are text, so first/filter literals are written inline in the document; only $after is a
+# variable (the cursor). The word for the third GraphQL operation type must not appear in a document.
+defaults:
+  lens: security
+  refresh: 1d
+rules:
+
+  # ---- issues --------------------------------------------------------------------------------
+
+  - id: WIZ-ISSUE-TOXIC-COMBINATION
+    title: Open toxic-combination issue
+    kind: misconfigured
+    category: CFG
+    severity:
+      field: severity
+      map: { CRITICAL: critical, HIGH: high, MEDIUM: medium, LOW: low, INFORMATIONAL: info }
+      default: medium
+    entity: issue
+    why: A toxic combination joins several weaknesses on one attack path (exposure, a vulnerability, a privileged identity, sensitive data) - the shortest route an attacker would take.
+    fix: Break the path at its cheapest link (remove the exposure, patch, or narrow the identity) and let Wiz re-evaluate.
+    refs: [NIST-800-53:RA-5, NIST-800-53:CM-6]
+    query:
+      protocol: graphql
+      document: |
+        query($after: String) {
+          issues: issuesV2(first: 500, after: $after, filterBy: {status: [OPEN, IN_PROGRESS], type: [TOXIC_COMBINATION]}) {
+            nodes {
+              id type status severity createdAt dueAt
+              sourceRule { __typename ... on Control { id name } ... on CloudEventRule { id name } ... on CloudConfigurationRule { id name } }
+              entitySnapshot { id type name cloudPlatform region subscriptionName }
+            }
+            pageInfo { hasNextPage endCursor }
+          }
+        }
+      items: data.issues.nodes
+      paging: { cursor: data.issues.pageInfo.endCursor, hasNext: data.issues.pageInfo.hasNextPage, variable: after }
+      key: id
+      name: sourceRule.name
+    each: any
+    evidence: "{severity} {sourceRule.name} on {entitySnapshot.type} {entitySnapshot.name} ({entitySnapshot.subscriptionName}), open since {createdAt}"
+
+  - id: WIZ-ISSUE-THREAT
+    title: Open threat-detection issue
+    kind: broken
+    category: CFG
+    severity:
+      field: severity
+      map: { CRITICAL: critical, HIGH: high, MEDIUM: medium, LOW: low, INFORMATIONAL: info }
+      default: high
+    entity: issue
+    refresh: 1h
+    why: A threat detection is suspected attacker activity (malware, unusual API use, crypto-mining); left open, it either gets investigated late or not at all.
+    fix: Triage it as a security incident - confirm or dismiss with evidence, contain the resource if confirmed.
+    refs: [NIST-800-53:IR-4, NIST-800-53:SI-4]
+    query:
+      protocol: graphql
+      document: |
+        query($after: String) {
+          issues: issuesV2(first: 500, after: $after, filterBy: {status: [OPEN, IN_PROGRESS], type: [THREAT_DETECTION]}) {
+            nodes {
+              id type status severity createdAt dueAt
+              sourceRule { __typename ... on Control { id name } ... on CloudEventRule { id name } ... on CloudConfigurationRule { id name } }
+              entitySnapshot { id type name cloudPlatform region subscriptionName }
+            }
+            pageInfo { hasNextPage endCursor }
+          }
+        }
+      items: data.issues.nodes
+      paging: { cursor: data.issues.pageInfo.endCursor, hasNext: data.issues.pageInfo.hasNextPage, variable: after }
+      key: id
+      name: sourceRule.name
+    each: any
+    evidence: "{severity} {sourceRule.name} on {entitySnapshot.name} ({entitySnapshot.subscriptionName}), open since {createdAt}"
+
+  - id: WIZ-ISSUE-CONFIG-HIGH
+    title: Open critical or high cloud-configuration issue
+    kind: misconfigured
+    category: CFG
+    severity:
+      field: severity
+      map: { CRITICAL: critical, HIGH: high }
+      default: high
+    entity: issue
+    why: A critical or high configuration issue is a known-bad setting on a resource Wiz can see - public storage, an open admin port, missing encryption.
+    fix: Fix the configuration per the rule's remediation, or accept the risk in Wiz with an owner and an expiry.
+    refs: [NIST-800-53:CM-6]
+    query:
+      protocol: graphql
+      document: |
+        query($after: String) {
+          issues: issuesV2(first: 500, after: $after, filterBy: {status: [OPEN, IN_PROGRESS], type: [CLOUD_CONFIGURATION], severity: [CRITICAL, HIGH]}) {
+            nodes {
+              id type status severity createdAt dueAt
+              sourceRule { __typename ... on Control { id name } ... on CloudEventRule { id name } ... on CloudConfigurationRule { id name } }
+              entitySnapshot { id type name cloudPlatform region subscriptionName }
+            }
+            pageInfo { hasNextPage endCursor }
+          }
+        }
+      items: data.issues.nodes
+      paging: { cursor: data.issues.pageInfo.endCursor, hasNext: data.issues.pageInfo.hasNextPage, variable: after }
+      key: id
+      name: sourceRule.name
+    each: any
+    evidence: "{severity} {sourceRule.name} on {entitySnapshot.type} {entitySnapshot.name} ({entitySnapshot.subscriptionName})"
+
+  - id: WIZ-ISSUE-OPEN-TOO-LONG
+    title: Critical or high issue open for too long
+    kind: broken
+    category: CFG
+    severity:
+      field: severity
+      map: { CRITICAL: critical, HIGH: high }
+      default: high
+    entity: issue
+    why: Issues that stay open for weeks stop being looked at; age is the clearest sign that nobody owns them.
+    fix: Assign an owner and a due date, fix it, or record a risk acceptance in Wiz.
+    refs: [NIST-800-53:RA-5, NIST-800-53:SI-2]
+    query:
+      protocol: graphql
+      document: |
+        query($after: String) {
+          issues: issuesV2(first: 500, after: $after, filterBy: {status: [OPEN, IN_PROGRESS], severity: [CRITICAL, HIGH]}) {
+            nodes {
+              id type status severity createdAt dueAt
+              sourceRule { __typename ... on Control { id name } ... on CloudEventRule { id name } ... on CloudConfigurationRule { id name } }
+              entitySnapshot { id type name cloudPlatform region subscriptionName }
+            }
+            pageInfo { hasNextPage endCursor }
+          }
+        }
+      items: data.issues.nodes
+      paging: { cursor: data.issues.pageInfo.endCursor, hasNext: data.issues.pageInfo.hasNextPage, variable: after }
+      key: id
+      name: sourceRule.name
+    each: { field: createdAt, op: age-gt, value: 30, threshold: wiz.issue-max-open-days }
+    evidence: "{severity} {type} {sourceRule.name} on {entitySnapshot.name}, open since {createdAt}"
+
+  - id: WIZ-ISSUE-PAST-DUE
+    title: Critical or high issue is past its due date
+    kind: broken
+    category: CFG
+    severity:
+      daysLeft: dueAt
+      ranges: [ { max: -14, value: critical }, { max: 0, value: high } ]
+      default: medium
+    entity: issue
+    why: A due date is the remediation commitment; past it the issue is a missed SLA, not just an open item.
+    fix: Fix it or renegotiate the due date with the risk owner.
+    refs: [NIST-800-53:SI-2]
+    deadline: dueAt
+    query:
+      protocol: graphql
+      document: |
+        query($after: String) {
+          issues: issuesV2(first: 500, after: $after, filterBy: {status: [OPEN, IN_PROGRESS], severity: [CRITICAL, HIGH]}) {
+            nodes {
+              id type status severity createdAt dueAt
+              sourceRule { __typename ... on Control { id name } ... on CloudEventRule { id name } ... on CloudConfigurationRule { id name } }
+              entitySnapshot { id type name cloudPlatform region subscriptionName }
+            }
+            pageInfo { hasNextPage endCursor }
+          }
+        }
+      items: data.issues.nodes
+      paging: { cursor: data.issues.pageInfo.endCursor, hasNext: data.issues.pageInfo.hasNextPage, variable: after }
+      key: id
+      name: sourceRule.name
+    each: { field: dueAt, op: until-lt, value: 0, threshold: wiz.issue-due-notice-days }
+    evidence: "{severity} {sourceRule.name} on {entitySnapshot.name} was due {dueAt}"
+
+  # ---- vulnerability findings ----------------------------------------------------------------
+
+  - id: WIZ-VULN-KEV
+    title: Open vulnerability that is known to be exploited (CISA KEV)
+    kind: broken
+    category: LCM
+    severity:
+      field: vulnerableAsset.hasWideInternetExposure
+      map: { "true": critical }
+      default: high
+    entity: vulnerability-finding
+    why: CVEs on the CISA Known Exploited Vulnerabilities list are being used in real attacks now; an internet-exposed asset with one is the first thing an attacker scans for. A score built only from toxic combinations can stay high while these pile up.
+    fix: Patch or upgrade to the fixed version; if that cannot happen quickly, remove the exposure or isolate the asset.
+    refs: [NIST-800-53:SI-2, NIST-800-53:RA-5, CISA-BOD-22-01]
+    query:
+      protocol: graphql
+      document: |
+        query($after: String) {
+          vulnerabilityFindings(first: 500, after: $after, filterBy: {status: [OPEN], hasCisaKevExploit: true}) {
+            nodes {
+              id name severity status firstDetectedAt fixedVersion
+              vulnerableAsset { __typename ... on VulnerableAssetBase { id name type cloudPlatform subscriptionName hasLimitedInternetExposure hasWideInternetExposure } }
+            }
+            pageInfo { hasNextPage endCursor }
+          }
+        }
+      items: data.vulnerabilityFindings.nodes
+      paging: { cursor: data.vulnerabilityFindings.pageInfo.endCursor, hasNext: data.vulnerabilityFindings.pageInfo.hasNextPage, variable: after }
+      maxPages: 200
+      key: id
+      name: name
+    each: any
+    evidence: "{name} ({severity}) on {vulnerableAsset.type} {vulnerableAsset.name} ({vulnerableAsset.subscriptionName}), wide internet exposure {vulnerableAsset.hasWideInternetExposure}, fixed in {fixedVersion}"
+
+  - id: WIZ-VULN-CRITICAL-FIX-OVERDUE
+    title: Critical vulnerability with a fix available is not patched in time
+    kind: broken
+    category: LCM
+    severity: high
+    entity: vulnerability-finding
+    refresh: 7d
+    why: A critical CVE with a published fix that is still open after the patch window is the gap a patch policy exists to close.
+    fix: Deploy the fixed version; for images, rebuild from a patched base and redeploy.
+    refs: [NIST-800-53:SI-2]
+    query:
+      protocol: graphql
+      document: |
+        query($after: String) {
+          vulnerabilityFindings(first: 500, after: $after, filterBy: {status: [OPEN], severity: [CRITICAL], hasFix: true}) {
+            nodes {
+              id name severity status firstDetectedAt fixedVersion
+              vulnerableAsset { __typename ... on VulnerableAssetBase { id name type cloudPlatform subscriptionName hasLimitedInternetExposure hasWideInternetExposure } }
+            }
+            pageInfo { hasNextPage endCursor }
+          }
+        }
+      items: data.vulnerabilityFindings.nodes
+      paging: { cursor: data.vulnerabilityFindings.pageInfo.endCursor, hasNext: data.vulnerabilityFindings.pageInfo.hasNextPage, variable: after }
+      maxPages: 200
+      key: id
+      name: name
+    each: { field: firstDetectedAt, op: age-gt, value: 30, threshold: wiz.critical-fix-max-age-days }
+    evidence: "{name} on {vulnerableAsset.name} ({vulnerableAsset.subscriptionName}) open since {firstDetectedAt}, fixed in {fixedVersion}"
+
+  - id: WIZ-VULN-EXPLOIT-INTERNET
+    title: Exploitable critical or high vulnerability on an internet-exposed asset
+    kind: broken
+    category: LCM
+    severity: critical
+    entity: vulnerability-finding
+    why: A public exploit plus wide internet exposure means anyone can try it without first getting inside.
+    fix: Patch first; until then restrict the exposure (security group, firewall, private endpoint).
+    refs: [NIST-800-53:SI-2, NIST-800-53:SC-7]
+    query:
+      protocol: graphql
+      document: |
+        query($after: String) {
+          vulnerabilityFindings(first: 500, after: $after, filterBy: {status: [OPEN], hasExploit: true, severity: [CRITICAL, HIGH]}) {
+            nodes {
+              id name severity status firstDetectedAt fixedVersion
+              vulnerableAsset { __typename ... on VulnerableAssetBase { id name type cloudPlatform subscriptionName hasLimitedInternetExposure hasWideInternetExposure } }
+            }
+            pageInfo { hasNextPage endCursor }
+          }
+        }
+      items: data.vulnerabilityFindings.nodes
+      paging: { cursor: data.vulnerabilityFindings.pageInfo.endCursor, hasNext: data.vulnerabilityFindings.pageInfo.hasNextPage, variable: after }
+      maxPages: 200
+      key: id
+      name: name
+    each: { field: vulnerableAsset.hasWideInternetExposure, op: eq, value: true }
+    evidence: "{name} ({severity}) on {vulnerableAsset.type} {vulnerableAsset.name} ({vulnerableAsset.subscriptionName}) is exposed to the internet"
+
+  # ---- Wiz's own coverage: system health, cloud accounts, connectors, controls ----------------
+
+  - id: WIZ-HEALTH-ISSUE
+    title: Open Wiz system-health issue
+    kind: broken
+    lens: both
+    category: MON
+    severity:
+      field: severity
+      map: { CRITICAL: high, HIGH: high, MEDIUM: medium, LOW: low, INFORMATIONAL: info }
+      default: medium
+    entity: health-issue
+    why: A health issue (most often a missing permission in the connector role) means Wiz cannot scan part of an account, so findings there are absent rather than fixed.
+    fix: Grant the missing permission in the connector's role or policy (update to the vendor's current policy), then let the next scan clear the issue.
+    refs: [NIST-800-53:CA-7]
+    query:
+      protocol: graphql
+      document: |
+        query($after: String) {
+          systemHealthIssues(first: 500, after: $after, filterBy: {status: [OPEN]}) {
+            nodes {
+              id name status severity region firstSeenAt lastSeenAt
+              type { id name category }
+              deployment { id name type status }
+              sourceSnapshot { name externalId }
+            }
+            pageInfo { hasNextPage endCursor }
+          }
+        }
+      items: data.systemHealthIssues.nodes
+      paging: { cursor: data.systemHealthIssues.pageInfo.endCursor, hasNext: data.systemHealthIssues.pageInfo.hasNextPage, variable: after }
+      key: id
+      name: name
+    each:
+      any:
+        - { field: region, op: absent }
+        - { field: region, op: eq, value: global }
+    evidence: "{name} ({type.category}) on {sourceSnapshot.name} via {deployment.name}, since {firstSeenAt}"
+
+  - id: WIZ-HEALTH-REGION-ISSUE
+    title: Wiz cannot scan a specific region
+    kind: broken
+    lens: both
+    category: MON
+    severity:
+      field: severity
+      map: { CRITICAL: high, HIGH: high, MEDIUM: medium, LOW: low, INFORMATIONAL: info }
+      default: medium
+    entity: health-issue
+    why: Region-specific scan errors usually come from a region-deny policy that blocks the scanner but not every workload - a region that can still run resources is then invisible.
+    fix: Either allow the scanner's read actions in that region, or make sure the region is denied for workloads too; do not narrow the connector's region scope while some accounts can still use the region.
+    refs: [NIST-800-53:CA-7]
+    query:
+      protocol: graphql
+      document: |
+        query($after: String) {
+          systemHealthIssues(first: 500, after: $after, filterBy: {status: [OPEN]}) {
+            nodes {
+              id name status severity region firstSeenAt lastSeenAt
+              type { id name category }
+              deployment { id name type status }
+              sourceSnapshot { name externalId }
+            }
+            pageInfo { hasNextPage endCursor }
+          }
+        }
+      items: data.systemHealthIssues.nodes
+      paging: { cursor: data.systemHealthIssues.pageInfo.endCursor, hasNext: data.systemHealthIssues.pageInfo.hasNextPage, variable: after }
+      key: id
+      name: name
+    each:
+      all:
+        - { field: region, op: notempty }
+        - { field: region, op: ne, value: global }
+    evidence: "{name} in {region} on {sourceSnapshot.name} via {deployment.name} ({deployment.type})"
+
+  - id: WIZ-HEALTH-IGNORED-RECURRING
+    title: Ignored Wiz health issue is still occurring
+    kind: misconfigured
+    lens: both
+    category: MON
+    severity: low
+    entity: health-issue
+    refresh: 7d
+    why: Ignoring a health issue silences it but does not restore coverage; while it keeps recurring, the blind spot is still there.
+    fix: Review ignored issues periodically; fix the cause or record why the gap is accepted.
+    query:
+      protocol: graphql
+      document: |
+        query($after: String) {
+          systemHealthIssues(first: 500, after: $after, filterBy: {status: [IGNORED]}) {
+            nodes {
+              id name status severity region firstSeenAt lastSeenAt
+              type { id name category }
+              deployment { id name type status }
+              sourceSnapshot { name externalId }
+            }
+            pageInfo { hasNextPage endCursor }
+          }
+        }
+      items: data.systemHealthIssues.nodes
+      paging: { cursor: data.systemHealthIssues.pageInfo.endCursor, hasNext: data.systemHealthIssues.pageInfo.hasNextPage, variable: after }
+      key: id
+      name: name
+    each: { field: lastSeenAt, op: age-lt, value: 2, threshold: wiz.ignored-health-recent-days }
+    evidence: "{name} ({type.category}) on {sourceSnapshot.name}, ignored but last seen {lastSeenAt}"
+
+  - id: WIZ-CLOUD-ACCOUNT-NOT-CONNECTED
+    title: Cloud account is not connected to Wiz
+    kind: broken
+    lens: both
+    category: MON
+    severity:
+      field: status
+      map: { ERROR: high, DISCONNECTED: high, DISABLED: medium, INITIAL_SCANNING: info }
+      default: medium
+    entity: cloud-account
+    why: An account Wiz knows but cannot read keeps its last findings and gets no new ones - it looks scanned while it is not.
+    fix: Repair the connector role or credentials for the account and trigger a scan.
+    refs: [NIST-800-53:CA-7]
+    query:
+      protocol: graphql
+      document: |
+        query {
+          cloudAccounts(first: 500) {
+            nodes { name externalId cloudProvider status }
+          }
+        }
+      items: data.cloudAccounts.nodes
+      key: externalId
+      name: name
+    each: { field: status, op: ne, value: CONNECTED }
+    evidence: "{cloudProvider} account {name}: {status}"
+
+  - id: WIZ-CONNECTOR-ERROR
+    title: Enabled Wiz connector is not connected
+    kind: broken
+    lens: both
+    category: MON
+    severity: high
+    entity: connector
+    refresh: 6h
+    why: A connector in error stops all scanning of what it covers - accounts, registries or identity sources.
+    fix: Open the connector's health details, fix its credentials or permissions, and rerun the connection test.
+    refs: [NIST-800-53:CA-7]
+    query:
+      protocol: graphql
+      document: |
+        query {
+          connectors(first: 500) {
+            nodes { name status enabled type { id name } }
+          }
+        }
+      items: data.connectors.nodes
+      key: name
+      name: name
+    each:
+      all:
+        - { field: enabled, op: eq, value: true }
+        - { field: status, op: notin, value: [CONNECTED, INITIAL_SCANNING] }
+    evidence: "{name} ({type.name}): {status}"
+
+  - id: WIZ-CONNECTOR-DISABLED
+    title: Wiz connector is disabled
+    kind: misconfigured
+    lens: both
+    category: MON
+    severity: low
+    entity: connector
+    why: A disabled connector leaves whatever it covered unscanned; it should be deleted if the source is gone, or re-enabled if not.
+    fix: Re-enable the connector or delete it with a note.
+    query:
+      protocol: graphql
+      document: |
+        query {
+          connectors(first: 500) {
+            nodes { name status enabled type { id name } }
+          }
+        }
+      items: data.connectors.nodes
+      key: name
+      name: name
+    each: { field: enabled, op: eq, value: false }
+    evidence: "{name} ({type.name}) is disabled"
+
+  - id: WIZ-CONTROL-DISABLED
+    title: Wiz control is disabled in the tenant
+    kind: misconfigured
+    category: CFG
+    severity:
+      field: severity
+      map: { CRITICAL: high, HIGH: medium }
+      default: low
+    entity: control
+    refresh: 7d
+    why: A disabled control never raises an issue, so its risk is invisible; disabling should be a recorded decision, not a convenience.
+    fix: Re-enable the control or record why it does not apply.
+    refs: [NIST-800-53:CA-7]
+    query:
+      protocol: graphql
+      document: |
+        query($after: String) {
+          controls(first: 500, after: $after, filterBy: {enabled: false}) {
+            nodes { id name severity }
+            pageInfo { hasNextPage endCursor }
+          }
+        }
+      items: data.controls.nodes
+      paging: { cursor: data.controls.pageInfo.endCursor, hasNext: data.controls.pageInfo.hasNextPage, variable: after }
+      key: id
+      name: name
+    each: any
+    evidence: "{name} ({severity}) is disabled"

@@ -1,0 +1,917 @@
+schema: keeper.rules/1
+system: windows-server
+name: Windows servers (live, over CIM)
+integration: cim
+# One WQL SELECT per server over WinRM. Targets are AD computers with a server operating system that
+# logged on within 30 days (domain controllers included). Rows carry `host`. Queries that return many
+# rows per host use a composite key ("{host}|{Name}") so every failing item is its own finding;
+# `count:` rules are evaluated per host, and a host whose query failed is unknown, never a pass.
+targets:
+  entity: computer
+  field: dNSHostName
+  where:
+    all:
+      - { field: operatingSystem, op: match, value: 'Server' }
+      - { field: lastLogonTimestamp, op: age-lt, value: 30 }
+defaults:
+  lens: maintenance
+  refresh: 1d
+  entity: computer
+rules:
+
+  # ---- operating system lifecycle, patching, uptime -----------------------------------------------
+
+  - id: WINSRV-OS-UNSUPPORTED
+    title: Server runs a Windows Server version out of support
+    kind: broken
+    lens: both
+    category: LCM
+    severity: critical
+    refresh: 7d
+    why: Windows Server 2012 and 2012 R2 lost their last Extended Security Updates on 2026-10-13; 2008 R2 and older, and the semi-annual channel builds, are long out of support. No security fixes exist any more.
+    fix: Migrate the workload to a supported release or decommission the server; until then isolate it and record the risk owner.
+    refs: [NIST-800-53:SA-22, NIST-800-53:SI-2, CIS-CSC-v8:2.2]
+    query:
+      protocol: cim
+      wql: SELECT Caption, Version, BuildNumber, LastBootUpTime, ProductType FROM Win32_OperatingSystem
+      key: host
+    each:
+      any:
+        - { field: BuildNumber, op: lt, value: 14393, threshold: windows-server.min-supported-build }
+        - { field: BuildNumber, op: in, value: [18362, 18363, 19041, 19042, 25398], threshold: windows-server.unsupported-builds }
+    evidence: "{host}: {Caption} build {BuildNumber}"
+
+  - id: WINSRV-OS-ENDING
+    title: Server version leaves support soon
+    kind: broken
+    lens: both
+    category: LCM
+    severity: medium
+    refresh: 7d
+    why: Windows Server 2016 (build 14393) leaves extended support on 2027-01-12; migrations take longer than the time left.
+    fix: Plan and start the migration now; update the threshold list as dates pass.
+    refs: [NIST-800-53:SA-22]
+    query:
+      protocol: cim
+      wql: SELECT Caption, Version, BuildNumber, LastBootUpTime, ProductType FROM Win32_OperatingSystem
+      key: host
+    each: { field: BuildNumber, op: in, value: [14393], threshold: windows-server.builds-ending-soon }
+    evidence: "{host}: {Caption} build {BuildNumber}"
+
+  - id: WINSRV-PATCH-NONE-RECENT
+    title: No update installed on the server within the patch window
+    kind: missing
+    lens: both
+    category: LCM
+    severity: high
+    why: When no hotfix is newer than the window, monthly cumulative updates are not reaching the server (no client, no maintenance window, broken update agent, or an out-of-support OS that gets nothing). InstalledOn is a text field; rows whose date cannot be read are listed as not judged.
+    fix: Install the current cumulative update and fix the update path; for an out-of-support version see WINSRV-OS-UNSUPPORTED.
+    refs: [NIST-800-53:SI-2, CIS-CSC-v8:7.3]
+    query:
+      protocol: cim
+      wql: SELECT HotFixID, Description, InstalledOn FROM Win32_QuickFixEngineering
+      key: "{host}|{HotFixID}"
+    count:
+      op: lt
+      value: 1
+      where: { field: InstalledOn, op: age-lt, value: 45, threshold: windows-server.patch-max-age-days }
+    evidence: "{host}: none of {rows} installed updates is newer than the patch window"
+
+  - id: WINSRV-UPTIME-LONG
+    title: Server not restarted within the patch cycle
+    kind: broken
+    lens: both
+    category: LCM
+    severity:
+      daysLeft: LastBootUpTime
+      ranges: [ { max: -180, value: high } ]
+      default: medium
+    why: Monthly cumulative updates need a restart; uptime longer than the patch cycle proves the latest fixes are not active.
+    fix: Restart in the next maintenance window; if the server cannot be restarted, record why and who owns that risk.
+    refs: [NIST-800-53:SI-2]
+    query:
+      protocol: cim
+      wql: SELECT Caption, Version, BuildNumber, LastBootUpTime, ProductType FROM Win32_OperatingSystem
+      key: host
+    each: { field: LastBootUpTime, op: age-gt, value: 45, threshold: windows-server.uptime-max-days }
+    evidence: "{host}: last boot {LastBootUpTime}"
+
+  # ---- memory and disk -------------------------------------------------------------------------
+
+  - id: WINSRV-COMMIT-HIGH
+    title: Commit charge close to the commit limit
+    kind: broken
+    category: HLT
+    severity: high
+    why: When committed memory nears RAM plus page file, allocations fail and services crash or hang.
+    fix: Find the process that grows (often one leaking service), restart it, or add memory.
+    query:
+      protocol: cim
+      wql: SELECT PercentCommittedBytesInUse, AvailableMBytes, PoolNonpagedBytes FROM Win32_PerfFormattedData_PerfOS_Memory
+      key: host
+    each: { field: PercentCommittedBytesInUse, op: ge, value: 85, threshold: windows-server.commit-pct-max }
+    evidence: "{host}: commit {PercentCommittedBytesInUse}%, {AvailableMBytes} MB available"
+
+  - id: WINSRV-MEM-AVAILABLE-LOW
+    title: Little physical memory available
+    kind: broken
+    category: HLT
+    severity: medium
+    why: With almost no available memory the server pages heavily and every request slows.
+    fix: Find the largest consumers; tune caches (for example SQL Server max memory) or add memory.
+    query:
+      protocol: cim
+      wql: SELECT PercentCommittedBytesInUse, AvailableMBytes, PoolNonpagedBytes FROM Win32_PerfFormattedData_PerfOS_Memory
+      key: host
+    each: { field: AvailableMBytes, op: lt, value: 512, threshold: windows-server.available-memory-mb-min }
+    evidence: "{host}: {AvailableMBytes} MB available, commit {PercentCommittedBytesInUse}%"
+
+  - id: WINSRV-PERF-COUNTERS-MISSING
+    title: Performance counters return nothing remotely
+    kind: broken
+    category: MON
+    severity: low
+    why: When the formatted performance classes are empty, the commit, memory and free-space percent rules have nothing to judge on this server.
+    fix: Rebuild the performance counter registry and the WMI performance adapter on the server, then re-scan.
+    query:
+      protocol: cim
+      wql: SELECT PercentCommittedBytesInUse, AvailableMBytes, PoolNonpagedBytes FROM Win32_PerfFormattedData_PerfOS_Memory
+      key: host
+    count: { op: lt, value: 1 }
+    evidence: "{host}: no rows from Win32_PerfFormattedData_PerfOS_Memory"
+
+  - id: WINSRV-DISK-FREE-PCT-LOW
+    title: Fixed volume below the free-space floor
+    kind: broken
+    category: HLT
+    severity:
+      field: PercentFreeSpace
+      ranges: [ { max: 5, value: critical } ]
+      default: high
+    entity: volume
+    why: A full system volume stops the server; a full data volume stops whatever writes there, usually at night. Very large volumes with plenty of gigabytes left are not flagged.
+    fix: Find what grows (logs, local backups, database files) and clean up or extend the volume.
+    refs: [NIST-800-53:SC-5]
+    query:
+      protocol: cim
+      wql: SELECT Name, PercentFreeSpace, FreeMegabytes FROM Win32_PerfFormattedData_PerfDisk_LogicalDisk WHERE Name <> '_Total'
+      key: "{host}|{Name}"
+    each:
+      all:
+        - { field: Name, op: match, value: '^[A-Za-z]:$' }
+        - { field: PercentFreeSpace, op: lt, value: 15, threshold: windows-server.disk-free-pct-min }
+        - { field: FreeMegabytes, op: lt, value: 102400, threshold: windows-server.disk-free-mb-ignore-above }
+    evidence: "{host}: {Name} {PercentFreeSpace}% free ({FreeMegabytes} MB)"
+
+  - id: WINSRV-DISK-FREE-LOW
+    title: Fixed volume almost full
+    kind: broken
+    category: HLT
+    severity: critical
+    entity: volume
+    why: Measured without performance counters (which some hosts do not serve remotely); under 2 GB free, writes start failing.
+    fix: Free space now or extend the volume. The threshold is in bytes.
+    refs: [NIST-800-53:SC-5]
+    query:
+      protocol: cim
+      wql: SELECT DeviceID, FreeSpace, Size FROM Win32_LogicalDisk WHERE DriveType = 3
+      key: "{host}|{DeviceID}"
+    each:
+      all:
+        - { field: Size, op: gt, value: 4294967296 }
+        - { field: FreeSpace, op: lt, value: 2147483648, threshold: windows-server.disk-free-bytes-min }
+    evidence: "{host}: {DeviceID} {FreeSpace} bytes free of {Size}"
+
+  - id: WINSRV-VOLUME-UNHEALTHY
+    title: Fixed volume reports a warning or unhealthy state
+    kind: broken
+    category: HLT
+    severity: high
+    entity: volume
+    why: A volume that is not healthy (file system errors, failing disk under it) is a silent corruption and failed-backup risk.
+    fix: Find the storage cause first, then schedule a file system check.
+    query:
+      protocol: cim
+      namespace: root/Microsoft/Windows/Storage
+      wql: SELECT UniqueId, DriveLetter, FileSystemLabel, HealthStatus, DriveType FROM MSFT_Volume WHERE DriveType = 3
+      key: "{host}|{UniqueId}"
+    each: { field: HealthStatus, op: ne, value: 0 }
+    evidence: "{host}: volume {DriveLetter} {FileSystemLabel} health {HealthStatus}"
+
+  # ---- services --------------------------------------------------------------------------------
+
+  - id: WINSRV-SVC-AUTO-STOPPED
+    title: Automatic service is not running
+    kind: broken
+    category: HLT
+    severity: medium
+    entity: service
+    why: The agent or application service that quietly died (backup, monitoring, the application itself) shows here first.
+    fix: Read the System log for the failure; start it, or set it to Manual if the server does not need it. Services idle by design go in the ignore pattern.
+    refs: [NIST-800-53:SI-4, CIS-CSC-v8:4.8]
+    query:
+      protocol: cim
+      wql: SELECT Name, DisplayName, State, StartMode, ExitCode, StartName FROM Win32_Service WHERE StartMode = 'Auto' AND State <> 'Running'
+      key: "{host}|{Name}"
+    each: { field: Name, op: notmatch, value: '^(sppsvc|RemoteRegistry|ShellHWDetection|MapsBroker|gupdate|gupdatem|edgeupdate|edgeupdatem|GoogleUpdater.*|clr_optimization_.*|CDPSvc|tiledatamodelsvc|TrustedInstaller|BITS|wuauserv|UsoSvc|WaaSMedicSvc|Ec2VssSoftwareProvider|AwsReplicationPostConvertService|OneSyncSvc_.*|CDPUserSvc_.*|WpnUserService_.*)$', threshold: windows-server.auto-service-ignore-pattern }
+    evidence: "{host}: {Name} ({DisplayName}) is {State}, exit code {ExitCode}"
+
+  - id: WINSRV-SVC-AGENT-STOPPED
+    title: Required agent service is not running
+    kind: broken
+    lens: both
+    category: MON
+    severity: high
+    entity: service
+    why: The management, security, backup or monitoring agent is set to start automatically but is not running, so the server is unprotected, unpatched or unwatched.
+    fix: Start the service and fix why it stopped. Set the pattern to the agents the organisation requires on servers.
+    refs: [NIST-800-53:SI-3, NIST-800-53:SI-4]
+    query:
+      protocol: cim
+      wql: SELECT Name, DisplayName, State, StartMode, ExitCode, StartName FROM Win32_Service WHERE StartMode = 'Auto' AND State <> 'Running'
+      key: "{host}|{Name}"
+    each: { field: Name, op: match, value: '^(CcmExec|WinDefend|Sense|MpsSvc|BFE|EventLog|Winmgmt)$', threshold: windows-server.required-agent-pattern }
+    evidence: "{host}: {Name} ({DisplayName}) is {State}, exit code {ExitCode}"
+
+  - id: WINSRV-SVC-LOGON-FAILED
+    title: Automatic service failed to log on
+    kind: broken
+    lens: both
+    category: IAM
+    severity: high
+    entity: service
+    why: Exit code 1069 means the service account could not log on, typically after a password change, an expired account or a logon right removed by hardening.
+    fix: Check the account and the logon rights granted by policy; move the service to a group managed service account.
+    query:
+      protocol: cim
+      wql: SELECT Name, DisplayName, State, StartMode, ExitCode, StartName FROM Win32_Service WHERE StartMode = 'Auto' AND State <> 'Running'
+      key: "{host}|{Name}"
+    each: { field: ExitCode, op: eq, value: 1069 }
+    evidence: "{host}: {Name} runs as {StartName} and failed to log on"
+
+  - id: WINSRV-SVC-STUCK
+    title: Service stuck in start or stop pending
+    kind: broken
+    category: HLT
+    severity: high
+    entity: service
+    why: A service stuck pending blocks everything that waits on it and usually needs a restart to clear.
+    fix: Identify the hung component; restart the service host or the server in a window.
+    query:
+      protocol: cim
+      wql: SELECT Name, DisplayName, State, StartMode, ProcessId FROM Win32_Service WHERE State = 'Start Pending' OR State = 'Stop Pending'
+      key: "{host}|{Name}"
+    each: any
+    evidence: "{host}: {Name} ({DisplayName}) is {State}"
+
+  - id: WINSRV-SVC-CORE-DOWN
+    title: Core platform service stopped or disabled
+    kind: broken
+    category: AVL
+    severity: high
+    entity: service
+    why: Event logging, WMI, RPC, DNS client, SMB, Task Scheduler, cryptography, time, Netlogon and the firewall engine underpin everything else; one down means a broken server.
+    fix: Start the service and set it back to its default start type; find what disabled it.
+    query:
+      protocol: cim
+      wql: >-
+        SELECT Name, State, StartMode FROM Win32_Service WHERE Name = 'EventLog' OR Name = 'Winmgmt'
+        OR Name = 'RpcSs' OR Name = 'Dnscache' OR Name = 'LanmanWorkstation' OR Name = 'LanmanServer'
+        OR Name = 'Schedule' OR Name = 'CryptSvc' OR Name = 'W32Time' OR Name = 'Netlogon'
+        OR Name = 'MpsSvc' OR Name = 'BFE'
+      key: "{host}|{Name}"
+    each:
+      any:
+        - { field: State, op: ne, value: Running }
+        - { field: StartMode, op: eq, value: Disabled }
+    evidence: "{host}: {Name} is {State} ({StartMode})"
+
+  - id: WINSRV-SVC-UPDATE-DISABLED
+    title: Windows update service disabled
+    kind: misconfigured
+    lens: both
+    category: LCM
+    severity: high
+    entity: service
+    why: With the update, transfer or servicing service disabled the server cannot install updates from any source.
+    fix: Restore the default start type and find the policy or tool that disabled it.
+    refs: [NIST-800-53:SI-2]
+    query:
+      protocol: cim
+      wql: >-
+        SELECT Name, State, StartMode FROM Win32_Service WHERE StartMode = 'Disabled' AND
+        (Name = 'wuauserv' OR Name = 'UsoSvc' OR Name = 'BITS' OR Name = 'TrustedInstaller' OR Name = 'WaaSMedicSvc')
+      key: "{host}|{Name}"
+    each: any
+    evidence: "{host}: {Name} is disabled"
+
+  - id: WINSRV-SVC-UNQUOTED-PATH
+    title: Service path with spaces is not quoted
+    kind: misconfigured
+    lens: security
+    category: IAM
+    severity: medium
+    entity: service
+    why: Windows tries each space-separated prefix of an unquoted path, so a writable folder on the way lets a user run code as the service account.
+    fix: Quote the ImagePath of the service.
+    refs: [NIST-800-53:CM-6]
+    query:
+      protocol: cim
+      wql: SELECT Name, PathName, StartMode, StartName FROM Win32_Service WHERE NOT PathName LIKE '"%'
+      key: "{host}|{Name}"
+    each: { field: PathName, op: match, value: '^[A-Za-z]:\\[^"]*\s[^"]*\.exe' }
+    evidence: "{host}: {Name} -> {PathName}"
+
+  - id: WINSRV-SVC-DOMAIN-ACCOUNT
+    title: Service runs as a domain user account
+    kind: misconfigured
+    lens: security
+    category: IAM
+    severity: medium
+    entity: service
+    why: The password of a service account sits in LSA secrets on the server; any local admin can recover it, and a privileged one compromises the domain.
+    fix: Move the service to a group managed service account or a virtual account; keep the account out of privileged groups.
+    refs: [NIST-800-53:IA-5, CIS-CSC-v8:5.4]
+    query:
+      protocol: cim
+      wql: >-
+        SELECT Name, StartName, State, StartMode FROM Win32_Service WHERE StartName <> 'LocalSystem'
+        AND NOT StartName LIKE 'NT AUTHORITY%' AND NOT StartName LIKE 'NT SERVICE%'
+      key: "{host}|{Name}"
+    each:
+      all:
+        - { field: StartName, op: notmatch, value: '^\.\\' }
+        - { field: StartName, op: notmatch, value: '\$$' }
+        - { field: StartName, op: match, value: '\\|@' }
+    evidence: "{host}: {Name} runs as {StartName}"
+
+  - id: WINSRV-SPOOLER-RUNNING
+    title: Print Spooler running on a server
+    kind: misconfigured
+    lens: security
+    category: AUT
+    severity: low
+    why: The spooler has a long record of remote code execution and coercion flaws; on servers that do not print (domain controllers above all) it is pure attack surface.
+    fix: Disable the Print Spooler on servers that are not print servers; record print servers as exceptions.
+    refs: [NIST-800-53:CM-7, CIS-CSC-v8:4.8]
+    query:
+      protocol: cim
+      wql: SELECT Name, State, StartMode FROM Win32_Service WHERE Name = 'Spooler' AND State = 'Running'
+      key: host
+    each: any
+    evidence: "{host}: Spooler is running ({StartMode})"
+
+  - id: WINSRV-REMOTE-TOOL-SERVICE
+    title: Third-party remote-access tool installed on a server
+    kind: misconfigured
+    lens: security
+    category: AUT
+    severity: medium
+    entity: service
+    why: Remote-access tools bypass the jump host, MFA and session recording that protect server administration.
+    fix: Remove the tool and use the approved administration path; list approved tools in the threshold.
+    refs: [CIS-CSC-v8:2.3, NIST-800-53:AC-17]
+    query:
+      protocol: cim
+      wql: >-
+        SELECT Name, DisplayName, State, StartMode FROM Win32_Service WHERE Name LIKE 'AnyDesk%'
+        OR Name LIKE 'TeamViewer%' OR Name LIKE 'tvnserver%' OR Name LIKE 'uvnc%' OR Name LIKE 'winvnc%'
+        OR Name LIKE 'vncserver%' OR Name LIKE 'ScreenConnect%' OR Name LIKE 'RustDesk%' OR Name LIKE 'Splashtop%'
+        OR Name LIKE 'LogMeIn%' OR Name LIKE 'LMIGuardian%'
+      key: "{host}|{Name}"
+    each: { field: Name, op: notmatch, value: '^$', threshold: windows-server.approved-remote-tool-pattern }
+    evidence: "{host}: {Name} ({DisplayName}) is {State}"
+
+  # ---- anti-malware and EDR --------------------------------------------------------------------
+
+  - id: WINSRV-AV-UNAPPROVED
+    title: Antivirus engine other than the approved one is installed
+    kind: misconfigured
+    lens: security
+    category: MON
+    severity: medium
+    entity: service
+    why: Leftover or second antivirus engines fight the approved one over file access, slow the server, and usually run unmanaged.
+    fix: Remove the engine (vendor removal tool if password-protected); set the approved pattern to the organisation's product.
+    refs: [CIS-CSC-v8:10.1]
+    query:
+      protocol: cim
+      wql: >-
+        SELECT Name, DisplayName, State, StartMode FROM Win32_Service WHERE Name = 'ekrn' OR Name = 'EraAgentSvc'
+        OR Name = 'SAVService' OR Name = 'McShield' OR Name = 'masvc' OR Name = 'ccSvcHst' OR Name = 'SepMasterService'
+        OR Name LIKE 'AVP%' OR Name = 'klnagent' OR Name = 'SentinelAgent' OR Name = 'CSFalconService'
+        OR Name = 'WinDefend' OR Name = 'ntrtscan' OR Name = 'TmCCSF' OR Name = 'AvastSvc' OR Name = 'AVGSvc'
+        OR Name = 'EPSecurityService' OR Name = 'bdservicehost'
+      key: "{host}|{Name}"
+    each: { field: Name, op: notmatch, value: '^(WinDefend)$', threshold: windows-server.approved-av-service-pattern }
+    evidence: "{host}: {Name} ({DisplayName}) is {State}"
+
+  - id: WINSRV-AV-MULTIPLE
+    title: More than one antivirus engine running
+    kind: misconfigured
+    lens: both
+    category: MON
+    severity: medium
+    why: Two running antivirus engines scan every file twice and can deadlock each other on busy servers. Defender is left out of the count by default because it may run in passive mode next to another product.
+    fix: Keep one engine active; remove leftovers. Adjust the ignore pattern if Defender is meant to be the only active engine.
+    refs: [CIS-CSC-v8:10.1]
+    query:
+      protocol: cim
+      wql: >-
+        SELECT Name, DisplayName, State, StartMode FROM Win32_Service WHERE Name = 'ekrn' OR Name = 'EraAgentSvc'
+        OR Name = 'SAVService' OR Name = 'McShield' OR Name = 'masvc' OR Name = 'ccSvcHst' OR Name = 'SepMasterService'
+        OR Name LIKE 'AVP%' OR Name = 'klnagent' OR Name = 'SentinelAgent' OR Name = 'CSFalconService'
+        OR Name = 'WinDefend' OR Name = 'ntrtscan' OR Name = 'TmCCSF' OR Name = 'AvastSvc' OR Name = 'AVGSvc'
+        OR Name = 'EPSecurityService' OR Name = 'bdservicehost'
+      key: "{host}|{Name}"
+    count:
+      op: gt
+      value: 1
+      where:
+        all:
+          - { field: State, op: eq, value: Running }
+          - { field: Name, op: notmatch, value: '^(WinDefend|EraAgentSvc|klnagent|masvc)$', threshold: windows-server.av-count-ignore-pattern }
+    evidence: "{host}: {count} antivirus engines running ({sample})"
+
+  - id: WINSRV-EDR-MULTIPLE
+    title: More than one EDR sensor running
+    kind: misconfigured
+    lens: both
+    category: MON
+    severity: medium
+    why: Two endpoint detection sensors on one server double the kernel hooks, memory and CPU and can block each other; usually one is a leftover or an unplanned overlap.
+    fix: Decide which EDR is primary and remove or switch the other to passive; set the pattern to the sensors that count.
+    refs: [CIS-CSC-v8:10.1]
+    query:
+      protocol: cim
+      wql: >-
+        SELECT Name, DisplayName, State FROM Win32_Service WHERE State = 'Running' AND (Name = 'Sense'
+        OR Name = 'CSFalconService' OR Name = 'SentinelAgent' OR Name = 'CbDefense' OR Name = 'cyserver'
+        OR Name = 'xagt' OR Name = 'CylanceSvc' OR Name = 'EFRService' OR Name = 'TracSrvWrapper')
+      key: "{host}|{Name}"
+    count:
+      op: gt
+      value: 1
+      threshold: windows-server.edr-sensors-max
+      where: { field: Name, op: match, value: '^(Sense|CSFalconService|SentinelAgent|CbDefense|cyserver|xagt|CylanceSvc|EFRService|TracSrvWrapper)$', threshold: windows-server.edr-sensor-pattern }
+    evidence: "{host}: {count} EDR sensors running ({sample})"
+
+  - id: WINSRV-DEFENDER-RTP-OFF
+    title: Defender is the active antivirus but real-time protection is off
+    kind: misconfigured
+    lens: security
+    category: MON
+    severity: high
+    why: In active mode with real-time protection off, files are not scanned when written or run.
+    fix: Turn real-time protection on and find the policy or tool that disabled it.
+    refs: [CIS-CSC-v8:10.1, NIST-800-53:SI-3]
+    query:
+      protocol: cim
+      namespace: root/Microsoft/Windows/Defender
+      wql: SELECT * FROM MSFT_MpComputerStatus
+      key: host
+    each:
+      all:
+        - { field: AMRunningMode, op: match, value: '^Normal' }
+        - { field: RealTimeProtectionEnabled, op: eq, value: false }
+    evidence: "{host}: mode {AMRunningMode}, real-time protection {RealTimeProtectionEnabled}"
+
+  - id: WINSRV-DEFENDER-SIG-OLD
+    title: Defender antivirus signatures are out of date
+    kind: broken
+    lens: security
+    category: MON
+    severity: medium
+    why: Old signatures miss current malware; 65535 days means they never updated.
+    fix: Check the signature update source and the server's internet or update-server path.
+    refs: [CIS-CSC-v8:10.2, NIST-800-53:SI-3]
+    query:
+      protocol: cim
+      namespace: root/Microsoft/Windows/Defender
+      wql: SELECT * FROM MSFT_MpComputerStatus
+      key: host
+    each:
+      all:
+        - { field: AMServiceEnabled, op: eq, value: true }
+        - { field: AntivirusSignatureAge, op: gt, value: 3, threshold: windows-server.defender-signature-max-age-days }
+    evidence: "{host}: signatures {AntivirusSignatureAge} days old (last update {AntivirusSignatureLastUpdated})"
+
+  - id: WINSRV-DEFENDER-ACTIVE-THREAT
+    title: Defender reports an active threat
+    kind: broken
+    lens: security
+    category: MON
+    severity: high
+    entity: threat
+    why: An active threat is one Defender found and has not removed; the server may be compromised.
+    fix: Investigate in the security console, isolate if needed, remediate and find how it got there.
+    refs: [NIST-800-53:SI-3, NIST-800-53:IR-4]
+    query:
+      protocol: cim
+      namespace: root/Microsoft/Windows/Defender
+      wql: SELECT * FROM MSFT_MpThreat
+      key: "{host}|{ThreatID}"
+    each: { field: IsActive, op: eq, value: true }
+    evidence: "{host}: active threat {ThreatName} (severity {SeverityID})"
+
+  # ---- firewall and Group Policy results ------------------------------------------------------
+
+  - id: WINSRV-FW-PROFILE-OFF
+    title: Windows Firewall profile turned off locally
+    kind: misconfigured
+    lens: security
+    category: AUT
+    severity: high
+    entity: firewall-profile
+    why: With the host firewall off, every listening service is reachable and lateral movement is unhindered.
+    fix: Turn the profile on. This reads the local store; a policy that turns it off is caught by WINSRV-GPO-FIREWALL-OFF.
+    refs: [CIS-CSC-v8:4.4, NIST-800-53:SC-7]
+    query:
+      protocol: cim
+      namespace: root/StandardCimv2
+      wql: SELECT Name, Enabled, DefaultInboundAction FROM MSFT_NetFirewallProfile
+      key: "{host}|{Name}"
+    each: { field: Enabled, op: eq, value: 0 }
+    evidence: "{host}: {Name} profile disabled in the local store"
+
+  - id: WINSRV-FW-INBOUND-ALLOW
+    title: Firewall profile allows inbound traffic by default
+    kind: misconfigured
+    lens: security
+    category: AUT
+    severity: high
+    entity: firewall-profile
+    why: Default-allow inbound means only explicit block rules protect the server; every new listener is exposed.
+    fix: Set the default inbound action to Block and add explicit allow rules for the services the server offers.
+    refs: [CIS-CSC-v8:4.4, NIST-800-53:SC-7]
+    query:
+      protocol: cim
+      namespace: root/StandardCimv2
+      wql: SELECT Name, Enabled, DefaultInboundAction FROM MSFT_NetFirewallProfile
+      key: "{host}|{Name}"
+    each: { field: DefaultInboundAction, op: eq, value: 2 }
+    evidence: "{host}: {Name} profile default inbound action Allow"
+
+  - id: WINSRV-GPO-FIREWALL-OFF
+    title: Group Policy turns the Windows Firewall off
+    kind: misconfigured
+    lens: security
+    category: AUT
+    severity: high
+    entity: policy-setting
+    why: A winning policy that sets EnableFirewall to 0 disables the host firewall on every server it reaches, whatever the local setting.
+    fix: Remove the setting from the GPO in the policy result and apply a policy that enables the firewall with inbound blocked.
+    refs: [CIS-CSC-v8:4.4, NIST-800-53:SC-7]
+    query:
+      protocol: cim
+      namespace: root/rsop/computer
+      wql: >-
+        SELECT registryKey, valueName, value, precedence FROM RSOP_RegistryPolicySetting
+        WHERE precedence = 1 AND (valueName = 'EnableFirewall' OR valueName = 'AlwaysInstallElevated')
+      key: "{host}|{registryKey}|{valueName}"
+    each:
+      all:
+        - { field: valueName, op: eq, value: EnableFirewall }
+        - { field: value, op: eq, value: 'AAAAAA==' }
+    evidence: "{host}: policy sets {registryKey}\\{valueName} = 0"
+
+  - id: WINSRV-GPO-ALWAYS-ELEVATED
+    title: Group Policy makes Windows Installer always run elevated
+    kind: misconfigured
+    lens: security
+    category: AUT
+    severity: high
+    entity: policy-setting
+    why: With AlwaysInstallElevated any user can run an MSI package with SYSTEM rights, a direct privilege escalation.
+    fix: Remove the setting from the winning GPO.
+    refs: [NIST-800-53:AC-6]
+    query:
+      protocol: cim
+      namespace: root/rsop/computer
+      wql: >-
+        SELECT registryKey, valueName, value, precedence FROM RSOP_RegistryPolicySetting
+        WHERE precedence = 1 AND (valueName = 'EnableFirewall' OR valueName = 'AlwaysInstallElevated')
+      key: "{host}|{registryKey}|{valueName}"
+    each:
+      all:
+        - { field: valueName, op: eq, value: AlwaysInstallElevated }
+        - { field: value, op: eq, value: 'AQAAAA==' }
+    evidence: "{host}: policy sets {registryKey}\\{valueName} = 1"
+
+  - id: WINSRV-GPO-UAC-WEAK
+    title: Group Policy turns User Account Control off or makes elevation silent
+    kind: misconfigured
+    lens: security
+    category: AUT
+    severity: high
+    entity: policy-setting
+    why: With UAC off, or administrators elevated without a prompt, every admin session runs with full rights and malware elevates unnoticed.
+    fix: Remove the setting from the winning GPO; keep Admin Approval Mode on.
+    refs: [NIST-800-53:AC-6, CIS-CSC-v8:4.1]
+    query:
+      protocol: cim
+      namespace: root/rsop/computer
+      wql: SELECT Path, Data, Type, precedence FROM RSOP_RegistryValue WHERE precedence = 1
+      key: "{host}|{Path}"
+    each:
+      any:
+        - all:
+            - { field: Path, op: match, value: '\\Policies\\System\\EnableLUA$' }
+            - { field: Data, op: eq, value: 0 }
+        - all:
+            - { field: Path, op: match, value: '\\Policies\\System\\ConsentPromptBehaviorAdmin$' }
+            - { field: Data, op: eq, value: 0 }
+    evidence: "{host}: policy sets {Path} = {Data}"
+
+  - id: WINSRV-GPO-LMCOMPAT-LOW
+    title: Group Policy allows LM or NTLMv1 authentication
+    kind: misconfigured
+    lens: security
+    category: AUT
+    severity: medium
+    entity: policy-setting
+    why: A LAN Manager authentication level below 5 lets the server accept LM and NTLMv1 responses, which are easy to crack or relay.
+    fix: Set the level to 'Send NTLMv2 response only, refuse LM and NTLM' after checking legacy clients.
+    refs: [NIST-800-53:IA-2, CIS-CSC-v8:4.1]
+    query:
+      protocol: cim
+      namespace: root/rsop/computer
+      wql: SELECT Path, Data, Type, precedence FROM RSOP_RegistryValue WHERE precedence = 1
+      key: "{host}|{Path}"
+    each:
+      all:
+        - { field: Path, op: match, value: '\\Lsa\\LmCompatibilityLevel$' }
+        - { field: Data, op: lt, value: 5, threshold: windows-server.lm-compatibility-min }
+    evidence: "{host}: policy sets {Path} = {Data}"
+
+  # ---- protocols -------------------------------------------------------------------------------
+
+  - id: WINSRV-SMB1-SERVER-ON
+    title: SMB1 is enabled on the SMB server
+    kind: misconfigured
+    lens: security
+    category: AUT
+    severity: high
+    why: SMB1 has no modern protections and carries the EternalBlue class of remote code execution.
+    fix: Disable SMB1 on the server and remove the SMB1 feature once no client needs it.
+    refs: [NIST-800-53:CM-7, CIS-CSC-v8:4.8]
+    query:
+      protocol: cim
+      namespace: root/Microsoft/Windows/SMB
+      wql: SELECT * FROM MSFT_SmbServerConfiguration
+      key: host
+    each: { field: EnableSMB1Protocol, op: eq, value: true }
+    evidence: "{host}: EnableSMB1Protocol = {EnableSMB1Protocol}"
+
+  - id: WINSRV-SMB-SIGNING-NOT-REQUIRED
+    title: SMB server does not require signing
+    kind: misconfigured
+    lens: security
+    category: AUT
+    severity: medium
+    why: Without required signing, SMB sessions to the server can be relayed or tampered with.
+    fix: Require SMB server signing by policy ('Microsoft network server - Digitally sign communications (always)').
+    refs: [NIST-800-53:SC-8]
+    query:
+      protocol: cim
+      namespace: root/Microsoft/Windows/SMB
+      wql: SELECT * FROM MSFT_SmbServerConfiguration
+      key: host
+    each: { field: RequireSecuritySignature, op: eq, value: false }
+    evidence: "{host}: RequireSecuritySignature = {RequireSecuritySignature}"
+
+  - id: WINSRV-FEATURE-UNWANTED
+    title: Legacy or unwanted Windows feature is installed
+    kind: misconfigured
+    lens: security
+    category: AUT
+    severity:
+      field: Name
+      map: { SMB1Protocol: high, SMB1Protocol-Server: high, SMB1Protocol-Client: high, MicrosoftWindowsPowerShellV2Root: medium, MicrosoftWindowsPowerShellV2: medium }
+      default: low
+    entity: feature
+    why: The SMB1 feature, the PowerShell 2.0 engine (bypasses script logging) and old clients such as Telnet or TFTP widen the attack surface for no business need.
+    fix: Remove the feature; set the pattern to what the organisation forbids.
+    refs: [CIS-CSC-v8:4.8, NIST-800-53:CM-7]
+    query:
+      protocol: cim
+      wql: SELECT Name, Caption, InstallState FROM Win32_OptionalFeature WHERE InstallState = 1
+      key: "{host}|{Name}"
+    each: { field: Name, op: match, value: '^(SMB1Protocol|SMB1Protocol-Client|SMB1Protocol-Server|MicrosoftWindowsPowerShellV2Root|MicrosoftWindowsPowerShellV2|TelnetClient|TFTP|SimpleTCP)$', threshold: windows-server.unwanted-feature-pattern }
+    evidence: "{host}: feature {Name} installed"
+
+  - id: WINSRV-RDP-NO-NLA
+    title: Remote Desktop accepts connections without Network Level Authentication
+    kind: misconfigured
+    lens: security
+    category: AUT
+    severity: high
+    why: Without NLA the logon screen is exposed before authentication, which enables pre-authentication attacks and resource exhaustion.
+    fix: Require Network Level Authentication by policy.
+    refs: [NIST-800-53:AC-17]
+    query:
+      protocol: cim
+      namespace: root/cimv2/TerminalServices
+      wql: SELECT TerminalName, UserAuthenticationRequired, SecurityLayer, MinEncryptionLevel FROM Win32_TSGeneralSetting WHERE TerminalName = 'RDP-Tcp'
+      key: host
+    each: { field: UserAuthenticationRequired, op: eq, value: 0 }
+    evidence: "{host}: RDP-Tcp UserAuthenticationRequired = {UserAuthenticationRequired}"
+
+  - id: WINSRV-RDP-WEAK-SECURITY
+    title: Remote Desktop security layer or encryption below the baseline
+    kind: misconfigured
+    lens: security
+    category: AUT
+    severity: medium
+    why: Below TLS as the security layer and High encryption, RDP sessions can be downgraded or intercepted.
+    fix: Require the SSL (TLS) security layer and High encryption level by policy.
+    refs: [NIST-800-53:SC-8, NIST-800-53:AC-17]
+    query:
+      protocol: cim
+      namespace: root/cimv2/TerminalServices
+      wql: SELECT TerminalName, UserAuthenticationRequired, SecurityLayer, MinEncryptionLevel FROM Win32_TSGeneralSetting WHERE TerminalName = 'RDP-Tcp'
+      key: host
+    each:
+      any:
+        - { field: SecurityLayer, op: lt, value: 2 }
+        - { field: MinEncryptionLevel, op: lt, value: 3 }
+    evidence: "{host}: RDP security layer {SecurityLayer}, encryption level {MinEncryptionLevel}"
+
+  - id: WINSRV-NETBIOS-ON
+    title: NetBIOS over TCP/IP enabled on a server adapter
+    kind: misconfigured
+    lens: security
+    category: AUT
+    severity: low
+    entity: network-adapter
+    why: NetBIOS name resolution can be answered by any host on the segment, which feeds credential relay attacks.
+    fix: Disable NetBIOS over TCP/IP on server adapters (or by DHCP option) once nothing depends on it.
+    refs: [NIST-800-53:CM-7]
+    query:
+      protocol: cim
+      wql: SELECT Index, Description, IPEnabled, TcpipNetbiosOptions FROM Win32_NetworkAdapterConfiguration WHERE IPEnabled = TRUE
+      key: "{host}|{Index}"
+    each: { field: TcpipNetbiosOptions, op: ne, value: 2 }
+    evidence: "{host}: {Description} NetBIOS option {TcpipNetbiosOptions} (2 = disabled)"
+
+  # ---- local Administrators --------------------------------------------------------------------
+  # The group is looked up by its English name through {HOST}. Domain controllers have no local
+  # Administrators group, so WINSRV-LOCALADMIN-UNREADABLE fires on them by design: record DCs as
+  # exceptions, or review their Administrators membership in the directory pack.
+
+  - id: WINSRV-LOCALADMIN-UNEXPECTED
+    title: Unexpected member of the local Administrators group
+    kind: misconfigured
+    lens: security
+    category: IAM
+    severity: high
+    entity: local-admin-member
+    why: Every extra local administrator on a server can read service credentials, disable security tools and move laterally.
+    fix: Remove the member; manage server Administrators through one reviewed group per tier and set the expected pattern to those principals.
+    refs: [NIST-800-53:AC-6, CIS-CSC-v8:5.4]
+    query:
+      protocol: cim
+      wql: SELECT GroupComponent, PartComponent FROM Win32_GroupUser WHERE GroupComponent = "Win32_Group.Domain='{HOST}',Name='Administrators'"
+      key: "{host}|{PartComponent}"
+    each: { field: PartComponent, op: notmatch, value: 'Name = "(Administrator|Domain Admins)"', threshold: windows-server.local-admin-expected-pattern }
+    evidence: "{host}: local admin {PartComponent}"
+
+  - id: WINSRV-LOCALADMIN-BROAD
+    title: Broad group is a member of the local Administrators group
+    kind: misconfigured
+    lens: security
+    category: IAM
+    severity: critical
+    entity: local-admin-member
+    why: When Domain Users, Authenticated Users, Everyone or a similar group is a local administrator, every user in the organisation is admin on this server.
+    fix: Remove the group immediately and find the policy that adds it.
+    refs: [NIST-800-53:AC-6, CIS-CSC-v8:5.4]
+    query:
+      protocol: cim
+      wql: SELECT GroupComponent, PartComponent FROM Win32_GroupUser WHERE GroupComponent = "Win32_Group.Domain='{HOST}',Name='Administrators'"
+      key: "{host}|{PartComponent}"
+    each: { field: PartComponent, op: match, value: 'Name = "(Everyone|Authenticated Users|Users|INTERACTIVE|Domain Users|Domain Computers|Domain Guests|Guests)"' }
+    evidence: "{host}: local admin {PartComponent}"
+
+  - id: WINSRV-LOCALADMIN-COUNT
+    title: Too many direct members in the local Administrators group
+    kind: misconfigured
+    lens: security
+    category: IAM
+    severity: medium
+    why: More direct members than the standard set (built-in account, the admin group, the server-tier admin group) means grants were added by hand or by stray policies. Nested group members are not expanded here.
+    fix: Reduce the group to the standard members with one replace-mode policy; review each extra grant.
+    refs: [NIST-800-53:AC-6, CIS-CSC-v8:5.4]
+    query:
+      protocol: cim
+      wql: SELECT GroupComponent, PartComponent FROM Win32_GroupUser WHERE GroupComponent = "Win32_Group.Domain='{HOST}',Name='Administrators'"
+      key: "{host}|{PartComponent}"
+    count: { op: gt, value: 3, threshold: windows-server.local-admins-max }
+    evidence: "{host}: {count} members in local Administrators ({sample})"
+
+  - id: WINSRV-LOCALADMIN-UNREADABLE
+    title: Local Administrators group could not be read by name
+    kind: missing
+    lens: security
+    category: IAM
+    severity: medium
+    why: The group is looked up by the English name 'Administrators'; no members back means the group is renamed or localised, the read was refused, or the server is a domain controller (no local groups), so the other local-admin rules cannot judge it.
+    fix: Check the group name and the scan account's rights; record domain controllers as exceptions.
+    refs: [NIST-800-53:AC-6]
+    query:
+      protocol: cim
+      wql: SELECT GroupComponent, PartComponent FROM Win32_GroupUser WHERE GroupComponent = "Win32_Group.Domain='{HOST}',Name='Administrators'"
+      key: "{host}|{PartComponent}"
+    count: { op: lt, value: 1 }
+    evidence: "{host}: no members returned for the group named Administrators"
+
+  # ---- updates through the Configuration Manager client ---------------------------------------
+
+  - id: WINSRV-CCM-UPDATE-OVERDUE
+    title: Deployed update still missing after its deadline
+    kind: missing
+    lens: both
+    category: LCM
+    severity: high
+    entity: software-update
+    why: The client knows the update is required and past its deadline, yet it is not installed; usually a maintenance window that never opens or a failing install.
+    fix: Check the server's maintenance window, disk space and update logs. Servers without the client return no rows here.
+    refs: [NIST-800-53:SI-2, CIS-CSC-v8:7.3]
+    query:
+      protocol: cim
+      namespace: root/ccm/ClientSDK
+      wql: SELECT ArticleID, Name, ComplianceState, EvaluationState, Deadline, ErrorCode FROM CCM_SoftwareUpdate
+      key: "{host}|{ArticleID}|{Name}"
+    each:
+      all:
+        - { field: ComplianceState, op: eq, value: 0 }
+        - { field: Deadline, op: age-gt, value: 7, threshold: windows-server.update-deadline-grace-days }
+    evidence: "{host}: KB{ArticleID} missing, deadline {Deadline}, state {EvaluationState}"
+
+  - id: WINSRV-CCM-UPDATE-RESTART-WAIT
+    title: Installed update waits for a restart
+    kind: broken
+    lens: both
+    category: LCM
+    severity: medium
+    entity: software-update
+    why: The update is installed but not active until the server restarts; the server stays exposed while reports may count it as done.
+    fix: Restart in the next maintenance window.
+    refs: [NIST-800-53:SI-2]
+    query:
+      protocol: cim
+      namespace: root/ccm/ClientSDK
+      wql: SELECT ArticleID, Name, ComplianceState, EvaluationState, Deadline, ErrorCode FROM CCM_SoftwareUpdate
+      key: "{host}|{ArticleID}|{Name}"
+    each: { field: EvaluationState, op: in, value: [8, 9, 10] }
+    evidence: "{host}: KB{ArticleID} waiting for restart (state {EvaluationState})"
+
+  # ---- licensing, logs, processes --------------------------------------------------------------
+
+  - id: WINSRV-NOT-ACTIVATED
+    title: Windows is not activated
+    kind: broken
+    category: CST
+    severity: medium
+    why: An unactivated server runs in a grace or notification state, nags, and eventually loses features; it also signals a licensing gap.
+    fix: Activate against the organisation's KMS or AD-based activation, or fix the key.
+    query:
+      protocol: cim
+      wql: SELECT Name, LicenseStatus FROM SoftwareLicensingProduct WHERE ApplicationID = '55c92734-d682-4d71-983e-d6ec3f16059f' AND PartialProductKey IS NOT NULL
+      key: host
+    each: { field: LicenseStatus, op: ne, value: 1 }
+    evidence: "{host}: {Name} license status {LicenseStatus} (1 = licensed)"
+
+  - id: WINSRV-EVENTLOG-SMALL
+    title: Application or System event log is too small
+    kind: misconfigured
+    category: LOG
+    severity: low
+    entity: event-log
+    why: A small circular log is overwritten within hours; the error that explains an outage is gone before anyone looks.
+    fix: Set the Application and System logs to at least 32 MB by policy. The threshold is in bytes.
+    refs: [NIST-800-53:AU-4, CIS-CSC-v8:8.3]
+    query:
+      protocol: cim
+      wql: SELECT LogfileName, MaxFileSize, NumberOfRecords FROM Win32_NTEventlogFile WHERE LogfileName = 'Application' OR LogfileName = 'System'
+      key: "{host}|{LogfileName}"
+    each: { field: MaxFileSize, op: lt, value: 33554432, threshold: windows-server.eventlog-min-bytes }
+    evidence: "{host}: {LogfileName} log max size {MaxFileSize} bytes"
+
+  - id: WINSRV-PROC-HANDLES-HIGH
+    title: Process holds an extreme number of handles
+    kind: broken
+    category: HLT
+    severity: low
+    entity: process
+    why: A handle count that keeps growing is a leak in an agent or application; it ends in a hang or a forced restart.
+    fix: Restart the process in a window and report the leak to its vendor.
+    query:
+      protocol: cim
+      wql: SELECT Name, ProcessId, HandleCount FROM Win32_Process WHERE HandleCount > 10000
+      key: "{host}|{Name}|{ProcessId}"
+    each:
+      all:
+        - { field: HandleCount, op: gt, value: 50000, threshold: windows-server.process-handles-max }
+        - { field: Name, op: notmatch, value: '^(System|Registry|Memory Compression|lsass\.exe|sqlservr\.exe|svchost\.exe|MsMpEng\.exe)$', threshold: windows-server.process-handles-ignore-pattern }
+    evidence: "{host}: {Name} (pid {ProcessId}) holds {HandleCount} handles"

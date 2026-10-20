@@ -100,6 +100,29 @@ public sealed class EvaluatorTests
         Assert.Equal(fails, Engine().Count(new CountCondition(mode, null, 0, null), rows).Fails);
     }
 
+    [Theory]
+    [InlineData("CIS-CSC-v8:5.3", "CIS-Controls-v8:5.3")]
+    [InlineData("cis-controls-8: 5.3 ", "CIS-Controls-v8:5.3")]
+    [InlineData("CIS-M365-5.2.3.5", "CIS-M365:5.2.3.5")]
+    [InlineData("NIST-800-53:AC-2(3)", "NIST-800-53:AC-2(3)")]
+    [InlineData("RFC-5280", "RFC-5280")]
+    [InlineData("Vendor-X:7", "Vendor-X:7")]
+    public void References_get_one_spelling_per_framework(string written, string canonical)
+    {
+        Assert.Equal(canonical, Refs.Normalize(written));
+    }
+
+    [Fact]
+    public void A_broken_pattern_in_a_tenant_setting_is_n_a_not_a_crash()
+    {
+        var rule = new LeafCondition("name", "notmatch", "^svc-", "ad.service-account-pattern");
+
+        var verdict = Engine(new() { ["ad.service-account-pattern"] = "([unclosed" }).Each(rule, new JsonObject { ["name"] = "alice" });
+
+        Assert.Null(verdict.Fails);
+        Assert.Contains("not a valid regular expression", verdict.Why, StringComparison.Ordinal);
+    }
+
     [Fact]
     public void Count_compares_with_a_threshold()
     {

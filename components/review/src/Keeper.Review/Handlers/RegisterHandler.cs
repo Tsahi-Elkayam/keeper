@@ -41,6 +41,8 @@ public sealed class RegisterHandler : IRequestHandler
         context.Execute(
             "INSERT OR REPLACE INTO build (build_id, stage, at, counts) VALUES (:id, 'track', :at, :counts);",
             (":id", register.BuildId), (":at", register.At), (":counts", JsonSerializer.Serialize(register.Counts, JsonLines.Options)));
+
+        TrendSnapshot.Write(context);
     }
 
     private static void UpsertEntity(RequestContext context, EntityRow e) =>

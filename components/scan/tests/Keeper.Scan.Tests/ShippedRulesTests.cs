@@ -113,9 +113,14 @@ public sealed class ShippedRulesTests : IDisposable
         Assert.Equal("ok", report.Manifest.Status);
     }
 
-    private static JsonObject Ad(string sid, string uac, string? logon, string created, string? mailbox = null, string? expires = null)
+    private static JsonObject Ad(string sid, string uac, string? logon, string created, string? mailbox = null, string? expires = null,
+        string ou = "Staff")
     {
-        var o = new JsonObject { ["objectSid"] = sid, ["userAccountControl"] = uac, ["whenCreated"] = created, ["accountExpires"] = expires ?? "9223372036854775807" };
+        var o = new JsonObject
+        {
+            ["objectSid"] = sid, ["userAccountControl"] = uac, ["whenCreated"] = created, ["accountExpires"] = expires ?? "9223372036854775807",
+            ["distinguishedName"] = $"CN=x,OU={ou},DC=example,DC=org",
+        };
         if (logon is not null)
             o["lastLogonTimestamp"] = logon;
         if (mailbox is not null)
@@ -136,7 +141,10 @@ public sealed class ShippedRulesTests : IDisposable
             ("erin", Ad("S-1-5-21-9-5", "514", Ago(900), Ago(1000))),          // disabled
             ("room1", Ad("S-1-5-21-9-6", "512", null, Ago(900), mailbox: "16")),   // room mailbox object
             ("frank", Ad("S-1-5-21-9-7", "512", Ago(5), Ago(900))),            // used this week
-            ("gina", Ad("S-1-5-21-9-8", "512", Ago(400), Ago(900), expires: Ago(30))));   // expired
+            ("gina", Ad("S-1-5-21-9-8", "512", Ago(400), Ago(900), expires: Ago(30))),    // expired
+            ("hank", Ad("S-1-5-21-9-9", "512", Ago(300), Ago(900), ou: "Disabled Accounts")), // moved to the leavers OU, never disabled
+            ("judy", Ad("S-1-5-21-9-10", "512", Ago(3), Ago(900), ou: "Disabled Accounts")),  // ... and still signing in
+            ("MSOL_0123abcd", Ad("S-1-5-21-9-11", "512", null, Ago(900))));               // directory sync account
         Seen("entra-run", "entra", 0,
             ("alice@example.org", Cloud("S-1-5-21-9-1", Ago(5))),
             ("bob@example.org", Cloud("S-1-5-21-9-2", Ago(200))));
@@ -168,10 +176,17 @@ public sealed class ShippedRulesTests : IDisposable
             Query.QueryRunner.Run(connection, query, new Dictionary<string, string?>(), new Query.TableWriter(output));
 
         var text = output.ToString();
-        // A domain-logon report calls alice, bob, carol and dave stale (4); only bob and carol are.
-        Assert.Contains("5 active: cloud sign-in only", text, StringComparison.Ordinal);
-        Assert.Contains("6 new, not used yet", text, StringComparison.Ordinal);
-        Assert.Matches(@"8 stale: no sign-in anywhere\s+2\s+2", text);
-        Assert.Matches(@"2 shared, room or equipment mailbox object\s+1", text);
+        // Every enabled account lands in exactly one bucket; only bob and carol are truly stale.
+        Assert.Matches(@"01 disabled\s+1", text);
+        Assert.Matches(@"02 shared, room or equipment mailbox object\s+1", text);
+        Assert.Matches(@"03 expired\s+1", text);
+        Assert.Matches(@"04 built-in or service account \(by name\)\s+1", text);
+        Assert.Matches(@"05 in a leavers OU but enabled - STILL SIGNING IN\s+1", text);
+        Assert.Matches(@"06 in a leavers OU but enabled\s+1", text);
+        Assert.Matches(@"07 active: domain logon\s+1\s+0", text);
+        Assert.Matches(@"08 active: cloud sign-in only\s+1\s+1", text);      // a domain-logon report would call alice stale
+        Assert.Matches(@"09 new, not used yet\s+1", text);
+        Assert.Matches(@"11 stale: never signed in anywhere\s+1", text);
+        Assert.Matches(@"13 stale: last sign-in in the window to a year ago\s+1", text);
     }
 }

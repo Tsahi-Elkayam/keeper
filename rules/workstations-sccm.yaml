@@ -1,0 +1,557 @@
+schema: keeper.rules/1
+system: workstations-sccm
+name: Workstations as Configuration Manager sees them
+integration: sccm
+# Agentless fleet view from the AdminService WMI route. Device rows are keyed by ResourceID so every
+# rule in this file talks about the same entity. Hardware-inventory classes (SMS_G_System_*) carry
+# only ResourceID and cannot be limited to workstations without a join: those rules cover every
+# inventoried device, servers included.
+defaults:
+  lens: maintenance
+  refresh: 1d
+  entity: computer
+rules:
+
+  # ---- client presence and activity -----------------------------------------------------------
+
+  - id: WSF-NO-CLIENT
+    title: Workstation active in AD but without a Configuration Manager client
+    kind: missing
+    lens: both
+    category: LCM
+    severity: high
+    why: The machine is in use (recent AD logon) but nothing deploys updates or software to it and nothing inventories it.
+    fix: Install the client (fix the push error first) or confirm the record is a leftover and retire it.
+    refs: [NIST-800-53:CM-8, NIST-800-53:SI-2, CIS-CSC-v8:1.1]
+    query:
+      protocol: http
+      path: /wmi/SMS_CombinedDeviceResources
+      params:
+        $filter: "startswith(DeviceOS,'Microsoft Windows NT Workstation') eq true"
+        $select: ResourceID,Name,IsClient,IsActive,IsObsolete,ClientVersion,ClientCheckPass,LastActiveTime,LastHardwareScan,LastPolicyRequest,DeviceOS,DeviceOSBuild,ADLastLogonTime
+      key: ResourceID
+      name: Name
+    each:
+      all:
+        - { field: IsClient, op: eq, value: 0 }
+        - any:
+            - { field: IsObsolete, op: absent }
+            - { field: IsObsolete, op: ne, value: 1 }
+        - { field: ADLastLogonTime, op: age-lt, value: 30, threshold: workstations.ad-logon-live-days }
+    evidence: "{Name}: no client, AD logon {ADLastLogonTime}"
+
+  - id: WSF-CLIENT-INACTIVE
+    title: Workstation client is inactive
+    kind: broken
+    category: HLT
+    severity: medium
+    why: An inactive client sends no heartbeat, policy request or inventory; it receives nothing and its compliance is unknown.
+    fix: Check whether the PC is in use; repair the client where it is, retire the record where it is gone.
+    query:
+      protocol: http
+      path: /wmi/SMS_CombinedDeviceResources
+      params:
+        $filter: "startswith(DeviceOS,'Microsoft Windows NT Workstation') eq true"
+        $select: ResourceID,Name,IsClient,IsActive,IsObsolete,ClientVersion,ClientCheckPass,LastActiveTime,LastHardwareScan,LastPolicyRequest,DeviceOS,DeviceOSBuild,ADLastLogonTime
+      key: ResourceID
+      name: Name
+    each:
+      all:
+        - { field: IsClient, op: eq, value: 1 }
+        - { field: IsActive, op: eq, value: 0 }
+        - any:
+            - { field: IsObsolete, op: absent }
+            - { field: IsObsolete, op: ne, value: 1 }
+    evidence: "{Name}: inactive, last active {LastActiveTime}, AD logon {ADLastLogonTime}"
+
+  - id: WSF-CLIENT-CHECK-FAILED
+    title: Workstation client fails the client health evaluation
+    kind: broken
+    category: HLT
+    severity: medium
+    why: ccmeval found a broken prerequisite (WMI, services, cache) that automatic remediation did not fix.
+    fix: Read CcmEval.log on the PC; reinstall the client when the failure repeats.
+    query:
+      protocol: http
+      path: /wmi/SMS_CombinedDeviceResources
+      params:
+        $filter: "startswith(DeviceOS,'Microsoft Windows NT Workstation') eq true"
+        $select: ResourceID,Name,IsClient,IsActive,IsObsolete,ClientVersion,ClientCheckPass,LastActiveTime,LastHardwareScan,LastPolicyRequest,DeviceOS,DeviceOSBuild,ADLastLogonTime
+      key: ResourceID
+      name: Name
+    each:
+      all:
+        - { field: IsClient, op: eq, value: 1 }
+        - { field: ClientCheckPass, op: eq, value: 2 }
+    evidence: "{Name}: client check failed, client {ClientVersion}"
+
+  - id: WSF-HWINV-STALE
+    title: Active workstation has no recent hardware inventory
+    kind: broken
+    category: HLT
+    severity: low
+    why: Every inventory-based rule (Windows 11 readiness, disk, BitLocker, software) is blind or stale for this device.
+    fix: Check InventoryAgent.log on the PC; an inventory that exceeds the size limit or a broken WMI repository are the usual causes.
+    query:
+      protocol: http
+      path: /wmi/SMS_CombinedDeviceResources
+      params:
+        $filter: "startswith(DeviceOS,'Microsoft Windows NT Workstation') eq true"
+        $select: ResourceID,Name,IsClient,IsActive,IsObsolete,ClientVersion,ClientCheckPass,LastActiveTime,LastHardwareScan,LastPolicyRequest,DeviceOS,DeviceOSBuild,ADLastLogonTime
+      key: ResourceID
+      name: Name
+    each:
+      all:
+        - { field: IsClient, op: eq, value: 1 }
+        - { field: IsActive, op: eq, value: 1 }
+        - any:
+            - { field: LastHardwareScan, op: absent }
+            - { field: LastHardwareScan, op: age-gt, value: 14, threshold: workstations.hw-inventory-max-age-days }
+    evidence: "{Name}: last hardware scan {LastHardwareScan}"
+
+  - id: WSF-POLICY-STALE
+    title: Active workstation has not requested policy for days
+    kind: broken
+    category: HLT
+    severity: medium
+    why: A client that stops requesting policy never learns of new deployments, even though it may still look active.
+    fix: Check PolicyAgent.log and LocationServices.log on the PC; a missing management point or boundary is a common cause.
+    query:
+      protocol: http
+      path: /wmi/SMS_CombinedDeviceResources
+      params:
+        $filter: "startswith(DeviceOS,'Microsoft Windows NT Workstation') eq true"
+        $select: ResourceID,Name,IsClient,IsActive,IsObsolete,ClientVersion,ClientCheckPass,LastActiveTime,LastHardwareScan,LastPolicyRequest,DeviceOS,DeviceOSBuild,ADLastLogonTime
+      key: ResourceID
+      name: Name
+    each:
+      all:
+        - { field: IsClient, op: eq, value: 1 }
+        - { field: IsActive, op: eq, value: 1 }
+        - { field: LastPolicyRequest, op: age-gt, value: 7, threshold: workstations.policy-request-max-age-days }
+    evidence: "{Name}: last policy request {LastPolicyRequest}"
+
+  - id: WSF-NO-AD-SITE
+    title: Active workstation client reports no AD site
+    kind: misconfigured
+    category: CFG
+    severity: medium
+    why: A client on a subnet that is in no AD site is usually in no boundary either; it gets no content location and deployments time out.
+    fix: Add the subnet to an AD site (or as a boundary in a group with a distribution point) after confirming what the network is.
+    query:
+      protocol: http
+      path: /wmi/SMS_R_System
+      params:
+        $filter: "Client eq 1 and Active eq 1 and startswith(OperatingSystemNameandVersion,'Microsoft Windows NT Workstation') eq true"
+        $select: ResourceId,Name,ADSiteName,OperatingSystemNameandVersion
+      key: ResourceId
+      name: Name
+    each: { field: ADSiteName, op: empty }
+    evidence: "{Name}: no AD site reported"
+
+  - id: WSF-CLIENT-NOTIFY-OFFLINE
+    title: Recently active client is not connected to the notification channel
+    kind: broken
+    category: HLT
+    severity: low
+    why: Clients that are active but never online on the fast channel do not get client notifications (policy refresh, scripts, CMPivot) and often have a certificate or port problem.
+    fix: Check CcmNotificationAgent.log on the PC and port 10123 to the management point.
+    query:
+      protocol: http
+      path: /wmi/SMS_CombinedDeviceResources
+      params:
+        $filter: "startswith(DeviceOS,'Microsoft Windows NT Workstation') eq true"
+        $select: ResourceID,Name,IsClient,IsActive,LastActiveTime,CNIsOnline,CNLastOnlineTime
+      key: ResourceID
+      name: Name
+    each:
+      all:
+        - { field: IsClient, op: eq, value: 1 }
+        - { field: LastActiveTime, op: age-lt, value: 2 }
+        - any:
+            - { field: CNLastOnlineTime, op: absent }
+            - { field: CNLastOnlineTime, op: age-gt, value: 7, threshold: workstations.notify-offline-days }
+    evidence: "{Name}: active {LastActiveTime}, last online on the notification channel {CNLastOnlineTime}"
+
+  # ---- operating system lifecycle -------------------------------------------------------------
+
+  - id: WSF-OS-WIN10
+    title: Workstation still runs Windows 10
+    kind: broken
+    lens: both
+    category: LCM
+    severity: high
+    why: Windows 10 left support on 2025-10-14; only paid Extended Security Updates or LTSC editions still get fixes.
+    fix: Upgrade to Windows 11 where the hardware allows, replace the rest; record ESU or LTSC devices as exceptions.
+    refs: [NIST-800-53:SA-22, CIS-CSC-v8:2.2]
+    query:
+      protocol: http
+      path: /wmi/SMS_CombinedDeviceResources
+      params:
+        $filter: "startswith(DeviceOS,'Microsoft Windows NT Workstation') eq true"
+        $select: ResourceID,Name,IsClient,IsActive,IsObsolete,ClientVersion,ClientCheckPass,LastActiveTime,LastHardwareScan,LastPolicyRequest,DeviceOS,DeviceOSBuild,ADLastLogonTime
+      key: ResourceID
+      name: Name
+    each:
+      all:
+        - { field: DeviceOSBuild, op: match, value: '^10\.0\.1\d{4}(\.|$)' }
+        - any:
+            - { field: IsObsolete, op: absent }
+            - { field: IsObsolete, op: ne, value: 1 }
+    evidence: "{Name}: build {DeviceOSBuild}"
+
+  - id: WSF-OS-BUILD-UNSUPPORTED
+    title: Workstation runs a Windows build that is out of servicing
+    kind: broken
+    lens: both
+    category: LCM
+    severity: high
+    why: Builds past their end of servicing get no monthly cumulative updates (Enterprise and Education dates; Home and Pro end earlier).
+    fix: Move the device to a serviced feature update. Update the threshold list when Microsoft retires a build.
+    refs: [NIST-800-53:SA-22, NIST-800-53:SI-2]
+    query:
+      protocol: http
+      path: /wmi/SMS_CombinedDeviceResources
+      params:
+        $filter: "startswith(DeviceOS,'Microsoft Windows NT Workstation') eq true"
+        $select: ResourceID,Name,IsClient,IsActive,IsObsolete,ClientVersion,ClientCheckPass,LastActiveTime,LastHardwareScan,LastPolicyRequest,DeviceOS,DeviceOSBuild,ADLastLogonTime
+      key: ResourceID
+      name: Name
+    each: { field: DeviceOSBuild, op: match, value: '^10\.0\.(10240|10586|14393|15063|16299|17134|18362|18363|19041|19042|19043|22000|22621)(\.|$)', threshold: workstations.unsupported-build-pattern }
+    evidence: "{Name}: build {DeviceOSBuild}"
+
+  - id: WSF-OS-BUILD-ENDING
+    title: Workstation build leaves servicing soon
+    kind: broken
+    category: LCM
+    severity: medium
+    why: Build 22631 (Windows 11 23H2, Enterprise/Education) ends 2026-11-10 and 19044 (Windows 10 LTSC 2021) ends 2027-01-12.
+    fix: Plan the feature update before the date. Update the threshold list as dates pass.
+    refs: [NIST-800-53:SA-22]
+    query:
+      protocol: http
+      path: /wmi/SMS_CombinedDeviceResources
+      params:
+        $filter: "startswith(DeviceOS,'Microsoft Windows NT Workstation') eq true"
+        $select: ResourceID,Name,IsClient,IsActive,IsObsolete,ClientVersion,ClientCheckPass,LastActiveTime,LastHardwareScan,LastPolicyRequest,DeviceOS,DeviceOSBuild,ADLastLogonTime
+      key: ResourceID
+      name: Name
+    each: { field: DeviceOSBuild, op: match, value: '^10\.0\.(22631|19044)(\.|$)', threshold: workstations.ending-build-pattern }
+    evidence: "{Name}: build {DeviceOSBuild}"
+
+  - id: WSF-UPTIME-LONG
+    title: Workstation not restarted for a long time (inventory)
+    kind: broken
+    category: LCM
+    severity: low
+    why: Long uptime means installed updates are not active, and leaks and hung services pile up until the next restart.
+    fix: Enforce restarts through the deployments' restart settings or a maintenance window.
+    query:
+      protocol: http
+      path: /wmi/SMS_G_System_OPERATING_SYSTEM
+      params:
+        $filter: "startswith(Caption,'Microsoft Windows 1') eq true"
+        $select: ResourceID,Caption,BuildNumber,LastBootUpTime
+      key: ResourceID
+    each: { field: LastBootUpTime, op: age-gt, value: 30, threshold: workstations.uptime-max-days }
+    evidence: "resource {ResourceID}: {Caption} build {BuildNumber}, last boot {LastBootUpTime} (as of its last inventory)"
+
+  # ---- Windows 11 hardware readiness (every inventoried device) -------------------------------
+
+  - id: WSF-W11-TPM
+    title: TPM 2.0 missing or not enabled and activated
+    kind: missing
+    lens: both
+    category: LCM
+    severity: medium
+    why: Windows 11 needs TPM 2.0; a 1.2 chip blocks the upgrade, a disabled firmware TPM only needs a BIOS setting.
+    fix: Enable and activate the TPM (Intel PTT / AMD fTPM) in firmware; plan replacement where only TPM 1.2 exists. Devices with no TPM row at all are not listed here.
+    query:
+      protocol: http
+      path: /wmi/SMS_G_System_TPM
+      params:
+        $select: ResourceID,SpecVersion,IsEnabled_InitialValue,IsActivated_InitialValue
+      key: ResourceID
+    each:
+      any:
+        - { field: SpecVersion, op: notmatch, value: '^\s*2\.0' }
+        - { field: IsEnabled_InitialValue, op: eq, value: false }
+        - { field: IsActivated_InitialValue, op: eq, value: false }
+    evidence: "resource {ResourceID}: TPM spec {SpecVersion}, enabled {IsEnabled_InitialValue}, activated {IsActivated_InitialValue}"
+
+  - id: WSF-W11-NOT-UEFI
+    title: Device boots in legacy BIOS mode
+    kind: misconfigured
+    category: LCM
+    severity: medium
+    why: Windows 11 requires UEFI; legacy boot also rules out Secure Boot.
+    fix: Convert the disk with MBR2GPT and switch the firmware to UEFI.
+    query:
+      protocol: http
+      path: /wmi/SMS_G_System_FIRMWARE
+      params:
+        $select: ResourceID,UEFI,SecureBoot
+      key: ResourceID
+    each: { field: UEFI, op: eq, value: 0 }
+    evidence: "resource {ResourceID}: UEFI {UEFI}, Secure Boot {SecureBoot}"
+
+  - id: WSF-SECUREBOOT-OFF
+    title: Secure Boot is off
+    kind: misconfigured
+    lens: security
+    category: CFG
+    severity: medium
+    why: Without Secure Boot, boot-level malware and unsigned boot loaders run before any security product starts.
+    fix: Turn Secure Boot on in firmware (UEFI mode required).
+    refs: [NIST-800-53:SI-7]
+    query:
+      protocol: http
+      path: /wmi/SMS_G_System_FIRMWARE
+      params:
+        $select: ResourceID,UEFI,SecureBoot
+      key: ResourceID
+    each: { field: SecureBoot, op: eq, value: 0 }
+    evidence: "resource {ResourceID}: Secure Boot {SecureBoot}, UEFI {UEFI}"
+
+  - id: WSF-W11-RAM
+    title: Less than 4 GB of memory
+    kind: missing
+    category: LCM
+    severity: medium
+    why: Windows 11 needs 4 GB; such devices cannot be upgraded and are slow with current security agents.
+    fix: Add memory where slots allow, otherwise plan replacement. The threshold is in KB.
+    query:
+      protocol: http
+      path: /wmi/SMS_G_System_X86_PC_MEMORY
+      params:
+        $select: ResourceID,TotalPhysicalMemory
+      key: ResourceID
+    each: { field: TotalPhysicalMemory, op: lt, value: 3800000, threshold: workstations.w11-min-memory-kb }
+    evidence: "resource {ResourceID}: {TotalPhysicalMemory} KB memory"
+
+  - id: WSF-W11-SYSTEM-DISK
+    title: System drive smaller than 64 GB
+    kind: missing
+    category: LCM
+    severity: medium
+    why: Windows 11 needs a 64 GB system volume; a smaller system drive fails the upgrade check.
+    fix: Replace the disk or the device. The threshold is in MB.
+    query:
+      protocol: http
+      path: /wmi/SMS_G_System_LOGICAL_DISK
+      params:
+        $filter: "DeviceID eq 'C:'"
+        $select: ResourceID,DeviceID,Size,FreeSpace,DriveType
+      key: ResourceID
+    each: { field: Size, op: lt, value: 65024, threshold: workstations.w11-min-system-disk-mb }
+    evidence: "resource {ResourceID}: C: {Size} MB"
+
+  - id: WSF-C-FREE-LOW
+    title: Low free space on the system drive (inventory)
+    kind: broken
+    category: HLT
+    severity: medium
+    why: Updates and feature upgrades fail and the PC slows down when the system drive runs out of space.
+    fix: Clean temporary files, old profiles and the update cache, or enlarge the disk. The threshold is in MB.
+    refs: [NIST-800-53:SC-5]
+    query:
+      protocol: http
+      path: /wmi/SMS_G_System_LOGICAL_DISK
+      params:
+        $filter: "DeviceID eq 'C:'"
+        $select: ResourceID,DeviceID,Size,FreeSpace,DriveType
+      key: ResourceID
+    each: { field: FreeSpace, op: lt, value: 10240, threshold: workstations.c-free-mb-min }
+    evidence: "resource {ResourceID}: C: {FreeSpace} MB free of {Size} MB"
+
+  - id: WSF-W11-CPU
+    title: Processor below the Windows 11 minimum
+    kind: missing
+    category: LCM
+    severity: medium
+    why: Windows 11 requires a listed 64-bit processor with 2 cores at 1 GHz; older families (for example Intel 7th generation and earlier) are not supported.
+    fix: Plan replacement; check borderline names against Microsoft's processor lists and adjust the pattern thresholds.
+    query:
+      protocol: http
+      path: /wmi/SMS_G_System_PROCESSOR
+      params:
+        $select: ResourceID,Name,NumberOfCores,MaxClockSpeed,AddressWidth
+      key: ResourceID
+    each:
+      any:
+        - { field: NumberOfCores, op: lt, value: 2 }
+        - { field: AddressWidth, op: lt, value: 64 }
+        - { field: MaxClockSpeed, op: lt, value: 1000 }
+        - all:
+            - { field: Name, op: match, value: 'Core\(TM\)2|Core 2 (Duo|Quad)|Pentium\(R\) (4|D|Dual)|Pentium\(R\) CPU [GN]\d{4}|Celeron\(R\) CPU|Core\(TM\) i[3579][ -](CPU )?([2-7]\d{3}|\d{3})[A-Z]{0,2}\b|AMD (FX|Phenom|Opteron|Sempron|A\d{1,2}-|E\d-)|AMD Athlon(?! (Gold|Silver))|Ryzen [3579] (PRO )?1\d{3}', threshold: workstations.w11-cpu-unsupported-pattern }
+            - { field: Name, op: notmatch, value: 'i7-7820HQ|i[579]-78[02]0X|i[79]-79[0-8]0XE?', threshold: workstations.w11-cpu-exception-pattern }
+    evidence: "resource {ResourceID}: {Name}, {NumberOfCores} cores, {MaxClockSpeed} MHz, {AddressWidth}-bit"
+
+  # ---- encryption, updates, deployments -------------------------------------------------------
+
+  - id: WSF-BITLOCKER-OFF
+    title: System drive not protected by BitLocker
+    kind: misconfigured
+    lens: security
+    category: CFG
+    severity: high
+    why: A lost or stolen PC without disk encryption gives away cached credentials and local data.
+    fix: Enable BitLocker with TPM and escrow the recovery key. Needs the Encryptable Volume class in hardware inventory.
+    refs: [NIST-800-53:SC-28, CIS-CSC-v8:3.6]
+    query:
+      protocol: http
+      path: /wmi/SMS_G_System_ENCRYPTABLE_VOLUME
+      params:
+        $select: ResourceID,DriveLetter,ProtectionStatus
+      key: ResourceID
+    each:
+      all:
+        - { field: DriveLetter, op: eq, value: 'C:' }
+        - { field: ProtectionStatus, op: ne, value: 1 }
+    evidence: "resource {ResourceID}: {DriveLetter} protection status {ProtectionStatus}"
+
+  - id: WSF-SUM-DEPLOY-ERROR
+    title: Device reports an error for a software update deployment
+    kind: broken
+    lens: both
+    category: LCM
+    severity: medium
+    why: The device tried to install deployed updates and failed, so it stays unpatched until the error is fixed. Covers every targeted device.
+    fix: Read WUAHandler.log and UpdatesDeployment.log on the device; disk space, a broken update agent or a pending restart are common causes.
+    refs: [NIST-800-53:SI-2]
+    query:
+      protocol: http
+      path: /wmi/SMS_SUMDeploymentAssetDetails
+      params:
+        $filter: "StatusType eq 5"
+        $select: ResourceID,DeviceName,AssignmentName,StatusType,StatusTime,StatusErrorCode,LastEnforcementErrorCode
+      key: ResourceID
+      name: DeviceName
+    each: any
+    evidence: "{DeviceName}: {AssignmentName} error {StatusErrorCode} / enforcement {LastEnforcementErrorCode} at {StatusTime}"
+
+  - id: WSF-SUM-NONCOMPLIANT
+    title: Device still missing required updates long after deployment
+    kind: missing
+    lens: both
+    category: LCM
+    severity: medium
+    why: The device is non-compliant with a deployed update group and its status has not moved for days, so updates are not getting installed.
+    fix: Check the device's scan and install logs; restart if it waits for one, repair the update agent otherwise.
+    refs: [NIST-800-53:SI-2, CIS-CSC-v8:7.3]
+    query:
+      protocol: http
+      path: /wmi/SMS_SUMDeploymentAssetDetails
+      params:
+        $filter: "IsCompliant eq 0"
+        $select: ResourceID,DeviceName,AssignmentName,StatusType,StatusTime,StatusErrorCode,LastEnforcementErrorCode
+      key: ResourceID
+      name: DeviceName
+    each: { field: StatusTime, op: age-gt, value: 14, threshold: workstations.update-stale-status-days }
+    evidence: "{DeviceName}: non-compliant with {AssignmentName}, status {StatusType} since {StatusTime}"
+
+  - id: WSF-APP-REQUIRED-ERROR
+    title: Required application keeps failing on a device
+    kind: broken
+    category: HLT
+    severity: medium
+    why: A Required deployment in error is retried every evaluation cycle; when detection never sees the installed product, the device reinstalls forever.
+    fix: Read AppEnforce.log; fix the detection method (product code, version, file) or the installer. Errors on every app of one device point at the device.
+    query:
+      protocol: http
+      path: /wmi/SMS_AppDeploymentAssetDetails
+      params:
+        $filter: "AppStatusType eq 5 and DeploymentIntent eq 1"
+        $select: MachineID,MachineName,AppName,AppStatusType,DeploymentIntent,EnforcementState,StartTime,CollectionName
+      key: MachineID
+      name: MachineName
+    each: { field: StartTime, op: age-gt, value: 7, threshold: workstations.app-error-days }
+    evidence: "{MachineName}: {AppName} in error (enforcement state {EnforcementState}), deployed {StartTime}"
+
+  # ---- installed software (Add/Remove Programs inventory) -------------------------------------
+
+  - id: WSF-SW-EOL-32
+    title: End-of-support runtime or component installed (32-bit view)
+    kind: broken
+    lens: both
+    category: LCM
+    severity: medium
+    why: Runtimes and plug-ins past end of support (Flash, Silverlight, Python 2, old .NET, old VC++ redistributables, old WinRAR) keep known holes open.
+    fix: Remove it or move the dependent application to a supported version. The server-side filter limits which names can be seen.
+    refs: [NIST-800-53:SA-22, CIS-CSC-v8:2.2]
+    query:
+      protocol: http
+      path: /wmi/SMS_G_System_ADD_REMOVE_PROGRAMS
+      params:
+        $filter: "startswith(DisplayName,'Adobe Flash') eq true or startswith(DisplayName,'Microsoft Silverlight') eq true or startswith(DisplayName,'Python 2.') eq true or startswith(DisplayName,'Microsoft Visual C++ 2005') eq true or startswith(DisplayName,'Microsoft Visual C++ 2008') eq true or startswith(DisplayName,'Microsoft .NET') eq true or startswith(DisplayName,'Microsoft ASP.NET Core') eq true or startswith(DisplayName,'Microsoft Windows Desktop Runtime') eq true or startswith(DisplayName,'PowerShell 7') eq true or startswith(DisplayName,'WinRAR') eq true or startswith(DisplayName,'Adobe Reader XI') eq true"
+        $select: ResourceID,DisplayName,Version,Publisher
+      key: ResourceID
+    each:
+      any:
+        - { field: DisplayName, op: match, value: '^(Adobe Flash|Microsoft Silverlight|Python 2\.|Microsoft Visual C\+\+ 200[58] |Microsoft (\.NET Core|\.NET|Windows Desktop) Runtime - [1-7]\.|Microsoft ASP\.NET Core [1-7]\.|WinRAR [1-6]\.|Adobe Reader XI)', threshold: workstations.eol-software-pattern }
+        - all:
+            - { field: DisplayName, op: match, value: '^PowerShell 7' }
+            - { field: Version, op: match, value: '^7\.[0-3]\.' }
+    evidence: "resource {ResourceID}: {DisplayName} {Version}"
+
+  - id: WSF-SW-EOL-64
+    title: End-of-support runtime or component installed (64-bit view)
+    kind: broken
+    lens: both
+    category: LCM
+    severity: medium
+    why: Runtimes and plug-ins past end of support keep known holes open.
+    fix: Remove it or move the dependent application to a supported version. The server-side filter limits which names can be seen.
+    refs: [NIST-800-53:SA-22, CIS-CSC-v8:2.2]
+    query:
+      protocol: http
+      path: /wmi/SMS_G_System_ADD_REMOVE_PROGRAMS_64
+      params:
+        $filter: "startswith(DisplayName,'Adobe Flash') eq true or startswith(DisplayName,'Microsoft Silverlight') eq true or startswith(DisplayName,'Python 2.') eq true or startswith(DisplayName,'Microsoft Visual C++ 2005') eq true or startswith(DisplayName,'Microsoft Visual C++ 2008') eq true or startswith(DisplayName,'Microsoft .NET') eq true or startswith(DisplayName,'Microsoft ASP.NET Core') eq true or startswith(DisplayName,'Microsoft Windows Desktop Runtime') eq true or startswith(DisplayName,'PowerShell 7') eq true or startswith(DisplayName,'WinRAR') eq true or startswith(DisplayName,'Adobe Reader XI') eq true"
+        $select: ResourceID,DisplayName,Version,Publisher
+      key: ResourceID
+    each:
+      any:
+        - { field: DisplayName, op: match, value: '^(Adobe Flash|Microsoft Silverlight|Python 2\.|Microsoft Visual C\+\+ 200[58] |Microsoft (\.NET Core|\.NET|Windows Desktop) Runtime - [1-7]\.|Microsoft ASP\.NET Core [1-7]\.|WinRAR [1-6]\.|Adobe Reader XI)', threshold: workstations.eol-software-pattern }
+        - all:
+            - { field: DisplayName, op: match, value: '^PowerShell 7' }
+            - { field: Version, op: match, value: '^7\.[0-3]\.' }
+    evidence: "resource {ResourceID}: {DisplayName} {Version}"
+
+  - id: WSF-SW-UNAPPROVED-32
+    title: Unapproved remote-access or messaging software installed (32-bit view)
+    kind: misconfigured
+    lens: security
+    category: AUT
+    severity: medium
+    why: Remote-access tools open an unmanaged way into the PC; consumer messaging apps move data outside approved channels.
+    fix: Remove it with a Required uninstall and block it with application control. Narrow the pattern threshold to what the organisation forbids.
+    refs: [CIS-CSC-v8:2.3, NIST-800-53:CM-7]
+    query:
+      protocol: http
+      path: /wmi/SMS_G_System_ADD_REMOVE_PROGRAMS
+      params:
+        $filter: "startswith(DisplayName,'AnyDesk') eq true or startswith(DisplayName,'TeamViewer') eq true or startswith(DisplayName,'RustDesk') eq true or startswith(DisplayName,'ScreenConnect') eq true or startswith(DisplayName,'Splashtop') eq true or startswith(DisplayName,'UltraVNC') eq true or startswith(DisplayName,'TightVNC') eq true or startswith(DisplayName,'RealVNC') eq true or startswith(DisplayName,'VNC') eq true or startswith(DisplayName,'Chrome Remote Desktop') eq true or startswith(DisplayName,'LogMeIn') eq true or startswith(DisplayName,'WhatsApp') eq true or startswith(DisplayName,'Telegram') eq true or startswith(DisplayName,'Signal') eq true or startswith(DisplayName,'Viber') eq true or startswith(DisplayName,'Discord') eq true"
+        $select: ResourceID,DisplayName,Version,Publisher
+      key: ResourceID
+    each: { field: DisplayName, op: match, value: '^(AnyDesk|TeamViewer|RustDesk|ScreenConnect|Splashtop|UltraVNC|TightVNC|RealVNC|VNC|Chrome Remote Desktop|LogMeIn|WhatsApp|Telegram|Signal|Viber|Discord)', threshold: workstations.unapproved-software-pattern }
+    evidence: "resource {ResourceID}: {DisplayName} {Version}"
+
+  - id: WSF-SW-UNAPPROVED-64
+    title: Unapproved remote-access or messaging software installed (64-bit view)
+    kind: misconfigured
+    lens: security
+    category: AUT
+    severity: medium
+    why: Remote-access tools open an unmanaged way into the PC; consumer messaging apps move data outside approved channels.
+    fix: Remove it with a Required uninstall and block it with application control. Narrow the pattern threshold to what the organisation forbids.
+    refs: [CIS-CSC-v8:2.3, NIST-800-53:CM-7]
+    query:
+      protocol: http
+      path: /wmi/SMS_G_System_ADD_REMOVE_PROGRAMS_64
+      params:
+        $filter: "startswith(DisplayName,'AnyDesk') eq true or startswith(DisplayName,'TeamViewer') eq true or startswith(DisplayName,'RustDesk') eq true or startswith(DisplayName,'ScreenConnect') eq true or startswith(DisplayName,'Splashtop') eq true or startswith(DisplayName,'UltraVNC') eq true or startswith(DisplayName,'TightVNC') eq true or startswith(DisplayName,'RealVNC') eq true or startswith(DisplayName,'VNC') eq true or startswith(DisplayName,'Chrome Remote Desktop') eq true or startswith(DisplayName,'LogMeIn') eq true or startswith(DisplayName,'WhatsApp') eq true or startswith(DisplayName,'Telegram') eq true or startswith(DisplayName,'Signal') eq true or startswith(DisplayName,'Viber') eq true or startswith(DisplayName,'Discord') eq true"
+        $select: ResourceID,DisplayName,Version,Publisher
+      key: ResourceID
+    each: { field: DisplayName, op: match, value: '^(AnyDesk|TeamViewer|RustDesk|ScreenConnect|Splashtop|UltraVNC|TightVNC|RealVNC|VNC|Chrome Remote Desktop|LogMeIn|WhatsApp|Telegram|Signal|Viber|Discord)', threshold: workstations.unapproved-software-pattern }
+    evidence: "resource {ResourceID}: {DisplayName} {Version}"

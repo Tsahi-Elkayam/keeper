@@ -7,15 +7,16 @@ namespace Keeper.Report;
 /// <summary>Reports for people who read rather than act: the state of the estate, security, what expires, what changed.</summary>
 public static class Reports
 {
-    public static readonly IReadOnlyList<string> Names = ["summary", "security", "expiring", "changes"];
+    public static readonly IReadOnlyList<string> Names = ["summary", "security", "expiring", "changes", "trends"];
 
-    public static Document Build(string name, SqliteConnection connection, DateTimeOffset now, string? since) => name switch
+    public static Document Build(string name, SqliteConnection connection, DateTimeOffset now, string? since, int days = 90) => name switch
     {
         "summary" => Summary(connection, now),
         "security" => Security(connection, now),
         "expiring" => Expiring(connection, now),
         "changes" => Changes(connection, since ?? Iso.Date(now.AddDays(-30))),
-        _ => throw new ArgumentException($"Reports: {string.Join(", ", Names)}."),
+        "trends" => Trends.Build(connection, now, days),
+        _ => throw new ArgumentException($"Reports: {string.Join(", ", Names)}, evidence."),
     };
 
     private static List<string> Lines(SqliteConnection connection, string sql, Func<Dictionary<string, object?>, string> line,
@@ -31,6 +32,7 @@ public static class Reports
                 SELECT kind, severity, COUNT(*) AS n FROM active_finding f JOIN severity s ON s.code = f.severity
                 GROUP BY kind, severity ORDER BY kind, MIN(s.rank);
                 """, r => $"{r["kind"]} / {r["severity"]}: {r["n"]}"), "No open findings."),
+            Widespread(connection, security: false),
             new Section("Systems with the most serious open findings", Lines(connection,
                 """
                 SELECT system_id, COUNT(*) AS n, SUM(severity = 'critical') AS c, SUM(severity = 'high') AS h
@@ -56,9 +58,30 @@ public static class Reports
                 "SELECT severity, COUNT(*) AS n FROM active_finding WHERE security = 1 GROUP BY severity ORDER BY MIN(severity_rank);",
                 r => $"{r["severity"]}: {r["n"]}"), "No open security findings."),
             new Section("Most serious", Lines(connection,
-                "SELECT severity, title, system_id, target, first_seen FROM active_finding WHERE security = 1 ORDER BY severity_rank, first_seen LIMIT 40;",
-                r => $"[{r["severity"]}] {r["title"]} - {r["system_id"]} / {r["target"]} (since {r["first_seen"]})")),
+                """
+                -- SQLite takes bare columns from the row MIN() picked: the most severe finding of each check.
+                SELECT MIN(severity_rank) AS rank, severity, title, system_id, target, COUNT(*) AS n, first_seen
+                FROM active_finding WHERE security = 1
+                GROUP BY check_id ORDER BY rank, n DESC, first_seen LIMIT 40;
+                """,
+                r => $"[{r["severity"]}] {r["title"]} - {Where(r)} (since {r["first_seen"]})")),
+            Widespread(connection, security: true),
         ]);
+
+    /// <summary>One check failing on many targets: seen once, it was likely to be everywhere, and here is how far.</summary>
+    private static Section Widespread(SqliteConnection connection, bool security) => new(
+        "Most widespread",
+        Lines(connection,
+            $"""
+            SELECT MIN(severity_rank) AS rank, severity, title, check_id, COUNT(*) AS n, COUNT(DISTINCT system_id) AS systems
+            FROM active_finding {(security ? "WHERE security = 1" : "")}
+            GROUP BY check_id HAVING COUNT(*) > 1 ORDER BY n DESC LIMIT 15;
+            """,
+            r => $"{r["n"]} x [{r["severity"]}] {r["title"]} ({r["check_id"]}) on {r["systems"]} system(s)"),
+        "No check fails on more than one target.");
+
+    private static string Where(Dictionary<string, object?> r) =>
+        r["n"] is long n && n > 1 ? $"{n} targets, e.g. {r["system_id"]} / {r["target"]}" : $"{r["system_id"]} / {r["target"]}";
 
     private static Document Expiring(SqliteConnection connection, DateTimeOffset now) => new(
         "What expires in the next 90 days",

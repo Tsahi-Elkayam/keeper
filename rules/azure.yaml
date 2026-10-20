@@ -1,0 +1,280 @@
+schema: keeper.rules/1
+system: azure
+name: Azure Resource Manager (tenant scope)
+integration: azure
+# Endpoint: https://management.azure.com. The integration obtains the ARM token; rules only name GET
+# paths. Only routes that work without a subscription id in the path are used here (subscription list,
+# root-scope role assignments, reservations, tenant service-health events). Subscription-scoped
+# checks - NSG rules, storage accounts, Key Vault, VMs, budgets, policy - are in
+# docs/backlog/infrastructure.md: they need either a per-subscription integration or engine fan-out.
+# ARM pages with "nextLink" (not "@odata.nextLink"), which the runner does not follow; these lists
+# are normally a single page.
+defaults:
+  lens: both
+  refresh: 1d
+rules:
+
+  # ---- subscriptions -------------------------------------------------------------------------
+
+  - id: AZ-SUBSCRIPTION-STATE
+    title: Subscription is not in the enabled state
+    kind: broken
+    lens: maintenance
+    category: AVL
+    severity:
+      field: state
+      map: { PastDue: high, Warned: high, Disabled: medium, Deleted: low }
+      default: medium
+    entity: subscription
+    why: A warned or past-due subscription is days away from having its resources stopped; a disabled one already has.
+    fix: Settle the billing issue or reactivate the subscription; if it is retired on purpose, move or delete what is left in it.
+    query:
+      protocol: http
+      path: /subscriptions
+      params: { api-version: "2022-12-01" }
+      paging: none
+      key: subscriptionId
+      name: displayName
+    each: { field: state, op: ne, value: Enabled }
+    evidence: "{displayName}: state {state}, offer {subscriptionPolicies.quotaId}"
+
+  - id: AZ-SUBSCRIPTION-SPENDING-LIMIT
+    title: Subscription has a spending limit that stops resources
+    kind: misconfigured
+    lens: maintenance
+    category: AVL
+    severity: medium
+    entity: subscription
+    why: With the spending limit on, Azure disables the subscription's resources when the credit runs out - a production outage triggered by billing.
+    fix: Remove the spending limit (or move the workloads to a pay-as-you-go or enterprise subscription) and use budgets for cost control.
+    query:
+      protocol: http
+      path: /subscriptions
+      params: { api-version: "2022-12-01" }
+      paging: none
+      key: subscriptionId
+      name: displayName
+    each: { field: subscriptionPolicies.spendingLimit, op: eq, value: "On" }
+    evidence: "{displayName}: spending limit {subscriptionPolicies.spendingLimit}, offer {subscriptionPolicies.quotaId}"
+
+  - id: AZ-SUBSCRIPTION-DELEGATED
+    title: Subscription is managed from another tenant
+    kind: misconfigured
+    lens: security
+    category: IAM
+    severity: medium
+    entity: subscription
+    why: A delegation to another tenant (for example a service provider) grants access that does not appear in this tenant's role assignments or sign-in logs.
+    fix: Confirm every managing tenant is a current, contracted provider with least-privilege roles; remove delegations that are not.
+    refs: [NIST-800-53:AC-2, NIST-800-53:AC-6]
+    query:
+      protocol: http
+      path: /subscriptions
+      params: { api-version: "2022-12-01" }
+      paging: none
+      key: subscriptionId
+      name: displayName
+    each: { field: managedByTenants, op: size-gt, value: 0 }
+    evidence: "{displayName}: managed by tenant(s) {managedByTenants[].tenantId}"
+
+  # ---- root scope ----------------------------------------------------------------------------
+
+  - id: AZ-ROOT-SCOPE-ROLE-ASSIGNMENT
+    title: Role assignment at the tenant root scope
+    kind: misconfigured
+    lens: security
+    category: IAM
+    severity:
+      field: properties.roleDefinitionId
+      map:
+        /providers/Microsoft.Authorization/roleDefinitions/18d7d88d-d35e-4fb5-a5c3-7773c20a72d9: critical
+        /providers/Microsoft.Authorization/roleDefinitions/8e3af657-a8ff-443c-a75c-2fe8c4bcb635: critical
+      default: high
+    entity: role-assignment
+    why: An assignment at "/" covers every management group and subscription. The usual one is User Access Administrator left behind by a Global Administrator who elevated access and never turned it off.
+    fix: Remove root-scope assignments that are not deliberate; turn off "Access management for Azure resources" after each elevation. Reading this scope needs root-scope read rights, otherwise the rule is unknown.
+    refs: [NIST-800-53:AC-6, NIST-800-53:AC-2]
+    query:
+      protocol: http
+      path: /providers/Microsoft.Authorization/roleAssignments
+      params: { api-version: "2022-04-01", $filter: "atScope()" }
+      paging: none
+      key: name
+      name: properties.principalId
+    each: { field: properties.scope, op: eq, value: / }
+    evidence: "principal {properties.principalId} ({properties.principalType}) holds {properties.roleDefinitionId} at / since {properties.createdOn}"
+
+  # ---- reservations --------------------------------------------------------------------------
+
+  - id: AZ-RESERVATION-EXPIRY
+    title: Reservation expires soon and will not renew
+    kind: broken
+    lens: maintenance
+    category: CST
+    severity:
+      daysLeft: properties.expiryDateTime
+      ranges: [ { max: 7, value: high }, { max: 30, value: medium } ]
+      default: low
+    entity: reservation
+    why: When a reservation lapses without renewal the covered resources fall back to pay-as-you-go prices overnight.
+    fix: Decide whether the capacity is still needed; turn on auto-renew or buy the replacement before the expiry date.
+    deadline: properties.expiryDateTime
+    query:
+      protocol: http
+      path: /providers/Microsoft.Capacity/reservations
+      params: { api-version: "2022-11-01", $filter: "(properties/archived eq false)" }
+      paging: none
+      key: name
+      name: properties.displayName
+    each:
+      all:
+        - { field: properties.provisioningState, op: eq, value: Succeeded }
+        - { field: properties.renew, op: eq, value: false }
+        - { field: properties.expiryDateTime, op: until-lt, value: 60, threshold: azure.reservation-notice-days }
+    evidence: "{properties.displayName} ({properties.reservedResourceType}, {sku.name}) expires {properties.expiryDate}, renew off"
+
+  - id: AZ-RESERVATION-FAILED
+    title: Reservation is in a failed billing or provisioning state
+    kind: broken
+    lens: maintenance
+    category: CST
+    severity: high
+    entity: reservation
+    why: A reservation whose billing failed gives no discount while the organisation believes it is covered.
+    fix: Fix the payment method or billing scope and contact billing support to restore the reservation.
+    query:
+      protocol: http
+      path: /providers/Microsoft.Capacity/reservations
+      params: { api-version: "2022-11-01", $filter: "(properties/archived eq false)" }
+      paging: none
+      key: name
+      name: properties.displayName
+    each: { field: properties.provisioningState, op: in, value: [BillingFailed, Failed] }
+    evidence: "{properties.displayName}: {properties.provisioningState}"
+
+  # ---- tenant service health -----------------------------------------------------------------
+  # Tenant-level events cover services scoped to the tenant; subscription-level service health is
+  # in the backlog. queryStartTime is set far back because the default (last 3 days of updates)
+  # drops active events that have not been updated recently.
+
+  - id: AZ-HEALTH-SERVICE-ISSUE
+    title: Active Azure service issue affecting the tenant
+    kind: broken
+    lens: maintenance
+    category: AVL
+    severity: high
+    entity: health-event
+    refresh: 1h
+    why: Knowing early that a failure is on the provider's side saves hours of local troubleshooting and lets users be told.
+    fix: Follow the event's updates and recommended actions; fail over if the impact is long.
+    query:
+      protocol: http
+      path: /providers/Microsoft.ResourceHealth/events
+      params: { api-version: "2025-05-01", queryStartTime: "1/1/2024" }
+      paging: none
+      key: name
+      name: properties.title
+    each:
+      all:
+        - { field: properties.eventType, op: eq, value: ServiceIssue }
+        - { field: properties.status, op: eq, value: Active }
+    evidence: "{name}: {properties.title} (since {properties.impactStartTime})"
+
+  - id: AZ-HEALTH-PLANNED-MAINTENANCE
+    title: Planned Azure maintenance is coming up
+    kind: broken
+    lens: maintenance
+    category: AVL
+    severity:
+      daysLeft: properties.impactStartTime
+      ranges: [ { max: 2, value: high }, { max: 7, value: medium } ]
+      default: low
+    entity: health-event
+    refresh: 6h
+    why: Maintenance only helps if someone plans around it - change freezes, failover tests and user notices need lead time.
+    fix: Check the impacted services and regions, and schedule or reschedule work around the window.
+    deadline: properties.impactStartTime
+    query:
+      protocol: http
+      path: /providers/Microsoft.ResourceHealth/events
+      params: { api-version: "2025-05-01", queryStartTime: "1/1/2024" }
+      paging: none
+      key: name
+      name: properties.title
+    each:
+      all:
+        - { field: properties.eventType, op: eq, value: PlannedMaintenance }
+        - { field: properties.status, op: eq, value: Active }
+        - { field: properties.impactStartTime, op: until-lt, value: 14, threshold: azure.maintenance-notice-days }
+    evidence: "{name}: {properties.title} starts {properties.impactStartTime}"
+
+  - id: AZ-HEALTH-SECURITY-ADVISORY
+    title: Active Azure security advisory for the tenant
+    kind: broken
+    lens: security
+    category: CFG
+    severity: high
+    entity: health-event
+    refresh: 6h
+    why: Security advisories announce issues that may need action on the customer side (credential rotation, configuration change).
+    fix: Read the advisory (sensitive details need the fetchEventDetails permission) and carry out its recommended actions.
+    refs: [NIST-800-53:SI-5]
+    query:
+      protocol: http
+      path: /providers/Microsoft.ResourceHealth/events
+      params: { api-version: "2025-05-01", queryStartTime: "1/1/2024" }
+      paging: none
+      key: name
+      name: properties.title
+    each:
+      all:
+        - { field: properties.eventType, op: eq, value: SecurityAdvisory }
+        - { field: properties.status, op: eq, value: Active }
+    evidence: "{name}: {properties.title}"
+
+  - id: AZ-HEALTH-RETIREMENT
+    title: Azure service or feature retirement announced
+    kind: broken
+    lens: maintenance
+    category: LCM
+    severity: medium
+    entity: health-event
+    refresh: 7d
+    why: Retirements give months of notice that are easy to waste; whatever still depends on the retired feature stops on the date.
+    fix: Inventory what uses the retiring feature and plan the migration now.
+    refs: [NIST-800-53:SA-22]
+    query:
+      protocol: http
+      path: /providers/Microsoft.ResourceHealth/events
+      params: { api-version: "2025-05-01", queryStartTime: "1/1/2024" }
+      paging: none
+      key: name
+      name: properties.title
+    each:
+      all:
+        - { field: properties.eventSubType, op: eq, value: Retirement }
+        - { field: properties.status, op: eq, value: Active }
+    evidence: "{name}: {properties.title}"
+
+  - id: AZ-HEALTH-ACTION-RECOMMENDED
+    title: Azure health advisory asks for customer action
+    kind: broken
+    lens: maintenance
+    category: CFG
+    severity: medium
+    entity: health-event
+    refresh: 1d
+    why: Events tagged "Action Recommended" need something done on the customer side to avoid disruption.
+    fix: Carry out the recommended actions listed in the event.
+    query:
+      protocol: http
+      path: /providers/Microsoft.ResourceHealth/events
+      params: { api-version: "2025-05-01", queryStartTime: "1/1/2024" }
+      paging: none
+      key: name
+      name: properties.title
+    each:
+      all:
+        - { field: properties.eventTags, op: contains, value: Action Recommended }
+        - { field: properties.status, op: eq, value: Active }
+    evidence: "{name}: {properties.title} ({properties.eventType})"

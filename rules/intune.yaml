@@ -1,0 +1,949 @@
+schema: keeper.rules/1
+system: intune
+name: Microsoft Intune
+integration: graph
+
+# Generic rules for any Microsoft Intune tenant, read through Microsoft Graph (GET only).
+# The Intune Graph API needs an active Intune licence. Permissions per query:
+# docs\backlog\microsoft-cloud.md, section "Graph permissions".
+#
+# Queries never select secret properties: managed-device activation-lock bypass codes,
+# VPP token strings, enrolment profile token values, Wi-Fi passwords and Surface Hub
+# device-account passwords are left out of every $select below.
+
+defaults:
+  lens: both
+  refresh: 1d
+
+rules:
+  # ======================================================================= managed devices ===
+  - id: INTUNE-DEVICE-NONCOMPLIANT
+    title: Active managed device is not compliant
+    kind: misconfigured
+    category: CFG
+    severity:
+      field: complianceState
+      map: { noncompliant: medium, error: medium, conflict: low }
+      default: medium
+    entity: managed-device
+    lens: security
+    why: "A noncompliant device fails the checks the organisation defined (encryption, OS level, threat level); if Conditional Access requires compliance it is blocked, otherwise it reaches data anyway. Only devices that synced recently are counted, stale records are handled by INTUNE-DEVICE-STALE."
+    fix: "Open the device's compliance report, fix the failing setting or retire the device; for error and conflict states fix the overlapping policies."
+    refs: ["NIST-800-53:CM-6", "NIST-800-53:AC-19"]
+    query:
+      protocol: graph
+      path: /deviceManagement/managedDevices
+      select: [id, deviceName, operatingSystem, osVersion, complianceState, lastSyncDateTime, enrolledDateTime, jailBroken, isEncrypted, managedDeviceOwnerType, managementAgent, userPrincipalName, managementCertificateExpirationDate, partnerReportedThreatState, androidSecurityPatchLevel, complianceGracePeriodExpirationDateTime, serialNumber, model]
+      key: id
+      name: deviceName
+    each:
+      all:
+        - { field: complianceState, op: in, value: [noncompliant, error, conflict] }
+        - { field: lastSyncDateTime, op: age-lt, value: 30, threshold: intune.device-stale-days }
+    evidence: "{deviceName} ({operatingSystem} {osVersion}, {userPrincipalName}): {complianceState}, last sync {lastSyncDateTime}"
+
+  - id: INTUNE-DEVICE-STALE
+    title: Managed device has not synced for a long time
+    kind: misconfigured
+    category: HYG
+    severity: low
+    entity: managed-device
+    why: "A device that stopped checking in keeps its last compliance state and licence, skews every report and may be lost or wiped already."
+    fix: "Confirm with the user; retire or delete the record, and set a device clean-up rule so stale records go automatically."
+    refs: ["NIST-800-53:CM-8(3)"]
+    query:
+      protocol: graph
+      path: /deviceManagement/managedDevices
+      select: [id, deviceName, operatingSystem, osVersion, complianceState, lastSyncDateTime, enrolledDateTime, jailBroken, isEncrypted, managedDeviceOwnerType, managementAgent, userPrincipalName, managementCertificateExpirationDate, partnerReportedThreatState, androidSecurityPatchLevel, complianceGracePeriodExpirationDateTime, serialNumber, model]
+      key: id
+      name: deviceName
+    each: { field: lastSyncDateTime, op: age-gt, value: 30, threshold: intune.device-stale-days }
+    evidence: "{deviceName} ({operatingSystem}, {managedDeviceOwnerType}, {userPrincipalName}): last sync {lastSyncDateTime}"
+
+  - id: INTUNE-DEVICE-JAILBROKEN
+    title: Managed device is jailbroken or rooted
+    kind: broken
+    category: CFG
+    severity: high
+    entity: managed-device
+    lens: security
+    why: "A rooted or jailbroken device has lost the platform's sandboxing, so app protection and stored credentials can no longer be trusted."
+    fix: "Block the device through compliance, wipe corporate data and re-provision it."
+    refs: ["NIST-800-53:AC-19", "NIST-800-53:SI-7"]
+    query:
+      protocol: graph
+      path: /deviceManagement/managedDevices
+      select: [id, deviceName, operatingSystem, osVersion, complianceState, lastSyncDateTime, enrolledDateTime, jailBroken, isEncrypted, managedDeviceOwnerType, managementAgent, userPrincipalName, managementCertificateExpirationDate, partnerReportedThreatState, androidSecurityPatchLevel, complianceGracePeriodExpirationDateTime, serialNumber, model]
+      key: id
+      name: deviceName
+    each: { field: jailBroken, op: eq, value: 'True' }
+    evidence: "{deviceName} ({operatingSystem} {osVersion}, {userPrincipalName}): jailBroken {jailBroken}"
+
+  - id: INTUNE-DEVICE-NOT-ENCRYPTED
+    title: Active managed device is not encrypted
+    kind: misconfigured
+    category: CFG
+    severity: medium
+    entity: managed-device
+    lens: security
+    why: "A lost or stolen unencrypted device gives away its cached mail, files and tokens to whoever holds it."
+    fix: "Deploy a disk-encryption policy (BitLocker on Windows, FileVault on macOS) with key escrow, require encryption in compliance, and check why the device did not encrypt."
+    refs: ["NIST-800-53:SC-28", "NIST-800-53:AC-19"]
+    query:
+      protocol: graph
+      path: /deviceManagement/managedDevices
+      select: [id, deviceName, operatingSystem, osVersion, complianceState, lastSyncDateTime, enrolledDateTime, jailBroken, isEncrypted, managedDeviceOwnerType, managementAgent, userPrincipalName, managementCertificateExpirationDate, partnerReportedThreatState, androidSecurityPatchLevel, complianceGracePeriodExpirationDateTime, serialNumber, model]
+      key: id
+      name: deviceName
+    each:
+      all:
+        - { field: isEncrypted, op: eq, value: false }
+        - { field: lastSyncDateTime, op: age-lt, value: 30, threshold: intune.device-stale-days }
+    evidence: "{deviceName} ({operatingSystem} {osVersion}, {userPrincipalName}): not encrypted, last sync {lastSyncDateTime}"
+
+  - id: INTUNE-DEVICE-NO-PRIMARY-USER
+    title: Corporate managed device has no primary user
+    kind: missing
+    category: HYG
+    severity: low
+    entity: managed-device
+    why: "Without a primary user nobody is accountable for the device, user-targeted apps and policies miss it, and lost devices cannot be traced. Shared and kiosk devices are expected here; record them as accepted."
+    fix: "Set the primary user, or tag the device as shared (category or enrolment profile) so it is reviewed as such."
+    refs: ["NIST-800-53:CM-8"]
+    query:
+      protocol: graph
+      path: /deviceManagement/managedDevices
+      select: [id, deviceName, operatingSystem, osVersion, complianceState, lastSyncDateTime, enrolledDateTime, jailBroken, isEncrypted, managedDeviceOwnerType, managementAgent, userPrincipalName, managementCertificateExpirationDate, partnerReportedThreatState, androidSecurityPatchLevel, complianceGracePeriodExpirationDateTime, serialNumber, model]
+      key: id
+      name: deviceName
+    each:
+      all:
+        - { field: managedDeviceOwnerType, op: eq, value: company }
+        - { field: userPrincipalName, op: empty }
+    evidence: "{deviceName} ({operatingSystem}, serial {serialNumber}): no primary user"
+
+  - id: INTUNE-DEVICE-ANDROID-DEVICE-ADMIN
+    title: Android device is managed through legacy device administrator
+    kind: misconfigured
+    category: LCM
+    severity: medium
+    entity: managed-device
+    lens: security
+    why: "Device administrator management is deprecated by Google and no longer supported by Intune on devices with Google services; it gives weak control and no work-profile separation."
+    fix: "Re-enrol the device as Android Enterprise (work profile or fully managed) and block device administrator enrolment."
+    refs: ["NIST-800-53:AC-19", "NIST-800-53:SA-22"]
+    query:
+      protocol: graph
+      path: /deviceManagement/managedDevices
+      select: [id, deviceName, operatingSystem, osVersion, complianceState, lastSyncDateTime, enrolledDateTime, jailBroken, isEncrypted, managedDeviceOwnerType, managementAgent, userPrincipalName, managementCertificateExpirationDate, partnerReportedThreatState, androidSecurityPatchLevel, complianceGracePeriodExpirationDateTime, serialNumber, model]
+      key: id
+      name: deviceName
+    each:
+      all:
+        - { field: operatingSystem, op: eq, value: Android }
+        - { field: managementAgent, op: eq, value: mdm }
+    evidence: "{deviceName} (Android {osVersion}, {managedDeviceOwnerType}, {userPrincipalName}): management agent {managementAgent}"
+
+  - id: INTUNE-DEVICE-WINDOWS-UNSUPPORTED
+    title: Active Windows device runs a release past end of servicing
+    kind: misconfigured
+    category: LCM
+    severity: medium
+    entity: managed-device
+    why: "A Windows build out of servicing gets no security updates. The default pattern marks builds below Windows 11 23H2 (22631) as unsupported, which includes all Windows 10 builds unless they are on Extended Security Updates; tune it with the threshold as releases age."
+    fix: "Upgrade through a feature-update policy, or record the device as covered by Extended Security Updates."
+    refs: ["NIST-800-53:SI-2", "NIST-800-53:SA-22"]
+    query:
+      protocol: graph
+      path: /deviceManagement/managedDevices
+      select: [id, deviceName, operatingSystem, osVersion, complianceState, lastSyncDateTime, enrolledDateTime, jailBroken, isEncrypted, managedDeviceOwnerType, managementAgent, userPrincipalName, managementCertificateExpirationDate, partnerReportedThreatState, androidSecurityPatchLevel, complianceGracePeriodExpirationDateTime, serialNumber, model]
+      key: id
+      name: deviceName
+    each:
+      all:
+        - { field: operatingSystem, op: eq, value: Windows }
+        - { field: lastSyncDateTime, op: age-lt, value: 30, threshold: intune.device-stale-days }
+        - { field: osVersion, op: match, value: '^10\.0\.(\d{1,4}|1\d{4}|2[01]\d{3}|22[0-5]\d{2}|226[0-2]\d|22630)(\.|$)', threshold: intune.windows-unsupported-build-pattern }
+    evidence: "{deviceName} ({userPrincipalName}): Windows {osVersion}, last sync {lastSyncDateTime}"
+
+  - id: INTUNE-DEVICE-IOS-UNSUPPORTED
+    title: iPhone or iPad runs an iOS version that no longer gets security updates
+    kind: misconfigured
+    category: LCM
+    severity: medium
+    entity: managed-device
+    lens: security
+    why: "Old iOS majors stop receiving security fixes, including for actively exploited flaws. The default pattern treats majors below 18 as unsupported; tune it with the threshold."
+    fix: "Update the device, or block the old version with a minimum OS version in the compliance policy."
+    refs: ["NIST-800-53:SI-2"]
+    query:
+      protocol: graph
+      path: /deviceManagement/managedDevices
+      select: [id, deviceName, operatingSystem, osVersion, complianceState, lastSyncDateTime, enrolledDateTime, jailBroken, isEncrypted, managedDeviceOwnerType, managementAgent, userPrincipalName, managementCertificateExpirationDate, partnerReportedThreatState, androidSecurityPatchLevel, complianceGracePeriodExpirationDateTime, serialNumber, model]
+      key: id
+      name: deviceName
+    each:
+      all:
+        - { field: operatingSystem, op: match, value: '^(iOS|iPadOS)$' }
+        - { field: osVersion, op: match, value: '^([1-9]|1[0-7])(\.|$)', threshold: intune.ios-unsupported-version-pattern }
+    evidence: "{deviceName} ({userPrincipalName}): {operatingSystem} {osVersion}"
+
+  - id: INTUNE-DEVICE-ANDROID-UNSUPPORTED
+    title: Android device runs a version that no longer gets security updates
+    kind: misconfigured
+    category: LCM
+    severity: medium
+    entity: managed-device
+    lens: security
+    why: "Android versions outside the vendor patch window stay open to known exploits. The default pattern treats versions below 13 as unsupported; tune it with the threshold."
+    fix: "Update or replace the device; set a minimum OS version in the Android compliance policies."
+    refs: ["NIST-800-53:SI-2"]
+    query:
+      protocol: graph
+      path: /deviceManagement/managedDevices
+      select: [id, deviceName, operatingSystem, osVersion, complianceState, lastSyncDateTime, enrolledDateTime, jailBroken, isEncrypted, managedDeviceOwnerType, managementAgent, userPrincipalName, managementCertificateExpirationDate, partnerReportedThreatState, androidSecurityPatchLevel, complianceGracePeriodExpirationDateTime, serialNumber, model]
+      key: id
+      name: deviceName
+    each:
+      all:
+        - { field: operatingSystem, op: eq, value: Android }
+        - { field: osVersion, op: match, value: '^([1-9]|1[0-2])(\.|$)', threshold: intune.android-unsupported-version-pattern }
+    evidence: "{deviceName} ({userPrincipalName}): Android {osVersion}, patch level {androidSecurityPatchLevel}"
+
+  - id: INTUNE-DEVICE-MACOS-UNSUPPORTED
+    title: Mac runs a macOS version that no longer gets security updates
+    kind: misconfigured
+    category: LCM
+    severity: medium
+    entity: managed-device
+    lens: security
+    why: "Apple patches only the latest macOS releases. The default pattern treats versions below 14 as unsupported; tune it with the threshold."
+    fix: "Upgrade the Mac (managed software update) or set a minimum macOS version in compliance."
+    refs: ["NIST-800-53:SI-2"]
+    query:
+      protocol: graph
+      path: /deviceManagement/managedDevices
+      select: [id, deviceName, operatingSystem, osVersion, complianceState, lastSyncDateTime, enrolledDateTime, jailBroken, isEncrypted, managedDeviceOwnerType, managementAgent, userPrincipalName, managementCertificateExpirationDate, partnerReportedThreatState, androidSecurityPatchLevel, complianceGracePeriodExpirationDateTime, serialNumber, model]
+      key: id
+      name: deviceName
+    each:
+      all:
+        - { field: operatingSystem, op: eq, value: macOS }
+        - { field: osVersion, op: match, value: '^(10|11|12|13)(\.|$)', threshold: intune.macos-unsupported-version-pattern }
+    evidence: "{deviceName} ({userPrincipalName}): macOS {osVersion}"
+
+  - id: INTUNE-DEVICE-ANDROID-PATCH-OLD
+    title: Android device security patch level is old
+    kind: misconfigured
+    category: LCM
+    severity: medium
+    entity: managed-device
+    lens: security
+    why: "The monthly Android security patch closes kernel and media exploits; a patch level months behind means the vendor stopped updating the device or updates are blocked."
+    fix: "Install pending system updates; replace devices the vendor no longer patches; set a minimum security patch level in compliance."
+    refs: ["NIST-800-53:SI-2"]
+    query:
+      protocol: graph
+      path: /deviceManagement/managedDevices
+      select: [id, deviceName, operatingSystem, osVersion, complianceState, lastSyncDateTime, enrolledDateTime, jailBroken, isEncrypted, managedDeviceOwnerType, managementAgent, userPrincipalName, managementCertificateExpirationDate, partnerReportedThreatState, androidSecurityPatchLevel, complianceGracePeriodExpirationDateTime, serialNumber, model]
+      key: id
+      name: deviceName
+    each:
+      all:
+        - { field: operatingSystem, op: eq, value: Android }
+        - { field: androidSecurityPatchLevel, op: age-gt, value: 90, threshold: intune.android-patch-max-age-days }
+    evidence: "{deviceName} ({userPrincipalName}): Android {osVersion}, security patch {androidSecurityPatchLevel}"
+
+  - id: INTUNE-DEVICE-MGMT-CERT-EXPIRY
+    title: Device management certificate expires soon
+    kind: broken
+    category: PKI
+    severity:
+      daysLeft: managementCertificateExpirationDate
+      ranges: [ { max: 0, value: critical }, { max: 7, value: high }, { max: 14, value: medium } ]
+      default: low
+    deadline: managementCertificateExpirationDate
+    entity: managed-device
+    why: "The MDM certificate renews itself only while the device checks in; once it expires the device drops out of management and must be re-enrolled."
+    fix: "Get the device to sync before the date (or re-enrol it); find out why it stopped renewing."
+    refs: ["NIST-800-53:SC-17"]
+    query:
+      protocol: graph
+      path: /deviceManagement/managedDevices
+      select: [id, deviceName, operatingSystem, osVersion, complianceState, lastSyncDateTime, enrolledDateTime, jailBroken, isEncrypted, managedDeviceOwnerType, managementAgent, userPrincipalName, managementCertificateExpirationDate, partnerReportedThreatState, androidSecurityPatchLevel, complianceGracePeriodExpirationDateTime, serialNumber, model]
+      key: id
+      name: deviceName
+    each:
+      all:
+        - { field: managementCertificateExpirationDate, op: until-lt, value: 30, threshold: intune.mgmt-cert-notice-days }
+        - { field: managementCertificateExpirationDate, op: age-lt, value: 365 }
+    evidence: "{deviceName} ({operatingSystem}, {userPrincipalName}): management certificate ends {managementCertificateExpirationDate}, last sync {lastSyncDateTime}"
+
+  - id: INTUNE-DEVICE-THREAT-REPORTED
+    title: Threat-defence partner reports the device as compromised or at risk
+    kind: broken
+    category: CFG
+    severity:
+      field: partnerReportedThreatState
+      map: { compromised: critical, highSeverity: high, mediumSeverity: medium }
+      default: medium
+    entity: managed-device
+    lens: security
+    why: "The Mobile Threat Defense or Defender for Endpoint partner found malware, a malicious network or a compromise on the device."
+    fix: "Investigate in the threat-defence console, block the device through compliance and remediate or wipe it."
+    refs: ["NIST-800-53:SI-3", "NIST-800-53:IR-4"]
+    query:
+      protocol: graph
+      path: /deviceManagement/managedDevices
+      select: [id, deviceName, operatingSystem, osVersion, complianceState, lastSyncDateTime, enrolledDateTime, jailBroken, isEncrypted, managedDeviceOwnerType, managementAgent, userPrincipalName, managementCertificateExpirationDate, partnerReportedThreatState, androidSecurityPatchLevel, complianceGracePeriodExpirationDateTime, serialNumber, model]
+      key: id
+      name: deviceName
+    each: { field: partnerReportedThreatState, op: in, value: [compromised, highSeverity, mediumSeverity] }
+    evidence: "{deviceName} ({operatingSystem}, {userPrincipalName}): threat state {partnerReportedThreatState}"
+
+  - id: INTUNE-DEVICE-GRACE-ENDING
+    title: Device compliance grace period is about to end
+    kind: broken
+    category: CFG
+    severity: low
+    deadline: complianceGracePeriodExpirationDateTime
+    entity: managed-device
+    why: "When the grace period ends the device turns noncompliant and Conditional Access starts blocking the user."
+    fix: "Fix the failing compliance setting before the date or tell the user what will happen."
+    refs: ["NIST-800-53:CM-6"]
+    query:
+      protocol: graph
+      path: /deviceManagement/managedDevices
+      select: [id, deviceName, operatingSystem, osVersion, complianceState, lastSyncDateTime, enrolledDateTime, jailBroken, isEncrypted, managedDeviceOwnerType, managementAgent, userPrincipalName, managementCertificateExpirationDate, partnerReportedThreatState, androidSecurityPatchLevel, complianceGracePeriodExpirationDateTime, serialNumber, model]
+      key: id
+      name: deviceName
+    each:
+      all:
+        - { field: complianceState, op: eq, value: inGracePeriod }
+        - { field: complianceGracePeriodExpirationDateTime, op: until-lt, value: 3, threshold: intune.grace-notice-days }
+    evidence: "{deviceName} ({userPrincipalName}): grace period ends {complianceGracePeriodExpirationDateTime}"
+
+  # =================================================================== compliance policies ===
+  - id: INTUNE-COMPLIANCE-NONE
+    title: No device compliance policy exists
+    kind: missing
+    category: CFG
+    severity: high
+    entity: tenant
+    lens: security
+    why: "Without compliance policies no device is ever judged, so 'require compliant device' in Conditional Access means nothing and encryption, OS level and threat level go unchecked."
+    fix: "Create compliance policies per platform in use (Windows, iOS/iPadOS, Android, macOS) and assign them to all managed devices."
+    refs: [CIS-M365-4.1, "NIST-800-53:CM-6"]
+    query:
+      protocol: graph
+      path: /deviceManagement/deviceCompliancePolicies
+      expand: assignments
+      key: id
+      name: displayName
+    count: none
+    evidence: "no device compliance policy"
+
+  - id: INTUNE-COMPLIANCE-UNASSIGNED
+    title: Compliance policy is not assigned to anyone
+    kind: misconfigured
+    category: HYG
+    severity: low
+    entity: compliance-policy
+    why: "An unassigned compliance policy evaluates nothing; it usually means the intended policy was never rolled out."
+    fix: "Assign the policy to the device or user groups it was written for, or delete it."
+    refs: ["NIST-800-53:CM-6"]
+    query:
+      protocol: graph
+      path: /deviceManagement/deviceCompliancePolicies
+      expand: assignments
+      key: id
+      name: displayName
+    each: { field: assignments, op: empty }
+    evidence: "{displayName}: no assignment"
+
+  - id: INTUNE-COMPLIANCE-WINDOWS-NONE-WIDE
+    title: No Windows compliance policy reaches more than a handful of devices
+    kind: missing
+    category: CFG
+    severity: medium
+    entity: tenant
+    lens: security
+    why: "When the only Windows compliance policies evaluate a pilot group, the rest of the estate is never compliance-checked (and, with 'mark devices with no policy as compliant', is reported compliant). A policy counts if it is a Windows 10/11 compliance policy and at least N devices report against it as compliant, failed or in error. Graph gives no total, so a policy whose devices are spread thinly over the three states may not count (see backlog)."
+    fix: "Assign a Windows compliance baseline to all managed Windows devices; keep pilot policies for testing only."
+    refs: [CIS-M365-4.1, "NIST-800-53:CM-6"]
+    query:
+      protocol: graph
+      path: /deviceManagement/deviceCompliancePolicies
+      expand: deviceStatusOverview
+      key: id
+      name: displayName
+    count:
+      op: lt
+      value: 1
+      where:
+        all:
+          - { field: bitLockerEnabled, op: exists }
+          - any:
+              - { field: deviceStatusOverview.successCount, op: ge, value: 10, threshold: intune.compliance-min-devices }
+              - { field: deviceStatusOverview.failedCount, op: ge, value: 10, threshold: intune.compliance-min-devices }
+              - { field: deviceStatusOverview.errorCount, op: ge, value: 10, threshold: intune.compliance-min-devices }
+    evidence: "{count} Windows compliance policies reach the estate, among {rows} compliance policies"
+
+  - id: INTUNE-COMPLIANCE-SHORT-PIN
+    title: Compliance policy accepts a short device PIN
+    kind: misconfigured
+    category: AUT
+    severity: medium
+    entity: compliance-policy
+    lens: security
+    why: "A 4-digit PIN is guessed in minutes on a lost device and unlocks everything cached on it. Read from the beta API so that Android Enterprise fully managed policies (beta-only type) are included."
+    fix: "Require at least a 6-digit PIN (or an alphanumeric password) in every mobile compliance policy."
+    refs: ["NIST-800-53:IA-5(1)", "NIST-800-53:AC-19"]
+    query:
+      protocol: graph
+      version: beta
+      path: /deviceManagement/deviceCompliancePolicies
+      key: id
+      name: displayName
+    each:
+      any:
+        - all:
+            - { field: passwordRequired, op: eq, value: true }
+            - { field: passwordMinimumLength, op: lt, value: 6, threshold: intune.pin-min-length }
+        - all:
+            - { field: passcodeRequired, op: eq, value: true }
+            - { field: passcodeMinimumLength, op: lt, value: 6, threshold: intune.pin-min-length }
+    evidence: "{displayName}: minimum length {passwordMinimumLength}{passcodeMinimumLength}"
+
+  - id: INTUNE-COMPLIANCE-NO-ROOT-CHECK
+    title: Mobile compliance policy does not block rooted or jailbroken devices
+    kind: misconfigured
+    category: CFG
+    severity: medium
+    entity: compliance-policy
+    lens: security
+    why: "Without a root or jailbreak check (or Play Integrity on Android) a compromised device can stay compliant. Read from the beta API so that all Android policy types are included."
+    fix: "Turn on 'block jailbroken/rooted devices' and, on Android, the Play Integrity basic integrity check."
+    refs: ["NIST-800-53:AC-19", "NIST-800-53:SI-7"]
+    query:
+      protocol: graph
+      version: beta
+      path: /deviceManagement/deviceCompliancePolicies
+      key: id
+      name: displayName
+    each:
+      all:
+        - { field: securityBlockJailbrokenDevices, op: eq, value: false }
+        - any:
+            - { field: securityRequireSafetyNetAttestationBasicIntegrity, op: absent }
+            - { field: securityRequireSafetyNetAttestationBasicIntegrity, op: eq, value: false }
+    evidence: "{displayName}: block rooted {securityBlockJailbrokenDevices}, Play Integrity {securityRequireSafetyNetAttestationBasicIntegrity}"
+
+  - id: INTUNE-COMPLIANCE-WINDOWS-NO-ENCRYPTION
+    title: Windows compliance policy requires neither BitLocker nor encryption
+    kind: misconfigured
+    category: CFG
+    severity: medium
+    entity: compliance-policy
+    lens: security
+    why: "A Windows compliance policy that ignores disk encryption marks unencrypted laptops compliant."
+    fix: "Require BitLocker (device health) or storage encryption in the Windows compliance policy."
+    refs: ["NIST-800-53:SC-28"]
+    query:
+      protocol: graph
+      version: beta
+      path: /deviceManagement/deviceCompliancePolicies
+      key: id
+      name: displayName
+    each:
+      all:
+        - { field: bitLockerEnabled, op: eq, value: false }
+        - { field: storageRequireEncryption, op: eq, value: false }
+    evidence: "{displayName}: bitLockerEnabled {bitLockerEnabled}, storageRequireEncryption {storageRequireEncryption}"
+
+  # =========================================================== configuration profiles ===
+  - id: INTUNE-CONFIG-UNASSIGNED
+    title: Device configuration profile is not assigned
+    kind: misconfigured
+    category: HYG
+    severity: low
+    entity: configuration-profile
+    lens: maintenance
+    why: "Unassigned profiles do nothing and make it hard to see which settings really apply."
+    fix: "Assign the profile to its intended groups or delete it."
+    refs: ["NIST-800-53:CM-2"]
+    query:
+      protocol: graph
+      path: /deviceManagement/deviceConfigurations
+      expand: assignments
+      key: id
+      name: displayName
+    each: { field: assignments, op: empty }
+    evidence: "{displayName}: no assignment"
+
+  - id: INTUNE-CONFIG-DEVICES-IN-ERROR
+    title: Devices report errors applying configuration profiles
+    kind: broken
+    category: CFG
+    severity: medium
+    entity: configuration-summary
+    why: "Devices in error did not get the settings they were assigned (security baselines, Wi-Fi, certificates), so they differ from what the console shows."
+    fix: "Open the per-profile device status, fix the failing setting or the device, and reapply."
+    refs: ["NIST-800-53:CM-6"]
+    query:
+      protocol: graph
+      path: /deviceManagement/deviceConfigurationDeviceStateSummaries
+      key: id
+    each: { field: errorDeviceCount, op: gt, value: 0, threshold: intune.config-error-devices-max }
+    evidence: "{errorDeviceCount} device(s) in error, {nonCompliantDeviceCount} noncompliant, {conflictDeviceCount} in conflict"
+
+  - id: INTUNE-CONFIG-DEVICES-IN-CONFLICT
+    title: Devices report conflicting configuration profiles
+    kind: misconfigured
+    category: CFG
+    severity: low
+    entity: configuration-summary
+    why: "Two profiles set the same setting differently; which one wins is undefined, so devices end up in different states."
+    fix: "Find the overlapping profiles in the device status and merge or exclude them."
+    refs: ["NIST-800-53:CM-6"]
+    query:
+      protocol: graph
+      path: /deviceManagement/deviceConfigurationDeviceStateSummaries
+      key: id
+    each: { field: conflictDeviceCount, op: gt, value: 0, threshold: intune.config-conflict-devices-max }
+    evidence: "{conflictDeviceCount} device(s) in conflict"
+
+  # ======================================================================= tenant settings ===
+  - id: INTUNE-NO-POLICY-MEANS-COMPLIANT
+    title: Devices with no compliance policy are reported compliant
+    kind: misconfigured
+    category: CFG
+    severity: medium
+    entity: intune-tenant
+    lens: security
+    why: "With this setting off, any device that no compliance policy targets is called compliant and passes 'require compliant device' Conditional Access."
+    fix: "Set 'Mark devices with no compliance policy assigned as' to Not compliant."
+    refs: [CIS-M365-4.1, "NIST-800-53:CM-6"]
+    query:
+      protocol: graph
+      path: /deviceManagement
+      key: id
+    each: { field: settings.secureByDefault, op: eq, value: false }
+    evidence: "settings.secureByDefault = {settings.secureByDefault}"
+
+  - id: INTUNE-COMPLIANCE-VALIDITY-LONG
+    title: Devices stay compliant for a long time without checking in
+    kind: misconfigured
+    category: CFG
+    severity: low
+    entity: intune-tenant
+    lens: security
+    why: "The compliance validity period decides how long a device that stopped checking in keeps its compliant status."
+    fix: "Set the compliance status validity period to 30 days or less."
+    refs: [CIS-M365-4.1, "NIST-800-53:CM-6"]
+    query:
+      protocol: graph
+      path: /deviceManagement
+      key: id
+    each: { field: settings.deviceComplianceCheckinThresholdDays, op: gt, value: 30, threshold: intune.compliance-validity-max-days }
+    evidence: "deviceComplianceCheckinThresholdDays = {settings.deviceComplianceCheckinThresholdDays}"
+
+  - id: INTUNE-SUBSCRIPTION-NOT-ACTIVE
+    title: Intune subscription is not active
+    kind: broken
+    category: LCM
+    severity:
+      field: subscriptionState
+      map: { warning: high, disabled: critical, deleted: critical, blocked: critical, lockedOut: critical, pending: medium }
+      default: high
+    entity: intune-tenant
+    lens: maintenance
+    why: "When the Intune subscription leaves the active state, management stops: no policy changes, no new enrolments, and eventually no managed devices."
+    fix: "Check the Intune licences and subscription in the Microsoft 365 admin centre and renew or reassign them."
+    refs: ["NIST-800-53:SA-4"]
+    query:
+      protocol: graph
+      path: /deviceManagement
+      key: id
+    each: { field: subscriptionState, op: ne, value: active }
+    evidence: "Intune subscriptionState = {subscriptionState}"
+
+  # ================================================================== enrolment restrictions ===
+  - id: INTUNE-ENROLL-ANDROID-DEVICE-ADMIN-ALLOWED
+    title: Android device administrator enrolment is allowed
+    kind: misconfigured
+    category: CFG
+    severity: medium
+    entity: enrollment-configuration
+    lens: security
+    why: "Device administrator is the deprecated Android management mode; allowing it lets users enrol devices outside Android Enterprise with weak control."
+    fix: "Block the Android device administrator platform in every enrolment restriction and move users to Android Enterprise."
+    refs: [CIS-M365-4.2, "NIST-800-53:AC-19"]
+    query:
+      protocol: graph
+      path: /deviceManagement/deviceEnrollmentConfigurations
+      key: id
+      name: displayName
+    each:
+      all:
+        - { field: androidRestriction, op: exists }
+        - { field: androidRestriction.platformBlocked, op: eq, value: false }
+    evidence: "{displayName} (priority {priority}): Android device administrator platform not blocked"
+
+  - id: INTUNE-ENROLL-PERSONAL-ALLOWED
+    title: Enrolment restriction allows personally owned devices
+    kind: misconfigured
+    category: CFG
+    severity: medium
+    entity: enrollment-configuration
+    lens: security
+    why: "When personal devices can enrol with full MDM, the organisation manages (and is liable for) private phones and PCs; personal devices are better served by app protection."
+    fix: "Block personally owned enrolment for each platform (or the whole platform if unused) and offer app protection policies instead."
+    refs: [CIS-M365-4.2, "NIST-800-53:AC-19", "NIST-800-53:AC-20(3)"]
+    query:
+      protocol: graph
+      path: /deviceManagement/deviceEnrollmentConfigurations
+      key: id
+      name: displayName
+    each:
+      any:
+        - all:
+            - { field: windowsRestriction, op: exists }
+            - { field: windowsRestriction.platformBlocked, op: eq, value: false }
+            - { field: windowsRestriction.personalDeviceEnrollmentBlocked, op: eq, value: false }
+        - all:
+            - { field: iosRestriction, op: exists }
+            - { field: iosRestriction.platformBlocked, op: eq, value: false }
+            - { field: iosRestriction.personalDeviceEnrollmentBlocked, op: eq, value: false }
+        - all:
+            - { field: macOSRestriction, op: exists }
+            - { field: macOSRestriction.platformBlocked, op: eq, value: false }
+            - { field: macOSRestriction.personalDeviceEnrollmentBlocked, op: eq, value: false }
+        - all:
+            - { field: androidRestriction, op: exists }
+            - { field: androidRestriction.platformBlocked, op: eq, value: false }
+            - { field: androidRestriction.personalDeviceEnrollmentBlocked, op: eq, value: false }
+    evidence: "{displayName} (priority {priority}): personal blocked - Windows {windowsRestriction.personalDeviceEnrollmentBlocked}, iOS {iosRestriction.personalDeviceEnrollmentBlocked}, macOS {macOSRestriction.personalDeviceEnrollmentBlocked}, Android {androidRestriction.personalDeviceEnrollmentBlocked}"
+
+  # ========================================================= Apple and Android connections ===
+  - id: INTUNE-APNS-MISSING
+    title: No Apple MDM push certificate is configured
+    kind: missing
+    category: CFG
+    severity: medium
+    entity: intune-tenant
+    why: "Without the Apple push certificate no iPhone, iPad or Mac can be enrolled or managed; iOS users fall back to unmanaged devices. Tenants with no Apple devices can accept this finding."
+    fix: "Create the Apple MDM push certificate with a shared, organisation-owned Apple ID and record that ID for the yearly renewal."
+    refs: ["NIST-800-53:AC-19"]
+    query:
+      protocol: graph
+      path: /deviceManagement
+      select: [id]
+      expand: applePushNotificationCertificate
+      key: id
+    each: { field: applePushNotificationCertificate, op: absent }
+    evidence: "no Apple push notification certificate"
+
+  - id: INTUNE-APNS-EXPIRY
+    title: Apple MDM push certificate expires soon
+    kind: broken
+    category: PKI
+    severity:
+      daysLeft: expirationDateTime
+      ranges: [ { max: 0, value: critical }, { max: 14, value: high }, { max: 30, value: medium } ]
+      default: low
+    deadline: expirationDateTime
+    entity: apple-push-certificate
+    why: "If the push certificate expires every Apple device loses management; renewing it with a different Apple ID forces every device to re-enrol."
+    fix: "Renew the certificate before the date with the same Apple ID that created it."
+    refs: ["NIST-800-53:SC-17"]
+    query:
+      protocol: graph
+      path: /deviceManagement/applePushNotificationCertificate
+      select: [id, topicIdentifier, expirationDateTime, lastModifiedDateTime]
+      key: id
+    each: { field: expirationDateTime, op: until-lt, value: 30, threshold: intune.apple-token-notice-days }
+    evidence: "Apple push certificate ends {expirationDateTime}"
+
+  - id: INTUNE-VPP-TOKEN-EXPIRY
+    title: Apple volume purchase (VPP) token expires soon
+    kind: broken
+    category: PKI
+    severity:
+      daysLeft: expirationDateTime
+      ranges: [ { max: 0, value: critical }, { max: 14, value: high }, { max: 30, value: medium } ]
+      default: low
+    deadline: expirationDateTime
+    entity: apple-token
+    why: "An expired VPP token stops app licence sync, so purchased apps stop installing and updating on managed Apple devices."
+    fix: "Download the renewed token from Apple Business or School Manager and upload it before the date."
+    refs: ["NIST-800-53:SA-4"]
+    query:
+      protocol: graph
+      path: /deviceAppManagement/vppTokens
+      select: [id, organizationName, vppTokenAccountType, expirationDateTime, lastSyncDateTime, state, lastSyncStatus]
+      key: id
+      name: organizationName
+    each: { field: expirationDateTime, op: until-lt, value: 30, threshold: intune.apple-token-notice-days }
+    evidence: "VPP token ends {expirationDateTime} (state {state})"
+
+  - id: INTUNE-VPP-TOKEN-UNHEALTHY
+    title: Apple volume purchase (VPP) token is invalid or failing to sync
+    kind: broken
+    category: HLT
+    severity: high
+    entity: apple-token
+    why: "A VPP token that is expired, invalid, claimed by another MDM or failing sync silently stops app delivery to Apple devices."
+    fix: "Re-upload a valid token; if it is assigned to another MDM, reclaim it in Apple Business Manager."
+    refs: ["NIST-800-53:SA-4"]
+    query:
+      protocol: graph
+      path: /deviceAppManagement/vppTokens
+      select: [id, organizationName, vppTokenAccountType, expirationDateTime, lastSyncDateTime, state, lastSyncStatus]
+      key: id
+      name: organizationName
+    each:
+      any:
+        - { field: state, op: ne, value: valid }
+        - { field: lastSyncStatus, op: eq, value: failed }
+    evidence: "VPP token state {state}, last sync {lastSyncStatus} at {lastSyncDateTime}"
+
+  - id: INTUNE-DEP-TOKEN-EXPIRY
+    title: Apple automated device enrolment token expires soon
+    kind: broken
+    category: PKI
+    severity:
+      daysLeft: tokenExpirationDateTime
+      ranges: [ { max: 0, value: critical }, { max: 14, value: high }, { max: 30, value: medium } ]
+      default: low
+    deadline: tokenExpirationDateTime
+    entity: apple-token
+    why: "When the automated device enrolment (ABM/ASM) token expires, new Apple devices no longer enrol automatically. Only exposed in the beta API."
+    fix: "Renew the server token in Apple Business or School Manager and upload it to Intune before the date."
+    refs: ["NIST-800-53:SA-4"]
+    query:
+      protocol: graph
+      version: beta
+      path: /deviceManagement/depOnboardingSettings
+      select: [id, tokenName, tokenExpirationDateTime, lastSuccessfulSyncDateTime, lastSyncErrorCode]
+      key: id
+      name: tokenName
+    each: { field: tokenExpirationDateTime, op: until-lt, value: 30, threshold: intune.apple-token-notice-days }
+    evidence: "{tokenName}: token ends {tokenExpirationDateTime}"
+
+  - id: INTUNE-DEP-SYNC-STALE
+    title: Apple automated device enrolment has not synced recently
+    kind: broken
+    category: HLT
+    severity: medium
+    entity: apple-token
+    why: "If the enrolment program token stops syncing, devices bought since then are unknown to Intune and enrol unmanaged. Only exposed in the beta API."
+    fix: "Run a sync; if it fails, check the token and the MDM server assignment in Apple Business Manager."
+    refs: ["NIST-800-53:CM-8"]
+    query:
+      protocol: graph
+      version: beta
+      path: /deviceManagement/depOnboardingSettings
+      select: [id, tokenName, tokenExpirationDateTime, lastSuccessfulSyncDateTime, lastSyncErrorCode]
+      key: id
+      name: tokenName
+    each: { field: lastSuccessfulSyncDateTime, op: age-gt, value: 7, threshold: intune.dep-sync-max-age-days }
+    evidence: "{tokenName}: last successful sync {lastSuccessfulSyncDateTime}, last error {lastSyncErrorCode}"
+
+  - id: INTUNE-MGP-CONSUMER-ACCOUNT
+    title: Managed Google Play is bound to a consumer Google account
+    kind: misconfigured
+    category: IAM
+    severity: high
+    entity: android-enterprise
+    lens: security
+    why: "The account that bound Managed Google Play owns the Android Enterprise binding; if it is a personal Gmail that is lost, locked or leaves with an employee, Android management goes with it. Only exposed in the beta API."
+    fix: "Move the binding to an organisation-owned account (managed Google domain or a shared, MFA-protected account) and document it."
+    refs: ["NIST-800-53:AC-2", "NIST-800-53:CP-2"]
+    query:
+      protocol: graph
+      version: beta
+      path: /deviceManagement/androidManagedStoreAccountEnterpriseSettings
+      select: [id, bindStatus, ownerUserPrincipalName, managedGooglePlayEnterpriseType, lastAppSyncStatus, lastAppSyncDateTime]
+      key: id
+    each: { field: ownerUserPrincipalName, op: match, value: '@(gmail|googlemail)\.com$', threshold: intune.consumer-account-pattern }
+    evidence: "Managed Google Play owner {ownerUserPrincipalName} ({bindStatus})"
+
+  - id: INTUNE-MGP-SYNC-FAILED
+    title: Managed Google Play app sync is failing
+    kind: broken
+    category: HLT
+    severity: high
+    entity: android-enterprise
+    why: "When the Managed Google Play sync fails, approved apps stop reaching Android devices and the binding may be broken. Only exposed in the beta API."
+    fix: "Check the binding and the owner account; resync, and rebind if the credentials are no longer valid."
+    refs: ["NIST-800-53:SI-4"]
+    query:
+      protocol: graph
+      version: beta
+      path: /deviceManagement/androidManagedStoreAccountEnterpriseSettings
+      select: [id, bindStatus, ownerUserPrincipalName, managedGooglePlayEnterpriseType, lastAppSyncStatus, lastAppSyncDateTime]
+      key: id
+    each: { field: lastAppSyncStatus, op: in, value: [credentialsNotValid, androidForWorkApiError, managementServiceError, unknownError] }
+    evidence: "Managed Google Play last app sync {lastAppSyncStatus} at {lastAppSyncDateTime}"
+
+  - id: INTUNE-ANDROID-PROFILE-TOKEN-EXPIRED
+    title: Corporate Android enrolment profile has no valid token
+    kind: misconfigured
+    category: HYG
+    severity: low
+    entity: enrollment-profile
+    why: "A fully managed or dedicated-device enrolment profile without a valid token cannot enrol devices; old test profiles pile up and nobody knows which one is in use. Only exposed in the beta API."
+    fix: "Renew the token on profiles still in use and delete the ones nobody uses."
+    refs: ["NIST-800-53:CM-8"]
+    query:
+      protocol: graph
+      version: beta
+      path: /deviceManagement/androidDeviceOwnerEnrollmentProfiles
+      select: [id, displayName, enrollmentMode, tokenCreationDateTime, tokenExpirationDateTime, enrolledDeviceCount]
+      key: id
+      name: displayName
+    each: { field: tokenExpirationDateTime, op: until-lt, value: 7, threshold: intune.enrollment-token-notice-days }
+    evidence: "{displayName} ({enrollmentMode}): token ends {tokenExpirationDateTime}, {enrolledDeviceCount} device(s) enrolled"
+
+  # ========================================================================= Autopilot ===
+  - id: INTUNE-AUTOPILOT-NO-PROFILE
+    title: Windows Autopilot device has no deployment profile
+    kind: missing
+    category: CFG
+    severity:
+      field: deploymentProfileAssignmentStatus
+      map: { failed: medium, notAssigned: low }
+      default: low
+    entity: autopilot-device
+    lens: maintenance
+    why: "A registered Autopilot device without a profile runs the consumer out-of-box experience at first boot and ends up unmanaged or wrongly configured. The profile status is only exposed in the beta API."
+    fix: "Add the device to a group targeted by a deployment profile (group tag or dynamic group) and check why assignment failed."
+    refs: ["NIST-800-53:CM-2"]
+    query:
+      protocol: graph
+      version: beta
+      path: /deviceManagement/windowsAutopilotDeviceIdentities
+      select: [id, serialNumber, model, manufacturer, groupTag, displayName, deploymentProfileAssignmentStatus, deploymentProfileAssignedDateTime, enrollmentState, lastContactedDateTime]
+      key: id
+      name: serialNumber
+    each: { field: deploymentProfileAssignmentStatus, op: in, value: [notAssigned, failed] }
+    evidence: "serial {serialNumber} ({model}, tag {groupTag}): profile {deploymentProfileAssignmentStatus}"
+
+  - id: INTUNE-AUTOPILOT-ENROLLMENT-FAILED
+    title: Windows Autopilot device failed to enrol
+    kind: broken
+    category: HLT
+    severity: medium
+    entity: autopilot-device
+    lens: maintenance
+    why: "A failed Autopilot enrolment leaves the device unusable or unmanaged until someone notices."
+    fix: "Read the enrolment status page and Autopilot diagnostics for the device, fix the cause and reset it."
+    refs: ["NIST-800-53:CM-2"]
+    query:
+      protocol: graph
+      version: beta
+      path: /deviceManagement/windowsAutopilotDeviceIdentities
+      select: [id, serialNumber, model, manufacturer, groupTag, displayName, deploymentProfileAssignmentStatus, deploymentProfileAssignedDateTime, enrollmentState, lastContactedDateTime]
+      key: id
+      name: serialNumber
+    each: { field: enrollmentState, op: eq, value: failed }
+    evidence: "serial {serialNumber} ({model}): enrolment {enrollmentState}, last contact {lastContactedDateTime}"
+
+  # ==================================================== threat defence and app protection ===
+  - id: INTUNE-MTD-NONE
+    title: No Defender for Endpoint or other threat-defence connector is set up
+    kind: missing
+    category: CFG
+    severity: medium
+    entity: intune-tenant
+    lens: security
+    why: "Without a threat-defence connector, compliance cannot use a device's threat level, so a device with active malware stays compliant."
+    fix: "Connect Microsoft Defender for Endpoint (or another Mobile Threat Defense partner) to Intune and turn on the platforms you manage."
+    refs: ["NIST-800-53:SI-3", "NIST-800-53:SI-4"]
+    query:
+      protocol: graph
+      path: /deviceManagement/mobileThreatDefenseConnectors
+      key: id
+    count: none
+    evidence: "no threat-defence connector"
+
+  - id: INTUNE-MTD-CONNECTOR-UNUSED
+    title: Threat-defence connector is connected but used by no platform
+    kind: misconfigured
+    category: CFG
+    severity: medium
+    entity: mtd-connector
+    lens: security
+    why: "A connected Defender for Endpoint (or partner) connector that is not switched on for Windows, iOS or Android feeds nothing into compliance; the integration looks done but protects nothing."
+    fix: "Enable the connector for each managed platform and add a 'maximum machine risk score' rule to the compliance policies."
+    refs: ["NIST-800-53:SI-3", "NIST-800-53:SI-4"]
+    query:
+      protocol: graph
+      path: /deviceManagement/mobileThreatDefenseConnectors
+      key: id
+    each:
+      all:
+        - { field: partnerState, op: in, value: [available, enabled] }
+        - { field: windowsEnabled, op: eq, value: false }
+        - { field: iosEnabled, op: eq, value: false }
+        - { field: androidEnabled, op: eq, value: false }
+    evidence: "connector {id}: state {partnerState}, Windows {windowsEnabled}, iOS {iosEnabled}, Android {androidEnabled}"
+
+  - id: INTUNE-MTD-CONNECTOR-UNHEALTHY
+    title: Threat-defence connector is unresponsive or in error
+    kind: broken
+    category: HLT
+    severity: high
+    entity: mtd-connector
+    lens: security
+    why: "When the partner stops sending heartbeats Intune ignores its data, so threat levels used by compliance go stale without any alert to users."
+    fix: "Check the connector in the Defender (or partner) console, renew the connection and confirm heartbeats resume."
+    refs: ["NIST-800-53:SI-4"]
+    query:
+      protocol: graph
+      path: /deviceManagement/mobileThreatDefenseConnectors
+      key: id
+    each:
+      any:
+        - { field: partnerState, op: in, value: [unresponsive, error] }
+        - all:
+            - { field: partnerState, op: eq, value: enabled }
+            - { field: lastHeartbeatDateTime, op: age-gt, value: 1, threshold: intune.mtd-heartbeat-max-age-days }
+    evidence: "connector {id}: state {partnerState}, last heartbeat {lastHeartbeatDateTime}"
+
+  - id: INTUNE-MAM-IOS-NONE
+    title: No app protection policy for iOS
+    kind: missing
+    category: CFG
+    severity: low
+    entity: intune-tenant
+    lens: security
+    why: "Without app protection, corporate mail and files on personal iPhones can be copied, backed up or saved anywhere."
+    fix: "Create an iOS app protection policy for Outlook, Teams and the Office apps and require it through Conditional Access."
+    refs: ["NIST-800-53:AC-19", "NIST-800-53:SC-28"]
+    query:
+      protocol: graph
+      path: /deviceAppManagement/iosManagedAppProtections
+      key: id
+      name: displayName
+    count: none
+    evidence: "no iOS app protection policy"
+
+  - id: INTUNE-MAM-ANDROID-NONE
+    title: No app protection policy for Android
+    kind: missing
+    category: CFG
+    severity: low
+    entity: intune-tenant
+    lens: security
+    why: "Without app protection, corporate data in apps on personal Android phones has no copy, save-as or backup controls."
+    fix: "Create an Android app protection policy for the Microsoft 365 apps and require it through Conditional Access."
+    refs: ["NIST-800-53:AC-19", "NIST-800-53:SC-28"]
+    query:
+      protocol: graph
+      path: /deviceAppManagement/androidManagedAppProtections
+      key: id
+      name: displayName
+    count: none
+    evidence: "no Android app protection policy"

@@ -50,13 +50,14 @@ public sealed class LoadRunHandler : IRequestHandler
 
         context.Execute(
             """
-            INSERT INTO run (run_id, instance, system, identity, host, started_at, finished_at, status, folder, manifest, loaded_at)
-            VALUES (:id, :instance, :system, :identity, :host, :started, :finished, :status, :folder, :manifest, :at);
+            INSERT INTO run (run_id, instance, system, identity, host, started_at, finished_at, status, folder, manifest, manifest_sha256, loaded_at)
+            VALUES (:id, :instance, :system, :identity, :host, :started, :finished, :status, :folder, :manifest, :sha, :at);
             """,
             (":id", manifest.RunId), (":instance", manifest.Instance), (":system", manifest.System),
             (":identity", manifest.Identity), (":host", manifest.Host), (":started", manifest.StartedAt),
             (":finished", manifest.FinishedAt), (":status", manifest.Status), (":folder", relative),
-            (":manifest", JsonSerializer.Serialize(manifest, JsonLines.Options)), (":at", context.NowText));
+            (":manifest", JsonSerializer.Serialize(manifest, JsonLines.Options)),
+            (":sha", Payload.Required(payload, "manifestSha256").ToLowerInvariant()), (":at", context.NowText));
 
         LoadRows(context, folder, manifest.RunId);
         LoadCoverage(context, folder, manifest.RunId);
@@ -156,12 +157,17 @@ public sealed class LoadRunHandler : IRequestHandler
         var keep = int.TryParse(context.Scalar("SELECT value FROM setting WHERE key = 'retention.runs';") as string, out var n) && n > 0
             ? n
             : DefaultRetention;
-        context.Execute(
-            """
-            DELETE FROM run WHERE instance = :instance AND system = :system AND run_id NOT IN (
-                SELECT run_id FROM run WHERE instance = :instance AND system = :system ORDER BY started_at DESC LIMIT :keep);
-            """,
-            (":instance", manifest.Instance), (":system", manifest.System), (":keep", keep));
+        // Old runs lose their bulk - rows, coverage, reported findings. The run row itself (with its manifest
+        // hash) stays while a result still cites it, so evidence can always name the scan that proved it.
+        const string old = """
+            SELECT run_id FROM run WHERE instance = :instance AND system = :system AND run_id NOT IN (
+                SELECT run_id FROM run WHERE instance = :instance AND system = :system ORDER BY started_at DESC LIMIT :keep)
+            """;
+        (string, object?)[] parameters = [(":instance", manifest.Instance), (":system", manifest.System), (":keep", keep)];
+        context.Execute($"DELETE FROM row_seen WHERE run_id IN ({old});", parameters);
+        context.Execute($"DELETE FROM coverage WHERE run_id IN ({old});", parameters);
+        context.Execute($"DELETE FROM reported WHERE run_id IN ({old});", parameters);
+        context.Execute($"DELETE FROM run WHERE run_id IN ({old}) AND NOT EXISTS (SELECT 1 FROM result WHERE result.run_id = run.run_id);", parameters);
     }
 
     private static IEnumerable<T> Read<T>(string folder, string file)

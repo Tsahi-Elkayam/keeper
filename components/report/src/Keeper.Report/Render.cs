@@ -107,6 +107,7 @@ public static class TodayDocument
     public static Document From(TodayReport report)
     {
         var minutes = report.Today.Sum(t => t.Minutes);
+        var findings = report.Today.Sum(t => t.Targets);
         var today = report.Today.Select(t =>
         {
             var due = t.Deadline is null ? "" : t.DaysLeft switch
@@ -116,14 +117,17 @@ public static class TodayDocument
                 _ => $" - due {t.Deadline}",
             };
             var next = string.IsNullOrWhiteSpace(t.Fix) ? "" : $" Next: {Short(t.Fix!, 160)}";
-            return $"{t.Position}. [{t.Severity}] {t.Title} - {t.SystemId} / {t.Target}{due}. Why now: {string.Join(", ", t.Reasons)}. (~{t.Minutes} min, key {t.FindingKey[..8]}){next}";
+            var where = t.Targets <= 1
+                ? $"{t.SystemId} / {t.Target}"
+                : $"{t.Targets} targets{(t.Systems > 1 ? $" on {t.Systems} systems" : $" on {t.SystemId}")}, e.g. {string.Join(", ", t.Examples ?? [])}";
+            return $"{t.Position}. [{t.Severity}] {t.Title} - {where}{due}. Why now: {string.Join(", ", t.Reasons)}. (~{t.Minutes} min, key {t.FindingKey[..8]}){next}";
         }).ToList();
 
         return new Document(
             "What to do today",
             report.RankedAt is null
                 ? "No ranking yet: run 'keeper run' (or 'keeper rank')."
-                : $"Ranked {report.RankedAt}. {report.Today.Count} items, about {minutes} of {report.BudgetMinutes} minutes.",
+                : $"Ranked {report.RankedAt}. {report.Today.Count} tasks covering {findings} findings, about {minutes} of {report.BudgetMinutes} minutes.",
             [
                 new Section("Today", today, "Nothing ranked for today."),
                 new Section("Waiting on others",
@@ -135,7 +139,9 @@ public static class TodayDocument
                 new Section($"New since yesterday ({report.NewSinceYesterday})", report.NewTitles.ToList(), "Nothing new."),
                 new Section("Blind spots",
                     [.. report.StaleScans.Select(s => "Not scanned recently: " + s),
-                     .. report.BlindSpots.Select(b => $"{b.System} via {b.Instance}: {b.Item} {b.State}{(b.Why is null ? "" : " - " + Short(b.Why, 200))}")],
+                     .. report.BlindSpots.Select(b => $"{b.System} via {b.Instance}: {b.Item} {b.State}{(b.Why is null ? "" : " - " + Short(b.Why, 200))}"),
+                     .. report.NeverScanned.Count == 0 ? Array.Empty<string>()
+                         : [$"Never scanned - none of these checks has run (add an integration, or accept KEEPER-SYSTEM-NEVER-SCANNED): {string.Join(", ", report.NeverScanned)}"]],
                     "Every source answered in its newest scan."),
             ]);
     }

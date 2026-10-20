@@ -25,17 +25,17 @@ public sealed class RankerTests : IDisposable
 
     private Database Db => new(Path.Combine(DataDir, "keeper.db"));
 
-    private void Finding(string key, string severity, string lifecycle = "open", int? dueInDays = null)
+    private void Finding(string key, string severity, string lifecycle = "open", int? dueInDays = null, string? check = null)
     {
         using var connection = Db.OpenReadWrite();
         Sql.Execute(connection,
             """
             INSERT INTO finding (finding_key, instance, system, system_id, rule_id, check_id, entity_type, target, kind, lens,
                                  category, severity, title, deadline, status, lifecycle, first_seen, last_seen)
-            VALUES (:k, 'ex', 'example', 'SYS1', 'R-' || :k, 'R-' || :k, 'host', 'host1.example.org', 'broken', 'both',
+            VALUES (:k, 'ex', 'example', 'SYS1', :check, :check, 'host', :k || '.example.org', 'broken', 'both',
                     'HLT', :s, 'Finding ' || :k, :due, 'open', :l, :now, :now);
             """,
-            null, (":k", key), (":s", severity), (":l", lifecycle),
+            null, (":k", key), (":check", check ?? "R-" + key), (":s", severity), (":l", lifecycle),
             (":due", dueInDays is { } d ? Iso.Date(DateTimeOffset.UtcNow.AddDays(d)) : null), (":now", Iso.Utc(DateTimeOffset.UtcNow)));
     }
 
@@ -94,6 +94,26 @@ public sealed class RankerTests : IDisposable
         Assert.Equal("waiting", ranking.Items.Single(i => i.FindingKey == "w").List);
         Assert.Contains("with network team", ranking.Items.Single(i => i.FindingKey == "w").Reasons);
         Assert.Equal("snoozed", ranking.Items.Single(i => i.FindingKey == "s").List);
+    }
+
+    [Fact]
+    public void One_check_on_many_targets_is_one_task_that_outranks_the_same_problem_on_one()
+    {
+        for (var i = 0; i < 91; i++)
+            Finding($"adm{i:D2}", "high", check: "WS-LOCAL-ADMINS");
+        Finding("solo", "high", check: "WS-OTHER");
+        Setting("rank.daily-minutes", "60");
+
+        var ranking = Rank();
+
+        var lead = ranking.Items[0];
+        Assert.StartsWith("adm", lead.FindingKey, StringComparison.Ordinal);
+        Assert.Contains("91 targets", lead.Reasons);
+        Assert.Equal(60 + Ranker.Spread(91), lead.Score, 1);
+        // Its 91 findings take the budget once (45 minutes), so the other high finding (45) is later.
+        Assert.Equal(91, ranking.Items.Count(i => i.List == "today"));
+        Assert.Equal(45, ranking.Items.Where(i => i.List == "today").Sum(i => i.Minutes));
+        Assert.Equal("later", ranking.Items.Single(i => i.FindingKey == "solo").List);
     }
 
     [Fact]

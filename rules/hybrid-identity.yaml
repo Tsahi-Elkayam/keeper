@@ -13,12 +13,17 @@ rules:
     title: Enabled account with no sign-in anywhere - no domain logon and no successful cloud sign-in
     kind: misconfigured
     category: IAM
-    severity: medium
+    severity:
+      field: idle_days
+      ranges: [ { min: 365, value: high }, { min: 180, value: medium } ]
+      default: low
     entity: user
     why: >
       An enabled account nobody uses is a door nobody watches. Domain logons alone overstate this in a
       hybrid estate: people who only use cloud services sign in to Entra and never reach a domain
-      controller, so this rule counts an account only when both directories show no activity.
+      controller, so this rule counts an account only when both directories show no activity. Never-used
+      accounts count from the day they were created. Accounts in a leavers OU and built-in or service
+      accounts are left to their own rules (AD-USER-ENABLED-IN-DISABLED-OU and the service-account rules).
     fix: >
       Confirm with the owner or HR, then disable it (and remove its licences). Accounts that must stay
       enabled without signing in (break-glass, device accounts) are accepted one by one with keeper decide accept.
@@ -28,6 +33,7 @@ rules:
       text: >
         WITH ad AS (
           SELECT r.instance, s.entity_key AS account,
+                 MAX(json_extract(s.attrs, '$.distinguishedName')) AS dn,
                  MAX(json_extract(s.attrs, '$.userPrincipalName')) AS upn,
                  MAX(json_extract(s.attrs, '$.objectSid')) AS sid,
                  MAX(CAST(json_extract(s.attrs, '$.userAccountControl') AS INTEGER)) AS uac,
@@ -51,25 +57,28 @@ rules:
           SELECT ad.*, c.cloud_signin, c.sid AS cloud_sid,
                  CASE WHEN ad.dc_logon_raw GLOB '[0-9][0-9][0-9][0-9]-*' THEN ad.dc_logon_raw END AS dc_logon
           FROM ad LEFT JOIN cloud c ON c.sid = ad.sid
+        ),
+        latest AS (
+          SELECT *, NULLIF(MAX(COALESCE(dc_logon, ''), COALESCE(cloud_signin, '')), '') AS last_activity FROM joined
         )
-        SELECT instance || '/' || account AS id, account, upn, created, dc_logon, cloud_signin,
+        SELECT instance || '/' || account AS id, account, dn, upn, created, dc_logon, cloud_signin, last_activity,
+               CAST(julianday(:now) - julianday(COALESCE(last_activity, created)) AS INTEGER) AS idle_days,
+               CASE WHEN last_activity IS NULL THEN 'never signed in' ELSE 'last sign-in ' || substr(last_activity, 1, 10) END AS activity,
                CASE WHEN cloud_sid IS NOT NULL THEN 'AD and Entra'
                     WHEN EXISTS (SELECT 1 FROM latest_run WHERE system = 'entra' AND status <> 'failed') THEN 'AD only (not synced)'
-                    ELSE 'AD only - no Entra scan yet, cloud sign-ins unknown' END AS seen_in,
-               NULLIF(MAX(COALESCE(dc_logon, ''), COALESCE(cloud_signin, '')), '') AS last_activity
-        FROM joined
+                    ELSE 'AD only - no Entra scan yet, cloud sign-ins unknown' END AS seen_in
+        FROM latest
         WHERE (COALESCE(uac, 0) & 2) = 0
           AND COALESCE(mailbox_type, 0) NOT IN (4, 16, 32, 8589934592, 17179869184, 34359738368)
           AND NOT (expires GLOB '[0-9][0-9][0-9][0-9]-*' AND expires < :now)
       key: id
       name: upn
     each:
-      any:
-        - { field: last_activity, op: age-gt, value: 90, threshold: identity.stale-user-days }
-        - all:
-            - { field: last_activity, op: absent }
-            - { field: created, op: age-gt, value: 90, threshold: identity.stale-user-days }
-    evidence: "{account}: last domain logon {dc_logon}, last cloud sign-in {cloud_signin}, created {created} ({seen_in})"
+      all:
+        - { field: account, op: notmatch, value: '(?i)^(krbtgt|Guest|DefaultAccount|WDAGUtilityAccount|MSOL_[0-9a-f]+|AAD_[0-9a-f]+|Sync_.*|HealthMailbox.*|SM_[0-9a-f]+|.*\$)$', threshold: ad.service-account-pattern }
+        - { field: dn, op: notmatch, value: '(?i)OU=[^,]*(disable|leaver|terminat|former|departed|deprovision)', threshold: ad.disabled-ou-pattern }
+        - { field: idle_days, op: gt, value: 90, threshold: identity.stale-user-days }
+    evidence: "{account}: {activity} ({idle_days} days idle; domain logon {dc_logon}, cloud sign-in {cloud_signin}, created {created}; {seen_in})"
 
   - id: HYB-USER-CLOUD-ONLY-ACTIVITY
     title: Accounts active only in the cloud - domain logons alone would call them stale

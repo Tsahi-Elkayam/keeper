@@ -1,0 +1,400 @@
+schema: keeper.rules/1
+system: dynatrace
+name: Dynatrace environment
+integration: dynatrace
+# Endpoint: the environment URL (https://<environment-id>.live.dynatrace.com, or an ActiveGate's
+# https://<activegate>:9999/e/<environment-id>). The integration adds "Authorization: Api-Token ...";
+# the token needs problems.read, oneAgents.read and activeGates.read.
+# Dynatrace pages with nextPageKey, which the runner does not follow, so each query asks for the
+# largest page the API allows. Timestamps in these APIs are epoch milliseconds, which the engine does
+# not read as dates; no rule here depends on one.
+defaults:
+  lens: maintenance
+  refresh: 1h
+rules:
+
+  # ---- open problems (environment API v2) ---------------------------------------------------
+  # The problems API only returns problems that started or ended inside the timeframe (default the
+  # last two hours), so "from" is widened; an open problem that started before it is not returned.
+
+  - id: DT-PROBLEM-AVAILABILITY
+    title: Open availability problem
+    kind: broken
+    category: AVL
+    severity: critical
+    entity: problem
+    why: Dynatrace has detected that something is down or unreachable for its users.
+    fix: Work the problem from its root-cause entity; close the loop in the incident record.
+    refs: [NIST-800-53:IR-4]
+    query:
+      protocol: http
+      path: /api/v2/problems
+      params: { problemSelector: 'status("open")', from: now-90d, pageSize: "500" }
+      paging: none
+      items: problems
+      key: problemId
+      name: title
+    each: { field: severityLevel, op: eq, value: AVAILABILITY }
+    evidence: "{displayId} {title} ({impactLevel}) on {affectedEntities[].name}"
+
+  - id: DT-PROBLEM-ERROR
+    title: Open error problem
+    kind: broken
+    category: AVL
+    severity: high
+    entity: problem
+    why: An error problem means failing requests or crashing processes that users or dependent services feel.
+    fix: Work the problem from its root-cause entity.
+    refs: [NIST-800-53:IR-4]
+    query:
+      protocol: http
+      path: /api/v2/problems
+      params: { problemSelector: 'status("open")', from: now-90d, pageSize: "500" }
+      paging: none
+      items: problems
+      key: problemId
+      name: title
+    each: { field: severityLevel, op: eq, value: ERROR }
+    evidence: "{displayId} {title} ({impactLevel}) on {affectedEntities[].name}"
+
+  - id: DT-PROBLEM-SLOWDOWN
+    title: Open performance or resource-contention problem
+    kind: broken
+    category: HLT
+    severity: medium
+    entity: problem
+    why: Slowdowns and resource saturation are the problems users report as "the system is slow" long before anything is down.
+    fix: Check the saturated resource or slow service named in the problem and its recent changes.
+    query:
+      protocol: http
+      path: /api/v2/problems
+      params: { problemSelector: 'status("open")', from: now-90d, pageSize: "500" }
+      paging: none
+      items: problems
+      key: problemId
+      name: title
+    each: { field: severityLevel, op: in, value: [PERFORMANCE, RESOURCE_CONTENTION] }
+    evidence: "{displayId} {title} ({severityLevel}) on {affectedEntities[].name}"
+
+  - id: DT-PROBLEM-CUSTOM-ALERT
+    title: Open custom-alert problem
+    kind: broken
+    category: HLT
+    severity: medium
+    entity: problem
+    why: A custom alert fires on a condition someone defined as important for this environment.
+    fix: Act on the alert or retune its threshold with a reason.
+    query:
+      protocol: http
+      path: /api/v2/problems
+      params: { problemSelector: 'status("open")', from: now-90d, pageSize: "500" }
+      paging: none
+      items: problems
+      key: problemId
+      name: title
+    each: { field: severityLevel, op: eq, value: CUSTOM_ALERT }
+    evidence: "{displayId} {title} on {affectedEntities[].name}"
+
+  - id: DT-PROBLEM-MONITORING-UNAVAILABLE
+    title: Dynatrace reports that it cannot monitor an entity
+    kind: broken
+    category: MON
+    severity: high
+    entity: problem
+    why: Monitoring-unavailable is the tool saying it went blind; everything behind it is unwatched while no other problem can open.
+    fix: Restore the OneAgent, ActiveGate or extension that lost contact.
+    refs: [NIST-800-53:SI-4]
+    query:
+      protocol: http
+      path: /api/v2/problems
+      params: { problemSelector: 'status("open")', from: now-90d, pageSize: "500" }
+      paging: none
+      items: problems
+      key: problemId
+      name: title
+    each: { field: severityLevel, op: eq, value: MONITORING_UNAVAILABLE }
+    evidence: "{displayId} {title} on {affectedEntities[].name}"
+
+  - id: DT-PROBLEM-LIST-TRUNCATED
+    title: Open-problem list reached the page limit
+    kind: broken
+    category: MON
+    severity: medium
+    entity: instance
+    why: The API returns at most 500 problems per page and the engine reads one page; at the limit the problem rules judge only part of what is open.
+    fix: Close or merge stale problems, or split the review with a tenant rule per management zone.
+    query:
+      protocol: http
+      path: /api/v2/problems
+      params: { problemSelector: 'status("open")', from: now-90d, pageSize: "500" }
+      paging: none
+      items: problems
+      key: problemId
+      name: title
+    count: { op: ge, value: 500 }
+    evidence: "{count} open problems returned - the list is probably cut off"
+
+  # ---- OneAgent on hosts (environment API v1) ------------------------------------------------
+
+  - id: DT-AGENT-NOT-MONITORING
+    title: OneAgent host is crashed, lost or unmonitored
+    kind: broken
+    category: MON
+    severity:
+      field: availabilityState
+      map: { CRASHED: high, LOST: high, UNMONITORED: high, UNEXPECTED_SHUTDOWN: medium, UNKNOWN: medium }
+      default: medium
+    entity: host
+    why: The host still appears in the host list, so it looks covered, while nothing is being collected from it.
+    fix: Check the OneAgent service on the host and its connection to the cluster or ActiveGate; reinstall the agent if it keeps crashing.
+    refs: [NIST-800-53:SI-4]
+    query:
+      protocol: http
+      path: /api/v1/oneagents
+      params: { relativeTime: week }
+      paging: none
+      items: hosts
+      key: hostInfo.entityId
+      name: hostInfo.displayName
+    each: { field: availabilityState, op: in, value: [CRASHED, LOST, UNEXPECTED_SHUTDOWN, UNMONITORED, UNKNOWN] }
+    evidence: "{hostInfo.displayName}: {availabilityState} ({detailedAvailabilityState}), agent {agentVersion}"
+
+  - id: DT-AGENT-MONITORING-DISABLED
+    title: Monitoring is switched off for a host
+    kind: misconfigured
+    category: MON
+    severity: medium
+    entity: host
+    why: A host with monitoring disabled in its settings keeps its agent installed and looks enrolled, but sends nothing.
+    fix: Re-enable monitoring for the host, or uninstall the agent and record why the host is excluded.
+    query:
+      protocol: http
+      path: /api/v1/oneagents
+      params: { relativeTime: week }
+      paging: none
+      items: hosts
+      key: hostInfo.entityId
+      name: hostInfo.displayName
+    each: { field: configuredMonitoringEnabled, op: eq, value: false }
+    evidence: "{hostInfo.displayName}: monitoring disabled, mode {configuredMonitoringMode}"
+
+  - id: DT-AGENT-UNLICENSED
+    title: Host is not monitored for lack of licence
+    kind: missing
+    category: MON
+    severity: high
+    entity: host
+    why: When the licence (host units or platform subscription) runs out, new hosts are silently left unmonitored - nothing turns red.
+    fix: Free licence capacity from retired hosts or extend the licence, then confirm the host reports data.
+    query:
+      protocol: http
+      path: /api/v1/oneagents
+      params: { relativeTime: week }
+      paging: none
+      items: hosts
+      key: hostInfo.entityId
+      name: hostInfo.displayName
+    each: { field: unlicensed, op: eq, value: true }
+    evidence: "{hostInfo.displayName}: unlicensed"
+
+  - id: DT-AGENT-FAULTY-VERSION
+    title: OneAgent runs a version flagged as faulty
+    kind: broken
+    lens: both
+    category: LCM
+    severity: high
+    entity: host
+    why: The vendor flags versions with known defects; a faulty agent can crash the processes it instruments or report wrong data.
+    fix: Update the agent to a version the environment offers as current.
+    refs: [NIST-800-53:SI-2]
+    query:
+      protocol: http
+      path: /api/v1/oneagents
+      params: { relativeTime: week }
+      paging: none
+      items: hosts
+      key: hostInfo.entityId
+      name: hostInfo.displayName
+    each: { field: faultyVersion, op: eq, value: true }
+    evidence: "{hostInfo.displayName}: agent {agentVersion} is flagged faulty"
+
+  - id: DT-AGENT-UPDATE-PROBLEM
+    title: OneAgent update failed or the version is incompatible
+    kind: broken
+    category: LCM
+    severity: medium
+    entity: host
+    why: An agent whose update fails stays behind indefinitely while auto-update looks switched on.
+    fix: Read the update error on the host, fix disk space or permissions, and update the agent manually.
+    refs: [NIST-800-53:SI-2]
+    query:
+      protocol: http
+      path: /api/v1/oneagents
+      params: { relativeTime: week }
+      paging: none
+      items: hosts
+      key: hostInfo.entityId
+      name: hostInfo.displayName
+    each: { field: updateStatus, op: in, value: [UPDATE_PROBLEM, INCOMPATIBLE] }
+    evidence: "{hostInfo.displayName}: update status {updateStatus}, agent {agentVersion}"
+
+  - id: DT-AGENT-OUTDATED
+    title: OneAgent is outdated
+    kind: broken
+    category: LCM
+    severity: low
+    entity: host
+    refresh: 1d
+    why: Old agents miss fixes and newer technology support; the environment reports them as outdated against its own update policy.
+    fix: Update the agent, or let auto-update do it inside a maintenance window.
+    refs: [NIST-800-53:SI-2]
+    query:
+      protocol: http
+      path: /api/v1/oneagents
+      params: { relativeTime: week }
+      paging: none
+      items: hosts
+      key: hostInfo.entityId
+      name: hostInfo.displayName
+    each: { field: updateStatus, op: eq, value: OUTDATED }
+    evidence: "{hostInfo.displayName}: agent {agentVersion} is outdated"
+
+  - id: DT-AGENT-AUTO-UPDATE-OFF
+    title: OneAgent auto-update is disabled
+    kind: misconfigured
+    category: LCM
+    severity: low
+    entity: host
+    refresh: 1d
+    why: With auto-update off, every agent upgrade is manual work that tends not to happen.
+    fix: Enable auto-update with a maintenance window, or document the manual update process for these hosts.
+    query:
+      protocol: http
+      path: /api/v1/oneagents
+      params: { relativeTime: week }
+      paging: none
+      items: hosts
+      key: hostInfo.entityId
+      name: hostInfo.displayName
+    each: { field: autoUpdateSetting, op: eq, value: DISABLED }
+    evidence: "{hostInfo.displayName}: auto-update disabled"
+
+  - id: DT-AGENT-DISCOVERY-ONLY
+    title: Host is monitored in discovery mode only
+    kind: misconfigured
+    category: MON
+    severity: low
+    entity: host
+    refresh: 1d
+    why: Discovery mode sees processes but not their health or performance; a host in it is counted as covered while its problems cannot open.
+    fix: Move the host to infrastructure or full-stack monitoring if it runs anything that matters.
+    query:
+      protocol: http
+      path: /api/v1/oneagents
+      params: { relativeTime: week }
+      paging: none
+      items: hosts
+      key: hostInfo.entityId
+      name: hostInfo.displayName
+    each: { field: monitoringType, op: eq, value: DISCOVERY }
+    evidence: "{hostInfo.displayName}: monitoring type {monitoringType}"
+
+  - id: DT-AGENT-NONE
+    title: Dynatrace returned no OneAgent hosts
+    kind: missing
+    category: MON
+    severity: medium
+    entity: instance
+    why: An empty host list means either the token cannot read OneAgents or nothing reports - from outside both look like a quiet environment.
+    fix: Check the token's oneAgents.read scope and the environment's host list.
+    query:
+      protocol: http
+      path: /api/v1/oneagents
+      params: { relativeTime: week }
+      paging: none
+      items: hosts
+      key: hostInfo.entityId
+      name: hostInfo.displayName
+    count: none
+    evidence: "no OneAgent hosts seen in the last week"
+
+  # ---- ActiveGates (environment API v2) ------------------------------------------------------
+
+  - id: DT-ACTIVEGATE-OFFLINE
+    title: ActiveGate is offline
+    kind: broken
+    category: MON
+    severity: high
+    entity: activegate
+    why: Every agent, extension and synthetic monitor routed through an offline ActiveGate stops reporting at once.
+    fix: Restore the ActiveGate service and its network path; add a second ActiveGate to the group for redundancy.
+    refs: [NIST-800-53:SI-4]
+    query:
+      protocol: http
+      path: /api/v2/activeGates
+      paging: none
+      items: activeGates
+      key: id
+      name: hostname
+    each: { field: offlineSince, op: exists }
+    evidence: "{hostname} ({type}, group {group}) offline since {offlineSince}"
+
+  - id: DT-ACTIVEGATE-UPDATE
+    title: ActiveGate is outdated or its update failed
+    kind: broken
+    category: LCM
+    severity: medium
+    entity: activegate
+    refresh: 1d
+    why: An ActiveGate left behind blocks agent updates that route through it and misses fixes.
+    fix: Update the ActiveGate, and fix whatever made the automatic update fail.
+    refs: [NIST-800-53:SI-2]
+    query:
+      protocol: http
+      path: /api/v2/activeGates
+      paging: none
+      items: activeGates
+      key: id
+      name: hostname
+    each: { field: autoUpdateStatus, op: in, value: [OUTDATED, UPDATE_PROBLEM, INCOMPATIBLE] }
+    evidence: "{hostname}: version {version}, update status {autoUpdateStatus}"
+
+  - id: DT-ACTIVEGATE-TOKEN
+    title: ActiveGate token is expiring or invalid
+    kind: broken
+    lens: both
+    category: AUT
+    severity: high
+    entity: activegate
+    refresh: 1d
+    why: When an ActiveGate token expires the gate stops connecting, taking its agents and extensions with it.
+    fix: Rotate the ActiveGate token before it expires and set a reminder for the next rotation.
+    refs: [NIST-800-53:IA-5]
+    query:
+      protocol: http
+      path: /api/v2/activeGates
+      paging: none
+      items: activeGates
+      key: id
+      name: hostname
+    each: { field: "activeGateTokens[].state", op: in, value: [EXPIRING, INVALID] }
+    evidence: "{hostname}: token state {activeGateTokens[].state}"
+
+  - id: DT-ACTIVEGATE-MODULE-MISCONFIGURED
+    title: ActiveGate module is misconfigured
+    kind: misconfigured
+    category: MON
+    severity: medium
+    entity: activegate
+    refresh: 1d
+    why: A misconfigured module (logs, synthetic, Kubernetes, extensions) silently stops the data it was meant to bring in.
+    fix: Check the module configuration on the ActiveGate and restart it.
+    query:
+      protocol: http
+      path: /api/v2/activeGates
+      paging: none
+      items: activeGates
+      key: id
+      name: hostname
+    each: { field: "modules[].misconfigured", op: eq, value: true }
+    evidence: "{hostname}: misconfigured module among {modules[].type}"

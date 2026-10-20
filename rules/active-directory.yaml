@@ -29,7 +29,7 @@ rules:
     query:
       protocol: ldap
       filter: '(&{USER}(!{UAC:2048}))'
-      attributes: [sAMAccountName, userPrincipalName, objectSid, userAccountControl, lastLogonTimestamp, pwdLastSet, whenCreated, accountExpires, msExchRecipientTypeDetails]
+      attributes: [sAMAccountName, userPrincipalName, objectSid, userAccountControl, lastLogonTimestamp, pwdLastSet, whenCreated, accountExpires, msExchRecipientTypeDetails, servicePrincipalName, givenName, sn]
       key: sAMAccountName
       name: userPrincipalName
     count: none
@@ -55,22 +55,31 @@ rules:
 
   # ---------------------------------------------------------------- user accounts
 
-  # One user inventory query (all user objects except trust accounts) feeds the rules below and the
-  # hybrid identity pack, which joins these rows to the cloud directory on objectSid.
+  # One user inventory query (all user objects except trust accounts) feeds every rule from here to
+  # AD-USER-GUEST-ENABLED, plus AD-POP-USERS-NONE, and the hybrid identity pack, which joins these
+  # rows to the cloud directory on objectSid. Keep the filter, attribute list and key identical so
+  # the rules share one fetch.
+  #
+  # The stale-user rules partition the enabled accounts so a breakdown adds up: expired accounts,
+  # shared/room/equipment mailbox objects (AD-USER-RESOURCE-MAILBOX-ENABLED), accounts in a
+  # leavers/disabled OU (AD-USER-ENABLED-IN-DISABLED-OU, AD-USER-DISABLED-OU-STILL-USED) and
+  # well-known service and system accounts (ad.service-account-pattern) are left out of
+  # AD-USER-NO-DC-LOGON, AD-USER-NO-DC-LOGON-1Y and AD-USER-NEVER-LOGGED-ON. The built-in
+  # Administrator (RID 500) is never excluded by the pattern.
 
   - id: AD-USER-NO-DC-LOGON
-    title: Enabled user with no domain controller logon for a long time
+    title: Enabled user with no domain controller logon for 90 days to a year
     lens: both
     category: HYG
     severity: info
     entity: user
-    why: lastLogonTimestamp records only authentication against a domain controller and ignores cloud sign-ins - users who work only in cloud services (password hash sync, no contact with a DC) look stale here while active. This is a list to reconcile with cloud sign-in data, not the authority for disabling accounts. Expired accounts and shared, room and equipment mailbox objects are left out.
+    why: lastLogonTimestamp records only authentication against a domain controller and ignores cloud sign-ins - users who work only in cloud services (password hash sync, no contact with a DC) look stale here while active. This is a list to reconcile with cloud sign-in data, not the authority for disabling accounts. Accounts idle for more than the long-idle threshold are reported by AD-USER-NO-DC-LOGON-1Y instead.
     fix: Join the list with cloud sign-in activity (the hybrid identity rules do this) and disable only accounts that are idle in both places, after owner confirmation.
     refs: [NIST-800-53:AC-2(3), CIS-CONTROLS-8:5.3, PINGCASTLE:S-Inactive]
     query:
       protocol: ldap
       filter: '(&{USER}(!{UAC:2048}))'
-      attributes: [sAMAccountName, userPrincipalName, objectSid, userAccountControl, lastLogonTimestamp, pwdLastSet, whenCreated, accountExpires, msExchRecipientTypeDetails]
+      attributes: [sAMAccountName, userPrincipalName, objectSid, userAccountControl, lastLogonTimestamp, pwdLastSet, whenCreated, accountExpires, msExchRecipientTypeDetails, servicePrincipalName, givenName, sn]
       key: sAMAccountName
       name: userPrincipalName
     each:
@@ -83,7 +92,44 @@ rules:
         - any:
             - { field: msExchRecipientTypeDetails, op: absent }
             - { field: msExchRecipientTypeDetails, op: notin, value: [4, 16, 32, 8589934592, 17179869184, 34359738368] }
-        - { field: lastLogonTimestamp, op: age-gt, value: 180, threshold: ad.stale-user-days }
+        - { field: distinguishedName, op: notmatch, value: '(?i)OU=[^,]*(disable|leaver|terminat|former|departed|deprovision)', threshold: ad.disabled-ou-pattern }
+        - any:
+            - { field: objectSid, op: match, value: '-500$' }
+            - { field: sAMAccountName, op: notmatch, value: '^(krbtgt|Guest|DefaultAccount|WDAGUtilityAccount|MSOL_[0-9a-f]+|AAD_[0-9a-f]+|Sync_.*|HealthMailbox.*|SM_[0-9a-f]+|.*\$)$', threshold: ad.service-account-pattern }
+        - { field: lastLogonTimestamp, op: age-gt, value: 90, threshold: ad.stale-user-days }
+        - { field: lastLogonTimestamp, op: age-lt, value: 365, threshold: ad.long-idle-user-days }
+    evidence: "{sAMAccountName} - last domain logon {lastLogonTimestamp}"
+
+  - id: AD-USER-NO-DC-LOGON-1Y
+    title: Enabled user with no domain controller logon for more than a year
+    lens: both
+    category: HYG
+    severity: low
+    entity: user
+    why: A year without authenticating to a domain controller usually means the account is abandoned, but lastLogonTimestamp still ignores cloud sign-ins - users who work only in cloud services (password hash sync) appear here while active. Confirm against cloud sign-in data before disabling.
+    fix: Join the list with cloud sign-in activity (the hybrid identity rules do this); disable accounts idle in both places after owner confirmation and delete them after the retention period.
+    refs: [NIST-800-53:AC-2(3), CIS-CONTROLS-8:5.3, PINGCASTLE:S-Inactive]
+    query:
+      protocol: ldap
+      filter: '(&{USER}(!{UAC:2048}))'
+      attributes: [sAMAccountName, userPrincipalName, objectSid, userAccountControl, lastLogonTimestamp, pwdLastSet, whenCreated, accountExpires, msExchRecipientTypeDetails, servicePrincipalName, givenName, sn]
+      key: sAMAccountName
+      name: userPrincipalName
+    each:
+      all:
+        - { field: userAccountControl, op: noflag, value: 2 }
+        - any:
+            - { field: accountExpires, op: absent }
+            - { field: accountExpires, op: eq, value: 0 }
+            - not: { field: accountExpires, op: until-lt, value: 0 }
+        - any:
+            - { field: msExchRecipientTypeDetails, op: absent }
+            - { field: msExchRecipientTypeDetails, op: notin, value: [4, 16, 32, 8589934592, 17179869184, 34359738368] }
+        - { field: distinguishedName, op: notmatch, value: '(?i)OU=[^,]*(disable|leaver|terminat|former|departed|deprovision)', threshold: ad.disabled-ou-pattern }
+        - any:
+            - { field: objectSid, op: match, value: '-500$' }
+            - { field: sAMAccountName, op: notmatch, value: '^(krbtgt|Guest|DefaultAccount|WDAGUtilityAccount|MSOL_[0-9a-f]+|AAD_[0-9a-f]+|Sync_.*|HealthMailbox.*|SM_[0-9a-f]+|.*\$)$', threshold: ad.service-account-pattern }
+        - { field: lastLogonTimestamp, op: age-gt, value: 365, threshold: ad.long-idle-user-days }
     evidence: "{sAMAccountName} - last domain logon {lastLogonTimestamp}"
 
   - id: AD-USER-NEVER-LOGGED-ON
@@ -92,13 +138,13 @@ rules:
     category: HYG
     severity: low
     entity: user
-    why: An account created long ago with no logon on record is usually a provisioning leftover that may still hold the initial password someone set or shared. Cloud-only use also leaves no domain logon, so confirm against cloud sign-ins. Expired accounts and resource mailbox objects are left out.
+    why: An account created long ago with no logon on record is usually a provisioning leftover that may still hold the initial password someone set or shared. Cloud-only use also leaves no domain logon, so confirm against cloud sign-ins.
     fix: Confirm the account is still needed; otherwise disable and delete it. Give new accounts an expiry date so unclaimed ones lapse.
     refs: [NIST-800-53:AC-2(3), CIS-CONTROLS-8:5.3]
     query:
       protocol: ldap
       filter: '(&{USER}(!{UAC:2048}))'
-      attributes: [sAMAccountName, userPrincipalName, objectSid, userAccountControl, lastLogonTimestamp, pwdLastSet, whenCreated, accountExpires, msExchRecipientTypeDetails]
+      attributes: [sAMAccountName, userPrincipalName, objectSid, userAccountControl, lastLogonTimestamp, pwdLastSet, whenCreated, accountExpires, msExchRecipientTypeDetails, servicePrincipalName, givenName, sn]
       key: sAMAccountName
       name: userPrincipalName
     each:
@@ -111,9 +157,82 @@ rules:
         - any:
             - { field: msExchRecipientTypeDetails, op: absent }
             - { field: msExchRecipientTypeDetails, op: notin, value: [4, 16, 32, 8589934592, 17179869184, 34359738368] }
+        - { field: distinguishedName, op: notmatch, value: '(?i)OU=[^,]*(disable|leaver|terminat|former|departed|deprovision)', threshold: ad.disabled-ou-pattern }
+        - any:
+            - { field: objectSid, op: match, value: '-500$' }
+            - { field: sAMAccountName, op: notmatch, value: '^(krbtgt|Guest|DefaultAccount|WDAGUtilityAccount|MSOL_[0-9a-f]+|AAD_[0-9a-f]+|Sync_.*|HealthMailbox.*|SM_[0-9a-f]+|.*\$)$', threshold: ad.service-account-pattern }
         - { field: lastLogonTimestamp, op: absent }
         - { field: whenCreated, op: age-gt, value: 30, threshold: ad.never-logged-on-days }
     evidence: "{sAMAccountName} - created {whenCreated}, no domain logon recorded"
+
+  - id: AD-USER-ENABLED-IN-DISABLED-OU
+    title: Enabled user in a leavers or disabled-accounts OU
+    category: IAM
+    severity: high
+    entity: user
+    why: Moving an account into a leavers OU is not disabling it - the password still works everywhere, and reviews skip the OU because everyone assumes its accounts are off. Accounts there that signed in recently are reported by AD-USER-DISABLED-OU-STILL-USED instead.
+    fix: Disable the account (and remove its group memberships) as part of the leaver process; set ad.disabled-ou-pattern to the estate's own leavers OU names.
+    refs: [NIST-800-53:AC-2(3), NIST-800-53:PS-4, CIS-CONTROLS-8:5.3]
+    query:
+      protocol: ldap
+      filter: '(&{USER}(!{UAC:2048}))'
+      attributes: [sAMAccountName, userPrincipalName, objectSid, userAccountControl, lastLogonTimestamp, pwdLastSet, whenCreated, accountExpires, msExchRecipientTypeDetails, servicePrincipalName, givenName, sn]
+      key: sAMAccountName
+      name: userPrincipalName
+    each:
+      all:
+        - { field: userAccountControl, op: noflag, value: 2 }
+        - { field: distinguishedName, op: match, value: '(?i)OU=[^,]*(disable|leaver|terminat|former|departed|deprovision)', threshold: ad.disabled-ou-pattern }
+        - any:
+            - { field: lastLogonTimestamp, op: absent }
+            - not: { field: lastLogonTimestamp, op: age-lt, value: 90, threshold: ad.stale-user-days }
+    evidence: "{sAMAccountName} - enabled in {distinguishedName}, last domain logon '{lastLogonTimestamp}'"
+
+  - id: AD-USER-DISABLED-OU-STILL-USED
+    title: Account in a leavers or disabled-accounts OU is still signing in
+    category: IAM
+    severity: critical
+    entity: user
+    why: Someone authenticates with an account the organisation believes it removed - a leaver who kept access, a shared credential, or an attacker using an account nobody watches.
+    fix: Disable the account now, find out who used it and from where, and review what it accessed since the move.
+    refs: [NIST-800-53:AC-2(3), NIST-800-53:PS-4, MITRE-ATTACK:T1078.002]
+    query:
+      protocol: ldap
+      filter: '(&{USER}(!{UAC:2048}))'
+      attributes: [sAMAccountName, userPrincipalName, objectSid, userAccountControl, lastLogonTimestamp, pwdLastSet, whenCreated, accountExpires, msExchRecipientTypeDetails, servicePrincipalName, givenName, sn]
+      key: sAMAccountName
+      name: userPrincipalName
+    each:
+      all:
+        - { field: userAccountControl, op: noflag, value: 2 }
+        - { field: distinguishedName, op: match, value: '(?i)OU=[^,]*(disable|leaver|terminat|former|departed|deprovision)', threshold: ad.disabled-ou-pattern }
+        - { field: lastLogonTimestamp, op: age-lt, value: 90, threshold: ad.stale-user-days }
+    evidence: "{sAMAccountName} - enabled in {distinguishedName}, last domain logon {lastLogonTimestamp}"
+
+  - id: AD-USER-SERVICE-LOOKS-LIKE-PERSON
+    title: Service account with a person's first and last name
+    lens: both
+    category: HYG
+    severity: low
+    entity: user
+    why: An account with a service principal name, or named like a service account, that also carries givenName and sn is counted as a person by every headcount, licence and leaver process, and its owner is unclear.
+    fix: Clear givenName and sn (or move the service to a group managed service account) and record the owner in managedBy or description; add the estate's own service-account prefixes to ad.service-account-pattern.
+    refs: [NIST-800-53:AC-2, CIS-CONTROLS-8:5.5]
+    query:
+      protocol: ldap
+      filter: '(&{USER}(!{UAC:2048}))'
+      attributes: [sAMAccountName, userPrincipalName, objectSid, userAccountControl, lastLogonTimestamp, pwdLastSet, whenCreated, accountExpires, msExchRecipientTypeDetails, servicePrincipalName, givenName, sn]
+      key: sAMAccountName
+      name: userPrincipalName
+    each:
+      all:
+        - { field: userAccountControl, op: noflag, value: 2 }
+        - { field: givenName, op: exists }
+        - { field: sn, op: exists }
+        - any:
+            - { field: servicePrincipalName, op: notempty }
+            - { field: sAMAccountName, op: match, value: '^(krbtgt|Guest|DefaultAccount|WDAGUtilityAccount|MSOL_[0-9a-f]+|AAD_[0-9a-f]+|Sync_.*|HealthMailbox.*|SM_[0-9a-f]+|.*\$)$', threshold: ad.service-account-pattern }
+    evidence: "{sAMAccountName} - named {givenName} {sn}, SPN '{servicePrincipalName}'"
 
   - id: AD-USER-RESOURCE-MAILBOX-ENABLED
     title: Enabled user object behind a shared, room or equipment mailbox
@@ -126,7 +245,7 @@ rules:
     query:
       protocol: ldap
       filter: '(&{USER}(!{UAC:2048}))'
-      attributes: [sAMAccountName, userPrincipalName, objectSid, userAccountControl, lastLogonTimestamp, pwdLastSet, whenCreated, accountExpires, msExchRecipientTypeDetails]
+      attributes: [sAMAccountName, userPrincipalName, objectSid, userAccountControl, lastLogonTimestamp, pwdLastSet, whenCreated, accountExpires, msExchRecipientTypeDetails, servicePrincipalName, givenName, sn]
       key: sAMAccountName
       name: userPrincipalName
     each:
@@ -147,7 +266,7 @@ rules:
     query:
       protocol: ldap
       filter: '(&{USER}(!{UAC:2048}))'
-      attributes: [sAMAccountName, userPrincipalName, objectSid, userAccountControl, lastLogonTimestamp, pwdLastSet, whenCreated, accountExpires, msExchRecipientTypeDetails]
+      attributes: [sAMAccountName, userPrincipalName, objectSid, userAccountControl, lastLogonTimestamp, pwdLastSet, whenCreated, accountExpires, msExchRecipientTypeDetails, servicePrincipalName, givenName, sn]
       key: sAMAccountName
       name: userPrincipalName
     each:
@@ -169,7 +288,7 @@ rules:
     query:
       protocol: ldap
       filter: '(&{USER}(!{UAC:2048}))'
-      attributes: [sAMAccountName, userPrincipalName, objectSid, userAccountControl, lastLogonTimestamp, pwdLastSet, whenCreated, accountExpires, msExchRecipientTypeDetails]
+      attributes: [sAMAccountName, userPrincipalName, objectSid, userAccountControl, lastLogonTimestamp, pwdLastSet, whenCreated, accountExpires, msExchRecipientTypeDetails, servicePrincipalName, givenName, sn]
       key: sAMAccountName
       name: userPrincipalName
     each:
@@ -190,7 +309,7 @@ rules:
     query:
       protocol: ldap
       filter: '(&{USER}(!{UAC:2048}))'
-      attributes: [sAMAccountName, userPrincipalName, objectSid, userAccountControl, lastLogonTimestamp, pwdLastSet, whenCreated, accountExpires, msExchRecipientTypeDetails]
+      attributes: [sAMAccountName, userPrincipalName, objectSid, userAccountControl, lastLogonTimestamp, pwdLastSet, whenCreated, accountExpires, msExchRecipientTypeDetails, servicePrincipalName, givenName, sn]
       key: sAMAccountName
       name: userPrincipalName
     each:

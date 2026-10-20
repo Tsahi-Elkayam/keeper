@@ -11,16 +11,28 @@ rules/*.yaml ─┐
 integrations ─┘                              │
                                     keeper-load ──> queue ──> store
                                              │
+              keeper-scan <store system> ────┘   rules over the store: registers, obligations,
+                                    keeper-load ──> queue ──> store   cross-system joins, Keeper's health
+                                             │
                                     keeper-track ──> queue ──> store   lifecycle, history, systems
                                              │
-                                    keeper-rank  ──> queue ──> store   today's order
+                                    keeper-rank  ──> queue ──> store   today's order, one task per check
                                              │
                           keeper-today / keeper-report / keeper-query  (read-only)
                                              │
-                                    keeper-push ──> trackers (dry run unless enabled)
+                                    keeper-push ──> trackers (plan is a dry run; apply asks)
 ```
 
-`keeper-run` runs the stages in order. `keeper <verb>` dispatches to `keeper-<verb>`.
+`keeper-run` runs the stages in order, each in its own process. `keeper <verb>` dispatches to
+`keeper-<verb>` in its own folder. People change the store through `keeper-decide`, `keeper-system`,
+`keeper-register` and `keeper-integration`, which only queue requests.
+
+Rules over the store (integration type `keeper`) run after the other scans are loaded, so a rule can
+join what two systems saw the same day - `hybrid-identity.yaml` joins Active Directory and Entra on
+the account's SID through `row_seen`.
+
+The ranker treats the findings of one check as one task: ranked by its worst instance plus its reach,
+its time counted once, shown as one line with its number of targets.
 
 ## Components
 
@@ -34,14 +46,14 @@ integrations ─┘                              │
 | `components/vault` | Keeper.Vault | AES-256-GCM, data key protected by the OS (DPAPI) |
 | `components/integrations` | Keeper.Integrations | Endpoints, identities, encrypted secrets, allowed hosts |
 | `components/rules` | Keeper.Rules | Rule files: model, loader, validation, condition evaluator |
-| `components/runners` | Keeper.Runners + one project per protocol | Read-only runners: ldap, graph, http, graphql, sql, cim, tls, file |
-| `components/scan` | keeper-scan | Runs a system's rules through its runner; writes a run folder |
-| `components/review` | Keeper.Review + bins | The domain: schema, handlers, questions, load, track |
+| `components/runners` | Keeper.Runners + one project per protocol | Read-only runners: ldap, graph, http, graphql, sql, cim, tls, file, store |
+| `components/scan` | Keeper.Scan, keeper-scan, keeper-rules | Runs a system's rules through its runner; writes a run folder; validates rule files |
+| `components/review` | Keeper.Review + bins | The domain: schema, handlers, questions, load, track; decide, system, register |
 | `components/rank` | Keeper.Rank + bin | What to do today |
 | `components/report` | Keeper.Report + bins | The daily list and audience reports |
 | `components/push` | Keeper.Push + bin | Tickets in ServiceNow / monday |
 | `components/home` | Keeper.Home | The Keeper home: where a tenant's settings and data live |
-| `components/keeper` | keeper + composition bins | The wrapper: dispatch, and the bins that compose several components |
+| `components/keeper` | Keeper.Composition, keeper, keeper-run, keeper-db, keeper-qm, keeper-query | The wrapper: dispatch, setup, the daily run, and the bins composed over every component |
 
 Each component owns its tables and ships its own migrations (`schema_version` keeps one version per
 component). Request kinds are namespaced: `review.override`, `integrations.set-secret`.

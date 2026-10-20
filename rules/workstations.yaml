@@ -1,0 +1,980 @@
+schema: keeper.rules/1
+system: workstations
+name: Windows workstations (live, over CIM)
+integration: cim
+# One WQL SELECT per workstation over WinRM. Targets are the AD computers the directory pack has seen:
+# Windows, not a server edition, logged on within 30 days. Rows carry `host`. Queries that return many
+# rows per host use a composite key ("{host}|{Name}") so every failing item is its own finding;
+# `count:` rules are evaluated per host, and a host whose query failed is unknown, never a pass.
+targets:
+  entity: computer
+  field: dNSHostName
+  where:
+    all:
+      - { field: operatingSystem, op: match, value: '^Windows' }
+      - { field: operatingSystem, op: notmatch, value: 'Server' }
+      - { field: lastLogonTimestamp, op: age-lt, value: 30 }
+defaults:
+  lens: maintenance
+  refresh: 1d
+  entity: computer
+rules:
+
+  # ---- operating system, patching, uptime --------------------------------------------------------
+
+  - id: WS-UPTIME-LONG
+    title: Workstation not restarted for a long time
+    kind: broken
+    category: HLT
+    severity: medium
+    why: Long uptime leaves installed updates inactive and lets leaks, hung services and piled-up processes accumulate; slowness complaints follow.
+    fix: Restart it; enforce restarts through the update deployment settings or a maintenance window.
+    refs: [NIST-800-53:SI-2]
+    query:
+      protocol: cim
+      wql: SELECT Caption, Version, BuildNumber, LastBootUpTime, FreePhysicalMemory, TotalVisibleMemorySize FROM Win32_OperatingSystem
+      key: host
+    each: { field: LastBootUpTime, op: age-gt, value: 30, threshold: workstations.uptime-max-days }
+    evidence: "{host}: last boot {LastBootUpTime}"
+
+  - id: WS-OS-WIN10
+    title: Workstation still runs Windows 10
+    kind: broken
+    lens: both
+    category: LCM
+    severity: high
+    why: Windows 10 left support on 2025-10-14; only paid Extended Security Updates keep it patched. LTSC editions are excluded here.
+    fix: Upgrade to Windows 11 where the hardware allows, replace the rest; record ESU devices as exceptions.
+    refs: [NIST-800-53:SA-22, CIS-CSC-v8:2.2]
+    query:
+      protocol: cim
+      wql: SELECT Caption, Version, BuildNumber, LastBootUpTime, FreePhysicalMemory, TotalVisibleMemorySize FROM Win32_OperatingSystem
+      key: host
+    each:
+      all:
+        - { field: Caption, op: match, value: 'Windows 10' }
+        - { field: Caption, op: notmatch, value: 'LTSC|LTSB' }
+    evidence: "{host}: {Caption} build {BuildNumber}"
+
+  - id: WS-OS-BUILD-UNSUPPORTED
+    title: Workstation runs a Windows build that is out of servicing
+    kind: broken
+    lens: both
+    category: LCM
+    severity: high
+    why: Builds past end of servicing get no monthly cumulative updates (Enterprise and Education dates; Home and Pro end earlier).
+    fix: Move the device to a serviced feature update. Update the threshold list when Microsoft retires a build.
+    refs: [NIST-800-53:SA-22, NIST-800-53:SI-2]
+    query:
+      protocol: cim
+      wql: SELECT Caption, Version, BuildNumber, LastBootUpTime, FreePhysicalMemory, TotalVisibleMemorySize FROM Win32_OperatingSystem
+      key: host
+    each: { field: BuildNumber, op: in, value: [10240, 10586, 14393, 15063, 16299, 17134, 18362, 18363, 19041, 19042, 19043, 22000, 22621], threshold: workstations.unsupported-builds }
+    evidence: "{host}: {Caption} build {BuildNumber}"
+
+  - id: WS-PATCH-NONE-RECENT
+    title: No update installed on the workstation within the patch window
+    kind: missing
+    lens: both
+    category: LCM
+    severity: high
+    why: When no hotfix is newer than the window, monthly cumulative updates are not reaching the PC (broken update agent, wrong update source, blocked deployment), whatever the reports say. InstalledOn is a text field; rows whose date cannot be read are listed as not judged.
+    fix: Check the PC's update source and the update and deployment logs; fix the agent and install the current cumulative update.
+    refs: [NIST-800-53:SI-2, CIS-CSC-v8:7.3]
+    query:
+      protocol: cim
+      wql: SELECT HotFixID, Description, InstalledOn FROM Win32_QuickFixEngineering
+      key: "{host}|{HotFixID}"
+    count:
+      op: lt
+      value: 1
+      where: { field: InstalledOn, op: age-lt, value: 45, threshold: workstations.patch-max-age-days }
+    evidence: "{host}: none of {rows} installed updates is newer than the patch window"
+
+  # ---- memory and disk ---------------------------------------------------------------------------
+
+  - id: WS-MEM-AVAILABLE-LOW
+    title: Little physical memory available
+    kind: broken
+    category: HLT
+    severity: medium
+    why: With almost no free memory the PC pages to disk and every application slows; often a leak or too little RAM for the security stack.
+    fix: Find the largest consumers; restart if a leak, add memory if the baseline load does not fit. The threshold is in KB.
+    query:
+      protocol: cim
+      wql: SELECT Caption, Version, BuildNumber, LastBootUpTime, FreePhysicalMemory, TotalVisibleMemorySize FROM Win32_OperatingSystem
+      key: host
+    each: { field: FreePhysicalMemory, op: lt, value: 1048576, threshold: workstations.available-memory-kb-min }
+    evidence: "{host}: {FreePhysicalMemory} KB free of {TotalVisibleMemorySize} KB"
+
+  - id: WS-MEMORY-SINGLE-MODULE
+    title: Only one memory module installed
+    kind: misconfigured
+    category: HLT
+    severity: low
+    why: A single module runs memory in single-channel mode, which roughly halves memory bandwidth and slows a PC that already runs a heavy security stack. Devices with soldered memory may report one module by design.
+    fix: Add a matching second module where the board has a free slot.
+    query:
+      protocol: cim
+      wql: SELECT BankLabel, DeviceLocator, Capacity FROM Win32_PhysicalMemory
+      key: "{host}|{BankLabel}|{DeviceLocator}"
+    count: { op: eq, value: 1 }
+    evidence: "{host}: one memory module ({sample})"
+
+  - id: WS-COMMIT-HIGH
+    title: Commit charge close to the commit limit
+    kind: broken
+    category: HLT
+    severity: medium
+    why: When committed memory nears RAM plus page file, allocations fail, applications hang and Windows starts terminating processes.
+    fix: Restart to clear leaks, find the process that grows, or add memory.
+    query:
+      protocol: cim
+      wql: SELECT PercentCommittedBytesInUse, AvailableMBytes FROM Win32_PerfFormattedData_PerfOS_Memory
+      key: host
+    each: { field: PercentCommittedBytesInUse, op: ge, value: 80, threshold: workstations.commit-pct-max }
+    evidence: "{host}: commit {PercentCommittedBytesInUse}%, {AvailableMBytes} MB available"
+
+  - id: WS-PERF-COUNTERS-MISSING
+    title: Performance counters return nothing remotely
+    kind: broken
+    category: MON
+    severity: low
+    why: When the formatted performance classes are empty, the commit and free-space percent rules have nothing to judge on this PC; the counters are usually disabled or corrupt.
+    fix: Rebuild the performance counter registry on the PC (and the WMI performance adapter), then re-scan.
+    query:
+      protocol: cim
+      wql: SELECT PercentCommittedBytesInUse, AvailableMBytes FROM Win32_PerfFormattedData_PerfOS_Memory
+      key: host
+    count: { op: lt, value: 1 }
+    evidence: "{host}: no rows from Win32_PerfFormattedData_PerfOS_Memory"
+
+  - id: WS-SYSTEM-DRIVE-FREE-PCT-LOW
+    title: System drive below the free-space floor (percent)
+    kind: broken
+    category: HLT
+    severity: medium
+    why: Updates, profiles and temporary files fail when the system drive fills; the PC slows long before it is full.
+    fix: Clean temporary files, old profiles and the update cache, or enlarge the disk.
+    refs: [NIST-800-53:SC-5]
+    query:
+      protocol: cim
+      wql: SELECT Name, PercentFreeSpace, FreeMegabytes FROM Win32_PerfFormattedData_PerfDisk_LogicalDisk WHERE Name = 'C:'
+      key: host
+    each: { field: PercentFreeSpace, op: lt, value: 10, threshold: workstations.system-drive-free-pct-min }
+    evidence: "{host}: {Name} {PercentFreeSpace}% free ({FreeMegabytes} MB)"
+
+  - id: WS-SYSTEM-DRIVE-FREE-LOW
+    title: System drive below the free-space floor (bytes)
+    kind: broken
+    category: HLT
+    severity: medium
+    why: Same risk as the percent rule, measured without performance counters (which some PCs do not serve remotely). A feature update needs about 20 GB.
+    fix: Clean up or enlarge the system drive. The threshold is in bytes.
+    refs: [NIST-800-53:SC-5]
+    query:
+      protocol: cim
+      wql: SELECT DeviceID, FreeSpace, Size FROM Win32_LogicalDisk WHERE DeviceID = 'C:'
+      key: host
+    each: { field: FreeSpace, op: lt, value: 10737418240, threshold: workstations.system-drive-free-bytes-min }
+    evidence: "{host}: {DeviceID} {FreeSpace} bytes free of {Size}"
+
+  - id: WS-DISK-UNHEALTHY
+    title: Physical disk reports a warning or unhealthy state
+    kind: broken
+    category: HLT
+    severity:
+      field: HealthStatus
+      map: { "2": high, "1": medium }
+      default: low
+    entity: disk
+    why: A disk that reports predictive failure or errors loses data and slows the PC with retries.
+    fix: Back up the user's data and replace the disk.
+    query:
+      protocol: cim
+      namespace: root/Microsoft/Windows/Storage
+      wql: SELECT DeviceId, FriendlyName, MediaType, HealthStatus FROM MSFT_PhysicalDisk
+      key: "{host}|{DeviceId}"
+    each: { field: HealthStatus, op: ne, value: 0 }
+    evidence: "{host}: disk {FriendlyName} health {HealthStatus} (0 healthy, 1 warning, 2 unhealthy)"
+
+  # ---- services --------------------------------------------------------------------------------
+
+  - id: WS-SVC-AUTO-STOPPED
+    title: Automatic service is not running
+    kind: broken
+    category: HLT
+    severity: low
+    entity: service
+    why: An automatic service that is stopped usually crashed or failed to start; when it is an agent (backup, security, management) that function is silently gone.
+    fix: Read the System log for the service's start failure; start it, or set it to Manual if this PC does not need it. Services that stop by design go in the ignore pattern.
+    query:
+      protocol: cim
+      wql: SELECT Name, DisplayName, State, StartMode, ExitCode, StartName FROM Win32_Service WHERE StartMode = 'Auto' AND State <> 'Running'
+      key: "{host}|{Name}"
+    each: { field: Name, op: notmatch, value: '^(sppsvc|RemoteRegistry|ShellHWDetection|MapsBroker|gupdate|gupdatem|edgeupdate|edgeupdatem|GoogleUpdater.*|clr_optimization_.*|CDPSvc|tiledatamodelsvc|WbioSrvc|TrustedInstaller|DoSvc|BITS|wuauserv|UsoSvc|WaaSMedicSvc|camsvc|OneSyncSvc_.*|CDPUserSvc_.*|WpnUserService_.*|AdobeARMservice|MozillaMaintenance|SysMain|stisvc|tzautoupdate|UevAgentService)$', threshold: workstations.auto-service-ignore-pattern }
+    evidence: "{host}: {Name} ({DisplayName}) is {State}, exit code {ExitCode}"
+
+  - id: WS-SVC-AGENT-STOPPED
+    title: Required agent service is not running
+    kind: broken
+    lens: both
+    category: MON
+    severity: high
+    entity: service
+    why: The management, security or logging agent on this PC is installed and set to start automatically but is not running, so the PC is unprotected or unmanaged.
+    fix: Start the service and read the System log for why it stopped; reinstall the agent if it does not stay up. Set the pattern to the agents the organisation requires.
+    refs: [NIST-800-53:SI-3, NIST-800-53:SI-4]
+    query:
+      protocol: cim
+      wql: SELECT Name, DisplayName, State, StartMode, ExitCode, StartName FROM Win32_Service WHERE StartMode = 'Auto' AND State <> 'Running'
+      key: "{host}|{Name}"
+    each: { field: Name, op: match, value: '^(CcmExec|WinDefend|Sense|MpsSvc|BFE|EventLog|Winmgmt|Dnscache)$', threshold: workstations.required-agent-pattern }
+    evidence: "{host}: {Name} ({DisplayName}) is {State}, exit code {ExitCode}"
+
+  - id: WS-SVC-LOGON-FAILED
+    title: Automatic service failed to log on
+    kind: broken
+    lens: both
+    category: IAM
+    severity: high
+    entity: service
+    why: Exit code 1069 means the service account could not log on (wrong password, expired account or a removed logon right), so the service is down.
+    fix: Check the account and the 'Log on as a service' right granted by policy; prefer a managed service account.
+    query:
+      protocol: cim
+      wql: SELECT Name, DisplayName, State, StartMode, ExitCode, StartName FROM Win32_Service WHERE StartMode = 'Auto' AND State <> 'Running'
+      key: "{host}|{Name}"
+    each: { field: ExitCode, op: eq, value: 1069 }
+    evidence: "{host}: {Name} runs as {StartName} and failed to log on"
+
+  - id: WS-SVC-STUCK
+    title: Service stuck in start or stop pending
+    kind: broken
+    category: HLT
+    severity: medium
+    entity: service
+    why: A service stuck pending (often Group Policy, Windows Update or licensing) blocks every caller that waits for it until the next restart.
+    fix: Restart the PC; if it recurs, trace which component hangs the service.
+    query:
+      protocol: cim
+      wql: SELECT Name, DisplayName, State, StartMode, ProcessId FROM Win32_Service WHERE State = 'Start Pending' OR State = 'Stop Pending'
+      key: "{host}|{Name}"
+    each: any
+    evidence: "{host}: {Name} ({DisplayName}) is {State}"
+
+  - id: WS-SVC-UPDATE-DISABLED
+    title: Windows update service disabled
+    kind: misconfigured
+    lens: both
+    category: LCM
+    severity: high
+    entity: service
+    why: With the update, transfer or servicing service disabled, neither Windows Update nor Configuration Manager can install updates.
+    fix: Set the service back to its default start type and find the policy or tool that disabled it.
+    refs: [NIST-800-53:SI-2]
+    query:
+      protocol: cim
+      wql: >-
+        SELECT Name, State, StartMode FROM Win32_Service WHERE StartMode = 'Disabled' AND
+        (Name = 'wuauserv' OR Name = 'UsoSvc' OR Name = 'BITS' OR Name = 'TrustedInstaller' OR Name = 'WaaSMedicSvc')
+      key: "{host}|{Name}"
+    each: any
+    evidence: "{host}: {Name} is disabled"
+
+  - id: WS-SVC-UNQUOTED-PATH
+    title: Service path with spaces is not quoted
+    kind: misconfigured
+    lens: security
+    category: IAM
+    severity: medium
+    entity: service
+    why: Windows tries each space-separated prefix of an unquoted path, so a writable folder on the way lets a user run code as the service account.
+    fix: Quote the ImagePath of the service (vendor fix or registry change).
+    refs: [NIST-800-53:CM-6]
+    query:
+      protocol: cim
+      wql: SELECT Name, PathName, StartMode, StartName FROM Win32_Service WHERE NOT PathName LIKE '"%'
+      key: "{host}|{Name}"
+    each: { field: PathName, op: match, value: '^[A-Za-z]:\\[^"]*\s[^"]*\.exe' }
+    evidence: "{host}: {Name} -> {PathName}"
+
+  - id: WS-IIS-INSTALLED
+    title: Web server (IIS) installed on a workstation
+    kind: misconfigured
+    lens: security
+    category: HYG
+    severity: low
+    entity: service
+    why: A web server on a user PC is an extra listening service that nobody patches or monitors as a server.
+    fix: Remove the IIS feature unless a documented application needs it.
+    refs: [NIST-800-53:CM-7, CIS-CSC-v8:4.8]
+    query:
+      protocol: cim
+      wql: SELECT Name, State, StartMode FROM Win32_Service WHERE Name = 'W3SVC' OR Name = 'SharedAccess'
+      key: "{host}|{Name}"
+    each:
+      all:
+        - { field: Name, op: eq, value: W3SVC }
+        - { field: StartMode, op: ne, value: Disabled }
+    evidence: "{host}: W3SVC is {State} ({StartMode})"
+
+  - id: WS-ICS-RUNNING
+    title: Internet Connection Sharing is running
+    kind: misconfigured
+    lens: security
+    category: AUT
+    severity: low
+    entity: service
+    why: Internet Connection Sharing turns the PC into a router between networks and bypasses network controls.
+    fix: Disable the SharedAccess service by policy unless hotspot or virtualization use is approved.
+    refs: [NIST-800-53:CM-7]
+    query:
+      protocol: cim
+      wql: SELECT Name, State, StartMode FROM Win32_Service WHERE Name = 'W3SVC' OR Name = 'SharedAccess'
+      key: "{host}|{Name}"
+    each:
+      all:
+        - { field: Name, op: eq, value: SharedAccess }
+        - { field: State, op: eq, value: Running }
+    evidence: "{host}: SharedAccess is running"
+
+  - id: WS-EDR-MULTIPLE
+    title: More than one EDR sensor running
+    kind: misconfigured
+    lens: both
+    category: MON
+    severity: medium
+    why: Two endpoint detection sensors on one PC double the kernel hooks, memory and CPU, slow file access and can block each other; usually one is a leftover or an unplanned overlap.
+    fix: Decide which EDR is primary and remove or switch the other to passive; set the pattern to the sensors that count.
+    refs: [CIS-CSC-v8:10.1]
+    query:
+      protocol: cim
+      wql: >-
+        SELECT Name, DisplayName, State FROM Win32_Service WHERE State = 'Running' AND (Name = 'Sense'
+        OR Name = 'CSFalconService' OR Name = 'SentinelAgent' OR Name = 'CbDefense' OR Name = 'cyserver'
+        OR Name = 'xagt' OR Name = 'CylanceSvc' OR Name = 'EFRService' OR Name = 'TracSrvWrapper')
+      key: "{host}|{Name}"
+    count:
+      op: gt
+      value: 1
+      threshold: workstations.edr-sensors-max
+      where: { field: Name, op: match, value: '^(Sense|CSFalconService|SentinelAgent|CbDefense|cyserver|xagt|CylanceSvc|EFRService|TracSrvWrapper)$', threshold: workstations.edr-sensor-pattern }
+    evidence: "{host}: {count} EDR sensors running ({sample})"
+
+  # ---- processes -------------------------------------------------------------------------------
+
+  - id: WS-PROC-HANDLES-HIGH
+    title: Process holds an extreme number of handles
+    kind: broken
+    category: HLT
+    severity: medium
+    entity: process
+    why: A process whose handle count keeps growing (a display driver leak in dwm is the classic) slows the session and ends in a hang.
+    fix: Restart the process or the PC; update the driver or application that leaks.
+    query:
+      protocol: cim
+      wql: SELECT Name, ProcessId, HandleCount FROM Win32_Process WHERE HandleCount > 10000
+      key: "{host}|{Name}|{ProcessId}"
+    each:
+      all:
+        - { field: HandleCount, op: gt, value: 20000, threshold: workstations.process-handles-max }
+        - { field: Name, op: notmatch, value: '^(System|Registry|Memory Compression)$', threshold: workstations.process-handles-ignore-pattern }
+    evidence: "{host}: {Name} (pid {ProcessId}) holds {HandleCount} handles"
+
+  - id: WS-PROC-MEMORY-HIGH
+    title: Shell or system process uses excessive memory
+    kind: broken
+    category: HLT
+    severity: medium
+    entity: process
+    why: Explorer, the window manager or the WMI host growing to gigabytes is a leak that drains memory from everything else.
+    fix: Restart the process or the PC and find the extension, driver or caller behind the growth. The threshold is in bytes.
+    query:
+      protocol: cim
+      wql: SELECT Name, ProcessId, PrivatePageCount FROM Win32_Process WHERE PrivatePageCount > 524288000
+      key: "{host}|{Name}|{ProcessId}"
+    each:
+      all:
+        - { field: Name, op: match, value: '^(explorer|dwm|WmiPrvSE|SearchHost|SearchIndexer|services|spoolsv|lsass)\.exe$', threshold: workstations.process-memory-watch-pattern }
+        - { field: PrivatePageCount, op: gt, value: 1610612736, threshold: workstations.process-private-bytes-max }
+    evidence: "{host}: {Name} (pid {ProcessId}) private bytes {PrivatePageCount}"
+
+  - id: WS-PROC-HUNG-TOOL
+    title: Short-lived system tool still running long after it started
+    kind: broken
+    category: HLT
+    severity: medium
+    entity: process
+    why: Command-line tools that normally exit in seconds (scheduled-task, policy, registry, licensing helpers) and stay for hours are hung calls; they point at a stuck service.
+    fix: Find the stuck service they wait on (often the Task Scheduler, Group Policy or WMI); restart it or the PC.
+    query:
+      protocol: cim
+      wql: SELECT Name, ProcessId, CreationDate FROM Win32_Process
+      key: "{host}|{Name}|{ProcessId}"
+    each:
+      all:
+        - { field: Name, op: match, value: '^(schtasks|wmic|reg|sc|net|net1|netsh|gpupdate|sppsvc|cscript|wscript)\.exe$', threshold: workstations.hung-tool-pattern }
+        - { field: CreationDate, op: age-gt, value: 0.5, threshold: workstations.hung-tool-age-days }
+    evidence: "{host}: {Name} (pid {ProcessId}) running since {CreationDate}"
+
+  - id: WS-PROC-PILED-UP
+    title: Many copies of a program that should not pile up
+    kind: broken
+    category: HLT
+    severity: medium
+    why: A program that leaves a copy behind each time it is used (or calls that never return) piles up until memory runs out; the count per PC shows it before users complain. The where pattern lists the programs that count.
+    fix: Find what starts the copies and why they do not exit; restart the PC to clear them. Add the organisation's known leakers (for example an OCR or viewer add-in) to the pattern.
+    query:
+      protocol: cim
+      wql: SELECT Name, ProcessId, CreationDate FROM Win32_Process
+      key: "{host}|{Name}|{ProcessId}"
+    count:
+      op: gt
+      value: 10
+      threshold: workstations.piled-process-max
+      where: { field: Name, op: match, value: '^(schtasks|wmic|reg|sc|net|net1|netsh|gpupdate|cscript|wscript|msiexec)\.exe$', threshold: workstations.piled-process-pattern }
+    evidence: "{host}: {count} copies of listed programs ({sample})"
+
+  - id: WS-PROC-UNAPPROVED
+    title: Unapproved remote-access or messaging program is running
+    kind: misconfigured
+    lens: security
+    category: AUT
+    severity: medium
+    entity: process
+    why: Running remote-access tools give an unmanaged way into the PC; consumer messaging apps (including store apps that no inventory sees) move data outside approved channels.
+    fix: Remove the program, block it with application control, and set the pattern to what the organisation forbids.
+    refs: [CIS-CSC-v8:2.3, NIST-800-53:CM-7]
+    query:
+      protocol: cim
+      wql: SELECT Name, ProcessId, CreationDate FROM Win32_Process
+      key: "{host}|{Name}|{ProcessId}"
+    each: { field: Name, op: match, value: '^(WhatsApp|Telegram|AnyDesk|TeamViewer|TeamViewer_Service|rustdesk|Signal|Viber|Discord|ToDesk|Supremo|AA_v3)\.exe$', threshold: workstations.unapproved-process-pattern }
+    evidence: "{host}: {Name} (pid {ProcessId}) running since {CreationDate}"
+
+  # ---- printers, logs --------------------------------------------------------------------------
+
+  - id: WS-PRINTER-WSD
+    title: Auto-installed WSD network printer present
+    kind: misconfigured
+    category: HYG
+    severity: low
+    entity: printer
+    why: Printers that Windows adds on its own over WSD are unmanaged; when one goes offline, printing from Office applications stalls.
+    fix: Remove WSD printers and turn off automatic network printer setup by policy; deploy managed TCP/IP queues instead.
+    query:
+      protocol: cim
+      wql: SELECT Name, PortName, WorkOffline FROM Win32_Printer WHERE PortName LIKE 'WSD%'
+      key: "{host}|{Name}"
+    each: any
+    evidence: "{host}: printer {Name} on port {PortName}"
+
+  - id: WS-EVENTLOG-SMALL
+    title: Application or System event log is too small
+    kind: misconfigured
+    category: LOG
+    severity: low
+    entity: event-log
+    why: A small circular log is overwritten within hours when one source floods it; crash and hang history is gone before anyone looks.
+    fix: Set the Application and System logs to at least 32 MB by policy. The threshold is in bytes.
+    refs: [NIST-800-53:AU-4, CIS-CSC-v8:8.3]
+    query:
+      protocol: cim
+      wql: SELECT LogfileName, MaxFileSize, NumberOfRecords FROM Win32_NTEventlogFile WHERE LogfileName = 'Application' OR LogfileName = 'System'
+      key: "{host}|{LogfileName}"
+    each: { field: MaxFileSize, op: lt, value: 33554432, threshold: workstations.eventlog-min-bytes }
+    evidence: "{host}: {LogfileName} log max size {MaxFileSize} bytes"
+
+  # ---- firewall and Group Policy results ------------------------------------------------------
+
+  - id: WS-FW-PROFILE-OFF
+    title: Windows Firewall profile turned off locally
+    kind: misconfigured
+    lens: security
+    category: AUT
+    severity: high
+    entity: firewall-profile
+    why: With the host firewall off, every listening service is reachable from the network and lateral movement is unhindered.
+    fix: Turn the profile on. This reads the local store; a policy that disables the firewall is caught by WS-GPO-FIREWALL-OFF.
+    refs: [CIS-CSC-v8:4.5, NIST-800-53:SC-7]
+    query:
+      protocol: cim
+      namespace: root/StandardCimv2
+      wql: SELECT Name, Enabled, DefaultInboundAction FROM MSFT_NetFirewallProfile
+      key: "{host}|{Name}"
+    each: { field: Enabled, op: eq, value: 0 }
+    evidence: "{host}: {Name} profile disabled in the local store"
+
+  - id: WS-GPO-FIREWALL-OFF
+    title: Group Policy turns the Windows Firewall off
+    kind: misconfigured
+    lens: security
+    category: AUT
+    severity: high
+    entity: policy-setting
+    why: A winning policy that sets EnableFirewall to 0 disables the host firewall on every computer it reaches, whatever the local setting.
+    fix: Find the GPO in the policy result, remove the setting, and keep a policy that turns the firewall on with inbound blocked by default.
+    refs: [CIS-CSC-v8:4.5, NIST-800-53:SC-7]
+    query:
+      protocol: cim
+      namespace: root/rsop/computer
+      wql: >-
+        SELECT registryKey, valueName, value, precedence FROM RSOP_RegistryPolicySetting
+        WHERE precedence = 1 AND (valueName = 'EnableFirewall' OR valueName = 'AlwaysInstallElevated'
+        OR valueName = 'fAllowToGetHelp' OR valueName = 'TargetReleaseVersion')
+      key: "{host}|{registryKey}|{valueName}"
+    each:
+      all:
+        - { field: valueName, op: eq, value: EnableFirewall }
+        - { field: value, op: eq, value: 'AAAAAA==' }
+    evidence: "{host}: policy sets {registryKey}\\{valueName} = 0"
+
+  - id: WS-GPO-RISKY-SETTING
+    title: Group Policy sets a risky value
+    kind: misconfigured
+    lens: security
+    category: AUT
+    severity:
+      field: valueName
+      map: { AlwaysInstallElevated: high, fAllowToGetHelp: medium, TargetReleaseVersion: low }
+      default: medium
+    entity: policy-setting
+    why: Policy makes every MSI install run elevated (AlwaysInstallElevated), allows solicited Remote Assistance, or pins the Windows feature version so the fleet cannot move to the next release.
+    fix: Remove or reverse the setting in the GPO that wins in the policy result; pinning must be a dated, owned decision.
+    refs: [NIST-800-53:CM-6, NIST-800-53:AC-17]
+    query:
+      protocol: cim
+      namespace: root/rsop/computer
+      wql: >-
+        SELECT registryKey, valueName, value, precedence FROM RSOP_RegistryPolicySetting
+        WHERE precedence = 1 AND (valueName = 'EnableFirewall' OR valueName = 'AlwaysInstallElevated'
+        OR valueName = 'fAllowToGetHelp' OR valueName = 'TargetReleaseVersion')
+      key: "{host}|{registryKey}|{valueName}"
+    each:
+      all:
+        - { field: valueName, op: in, value: [AlwaysInstallElevated, fAllowToGetHelp, TargetReleaseVersion] }
+        - { field: value, op: eq, value: 'AQAAAA==' }
+    evidence: "{host}: policy sets {registryKey}\\{valueName} = 1"
+
+  - id: WS-GPO-UAC-WEAK
+    title: Group Policy turns User Account Control off or makes elevation silent
+    kind: misconfigured
+    lens: security
+    category: AUT
+    severity: high
+    entity: policy-setting
+    why: With UAC off, or administrators elevated without a prompt, any process an admin starts runs with full rights and malware elevates unnoticed.
+    fix: Remove the setting from the winning GPO; keep Admin Approval Mode on and require a prompt for administrators.
+    refs: [NIST-800-53:AC-6, CIS-CSC-v8:4.1]
+    query:
+      protocol: cim
+      namespace: root/rsop/computer
+      wql: SELECT Path, Data, Type, precedence FROM RSOP_RegistryValue WHERE precedence = 1
+      key: "{host}|{Path}"
+    each:
+      any:
+        - all:
+            - { field: Path, op: match, value: '\\Policies\\System\\EnableLUA$' }
+            - { field: Data, op: eq, value: 0 }
+        - all:
+            - { field: Path, op: match, value: '\\Policies\\System\\ConsentPromptBehaviorAdmin$' }
+            - { field: Data, op: eq, value: 0 }
+    evidence: "{host}: policy sets {Path} = {Data}"
+
+  - id: WS-GPO-LMCOMPAT-LOW
+    title: Group Policy allows LM or NTLMv1 authentication
+    kind: misconfigured
+    lens: security
+    category: AUT
+    severity: medium
+    entity: policy-setting
+    why: An LAN Manager authentication level below 5 lets the computer accept or send LM and NTLMv1 responses, which are easy to crack or relay.
+    fix: Set the LAN Manager authentication level to 'Send NTLMv2 response only, refuse LM and NTLM' after checking for legacy dependencies.
+    refs: [NIST-800-53:IA-2, CIS-CSC-v8:4.1]
+    query:
+      protocol: cim
+      namespace: root/rsop/computer
+      wql: SELECT Path, Data, Type, precedence FROM RSOP_RegistryValue WHERE precedence = 1
+      key: "{host}|{Path}"
+    each:
+      all:
+        - { field: Path, op: match, value: '\\Lsa\\LmCompatibilityLevel$' }
+        - { field: Data, op: lt, value: 5, threshold: workstations.lm-compatibility-min }
+    evidence: "{host}: policy sets {Path} = {Data}"
+
+  - id: WS-GPO-DC-POLICY-APPLIED
+    title: Workstation applies the Default Domain Controllers Policy
+    kind: misconfigured
+    lens: security
+    category: CFG
+    severity: high
+    why: The domain controllers' policy linked above workstations replaces their user rights assignment; services lose rights they need and the PC gets server-grade settings it should not have.
+    fix: Remove the extra links of the Default Domain Controllers Policy so it applies to the Domain Controllers OU only.
+    refs: [NIST-800-53:CM-6]
+    query:
+      protocol: cim
+      namespace: root/rsop/computer
+      wql: SELECT name, guidName, enabled, accessDenied, filterAllowed FROM RSOP_GPO WHERE guidName = '{6AC1786C-016F-11D2-945F-00C04fB984F9}'
+      key: host
+    each:
+      all:
+        - { field: enabled, op: eq, value: true }
+        - { field: accessDenied, op: eq, value: false }
+        - { field: filterAllowed, op: eq, value: true }
+    evidence: "{host}: applies {name}"
+
+  # ---- anti-malware ----------------------------------------------------------------------------
+
+  - id: WS-DEFENDER-RTP-OFF
+    title: Defender is the active antivirus but real-time protection is off
+    kind: misconfigured
+    lens: security
+    category: MON
+    severity: high
+    why: In normal (active) mode with real-time protection off, files are not scanned when written or run.
+    fix: Turn real-time protection on and find the policy or tool that disabled it; enable tamper protection.
+    refs: [CIS-CSC-v8:10.1, NIST-800-53:SI-3]
+    query:
+      protocol: cim
+      namespace: root/Microsoft/Windows/Defender
+      wql: SELECT * FROM MSFT_MpComputerStatus
+      key: host
+    each:
+      all:
+        - { field: AMRunningMode, op: match, value: '^Normal' }
+        - { field: RealTimeProtectionEnabled, op: eq, value: false }
+    evidence: "{host}: mode {AMRunningMode}, real-time protection {RealTimeProtectionEnabled}"
+
+  - id: WS-DEFENDER-SIG-OLD
+    title: Defender antivirus signatures are out of date
+    kind: broken
+    lens: security
+    category: MON
+    severity: medium
+    why: Old signatures miss current malware; an age of 65535 days means the signatures never updated.
+    fix: Check the update source (update service, management point, or internet) and the Defender update logs.
+    refs: [CIS-CSC-v8:10.2, NIST-800-53:SI-3]
+    query:
+      protocol: cim
+      namespace: root/Microsoft/Windows/Defender
+      wql: SELECT * FROM MSFT_MpComputerStatus
+      key: host
+    each:
+      all:
+        - { field: AMServiceEnabled, op: eq, value: true }
+        - { field: AntivirusSignatureAge, op: gt, value: 3, threshold: workstations.defender-signature-max-age-days }
+    evidence: "{host}: signatures {AntivirusSignatureAge} days old (last update {AntivirusSignatureLastUpdated})"
+
+  - id: WS-AV-UNAPPROVED
+    title: Antivirus product other than the approved one is registered
+    kind: misconfigured
+    lens: security
+    category: MON
+    severity: medium
+    entity: av-product
+    why: Leftover or extra antivirus engines next to the approved one fight over file access, slow the PC, and the old one often runs unmanaged and unpatched.
+    fix: Remove the product (vendor removal tool if it is password-protected) and set the pattern to the approved product names.
+    refs: [CIS-CSC-v8:10.1]
+    query:
+      protocol: cim
+      namespace: root/SecurityCenter2
+      wql: SELECT displayName, productState, pathToSignedProductExe FROM AntiVirusProduct
+      key: "{host}|{displayName}"
+    each: { field: displayName, op: notmatch, value: '^(Windows Defender|Microsoft Defender Antivirus)$', threshold: workstations.approved-av-pattern }
+    evidence: "{host}: registered antivirus {displayName} (state {productState})"
+
+  - id: WS-AV-DEFS-OUTDATED
+    title: Security Center reports antivirus definitions out of date
+    kind: broken
+    lens: security
+    category: MON
+    severity: medium
+    entity: av-product
+    why: Windows Security Center flags a registered antivirus product whose definitions are stale, whichever vendor it is.
+    fix: Repair the product's update path; remove the product if it is a leftover.
+    refs: [CIS-CSC-v8:10.2]
+    query:
+      protocol: cim
+      namespace: root/SecurityCenter2
+      wql: SELECT displayName, productState, pathToSignedProductExe FROM AntiVirusProduct
+      key: "{host}|{displayName}"
+    each: { field: productState, op: flag, value: 16 }
+    evidence: "{host}: {displayName} definitions out of date (state {productState})"
+
+  - id: WS-AV-MULTIPLE
+    title: More than one antivirus product active
+    kind: misconfigured
+    lens: both
+    category: MON
+    severity: medium
+    why: Two active antivirus engines scan every file twice, slow the PC and can deadlock each other; one of them is usually a leftover. Only products whose Security Center state says on are counted.
+    fix: Keep the approved product active, remove the other or switch it to passive mode.
+    refs: [CIS-CSC-v8:10.1]
+    query:
+      protocol: cim
+      namespace: root/SecurityCenter2
+      wql: SELECT displayName, productState, pathToSignedProductExe FROM AntiVirusProduct
+      key: "{host}|{displayName}"
+    count:
+      op: gt
+      value: 1
+      where: { field: productState, op: flag, value: 4096 }
+    evidence: "{host}: {count} active antivirus products ({sample})"
+
+  # ---- hardening ---------------------------------------------------------------------------------
+
+  - id: WS-BITLOCKER-OS-OFF
+    title: Operating system drive not protected by BitLocker
+    kind: misconfigured
+    lens: security
+    category: CFG
+    severity: high
+    why: A lost or stolen PC without disk encryption gives away cached credentials and local data.
+    fix: Enable BitLocker with TPM protection and escrow the recovery key.
+    refs: [CIS-CSC-v8:3.6, NIST-800-53:SC-28]
+    query:
+      protocol: cim
+      namespace: root/cimv2/Security/MicrosoftVolumeEncryption
+      wql: SELECT DriveLetter, ProtectionStatus, ConversionStatus, VolumeType FROM Win32_EncryptableVolume WHERE VolumeType = 0
+      key: host
+    each: { field: ProtectionStatus, op: ne, value: 1 }
+    evidence: "{host}: {DriveLetter} protection status {ProtectionStatus}, conversion {ConversionStatus}"
+
+  - id: WS-CREDGUARD-OFF
+    title: Credential Guard is not running
+    kind: misconfigured
+    lens: security
+    category: AUT
+    severity: medium
+    why: Without Credential Guard, credential material in LSASS can be dumped by anyone with admin rights on the PC.
+    fix: Enable virtualization-based security and Credential Guard by policy on hardware that supports it.
+    refs: [NIST-800-53:SC-39]
+    query:
+      protocol: cim
+      namespace: root/Microsoft/Windows/DeviceGuard
+      wql: SELECT * FROM Win32_DeviceGuard
+      key: host
+    each: { field: SecurityServicesRunning, op: notcontains, value: 1 }
+    evidence: "{host}: VBS status {VirtualizationBasedSecurityStatus}, running services {SecurityServicesRunning}"
+
+  - id: WS-HVCI-OFF
+    title: Memory integrity (HVCI) is not running
+    kind: misconfigured
+    lens: security
+    category: AUT
+    severity: low
+    why: Memory integrity blocks unsigned or vulnerable kernel drivers; without it a malicious driver can disable security tools.
+    fix: Enable memory integrity by policy after checking driver compatibility.
+    refs: [NIST-800-53:SI-7]
+    query:
+      protocol: cim
+      namespace: root/Microsoft/Windows/DeviceGuard
+      wql: SELECT * FROM Win32_DeviceGuard
+      key: host
+    each: { field: SecurityServicesRunning, op: notcontains, value: 2 }
+    evidence: "{host}: VBS status {VirtualizationBasedSecurityStatus}, running services {SecurityServicesRunning}"
+
+  - id: WS-FEATURE-UNWANTED
+    title: Legacy or unwanted Windows feature is enabled
+    kind: misconfigured
+    lens: security
+    category: AUT
+    severity:
+      field: Name
+      map: { SMB1Protocol: high, SMB1Protocol-Server: high, SMB1Protocol-Client: high, MicrosoftWindowsPowerShellV2Root: medium, MicrosoftWindowsPowerShellV2: medium, Recall: medium }
+      default: low
+    entity: feature
+    why: SMB1, the PowerShell 2.0 engine (bypasses script logging), Recall snapshots and old clients such as Telnet or TFTP widen the attack surface for no business need.
+    fix: Remove the optional feature by policy or a configuration item; set the pattern to what the organisation forbids.
+    refs: [CIS-CSC-v8:4.8, NIST-800-53:CM-7]
+    query:
+      protocol: cim
+      wql: SELECT Name, Caption, InstallState FROM Win32_OptionalFeature WHERE InstallState = 1
+      key: "{host}|{Name}"
+    each: { field: Name, op: match, value: '^(SMB1Protocol|SMB1Protocol-Client|SMB1Protocol-Server|MicrosoftWindowsPowerShellV2Root|MicrosoftWindowsPowerShellV2|Recall|TelnetClient|TFTP|SimpleTCP|Internet-Explorer-Optional-amd64)$', threshold: workstations.unwanted-feature-pattern }
+    evidence: "{host}: feature {Name} enabled"
+
+  - id: WS-SMB-CLIENT-SIGNING-OFF
+    title: SMB client does not require signing
+    kind: misconfigured
+    lens: security
+    category: AUT
+    severity: medium
+    why: Without required signing, SMB sessions from this PC can be tampered with or relayed by a machine in the middle.
+    fix: Require SMB client signing by policy ('Microsoft network client - Digitally sign communications (always)').
+    refs: [NIST-800-53:SC-8]
+    query:
+      protocol: cim
+      namespace: root/Microsoft/Windows/SMB
+      wql: SELECT * FROM MSFT_SmbClientConfiguration
+      key: host
+    each: { field: RequireSecuritySignature, op: eq, value: false }
+    evidence: "{host}: SMB client RequireSecuritySignature = {RequireSecuritySignature}"
+
+  - id: WS-SMB-INSECURE-GUEST
+    title: SMB client allows insecure guest logons
+    kind: misconfigured
+    lens: security
+    category: AUT
+    severity: medium
+    why: Guest logons to file shares carry no identity and no signing, so a rogue server can feed the PC files unnoticed.
+    fix: Disable insecure guest logons by policy and fix any share that depends on guest access.
+    refs: [NIST-800-53:IA-2]
+    query:
+      protocol: cim
+      namespace: root/Microsoft/Windows/SMB
+      wql: SELECT * FROM MSFT_SmbClientConfiguration
+      key: host
+    each: { field: EnableInsecureGuestLogons, op: eq, value: true }
+    evidence: "{host}: EnableInsecureGuestLogons = {EnableInsecureGuestLogons}"
+
+  - id: WS-RDP-NO-NLA
+    title: Remote Desktop accepts connections without Network Level Authentication
+    kind: misconfigured
+    lens: security
+    category: AUT
+    severity: medium
+    why: Without NLA the logon screen is exposed to anyone who reaches the port, which enables pre-authentication attacks and resource exhaustion.
+    fix: Require Network Level Authentication by policy.
+    refs: [NIST-800-53:AC-17]
+    query:
+      protocol: cim
+      namespace: root/cimv2/TerminalServices
+      wql: SELECT TerminalName, UserAuthenticationRequired, SecurityLayer, MinEncryptionLevel FROM Win32_TSGeneralSetting WHERE TerminalName = 'RDP-Tcp'
+      key: host
+    each: { field: UserAuthenticationRequired, op: eq, value: 0 }
+    evidence: "{host}: RDP-Tcp UserAuthenticationRequired = {UserAuthenticationRequired}"
+
+  # ---- local accounts and Administrators ------------------------------------------------------
+  # The group is looked up by its English name through {HOST}; WS-LOCALADMIN-UNREADABLE turns a group
+  # that cannot be read (renamed, localised, access denied) into a finding instead of a silent pass.
+
+  - id: WS-LOCALADMIN-UNEXPECTED
+    title: Unexpected member of the local Administrators group
+    kind: misconfigured
+    lens: security
+    category: IAM
+    severity: high
+    entity: local-admin-member
+    why: Every extra local administrator can install software, disable security tools and harvest credentials; broad admin rights are how one infected PC becomes many.
+    fix: Remove the member; manage local Administrators with one replace-mode policy (or LAPS plus a reviewed group) and set the expected pattern to those principals.
+    refs: [NIST-800-53:AC-6, CIS-CSC-v8:5.4]
+    query:
+      protocol: cim
+      wql: SELECT GroupComponent, PartComponent FROM Win32_GroupUser WHERE GroupComponent = "Win32_Group.Domain='{HOST}',Name='Administrators'"
+      key: "{host}|{PartComponent}"
+    each: { field: PartComponent, op: notmatch, value: 'Name = "(Administrator|Domain Admins)"', threshold: workstations.local-admin-expected-pattern }
+    evidence: "{host}: local admin {PartComponent}"
+
+  - id: WS-LOCALADMIN-BROAD
+    title: Broad group is a member of the local Administrators group
+    kind: misconfigured
+    lens: security
+    category: IAM
+    severity: critical
+    entity: local-admin-member
+    why: When Domain Users, Authenticated Users, Everyone or a similar group is a local administrator, every user in the organisation is admin on this PC.
+    fix: Remove the group at once and find the policy (often a group policy preference) that adds it.
+    refs: [NIST-800-53:AC-6, CIS-CSC-v8:5.4]
+    query:
+      protocol: cim
+      wql: SELECT GroupComponent, PartComponent FROM Win32_GroupUser WHERE GroupComponent = "Win32_Group.Domain='{HOST}',Name='Administrators'"
+      key: "{host}|{PartComponent}"
+    each: { field: PartComponent, op: match, value: 'Name = "(Everyone|Authenticated Users|Users|INTERACTIVE|Domain Users|Domain Computers|Domain Guests|Guests)"' }
+    evidence: "{host}: local admin {PartComponent}"
+
+  - id: WS-LOCALADMIN-COUNT
+    title: Too many direct members in the local Administrators group
+    kind: misconfigured
+    lens: security
+    category: IAM
+    severity: medium
+    why: More direct members than the standard set (built-in account, the admin group, the LAPS or helpdesk group) means grants were added by hand or by stray policies; each one widens who controls the PC. Nested group members are not expanded here.
+    fix: Reduce the group to the standard members with one replace-mode policy; review each extra grant.
+    refs: [NIST-800-53:AC-6, CIS-CSC-v8:5.4]
+    query:
+      protocol: cim
+      wql: SELECT GroupComponent, PartComponent FROM Win32_GroupUser WHERE GroupComponent = "Win32_Group.Domain='{HOST}',Name='Administrators'"
+      key: "{host}|{PartComponent}"
+    count: { op: gt, value: 3, threshold: workstations.local-admins-max }
+    evidence: "{host}: {count} members in local Administrators ({sample})"
+
+  - id: WS-LOCALADMIN-UNREADABLE
+    title: Local Administrators group could not be read by name
+    kind: missing
+    lens: security
+    category: IAM
+    severity: medium
+    why: The group is looked up by the English name 'Administrators'; no members back means the group is renamed or localised, or the read was refused, so the other local-admin rules cannot judge this PC.
+    fix: Check the group name and the scan account's rights on the PC; a localised name needs a tenant copy of the local-admin rules with that name.
+    refs: [NIST-800-53:AC-6]
+    query:
+      protocol: cim
+      wql: SELECT GroupComponent, PartComponent FROM Win32_GroupUser WHERE GroupComponent = "Win32_Group.Domain='{HOST}',Name='Administrators'"
+      key: "{host}|{PartComponent}"
+    count: { op: lt, value: 1 }
+    evidence: "{host}: no members returned for the group named Administrators"
+
+  - id: WS-LOCAL-ACCOUNT-WEAK
+    title: Guest enabled or a local account needs no password
+    kind: misconfigured
+    lens: security
+    category: IAM
+    severity: medium
+    entity: local-account
+    why: An enabled Guest account or an enabled local account without a required password is a free logon to the PC.
+    fix: Disable the Guest account and set a password requirement (or disable) for the local account.
+    refs: [NIST-800-53:IA-5, CIS-CSC-v8:5.2]
+    query:
+      protocol: cim
+      wql: SELECT Name, SID, Disabled, PasswordRequired, Lockout FROM Win32_UserAccount WHERE LocalAccount = TRUE
+      key: "{host}|{Name}"
+    each:
+      all:
+        - { field: Disabled, op: eq, value: false }
+        - any:
+            - { field: SID, op: match, value: '-501$' }
+            - { field: PasswordRequired, op: eq, value: false }
+    evidence: "{host}: local account {Name} enabled, password required {PasswordRequired}"
+
+  # ---- Configuration Manager client view of updates -------------------------------------------
+
+  - id: WS-CCM-UPDATE-OVERDUE
+    title: Deployed update still missing after its deadline
+    kind: missing
+    lens: both
+    category: LCM
+    severity: high
+    entity: software-update
+    why: The client knows the update is required and past its deadline, yet it is not installed; the PC is exposed to a published vulnerability.
+    fix: Check disk space, maintenance windows and the client's update logs; a pending restart or a broken update agent are common causes.
+    refs: [NIST-800-53:SI-2, CIS-CSC-v8:7.3]
+    query:
+      protocol: cim
+      namespace: root/ccm/ClientSDK
+      wql: SELECT ArticleID, Name, ComplianceState, EvaluationState, Deadline, ErrorCode FROM CCM_SoftwareUpdate
+      key: "{host}|{ArticleID}|{Name}"
+    each:
+      all:
+        - { field: ComplianceState, op: eq, value: 0 }
+        - { field: Deadline, op: age-gt, value: 3, threshold: workstations.update-deadline-grace-days }
+    evidence: "{host}: KB{ArticleID} missing, deadline {Deadline}, state {EvaluationState}"
+
+  - id: WS-CCM-UPDATE-FAILED
+    title: Update installation failed on the client
+    kind: broken
+    lens: both
+    category: LCM
+    severity: medium
+    entity: software-update
+    why: The client tried to install a deployed update and failed; it retries and the PC stays unpatched until the error is fixed.
+    fix: Look up the error code in WUAHandler.log; fix disk space, servicing stack or component store problems.
+    refs: [NIST-800-53:SI-2]
+    query:
+      protocol: cim
+      namespace: root/ccm/ClientSDK
+      wql: SELECT ArticleID, Name, ComplianceState, EvaluationState, Deadline, ErrorCode FROM CCM_SoftwareUpdate
+      key: "{host}|{ArticleID}|{Name}"
+    each: { field: EvaluationState, op: eq, value: 13 }
+    evidence: "{host}: KB{ArticleID} failed with error {ErrorCode}"

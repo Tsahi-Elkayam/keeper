@@ -110,6 +110,17 @@ public sealed class TlsRunner : IRunner
             ["chainErrors"] = string.Join(", ", chainStatus.Distinct()),
             ["selfSigned"] = certificate.Subject == certificate.Issuer,
             ["sans"] = new JsonArray(sans.Select(s => (JsonNode)JsonValue.Create(s)).ToArray()),
+            ["eku"] = new JsonArray(Ekus(certificate).Select(s => (JsonNode)JsonValue.Create(s)).ToArray()),
         };
     }
+
+    /// <summary>
+    /// The certificate's extended key usages as OIDs (1.3.6.1.5.5.7.3.1 server authentication,
+    /// 1.3.6.1.5.2.3.5 KDC authentication, ...). OIDs, not names: names differ by platform and language.
+    /// </summary>
+    public static IEnumerable<string> Ekus(X509Certificate2 certificate) =>
+        certificate.Extensions.OfType<X509EnhancedKeyUsageExtension>()
+            .SelectMany(e => e.EnhancedKeyUsages.Cast<System.Security.Cryptography.Oid>())
+            .Select(o => o.Value ?? "")
+            .Where(v => v.Length > 0);
 }

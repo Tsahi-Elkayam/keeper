@@ -187,8 +187,16 @@ public sealed class Scanner(RunnerRegistry registry, TimeProvider? clock = null)
         }
     }
 
-    private static string KeyOf(QuerySpec query, JsonObject row, string? target) =>
-        Values.Text(FieldPath.First(row, query.Key)) is { Length: > 0 } key ? key : target ?? "-";
+    /// <summary>
+    /// The row's entity key: a field, or a template of fields ("{host}|{PartComponent}") when one field is not
+    /// unique - several members of one host's Administrators group are several findings, not one.
+    /// </summary>
+    private static string KeyOf(QuerySpec query, JsonObject row, string? target)
+    {
+        if (query.Key.Contains('{', StringComparison.Ordinal))
+            return Templates.Render(query.Key, row) is { Length: > 0 } rendered ? rendered : target ?? "-";
+        return Values.Text(FieldPath.First(row, query.Key)) is { Length: > 0 } key ? key : target ?? "-";
+    }
 
     private int Evaluate(Rule rule, QueryOutcome outcome, ScanRequest request, RunWriter run, string instance, string system, string observedAt)
     {
@@ -219,17 +227,28 @@ public sealed class Scanner(RunnerRegistry registry, TimeProvider? clock = null)
         var findings = 0;
         if (rule.Count is { } count)
         {
-            var evaluator = new Evaluator(name => request.OverrideThreshold(rule.Id, "-") ?? request.Threshold(name), now);
-            var verdict = evaluator.Count(count, outcome.Rows.Count);
-            Result("instance", "-", verdict);
-            if (verdict.Fails == true)
+            // A per-host query counts per host: "no update installed in 45 days" and "more than 3 local
+            // administrators" are about each machine. A host whose query failed is unknown, never a pass.
+            if (outcome.Targets.Any(t => t.Target is not null))
             {
-                var sample = string.Join(", ", outcome.Rows.Take(10).Select(r => KeyOf(rule.Query, r.Row, r.Target)));
-                run.Finding(BuildFinding(rule, instance, system, "instance", "-", null, null, evaluator, observedAt,
-                    rule.Evidence is null
-                        ? $"{verdict.Value} found (limit {verdict.Operand}){(sample.Length > 0 ? ": " + sample : "")}"
-                        : Templates.Render(rule.Evidence, new JsonObject { ["count"] = outcome.Rows.Count, ["sample"] = sample })));
-                findings++;
+                var byTarget = outcome.Rows.ToLookup(r => r.Target, StringComparer.OrdinalIgnoreCase);
+                foreach (var target in outcome.Targets.Where(t => t.Target is not null))
+                {
+                    if (target.State == "failed")
+                    {
+                        run.Result(new ResultRecord
+                        {
+                            Instance = instance, System = system, RuleId = rule.Id, EntityType = rule.EntityType, EntityKey = target.Target!,
+                            State = "unknown", Why = Redactor.Clean($"the query failed on this host: {target.Reason}"), TtlMinutes = rule.TtlMinutes, At = observedAt,
+                        });
+                        continue;
+                    }
+                    findings += CountOne(byTarget[target.Target].ToList(), rule.EntityType, target.Target!);
+                }
+            }
+            else
+            {
+                findings += CountOne(outcome.Rows, "instance", "-");
             }
         }
         else
@@ -254,6 +273,33 @@ public sealed class Scanner(RunnerRegistry registry, TimeProvider? clock = null)
 
         Coverage(outcome.State, outcome.State == "ok" ? null : outcome.Reason, outcome.Rows.Count);
         return findings;
+
+        int CountOne(List<(JsonObject Row, string? Target)> rows, string entityType, string target)
+        {
+            var count = rule.Count!;
+            var evaluator = new Evaluator(name => request.OverrideThreshold(rule.Id, target) ?? request.Threshold(name), now);
+            var judged = count.Where is null
+                ? rows.Select(r => (r.Row, r.Target, Fails: (bool?)true)).ToList()
+                : rows.Select(r => (r.Row, r.Target, evaluator.Each(count.Where, r.Row).Fails)).ToList();
+            var matching = judged.Where(j => j.Fails == true).ToList();
+            var unjudged = judged.Count(j => j.Fails is null);
+            var verdict = evaluator.Count(count, matching.Count);
+            Result(entityType, target, verdict);
+            if (verdict.Fails != true)
+                return 0;
+
+            var sample = string.Join(", ", matching.Take(10).Select(r => KeyOf(rule.Query, r.Row, r.Target)));
+            var note = unjudged > 0 ? $" ({unjudged} of {judged.Count} rows could not be judged)" : "";
+            var where = target == "-" ? "" : $"{target}: ";
+            run.Finding(BuildFinding(rule, instance, system, entityType, target, target == "-" ? null : target, null, evaluator, observedAt,
+                rule.Evidence is null
+                    ? $"{where}{verdict.Value} found (limit {verdict.Operand}){(sample.Length > 0 ? ": " + sample : "")}{note}"
+                    : Templates.Render(rule.Evidence, new JsonObject
+                    {
+                        ["host"] = target, ["count"] = matching.Count, ["rows"] = judged.Count, ["unjudged"] = unjudged, ["sample"] = sample,
+                    }) + note));
+            return 1;
+        }
     }
 
     private static FindingRecord BuildFinding(Rule rule, string instance, string system, string entityType, string target, string? name,

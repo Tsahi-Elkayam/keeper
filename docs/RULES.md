@@ -59,6 +59,17 @@ A rule has **one** of:
 | `count: { op: gt, value: 5 }` | Compares the number of rows | One for the whole system |
 | `count: none` | Returning no rows is the problem ("this should exist") | One for the whole system |
 | `count: some` | Returning any rows is the problem | One for the whole system |
+| `count: { op: lt, value: 1, where: <condition> }` | Counts only the rows the condition holds for: "an enforced MFA policy must exist" | One for the whole system |
+
+For a per-host protocol (`cim`, `sql`, `tls`) a `count` is judged **per host**, and the finding is
+about that host: "no update installed in 45 days" is `count: { op: lt, value: 1, where: { field:
+InstalledOn, op: age-lt, value: 45 } }` over the host's hotfixes. A host whose query failed is
+*unknown* for the rule, never a pass. In `where`, a row the condition cannot judge (a missing field)
+is not counted, so an unreadable policy never satisfies a must-exist rule; the evidence says how many
+rows could not be judged.
+
+`key:` is a field, or a template when one field is not unique per entity: `key: "{host}|{PartComponent}"`
+makes each member of a host's Administrators group its own finding.
 
 A condition is a leaf or a combination:
 
@@ -106,7 +117,7 @@ Every query has `protocol:`, `key:` (the row field that identifies the entity) a
 | `graphql` | `document` (required, a query), `path` (default /graphql), `variables`: mapping, `items`: path to the array, `paging`: { cursor, hasNext, variable }, `maxPages`. | One per item. |
 | `sql` | `text` (required, one SELECT/WITH), `database` (default master). Per target instance. | One per result row, plus `instance`. |
 | `cim` | `wql` (required, one SELECT; `{HOST}` stands for the target's computer name, upper case - e.g. `Win32_Group.Domain='{HOST}',Name='Administrators'`), `namespace` (default root/cimv2). Per target host. Never `Win32_Product`: reading it makes Windows Installer re-check (and repair) every package. | One per instance, plus `host`. Dates are ISO. |
-| `tls` | `port` (default 443; a target may also be host:port). Per target. | endpoint, host, port, subject, issuer, notBefore, notAfter, daysLeft, serial, thumbprint, keyAlgorithm, keySize, signatureAlgorithm, protocol, cipherSuite, chainValid, nameMatches, chainErrors, selfSigned, sans. |
+| `tls` | `port` (default 443; a target may also be host:port). Per target. | endpoint, host, port, subject, issuer, notBefore, notAfter, daysLeft, serial, thumbprint, keyAlgorithm, keySize, signatureAlgorithm, protocol, cipherSuite, chainValid, nameMatches, chainErrors, selfSigned, sans, eku (OIDs: 1.3.6.1.5.5.7.3.1 server authentication, 1.3.6.1.5.2.3.5 KDC authentication, ...). |
 | `file` | `path` (required, relative to imports\, wildcards in the file name), `format`: json (default), xml, csv; `items`: JSON path (json) or XPath (xml, required); `delimiter` (csv). | One per item, plus `_file` and `_modified`. XML elements become objects: attributes and child elements by name, repeated children as arrays. |
 | `store` | `text` (required, one SELECT or WITH; `:now` and `:today` are bound). | One per result row. Readable: the registers (licence, contract, key_date, vendor, initiative, attestation, latest_attestation), the review tables (system, entity, finding, active_finding, override, setting, rule, run, latest_run, coverage, row_seen) and integration_status / integration_test. Never: integration_secret, vault_key, request, schema_version. |
 

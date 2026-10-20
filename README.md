@@ -64,6 +64,8 @@ A scan reads; it never changes the system it reads. Keeper writes only its own s
 | `keeper system add <ID> --name ..` | The systems findings are grouped, routed and ranked by; `map` claims entities for them |
 | `keeper register licence set <id> --expires-on ..` | Licences, contracts, vendors, key dates, initiatives: rules warn before they bite |
 | `keeper report security` | `summary`, `security`, `expiring`, `changes --since` |
+| `keeper report trends` | Progress per system for management: now against 30 and 90 days ago, fixed vs new, sparklines (`keeper trend --system <ID>` for the daily rows) |
+| `keeper report evidence --framework NIST-800-53 --pack` | GRC evidence: per control, each rule's results and the scan that proved them (manifest SHA-256), accepted risks, attestations; `--pack` writes a folder with `SHA256SUMS.txt` an auditor can verify. `keeper controls` shows each control's status |
 | `keeper push plan` | Tickets for delegated findings (ServiceNow, monday.com); `apply` asks first |
 | `keeper rules explain <id>` | What a rule checks, why, and how to fix it |
 

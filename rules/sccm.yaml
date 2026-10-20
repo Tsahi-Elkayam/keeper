@@ -1,0 +1,786 @@
+schema: keeper.rules/1
+system: sccm
+name: Configuration Manager site health
+integration: sccm
+# All rules read the SMS Provider's AdminService WMI route (endpoint like https://<provider>/AdminService).
+# Paths are relative to that endpoint. Class and property names follow the Configuration Manager SDK.
+defaults:
+  lens: maintenance
+  refresh: 1d
+rules:
+
+  # ---- site, version, site systems, components ----------------------------------------------
+
+  - id: SCCM-SITE-STATUS
+    title: Site is not in the active state
+    kind: broken
+    category: AVL
+    severity: high
+    entity: site
+    refresh: 6h
+    why: A site that is pending, failed or being upgraded does not process client data, policy or content as it should.
+    fix: Check sitecomp.log and the Site Status node; finish or roll back the operation that left the site in this state.
+    query:
+      protocol: http
+      path: /wmi/SMS_Site
+      params:
+        $select: SiteCode,SiteName,Version,BuildNumber,Status,Type
+      key: SiteCode
+      name: SiteName
+    each: { field: Status, op: ne, value: 1 }
+    evidence: "{SiteCode} {SiteName}: status {Status} (1 = active), version {Version}"
+
+  - id: SCCM-SITE-VERSION-UNSUPPORTED
+    title: Site runs a current-branch release that is out of support
+    kind: broken
+    lens: both
+    category: LCM
+    severity: high
+    entity: site
+    refresh: 7d
+    why: Each current-branch release gets fixes for 18 months; after that neither the site nor its clients receive security updates.
+    fix: Install the newest release from Updates and Servicing. Raise the threshold when Microsoft retires the next release.
+    refs: [NIST-800-53:SA-22, NIST-800-53:SI-2]
+    query:
+      protocol: http
+      path: /wmi/SMS_Site
+      params:
+        $select: SiteCode,SiteName,Version,BuildNumber,Status,Type
+      key: SiteCode
+      name: SiteName
+    each: { field: BuildNumber, op: lt, value: 9141, threshold: sccm.min-supported-build }
+    evidence: "{SiteCode}: build {BuildNumber} ({Version}) is below the oldest supported build"
+
+  - id: SCCM-SITE-VERSION-ENDING
+    title: Site release leaves support within the next months
+    kind: broken
+    lens: both
+    category: LCM
+    severity: medium
+    entity: site
+    refresh: 7d
+    why: Planning an in-console update takes weeks (prerequisite check, backup, change window); starting late risks running unsupported.
+    fix: Schedule the update to the newest release now.
+    refs: [NIST-800-53:SA-22]
+    query:
+      protocol: http
+      path: /wmi/SMS_Site
+      params:
+        $select: SiteCode,SiteName,Version,BuildNumber,Status,Type
+      key: SiteCode
+      name: SiteName
+    each:
+      all:
+        - { field: BuildNumber, op: ge, value: 9141, threshold: sccm.min-supported-build }
+        - { field: BuildNumber, op: lt, value: 9146, threshold: sccm.ending-soon-build }
+    evidence: "{SiteCode}: build {BuildNumber} is supported but its support window closes next"
+
+  - id: SCCM-SITE-SYSTEM-STATUS
+    title: Site system storage object reports warning or critical
+    kind: broken
+    category: HLT
+    severity:
+      field: Status
+      map: { "2": high, "1": medium }
+      default: medium
+    entity: site-system
+    refresh: 6h
+    why: The site system summarizer turns yellow or red when a role's folder, database or log is near or past its threshold.
+    fix: Open Monitoring > Site Status for the role, read its status messages, then free space or repair access.
+    query:
+      protocol: http
+      path: /wmi/SMS_SiteSystemSummarizer
+      params:
+        $select: SiteSystem,Role,SiteObject,ObjectType,Status,PercentFree,BytesTotal,DownSince
+      key: SiteObject
+      name: SiteSystem
+    each: { field: Status, op: gt, value: 0, threshold: sccm.site-system-status-max }
+    evidence: "{SiteSystem} {Role}: status {Status}, {PercentFree}% free"
+
+  - id: SCCM-SITE-SYSTEM-DOWN
+    title: Site system storage object is unreachable
+    kind: broken
+    category: AVL
+    severity: high
+    entity: site-system
+    refresh: 6h
+    why: When the site server cannot reach a role's storage (network, permissions, server off), that role stops serving clients.
+    fix: Check the server is up and the site server's computer account still has access to the share or database.
+    query:
+      protocol: http
+      path: /wmi/SMS_SiteSystemSummarizer
+      params:
+        $select: SiteSystem,Role,SiteObject,ObjectType,Status,PercentFree,BytesTotal,DownSince
+      key: SiteObject
+      name: SiteSystem
+    each: { field: DownSince, op: exists }
+    evidence: "{SiteSystem} {Role}: unreachable since {DownSince}"
+
+  - id: SCCM-SITE-SYSTEM-LOW-SPACE
+    title: Site system storage is low on free space
+    kind: broken
+    category: HLT
+    severity:
+      field: PercentFree
+      ranges: [ { max: 5, value: critical } ]
+      default: high
+    entity: site-system
+    refresh: 6h
+    why: A full content library, inbox volume or site database stops distribution, inventory processing and status handling.
+    fix: Clean up content and logs, remove unused packages, or extend the volume before it fills.
+    refs: [NIST-800-53:SC-5]
+    query:
+      protocol: http
+      path: /wmi/SMS_SiteSystemSummarizer
+      params:
+        $select: SiteSystem,Role,SiteObject,ObjectType,Status,PercentFree,BytesTotal,DownSince
+      key: SiteObject
+      name: SiteSystem
+    each:
+      all:
+        - { field: BytesTotal, op: gt, value: 0 }
+        - { field: PercentFree, op: lt, value: 10, threshold: sccm.site-system-free-pct-min }
+    evidence: "{SiteSystem} {Role} {SiteObject}: {PercentFree}% free"
+
+  - id: SCCM-COMPONENT-STATUS
+    title: Site component reported errors or warnings today
+    kind: broken
+    category: HLT
+    severity:
+      field: Status
+      map: { "2": high, "1": medium }
+      default: medium
+    entity: component
+    refresh: 6h
+    why: Component status turns red when a site component logs error status messages; repeated errors mean work is not being processed.
+    fix: Monitoring > Component Status > Show Messages > Errors; fix the cause, then reset the counts.
+    query:
+      protocol: http
+      path: /wmi/SMS_ComponentSummarizer
+      params:
+        $filter: "TallyInterval eq '0001128000100008'"
+        $select: ComponentName,MachineName,SiteCode,Status,State,Type,Errors,Warnings,LastContacted
+      key: ComponentName
+      name: MachineName
+    each: { field: Status, op: gt, value: 0, threshold: sccm.component-status-max }
+    evidence: "{ComponentName} on {MachineName}: status {Status}, {Errors} errors, {Warnings} warnings since midnight"
+
+  - id: SCCM-COMPONENT-STOPPED
+    title: Auto-starting site component is stopped
+    kind: broken
+    category: AVL
+    severity: high
+    entity: component
+    refresh: 6h
+    why: An auto-starting component that is stopped (often after a crash or a site server restart) leaves its inbox unprocessed.
+    fix: Restart the component from Configuration Manager Service Manager and read its log for the stop reason.
+    query:
+      protocol: http
+      path: /wmi/SMS_ComponentSummarizer
+      params:
+        $filter: "TallyInterval eq '0001128000100008'"
+        $select: ComponentName,MachineName,SiteCode,Status,State,Type,Errors,Warnings,LastContacted
+      key: ComponentName
+      name: MachineName
+    each:
+      all:
+        - { field: State, op: eq, value: 0 }
+        - { field: Type, op: eq, value: 0 }
+    evidence: "{ComponentName} on {MachineName}: stopped (autostarting component)"
+
+  - id: SCCM-ALERT-ACTIVE
+    title: Active error or warning alert in the console
+    kind: broken
+    category: MON
+    severity:
+      field: Severity
+      map: { "1": high, "2": medium }
+      default: medium
+    entity: alert
+    refresh: 6h
+    why: Site alerts encode conditions Microsoft considers actionable (database space, failed sync, low client health); an open one is unattended.
+    fix: Monitoring > Alerts; fix the underlying condition or tune the alert, then close it.
+    query:
+      protocol: http
+      path: /wmi/SMS_Alert
+      params:
+        $filter: "AlertState eq 0"
+        $select: ID,Name,Severity,AlertState,DateFirstActivated,SourceSiteCode,OccurrenceCount
+      key: ID
+      name: Name
+    each: { field: Severity, op: le, value: 2 }
+    evidence: "{Name}: active since {DateFirstActivated}, raised {OccurrenceCount} times"
+
+  # ---- software update point ------------------------------------------------------------------
+
+  - id: SCCM-SUP-SYNC-STALE
+    title: Software update point has not synchronized recently
+    kind: broken
+    lens: both
+    category: LCM
+    severity: high
+    entity: update-server
+    refresh: 6h
+    why: Without a recent sync the site does not know about this month's updates, so nothing new can be deployed or reported.
+    fix: Read wsyncmgr.log and WCM.log on the site server; check WSUS is reachable and its application pool is healthy.
+    refs: [NIST-800-53:SI-2]
+    query:
+      protocol: http
+      path: /wmi/SMS_SUPSyncStatus
+      params:
+        $select: WSUSServerName,SiteCode,LastSuccessfulSyncTime,LastSyncState,LastSyncErrorCode,LastSyncStateTime
+      key: WSUSServerName
+    each:
+      any:
+        - { field: LastSuccessfulSyncTime, op: absent }
+        - { field: LastSuccessfulSyncTime, op: age-gt, value: 1, threshold: sccm.sup-sync-max-age-days }
+    evidence: "{WSUSServerName}: last successful sync {LastSuccessfulSyncTime}"
+
+  - id: SCCM-SUP-SYNC-FAILED
+    title: Last software update synchronization failed
+    kind: broken
+    category: LCM
+    severity: high
+    entity: update-server
+    refresh: 6h
+    why: State 6703 (failed) or 6707 (out of sync with upstream) means the catalog on the site may be incomplete or stale.
+    fix: Read wsyncmgr.log for the error, fix connectivity or WSUS, then run a manual synchronization.
+    refs: [NIST-800-53:SI-2]
+    query:
+      protocol: http
+      path: /wmi/SMS_SUPSyncStatus
+      params:
+        $select: WSUSServerName,SiteCode,LastSuccessfulSyncTime,LastSyncState,LastSyncErrorCode,LastSyncStateTime
+      key: WSUSServerName
+    each:
+      any:
+        - { field: LastSyncState, op: in, value: [6703, 6707] }
+        - { field: LastSyncErrorCode, op: ne, value: 0 }
+    evidence: "{WSUSServerName}: sync state {LastSyncState}, error {LastSyncErrorCode} at {LastSyncStateTime}"
+
+  - id: SCCM-SUP-MISSING
+    title: No software update point reports synchronization status
+    kind: missing
+    lens: both
+    category: LCM
+    severity: high
+    entity: site
+    refresh: 1d
+    why: Without a software update point the site cannot deploy or measure Windows updates at all.
+    fix: Install and configure a software update point, or record which other tool patches these clients.
+    refs: [NIST-800-53:SI-2]
+    query:
+      protocol: http
+      path: /wmi/SMS_SUPSyncStatus
+      params:
+        $select: WSUSServerName,SiteCode,LastSuccessfulSyncTime,LastSyncState,LastSyncErrorCode,LastSyncStateTime
+      key: WSUSServerName
+    count: none
+    evidence: "no software update point returned sync status"
+
+  # ---- content and boundaries -----------------------------------------------------------------
+
+  - id: SCCM-DP-CONTENT-FAILED
+    title: Content failed to install or be removed on a distribution point
+    kind: broken
+    category: AVL
+    severity: high
+    entity: package
+    refresh: 6h
+    why: Clients that look up this content on that distribution point fail or fall back, so deployments stall.
+    fix: Monitoring > Distribution Status > Content Status; read the message, then redistribute or validate the content.
+    query:
+      protocol: http
+      path: /wmi/SMS_PackageStatusDistPointsSummarizer
+      params:
+        $filter: "State eq 3 or State eq 6"
+        $select: PackageID,ServerNALPath,State,SummaryDate,PackageType,SiteCode
+      key: PackageID
+      name: ServerNALPath
+    each: any
+    evidence: "{PackageID} on {ServerNALPath}: state {State} (3 install failed, 6 removal failed) since {SummaryDate}"
+
+  - id: SCCM-DP-CONTENT-STUCK
+    title: Content distribution has been pending or retrying for days
+    kind: broken
+    category: AVL
+    severity: medium
+    entity: package
+    refresh: 6h
+    why: Content that sits in pending or retrying never reaches the distribution point; deployments that need it wait silently.
+    fix: Check distmgr.log and PkgXferMgr.log for the package, fix the transfer, then redistribute.
+    query:
+      protocol: http
+      path: /wmi/SMS_PackageStatusDistPointsSummarizer
+      params:
+        $filter: "State eq 1 or State eq 2 or State eq 4 or State eq 5"
+        $select: PackageID,ServerNALPath,State,SummaryDate,PackageType,SiteCode
+      key: PackageID
+      name: ServerNALPath
+    each: { field: SummaryDate, op: age-gt, value: 3, threshold: sccm.dp-content-stuck-days }
+    evidence: "{PackageID} on {ServerNALPath}: state {State} unchanged since {SummaryDate}"
+
+  - id: SCCM-BOUNDARY-NO-GROUP
+    title: Boundary is not a member of any boundary group
+    kind: misconfigured
+    category: CFG
+    severity: low
+    entity: boundary
+    why: A boundary outside every boundary group gives clients neither site assignment nor a content location.
+    fix: Add the boundary to a boundary group that has a site assignment and a distribution point, or delete it.
+    query:
+      protocol: http
+      path: /wmi/SMS_Boundary
+      params:
+        $select: BoundaryID,DisplayName,BoundaryType,Value,GroupCount
+      key: BoundaryID
+      name: DisplayName
+    each: { field: GroupCount, op: eq, value: 0 }
+    evidence: "{DisplayName} (type {BoundaryType}, value {Value}) is in no boundary group"
+
+  - id: SCCM-BOUNDARY-GROUP-NO-SITE-SYSTEM
+    title: Boundary group with boundaries but no site system
+    kind: misconfigured
+    category: CFG
+    severity: medium
+    entity: boundary-group
+    why: Clients in such a group find no distribution point or management point of their own and depend on fallback, or get no content.
+    fix: Add a distribution point (and management point if needed) to the group's references, or configure fallback deliberately.
+    query:
+      protocol: http
+      path: /wmi/SMS_BoundaryGroup
+      params:
+        $select: GroupID,Name,MemberCount,SiteSystemCount,DefaultSiteCode
+      key: GroupID
+      name: Name
+    each:
+      all:
+        - { field: MemberCount, op: gt, value: 0 }
+        - { field: SiteSystemCount, op: eq, value: 0 }
+    evidence: "{Name}: {MemberCount} boundaries, no site system"
+
+  # ---- deployments and software updates -------------------------------------------------------
+
+  - id: SCCM-DEPLOYMENT-REQUIRED-ERRORS
+    title: Required deployment keeps failing on many clients
+    kind: broken
+    category: HLT
+    severity: medium
+    entity: deployment
+    why: A Required deployment that errors is retried on every evaluation cycle; when detection never matches, clients reinstall forever and load disk and network.
+    fix: Read AppEnforce.log on two failing clients; fix the detection method or the installer, then let the clients re-evaluate. Summary counts can lag the per-device view by days.
+    query:
+      protocol: http
+      path: /wmi/SMS_DeploymentSummary
+      params:
+        $select: DeploymentID,SoftwareName,CollectionName,FeatureType,DeploymentIntent,DeploymentTime,NumberTargeted,NumberSuccess,NumberErrors,NumberInProgress
+      key: DeploymentID
+      name: SoftwareName
+    each:
+      all:
+        - { field: DeploymentIntent, op: eq, value: 1 }
+        - { field: FeatureType, op: in, value: [1, 2, 7] }
+        - { field: NumberErrors, op: gt, value: 10, threshold: sccm.deployment-errors-max }
+        - { field: DeploymentTime, op: age-gt, value: 7, threshold: sccm.deployment-retry-days }
+    evidence: "{SoftwareName} -> {CollectionName}: {NumberErrors} errors of {NumberTargeted} targeted, deployed {DeploymentTime}"
+
+  - id: SCCM-UPDATE-DEPLOYED-LOW-COMPLIANCE
+    title: Deployed update released weeks ago is still missing on many clients
+    kind: missing
+    lens: both
+    category: LCM
+    severity:
+      field: Severity
+      map: { "10": high, "8": medium }
+      default: low
+    entity: software-update
+    why: An update deployed and released a month ago that most clients still lack means the deployment, content or client is not working.
+    fix: Check the deployment's error and unknown counts and the clients' WUAHandler.log / UpdatesDeployment.log.
+    refs: [NIST-800-53:SI-2, CIS-CSC-v8:7.3]
+    query:
+      protocol: http
+      path: /wmi/SMS_SoftwareUpdate
+      params:
+        $filter: "IsDeployed eq true and IsExpired eq false and IsSuperseded eq false and NumMissing gt 0"
+        $select: CI_ID,ArticleID,LocalizedDisplayName,DatePosted,Severity,NumMissing,NumPresent,PercentCompliant
+      key: CI_ID
+      name: LocalizedDisplayName
+    each:
+      all:
+        - { field: DatePosted, op: age-gt, value: 30, threshold: sccm.update-release-age-days }
+        - { field: PercentCompliant, op: lt, value: 95, threshold: sccm.update-compliance-pct-min }
+    evidence: "KB{ArticleID} {LocalizedDisplayName}: {PercentCompliant}% compliant, missing on {NumMissing}"
+
+  - id: SCCM-UPDATE-REQUIRED-NOT-DEPLOYED
+    title: Security update required by clients is not deployed
+    kind: missing
+    lens: both
+    category: LCM
+    severity:
+      field: Severity
+      map: { "10": critical, "8": high }
+      default: medium
+    entity: software-update
+    why: Clients report they need this critical or important update, but no deployment delivers it, so the hole stays open.
+    fix: Add the update to an update group and deployment (or an automatic deployment rule), or record why it is withheld.
+    refs: [NIST-800-53:SI-2, CIS-CSC-v8:7.3]
+    query:
+      protocol: http
+      path: /wmi/SMS_SoftwareUpdate
+      params:
+        $filter: "IsDeployed eq false and IsExpired eq false and IsSuperseded eq false and NumMissing gt 0 and Severity ge 8"
+        $select: CI_ID,ArticleID,LocalizedDisplayName,DatePosted,Severity,NumMissing,NumPresent,PercentCompliant
+      key: CI_ID
+      name: LocalizedDisplayName
+    each: { field: DatePosted, op: age-gt, value: 30, threshold: sccm.update-release-age-days }
+    evidence: "KB{ArticleID} {LocalizedDisplayName}: required by {NumMissing} clients, not deployed, released {DatePosted}"
+
+  - id: SCCM-SUG-EXPIRED-UPDATES
+    title: Deployed update group still contains expired updates
+    kind: misconfigured
+    category: HYG
+    severity: low
+    entity: update-group
+    why: Expired updates in a deployed group bloat client policy and compliance data and can no longer be installed.
+    fix: Remove expired updates from the group (or let the automatic deployment rule rebuild it) and let the WSUS cleanup run.
+    query:
+      protocol: http
+      path: /wmi/SMS_AuthorizationList
+      params:
+        $select: CI_ID,LocalizedDisplayName,IsDeployed,ContainsExpiredUpdates,ContainsSupersededUpdates,NumberOfUpdates,NumberOfExpiredUpdates,DateLastModified
+      key: CI_ID
+      name: LocalizedDisplayName
+    each:
+      all:
+        - { field: IsDeployed, op: eq, value: true }
+        - { field: ContainsExpiredUpdates, op: eq, value: true }
+    evidence: "{LocalizedDisplayName}: {NumberOfExpiredUpdates} expired of {NumberOfUpdates} updates"
+
+  - id: SCCM-SUG-MANY
+    title: Very many software update groups
+    kind: misconfigured
+    category: HYG
+    severity: low
+    entity: site
+    why: Automatic deployment rules that create a new group on every run pile up groups and deployments, and every client evaluates their policies.
+    fix: Set the rules to add to the existing group, consolidate old groups, and delete empty or fully superseded ones.
+    query:
+      protocol: http
+      path: /wmi/SMS_AuthorizationList
+      params:
+        $select: CI_ID,LocalizedDisplayName,IsDeployed,ContainsExpiredUpdates,ContainsSupersededUpdates,NumberOfUpdates,NumberOfExpiredUpdates,DateLastModified
+      key: CI_ID
+      name: LocalizedDisplayName
+    count: { op: gt, value: 100, threshold: sccm.update-groups-max }
+    evidence: "{count} software update groups (sample: {sample})"
+
+  - id: SCCM-ADR-FAILING
+    title: Automatic deployment rule failed or has not run for weeks
+    kind: broken
+    lens: both
+    category: LCM
+    severity: high
+    entity: adr
+    why: When an automatic deployment rule fails or stops running, monthly updates silently stop reaching the collections it serves.
+    fix: Check ruleengine.log for the error; confirm the rule's schedule runs after the monthly sync.
+    refs: [NIST-800-53:SI-2]
+    query:
+      protocol: http
+      path: /wmi/SMS_AutoDeployment
+      params:
+        $select: Name,AutoDeploymentEnabled,LastRunTime,LastErrorCode,LastErrorTime
+      key: Name
+    each:
+      all:
+        - { field: AutoDeploymentEnabled, op: eq, value: true }
+        - any:
+            - { field: LastErrorCode, op: ne, value: 0 }
+            - { field: LastRunTime, op: age-gt, value: 35, threshold: sccm.adr-max-days-since-run }
+    evidence: "{Name}: last run {LastRunTime}, last error {LastErrorCode} at {LastErrorTime}"
+
+  # ---- collections and clients ----------------------------------------------------------------
+
+  - id: SCCM-COLLECTIONS-INCREMENTAL-MANY
+    title: Too many collections use incremental updates
+    kind: misconfigured
+    category: HLT
+    severity: medium
+    entity: site
+    why: Every collection with incremental evaluation adds load to the collection evaluator; past a few hundred, evaluation of all collections slows.
+    fix: Keep incremental updates for the few collections that need near-real-time membership; use scheduled updates for the rest.
+    query:
+      protocol: http
+      path: /wmi/SMS_Collection
+      params:
+        $filter: "RefreshType eq 4 or RefreshType eq 6"
+        $select: CollectionID,Name,MemberCount
+      key: CollectionID
+      name: Name
+    count: { op: gt, value: 200, threshold: sccm.incremental-collections-max }
+    evidence: "{count} collections with incremental updates (sample: {sample})"
+
+  - id: SCCM-CLIENTS-INACTIVE-MANY
+    title: Many installed clients are inactive
+    kind: broken
+    category: HLT
+    severity: medium
+    entity: site
+    why: Inactive clients send no heartbeat, inventory or policy requests; they receive no deployments and their compliance is unknown.
+    fix: Reconcile with AD logon data; repair clients on machines that are in use and retire the records of those that are gone.
+    query:
+      protocol: http
+      path: /wmi/SMS_R_System
+      params:
+        $filter: "Client eq 1 and Active eq 0 and Obsolete eq 0"
+        $select: ResourceId,Name
+      key: ResourceId
+      name: Name
+    count: { op: gt, value: 50, threshold: sccm.inactive-clients-max }
+    evidence: "{count} inactive clients (sample: {sample})"
+
+  - id: SCCM-CLIENT-CHECK-FAILED-MANY
+    title: Many clients fail the client health evaluation
+    kind: broken
+    category: HLT
+    severity: medium
+    entity: site
+    why: Clients that fail ccmeval repeatedly have a broken WMI, service or prerequisite and stop reporting reliably.
+    fix: Read CcmEval.log on a sample; a repeated failure after automatic remediation needs a client reinstall.
+    query:
+      protocol: http
+      path: /wmi/SMS_CombinedDeviceResources
+      params:
+        $filter: "ClientCheckPass eq 2"
+        $select: ResourceID,Name
+      key: ResourceID
+      name: Name
+    count: { op: gt, value: 25, threshold: sccm.client-check-failed-max }
+    evidence: "{count} clients failed the client check (sample: {sample})"
+
+  - id: SCCM-CLIENT-PUSH-FAILED
+    title: Client push fails on a machine that is still active in AD
+    kind: broken
+    category: HLT
+    severity: medium
+    entity: computer
+    why: The machine logs on to the domain but has no client because the push keeps failing (access denied, name mismatch, firewall), so it is unmanaged.
+    fix: Group failures by error code; 5 = admin rights, 53/64 = name or SMB path, 1396 = DNS or computer object mismatch. Fix the cause, not the push account.
+    query:
+      protocol: http
+      path: /wmi/SMS_CombinedDeviceResources
+      params:
+        $select: ResourceID,Name,IsClient,IsActive,IsObsolete,ClientVersion,DeviceOS,LastInstallationError,ADLastLogonTime
+      key: ResourceID
+      name: Name
+    each:
+      all:
+        - { field: IsClient, op: eq, value: 0 }
+        - any:
+            - { field: IsObsolete, op: absent }
+            - { field: IsObsolete, op: ne, value: 1 }
+        - { field: LastInstallationError, op: ne, value: 0 }
+        - { field: ADLastLogonTime, op: age-lt, value: 30, threshold: sccm.push-candidate-logon-days }
+    evidence: "{Name}: last client push error {LastInstallationError}, AD logon {ADLastLogonTime}"
+
+  - id: SCCM-CLIENT-VERSION-UNSUPPORTED
+    title: Client version older than the oldest supported release
+    kind: broken
+    lens: both
+    category: LCM
+    severity: medium
+    entity: computer
+    why: Clients left on an out-of-support version miss security fixes and features the site expects, typically because automatic upgrade is off or the pre-production client was never promoted.
+    fix: Enable automatic client upgrade or promote the pre-production client; reinstall clients that are stuck.
+    refs: [NIST-800-53:SI-2]
+    query:
+      protocol: http
+      path: /wmi/SMS_CombinedDeviceResources
+      params:
+        $select: ResourceID,Name,IsClient,IsActive,IsObsolete,ClientVersion,DeviceOS,LastInstallationError,ADLastLogonTime
+      key: ResourceID
+      name: Name
+    each:
+      all:
+        - { field: IsClient, op: eq, value: 1 }
+        - { field: ClientVersion, op: match, value: '^5\.0+\.(\d{1,3}|[0-8]\d{3}|90\d\d|91[0-3]\d|9140)\.', threshold: sccm.client-version-unsupported-pattern }
+    evidence: "{Name}: client {ClientVersion} on {DeviceOS}"
+
+  - id: SCCM-CLIENT-RESTART-PENDING
+    title: Client reports a pending restart
+    kind: broken
+    lens: both
+    category: LCM
+    severity: medium
+    entity: computer
+    why: Updates or installs that wait for a restart are not active; the device stays exposed while it reports the change as done.
+    fix: Restart the device in a maintenance window, or set the restart behaviour of the deployments so the restart happens.
+    refs: [NIST-800-53:SI-2]
+    query:
+      protocol: http
+      path: /wmi/SMS_CombinedDeviceResources
+      params:
+        $select: ResourceID,Name,IsClient,ClientState,DeviceOS
+      key: ResourceID
+      name: Name
+    each:
+      all:
+        - { field: IsClient, op: eq, value: 1 }
+        - { field: ClientState, op: gt, value: 0 }
+    evidence: "{Name}: pending-restart state {ClientState} ({DeviceOS})"
+
+  - id: SCCM-SERVER-NO-CLIENT
+    title: Active server has no Configuration Manager client
+    kind: missing
+    lens: both
+    category: LCM
+    severity: high
+    entity: computer
+    why: A server that logs on to the domain but has no client gets no update deployments and no inventory.
+    fix: Install the client, or record which other tool patches and inventories the server.
+    refs: [NIST-800-53:SI-2, NIST-800-53:CM-8]
+    query:
+      protocol: http
+      path: /wmi/SMS_R_System
+      params:
+        $filter: "startswith(OperatingSystemNameandVersion,'Microsoft Windows NT Server') eq true or startswith(OperatingSystemNameandVersion,'Microsoft Windows NT Advanced Server') eq true"
+        $select: ResourceId,Name,Client,Active,Obsolete,OperatingSystemNameandVersion,LastLogonTimestamp
+      key: ResourceId
+      name: Name
+    each:
+      all:
+        - any:
+            - { field: Client, op: absent }
+            - { field: Client, op: ne, value: 1 }
+        - any:
+            - { field: Obsolete, op: absent }
+            - { field: Obsolete, op: ne, value: 1 }
+        - { field: LastLogonTimestamp, op: age-lt, value: 30, threshold: sccm.server-logon-live-days }
+    evidence: "{Name}: no client, AD logon {LastLogonTimestamp}"
+
+  # ---- administration, maintenance, OS deployment ---------------------------------------------
+
+  - id: SCCM-RBAC-FULLADMIN-USER
+    title: Full Administrator granted to an individual user account
+    kind: misconfigured
+    lens: security
+    category: IAM
+    severity: medium
+    entity: admin
+    why: Grants to individual accounts escape group reviews and survive role changes; Full Administrator controls code execution on every client.
+    fix: Grant Full Administrator through one reviewed AD group and keep individual grants to documented break-glass accounts.
+    refs: [NIST-800-53:AC-6, CIS-CSC-v8:5.4]
+    query:
+      protocol: http
+      path: /wmi/SMS_Admin
+      params:
+        $select: AdminID,LogonName,IsGroup,IsDeleted,AccountType,RoleNames
+      key: AdminID
+      name: LogonName
+    each:
+      all:
+        - { field: IsGroup, op: eq, value: false }
+        - { field: RoleNames, op: contains, value: Full Administrator }
+    evidence: "{LogonName}: Full Administrator on a user account"
+
+  - id: SCCM-RBAC-DELETED-ACCOUNT
+    title: Administrative user whose AD account no longer exists
+    kind: misconfigured
+    lens: security
+    category: IAM
+    severity: medium
+    entity: admin
+    why: A grant to a deleted account is dead weight in the role review and a risk if the name is reused.
+    fix: Remove the administrative user after confirming the account deletion was intended.
+    refs: [NIST-800-53:AC-2]
+    query:
+      protocol: http
+      path: /wmi/SMS_Admin
+      params:
+        $select: AdminID,LogonName,IsGroup,IsDeleted,AccountType,RoleNames
+      key: AdminID
+      name: LogonName
+    each: { field: IsDeleted, op: eq, value: true }
+    evidence: "{LogonName}: deleted from AD, roles {RoleNames}"
+
+  - id: SCCM-MAINT-TASK-DISABLED
+    title: Important site maintenance task is disabled
+    kind: misconfigured
+    category: HYG
+    severity:
+      field: TaskName
+      map: { "Backup SMS Site Server": high, "Rebuild Indexes": medium }
+      default: medium
+    entity: maintenance-task
+    refresh: 7d
+    why: Without index rebuilds and data cleanup the site database grows and slows; without the site backup there is no supported recovery.
+    fix: Enable the task with a schedule outside business hours, or record which other job covers it.
+    refs: [NIST-800-53:CP-9]
+    query:
+      protocol: http
+      path: /wmi/SMS_SCI_SQLTask
+      params:
+        $select: ItemName,TaskName,Enabled,SiteCode,DaysOfWeek
+      key: TaskName
+      name: ItemName
+    each:
+      all:
+        - { field: TaskName, op: match, value: '^(Backup SMS Site Server|Rebuild Indexes|Delete Obsolete Client Discovery Data|Delete Aged Discovery Data|Delete Aged Inventory History|Delete Aged Status Messages)$', threshold: sccm.required-maintenance-tasks }
+        - { field: Enabled, op: eq, value: false }
+    evidence: "{SiteCode} {TaskName}: disabled"
+
+  - id: SCCM-TS-STALE
+    title: Task sequence not changed for over a year
+    kind: misconfigured
+    category: LCM
+    severity: low
+    entity: task-sequence
+    refresh: 7d
+    why: An old task sequence usually installs an old OS image and references applications, drivers and boot images that were replaced since.
+    fix: Review the task sequence; update its image, references and boot image, or retire it and its deployments.
+    query:
+      protocol: http
+      path: /wmi/SMS_TaskSequencePackage
+      params:
+        $select: PackageID,Name,SourceDate,LastRefreshTime
+      key: PackageID
+      name: Name
+    each: { field: SourceDate, op: age-gt, value: 365, threshold: sccm.task-sequence-max-age-days }
+    evidence: "{Name} ({PackageID}): last changed {SourceDate}"
+
+  - id: SCCM-BOOTIMAGE-STALE
+    title: Boot image not updated for over a year
+    kind: misconfigured
+    category: LCM
+    severity: low
+    entity: boot-image
+    refresh: 7d
+    why: Boot images built from an old Windows PE lack drivers and fixes for current hardware and may not service current OS images.
+    fix: Upgrade the ADK and Windows PE add-on on the site server and regenerate the boot images.
+    query:
+      protocol: http
+      path: /wmi/SMS_BootImagePackage
+      params:
+        $select: PackageID,Name,SourceDate,LastRefreshTime
+      key: PackageID
+      name: Name
+    each: { field: SourceDate, op: age-gt, value: 365, threshold: sccm.boot-image-max-age-days }
+    evidence: "{Name} ({PackageID}): source date {SourceDate}"
+
+  - id: SCCM-ADK-OLD
+    title: Old Windows ADK installed on a site system
+    kind: misconfigured
+    category: LCM
+    severity: medium
+    entity: computer
+    refresh: 7d
+    why: The ADK on the site server builds boot images and services OS images; an old release cannot handle current Windows 11 builds.
+    fix: Install a Windows ADK and Windows PE add-on supported by the current site release, then regenerate the boot images.
+    query:
+      protocol: http
+      path: /wmi/SMS_G_System_ADD_REMOVE_PROGRAMS
+      params:
+        $filter: "startswith(DisplayName,'Windows Assessment and Deployment Kit') eq true"
+        $select: ResourceID,DisplayName,Version
+      key: ResourceID
+    each: { field: Version, op: match, value: '^10\.1\.(1\d{4}|2[01]\d{3}|22000)\.', threshold: sccm.adk-old-version-pattern }
+    evidence: "resource {ResourceID}: {DisplayName} {Version}"

@@ -33,6 +33,21 @@ public sealed class RenderTests
     }
 
     [Fact]
+    public void A_check_on_many_targets_is_one_line_with_its_reach()
+    {
+        var report = Report("x") with
+        {
+            Today = [new TodayItem(1, "high", "Unexpected local administrators", "WORKSTATIONS", "pc01.example.org", null, null, 45,
+                ["high", "91 targets"], null, "0123456789abcdef", Targets: 91, Systems: 1, Examples: ["pc01", "pc02", "pc03"])],
+        };
+
+        var text = Render.As(TodayDocument.From(report), "text");
+
+        Assert.Contains("Unexpected local administrators - 91 targets on WORKSTATIONS, e.g. pc01, pc02, pc03", text, StringComparison.Ordinal);
+        Assert.Contains("1 tasks covering 91 findings", text, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void An_unknown_format_is_refused()
     {
         Assert.Throws<ArgumentException>(() => Render.As(TodayDocument.From(Report("x")), "pdf"));

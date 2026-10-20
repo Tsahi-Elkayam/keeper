@@ -1,0 +1,716 @@
+schema: keeper.rules/1
+system: m365
+name: Microsoft 365
+integration: graph
+
+# Generic rules for any Microsoft 365 tenant, read through Microsoft Graph (GET only):
+# licences and subscriptions, licence use per user, service health and message center,
+# SharePoint/OneDrive tenant settings, domains, Microsoft 365 org settings.
+# Permissions per query: docs\backlog\microsoft-cloud.md, section "Graph permissions".
+#
+# SKU ids used below are Microsoft's product GUIDs (identical in every tenant), from the
+# "Product names and service plan identifiers for licensing" reference:
+#   free or no-cost (threshold m365.free-sku-ids):
+#     f30db892-07e9-47e9-837c-80727f46fd3d FLOW_FREE (Power Automate Free)
+#     a403ebcc-fae0-4ca2-8c8c-7a907fd6c235 POWER_BI_STANDARD (Fabric Free)
+#     710779e8-3d4a-4c88-adb9-386c958d1fdf TEAMS_EXPLORATORY
+#     dcb1a3ae-b33f-4487-846a-a640262fadf4 POWERAPPS_VIRAL (Power Apps Plan 2 Trial)
+#     5b631642-bd26-49fe-bd20-1daaa972ef80 POWERAPPS_DEV
+#     1f2f344a-700d-42c9-9427-5cea1d5d7ba6 STREAM
+#     6470687e-a428-4b7a-bef2-8a291ad947c9 WINDOWS_STORE
+#     8c4ce438-32a7-4ac5-91a6-e22ae08d9c8b RIGHTSMANAGEMENT_ADHOC
+#     bc946dac-7877-4271-b2f7-99d2db13cd2c FORMS_PRO (Customer Voice Trial)
+#     440eaaa8-b3e0-484b-a8be-62870b9ba70a PHONESYSTEM_VIRTUALUSER (Teams Phone Resource Account)
+#     94763226-9b3c-4e75-a931-5c89701abe66 STANDARDWOFFPACK_FACULTY (Office 365 A1 faculty)
+#     314c4481-f395-4525-be8b-2ec4bb1e9d91 STANDARDWOFFPACK_STUDENT (Office 365 A1 students)
+#   suites:
+#     18181a46-0d4e-45cd-891e-60aabd171b4e STANDARDPACK (Office 365 E1)
+#     6fd2c87f-b296-42f0-b197-1e91e994b900 ENTERPRISEPACK (Office 365 E3)
+#     c7df2760-2c81-4ef7-b578-5b5392b571df ENTERPRISEPREMIUM (Office 365 E5)
+#     05e9a617-0261-4cee-bb44-138d3ef5d965 SPE_E3 (Microsoft 365 E3)
+#     06ebc4ee-1bb5-47dd-8120-11324bc54e06 SPE_E5 (Microsoft 365 E5)
+#     efccb6f7-5641-4e0e-bd10-b4976e1bf68e EMS (Enterprise Mobility + Security E3)
+#     b05e124f-c7cc-45a0-a6aa-8cf78c946968 EMSPREMIUM (Enterprise Mobility + Security E5)
+#
+# The user inventory query is the same one entra.yaml uses (fetched once).
+
+defaults:
+  lens: maintenance
+  refresh: 1d
+
+rules:
+  # ============================================================ licences (subscribed SKUs) ===
+  - id: M365-SKU-NOT-ENABLED
+    title: Licence SKU is in warning, suspended or locked-out state
+    kind: broken
+    category: LCM
+    severity:
+      field: capabilityStatus
+      map: { Warning: high, Suspended: critical, LockedOut: critical, Deleted: low }
+      default: high
+    entity: sku
+    why: "A SKU that left the Enabled state is on its way to losing service: in Warning it still works but expires soon, Suspended and LockedOut users already lost access."
+    fix: "Renew or re-purchase the subscription behind the SKU, or move its users to another SKU before the next state change."
+    refs: ["NIST-800-53:SA-4", "NIST-800-53:CP-2"]
+    query:
+      protocol: graph
+      path: /subscribedSkus
+      select: [id, skuId, skuPartNumber, appliesTo, capabilityStatus, consumedUnits, prepaidUnits]
+      key: skuId
+      name: skuPartNumber
+    each: { field: capabilityStatus, op: ne, value: Enabled }
+    evidence: "{skuPartNumber}: {capabilityStatus}, {consumedUnits} assigned"
+
+  - id: M365-SKU-UNITS-IN-WARNING
+    title: Licence units are in the warning (grace) period
+    kind: broken
+    category: LCM
+    severity: high
+    entity: sku
+    why: "Units in warning belong to a subscription that has expired and will be suspended at the end of the grace period; the users assigned to them lose the service then."
+    fix: "Renew the expiring subscription, or reduce assignments to the units that will remain."
+    refs: ["NIST-800-53:SA-4"]
+    query:
+      protocol: graph
+      path: /subscribedSkus
+      select: [id, skuId, skuPartNumber, appliesTo, capabilityStatus, consumedUnits, prepaidUnits]
+      key: skuId
+      name: skuPartNumber
+    each: { field: prepaidUnits.warning, op: gt, value: 0 }
+    evidence: "{skuPartNumber}: {prepaidUnits.warning} unit(s) in warning, {prepaidUnits.enabled} enabled, {consumedUnits} assigned"
+
+  - id: M365-SKU-UNITS-SUSPENDED
+    title: Licence units are suspended or locked out
+    kind: broken
+    category: LCM
+    severity: critical
+    entity: sku
+    why: "Suspended or locked-out units no longer provide the service; users counted on them have already lost it, and data is deleted at the end of the suspension."
+    fix: "Reactivate the subscription or move the users to enabled units now."
+    refs: ["NIST-800-53:SA-4", "NIST-800-53:CP-2"]
+    query:
+      protocol: graph
+      path: /subscribedSkus
+      select: [id, skuId, skuPartNumber, appliesTo, capabilityStatus, consumedUnits, prepaidUnits]
+      key: skuId
+      name: skuPartNumber
+    each:
+      any:
+        - { field: prepaidUnits.suspended, op: gt, value: 0 }
+        - { field: prepaidUnits.lockedOut, op: gt, value: 0 }
+    evidence: "{skuPartNumber}: {prepaidUnits.suspended} suspended, {prepaidUnits.lockedOut} locked out, {prepaidUnits.enabled} enabled"
+
+  - id: M365-SKU-PAID-UNASSIGNED
+    title: Paid licence SKU has no unit assigned
+    kind: misconfigured
+    category: CST
+    severity: medium
+    entity: sku
+    why: "Units that are bought and not assigned to anyone are pure cost. Free and trial SKUs are excluded by the free-SKU list (threshold)."
+    fix: "Assign the units to the people they were bought for, or reduce the quantity at the next renewal."
+    refs: ["NIST-800-53:PM-3"]
+    query:
+      protocol: graph
+      path: /subscribedSkus
+      select: [id, skuId, skuPartNumber, appliesTo, capabilityStatus, consumedUnits, prepaidUnits]
+      key: skuId
+      name: skuPartNumber
+    each:
+      all:
+        - { field: appliesTo, op: eq, value: User }
+        - { field: capabilityStatus, op: eq, value: Enabled }
+        - { field: prepaidUnits.enabled, op: gt, value: 0 }
+        - { field: consumedUnits, op: eq, value: 0 }
+        - field: skuId
+          op: notin
+          threshold: m365.free-sku-ids
+          value: [f30db892-07e9-47e9-837c-80727f46fd3d, a403ebcc-fae0-4ca2-8c8c-7a907fd6c235, 710779e8-3d4a-4c88-adb9-386c958d1fdf, dcb1a3ae-b33f-4487-846a-a640262fadf4, 5b631642-bd26-49fe-bd20-1daaa972ef80, 1f2f344a-700d-42c9-9427-5cea1d5d7ba6, 6470687e-a428-4b7a-bef2-8a291ad947c9, 8c4ce438-32a7-4ac5-91a6-e22ae08d9c8b, bc946dac-7877-4271-b2f7-99d2db13cd2c, 440eaaa8-b3e0-484b-a8be-62870b9ba70a, 94763226-9b3c-4e75-a931-5c89701abe66, 314c4481-f395-4525-be8b-2ec4bb1e9d91]
+    evidence: "{skuPartNumber}: {prepaidUnits.enabled} units bought, none assigned"
+
+  # ======================================================================= subscriptions ===
+  - id: M365-SUBSCRIPTION-LIFECYCLE-SOON
+    title: Subscription reaches its renewal or expiry date soon
+    kind: broken
+    category: LCM
+    severity:
+      daysLeft: nextLifecycleDateTime
+      ranges: [ { max: 0, value: critical }, { max: 14, value: high }, { max: 30, value: medium } ]
+      default: low
+    deadline: nextLifecycleDateTime
+    entity: subscription
+    why: "On its lifecycle date a subscription that is not renewed moves to warning, then suspended, then deleted, and its users lose the service. Auto-renewing subscriptions also show here so the renewal is a known event, not a surprise."
+    fix: "Confirm the renewal (or the planned end) with whoever owns the contract before the date; record the decision."
+    refs: ["NIST-800-53:SA-4", "NIST-800-53:CP-2"]
+    query:
+      protocol: graph
+      path: /directory/subscriptions
+      select: [id, skuId, skuPartNumber, status, isTrial, nextLifecycleDateTime, totalLicenses, createdDateTime]
+      key: id
+      name: skuPartNumber
+    each:
+      all:
+        - { field: status, op: eq, value: Enabled }
+        - { field: isTrial, op: eq, value: false }
+        - { field: nextLifecycleDateTime, op: until-lt, value: 60, threshold: m365.subscription-notice-days }
+    evidence: "{skuPartNumber}: {totalLicenses} licences, next lifecycle date {nextLifecycleDateTime}"
+
+  - id: M365-SUBSCRIPTION-DEGRADED
+    title: Subscription is in warning, suspended or locked out
+    kind: broken
+    category: LCM
+    severity:
+      field: status
+      map: { Warning: high, Suspended: critical, LockedOut: critical }
+      default: high
+    deadline: nextLifecycleDateTime
+    entity: subscription
+    why: "The subscription already passed its end date; the deadline is when it moves to the next, worse state (suspension, then deletion of data)."
+    fix: "Renew or reactivate the subscription now, or migrate its users and data before the deadline."
+    refs: ["NIST-800-53:SA-4", "NIST-800-53:CP-2"]
+    query:
+      protocol: graph
+      path: /directory/subscriptions
+      select: [id, skuId, skuPartNumber, status, isTrial, nextLifecycleDateTime, totalLicenses, createdDateTime]
+      key: id
+      name: skuPartNumber
+    each: { field: status, op: in, value: [Warning, Suspended, LockedOut] }
+    evidence: "{skuPartNumber}: {status}, next state on {nextLifecycleDateTime}"
+
+  - id: M365-SUBSCRIPTION-TRIAL-ENDING
+    title: Trial subscription ends soon
+    kind: broken
+    category: LCM
+    severity:
+      daysLeft: nextLifecycleDateTime
+      ranges: [ { max: 0, value: high }, { max: 7, value: medium } ]
+      default: low
+    deadline: nextLifecycleDateTime
+    entity: subscription
+    why: "Users and data that came to depend on a trial lose the service when it ends; trials also enable services nobody formally owns."
+    fix: "Decide to buy or let it lapse; remove the trial's assignments before the date if it lapses."
+    refs: ["NIST-800-53:SA-4"]
+    query:
+      protocol: graph
+      path: /directory/subscriptions
+      select: [id, skuId, skuPartNumber, status, isTrial, nextLifecycleDateTime, totalLicenses, createdDateTime]
+      key: id
+      name: skuPartNumber
+    each:
+      all:
+        - { field: isTrial, op: eq, value: true }
+        - { field: status, op: in, value: [Enabled, Warning] }
+        - { field: nextLifecycleDateTime, op: until-lt, value: 30, threshold: m365.trial-notice-days }
+    evidence: "trial {skuPartNumber} ({totalLicenses} licences) ends {nextLifecycleDateTime}"
+
+  # ============================================================= licence use per user ===
+  - id: M365-LICENSED-USER-INACTIVE
+    title: Paid licence on an account with no successful sign-in for a long time
+    kind: misconfigured
+    category: CST
+    severity: medium
+    entity: user
+    why: "A paid seat on an account nobody uses is money spent for nothing and an attack surface nobody watches. Activity is the last successful sign-in, so failed attempts do not keep a dormant account looking used. Free SKUs (threshold m365.free-sku-ids) do not count. Needs Entra ID P1."
+    fix: "Confirm with the owner or HR (leave, service accounts and on-premises-only workers exist); then remove the licence after handling the mailbox and OneDrive, and reduce the SKU at renewal."
+    refs: ["NIST-800-53:PM-3", "NIST-800-53:AC-2(3)"]
+    query:
+      protocol: graph
+      path: /users
+      select: [id, userPrincipalName, accountEnabled, userType, createdDateTime, onPremisesSyncEnabled, onPremisesSecurityIdentifier, signInActivity, assignedLicenses]
+      top: 500
+      key: id
+      name: userPrincipalName
+    each:
+      all:
+        - { field: accountEnabled, op: eq, value: true }
+        - { field: assignedLicenses, op: notempty }
+        - field: 'assignedLicenses[].skuId'
+          op: notin
+          threshold: m365.free-sku-ids
+          value: [f30db892-07e9-47e9-837c-80727f46fd3d, a403ebcc-fae0-4ca2-8c8c-7a907fd6c235, 710779e8-3d4a-4c88-adb9-386c958d1fdf, dcb1a3ae-b33f-4487-846a-a640262fadf4, 5b631642-bd26-49fe-bd20-1daaa972ef80, 1f2f344a-700d-42c9-9427-5cea1d5d7ba6, 6470687e-a428-4b7a-bef2-8a291ad947c9, 8c4ce438-32a7-4ac5-91a6-e22ae08d9c8b, bc946dac-7877-4271-b2f7-99d2db13cd2c, 440eaaa8-b3e0-484b-a8be-62870b9ba70a, 94763226-9b3c-4e75-a931-5c89701abe66, 314c4481-f395-4525-be8b-2ec4bb1e9d91]
+        - any:
+            - { field: createdDateTime, op: absent }
+            - { field: createdDateTime, op: age-gt, value: 90, threshold: m365.licensed-inactive-days }
+        - any:
+            - { field: signInActivity.lastSuccessfulSignInDateTime, op: absent }
+            - { field: signInActivity.lastSuccessfulSignInDateTime, op: age-gt, value: 90, threshold: m365.licensed-inactive-days }
+    evidence: "{userPrincipalName}: last successful sign-in {signInActivity.lastSuccessfulSignInDateTime}, licences {assignedLicenses[].skuId}"
+
+  - id: M365-LICENSED-USER-DISABLED
+    title: Disabled account still holds a paid licence
+    kind: misconfigured
+    category: CST
+    severity: medium
+    entity: user
+    why: "A disabled account cannot use its seat; the licence is paid for nothing and the mailbox behind it keeps growing. Free SKUs (threshold m365.free-sku-ids) do not count."
+    fix: "Remove the licence (convert mailboxes that must be kept to shared or inactive mailboxes first) and make licensing groups exclude disabled accounts."
+    refs: ["NIST-800-53:PM-3", "NIST-800-53:AC-2"]
+    query:
+      protocol: graph
+      path: /users
+      select: [id, userPrincipalName, accountEnabled, userType, createdDateTime, onPremisesSyncEnabled, onPremisesSecurityIdentifier, signInActivity, assignedLicenses]
+      top: 500
+      key: id
+      name: userPrincipalName
+    each:
+      all:
+        - { field: accountEnabled, op: eq, value: false }
+        - { field: assignedLicenses, op: notempty }
+        - field: 'assignedLicenses[].skuId'
+          op: notin
+          threshold: m365.free-sku-ids
+          value: [f30db892-07e9-47e9-837c-80727f46fd3d, a403ebcc-fae0-4ca2-8c8c-7a907fd6c235, 710779e8-3d4a-4c88-adb9-386c958d1fdf, dcb1a3ae-b33f-4487-846a-a640262fadf4, 5b631642-bd26-49fe-bd20-1daaa972ef80, 1f2f344a-700d-42c9-9427-5cea1d5d7ba6, 6470687e-a428-4b7a-bef2-8a291ad947c9, 8c4ce438-32a7-4ac5-91a6-e22ae08d9c8b, bc946dac-7877-4271-b2f7-99d2db13cd2c, 440eaaa8-b3e0-484b-a8be-62870b9ba70a, 94763226-9b3c-4e75-a931-5c89701abe66, 314c4481-f395-4525-be8b-2ec4bb1e9d91]
+    evidence: "disabled {userPrincipalName}: licences {assignedLicenses[].skuId}"
+
+  - id: M365-LICENSED-GUEST
+    title: Guest account holds a licence
+    kind: misconfigured
+    category: CST
+    severity: low
+    entity: user
+    why: "Guests are covered by monthly-active-user billing for Entra features; a product licence on a guest is usually a mistake from a group assignment."
+    fix: "Remove the licence, or exclude guests from the licensing group."
+    refs: ["NIST-800-53:PM-3", "NIST-800-53:AC-2(9)"]
+    query:
+      protocol: graph
+      path: /users
+      select: [id, userPrincipalName, accountEnabled, userType, createdDateTime, onPremisesSyncEnabled, onPremisesSecurityIdentifier, signInActivity, assignedLicenses]
+      top: 500
+      key: id
+      name: userPrincipalName
+    each:
+      all:
+        - { field: userType, op: eq, value: Guest }
+        - { field: assignedLicenses, op: notempty }
+    evidence: "guest {userPrincipalName}: licences {assignedLicenses[].skuId}"
+
+  - id: M365-LICENSE-OVERLAP-OFFICE
+    title: User holds two Office suites that deliver the same services
+    kind: misconfigured
+    category: CST
+    severity: medium
+    entity: user
+    why: "Office 365 E1/E3 together with Office 365 E5 or a Microsoft 365 E3/E5 suite pays twice for Exchange, SharePoint and Teams. Extend the two lists through the thresholds for other overlapping pairs."
+    fix: "Remove the lower suite from the user (check disabled service plans first) and reduce that SKU at renewal."
+    refs: ["NIST-800-53:PM-3"]
+    query:
+      protocol: graph
+      path: /users
+      select: [id, userPrincipalName, accountEnabled, userType, createdDateTime, onPremisesSyncEnabled, onPremisesSecurityIdentifier, signInActivity, assignedLicenses]
+      top: 500
+      key: id
+      name: userPrincipalName
+    each:
+      all:
+        - field: 'assignedLicenses[].skuId'
+          op: in
+          threshold: m365.overlap-office-lower-sku-ids
+          value: [18181a46-0d4e-45cd-891e-60aabd171b4e, 6fd2c87f-b296-42f0-b197-1e91e994b900]
+        - field: 'assignedLicenses[].skuId'
+          op: in
+          threshold: m365.overlap-office-higher-sku-ids
+          value: [c7df2760-2c81-4ef7-b578-5b5392b571df, 05e9a617-0261-4cee-bb44-138d3ef5d965, 06ebc4ee-1bb5-47dd-8120-11324bc54e06]
+    evidence: "{userPrincipalName}: licences {assignedLicenses[].skuId}"
+
+  - id: M365-LICENSE-OVERLAP-EMS
+    title: User holds two security suites that deliver the same services
+    kind: misconfigured
+    category: CST
+    severity: medium
+    entity: user
+    why: "Enterprise Mobility + Security E3 is fully contained in EMS E5 and in Microsoft 365 E3/E5; holding both pays twice for Entra ID P1, Intune and Purview Information Protection."
+    fix: "Remove the contained SKU from the user and reduce it at renewal."
+    refs: ["NIST-800-53:PM-3"]
+    query:
+      protocol: graph
+      path: /users
+      select: [id, userPrincipalName, accountEnabled, userType, createdDateTime, onPremisesSyncEnabled, onPremisesSecurityIdentifier, signInActivity, assignedLicenses]
+      top: 500
+      key: id
+      name: userPrincipalName
+    each:
+      all:
+        - field: 'assignedLicenses[].skuId'
+          op: in
+          threshold: m365.overlap-ems-lower-sku-ids
+          value: [efccb6f7-5641-4e0e-bd10-b4976e1bf68e]
+        - field: 'assignedLicenses[].skuId'
+          op: in
+          threshold: m365.overlap-ems-higher-sku-ids
+          value: [b05e124f-c7cc-45a0-a6aa-8cf78c946968, 05e9a617-0261-4cee-bb44-138d3ef5d965, 06ebc4ee-1bb5-47dd-8120-11324bc54e06]
+    evidence: "{userPrincipalName}: licences {assignedLicenses[].skuId}"
+
+  - id: M365-LICENSE-WATCHLIST-SKU
+    title: User holds a SKU on the tenant's restricted-SKU list
+    kind: misconfigured
+    category: CST
+    severity: low
+    entity: user
+    why: "Some SKUs are only valid for an eligible population (for example education SKUs for academic staff, frontline SKUs for frontline workers); handed out as a cheap stand-in they breach the licence terms. The list is tenant-specific and empty by default: fill the threshold with the SKU ids to watch."
+    fix: "Check each holder's eligibility; move ineligible users to the right SKU."
+    refs: ["NIST-800-53:SA-4"]
+    query:
+      protocol: graph
+      path: /users
+      select: [id, userPrincipalName, accountEnabled, userType, createdDateTime, onPremisesSyncEnabled, onPremisesSecurityIdentifier, signInActivity, assignedLicenses]
+      top: 500
+      key: id
+      name: userPrincipalName
+    each:
+      all:
+        - { field: accountEnabled, op: eq, value: true }
+        - field: 'assignedLicenses[].skuId'
+          op: in
+          threshold: m365.watch-sku-ids
+          value: []
+    evidence: "{userPrincipalName}: licences {assignedLicenses[].skuId}"
+
+  - id: M365-LICENSE-ASSIGNMENT-ERROR
+    title: Licence assignment failed for a user
+    kind: broken
+    category: HYG
+    severity: medium
+    entity: user
+    why: "A failed assignment (no free units, conflicting plans, missing usage location) leaves the user silently without the service the group or admin meant to give."
+    fix: "Fix the cause shown in the error (buy or free units, remove the conflicting SKU, set the usage location) and reprocess the assignment."
+    refs: ["NIST-800-53:CM-8"]
+    query:
+      protocol: graph
+      path: /users
+      select: [id, userPrincipalName, accountEnabled, userType, createdDateTime, assignedLicenses, licenseAssignmentStates, onPremisesSyncEnabled, onPremisesDistinguishedName, onPremisesProvisioningErrors, passwordPolicies, lastPasswordChangeDateTime, externalUserState, externalUserStateChangeDateTime]
+      top: 999
+      key: id
+      name: userPrincipalName
+    each: { field: 'licenseAssignmentStates[].state', op: eq, value: Error }
+    evidence: "{userPrincipalName}: {licenseAssignmentStates[].error} (SKU {licenseAssignmentStates[].skuId}, group {licenseAssignmentStates[].assignedByGroup})"
+
+  - id: M365-LICENSE-DISABLED-VIA-GROUP
+    title: Licensing group keeps licensing disabled accounts
+    kind: misconfigured
+    category: CST
+    severity: low
+    entity: user
+    why: "When a licensing group does not exclude disabled accounts, every leaver keeps consuming units until someone removes them from the group by hand."
+    fix: "Make the licensing group's membership exclude disabled accounts (for example a dynamic rule on accountEnabled) or remove leavers as part of offboarding."
+    refs: ["NIST-800-53:PM-3", "NIST-800-53:AC-2"]
+    query:
+      protocol: graph
+      path: /users
+      select: [id, userPrincipalName, accountEnabled, userType, createdDateTime, assignedLicenses, licenseAssignmentStates, onPremisesSyncEnabled, onPremisesDistinguishedName, onPremisesProvisioningErrors, passwordPolicies, lastPasswordChangeDateTime, externalUserState, externalUserStateChangeDateTime]
+      top: 999
+      key: id
+      name: userPrincipalName
+    each:
+      all:
+        - { field: accountEnabled, op: eq, value: false }
+        - { field: 'licenseAssignmentStates[].assignedByGroup', op: exists }
+    evidence: "disabled {userPrincipalName}: licensed through group {licenseAssignmentStates[].assignedByGroup}"
+
+  - id: M365-LICENSE-DIRECT-ONLY
+    title: User is licensed only by direct assignment
+    kind: misconfigured
+    category: HYG
+    severity: low
+    entity: user
+    why: "Directly assigned licences are invisible to group-based joiner and leaver processes, so they are never reclaimed automatically."
+    fix: "Move the user's licences to licensing groups and remove the direct assignments."
+    refs: ["NIST-800-53:AC-2", "NIST-800-53:PM-3"]
+    query:
+      protocol: graph
+      path: /users
+      select: [id, userPrincipalName, accountEnabled, userType, createdDateTime, assignedLicenses, licenseAssignmentStates, onPremisesSyncEnabled, onPremisesDistinguishedName, onPremisesProvisioningErrors, passwordPolicies, lastPasswordChangeDateTime, externalUserState, externalUserStateChangeDateTime]
+      top: 999
+      key: id
+      name: userPrincipalName
+    each:
+      all:
+        - { field: accountEnabled, op: eq, value: true }
+        - { field: licenseAssignmentStates, op: notempty }
+        - { field: 'licenseAssignmentStates[].assignedByGroup', op: absent }
+    evidence: "{userPrincipalName}: licences {licenseAssignmentStates[].skuId}, none through a group"
+
+  - id: M365-LICENSE-GROUP-ERRORS
+    title: Licensing group has members with licence errors
+    kind: broken
+    category: HYG
+    severity: medium
+    entity: group
+    why: "Members of this group did not get the licence the group assigns (no free units, conflicting SKUs or missing usage location), so they are silently without the service."
+    fix: "Open the group's licence errors, fix each cause and reprocess."
+    refs: ["NIST-800-53:CM-8"]
+    query:
+      protocol: graph
+      path: /groups
+      filter: "hasMembersWithLicenseErrors eq true"
+      select: [id, displayName, assignedLicenses]
+      key: id
+      name: displayName
+    each: any
+    evidence: "{displayName}: members with licence errors (assigns {assignedLicenses[].skuId})"
+
+  # ============================================================ service health and changes ===
+  - id: M365-SERVICE-ISSUE-OPEN
+    title: Open Microsoft 365 service health issue
+    kind: broken
+    category: AVL
+    severity:
+      field: classification
+      map: { incident: high, advisory: low }
+      default: medium
+    entity: service-issue
+    refresh: 1h
+    why: "An open incident or advisory explains user complaints and failed jobs before anyone opens a ticket; an incident means users cannot use a feature right now."
+    fix: "Read the issue, tell affected users and the help desk, apply any workaround and follow it until it is resolved."
+    refs: ["NIST-800-53:IR-6", "NIST-800-53:SI-5"]
+    query:
+      protocol: graph
+      path: /admin/serviceAnnouncement/issues
+      select: [id, title, service, feature, classification, status, isResolved, startDateTime, lastModifiedDateTime, impactDescription]
+      key: id
+      name: title
+    each: { field: isResolved, op: eq, value: false }
+    evidence: "{service} {id} ({classification}, {status}) since {startDateTime}: {title}"
+
+  - id: M365-MESSAGE-ACTION-DUE
+    title: Message center change needs action by a date
+    kind: broken
+    category: LCM
+    severity:
+      daysLeft: actionRequiredByDateTime
+      ranges: [ { max: 0, value: high }, { max: 14, value: high }, { max: 30, value: medium } ]
+      default: low
+    deadline: actionRequiredByDateTime
+    entity: service-message
+    why: "Retirements and plan-for-change notices with an action date break something on that date if nobody acts (protocols turned off, features removed, settings flipped)."
+    fix: "Give the message an owner, plan the change before the date and record what was done."
+    refs: ["NIST-800-53:CM-3", "NIST-800-53:SI-5"]
+    query:
+      protocol: graph
+      path: /admin/serviceAnnouncement/messages
+      select: [id, title, category, severity, isMajorChange, actionRequiredByDateTime, services, startDateTime, lastModifiedDateTime]
+      key: id
+      name: title
+    each:
+      all:
+        - { field: actionRequiredByDateTime, op: until-lt, value: 60, threshold: m365.message-action-notice-days }
+        - { field: actionRequiredByDateTime, op: age-lt, value: 30, threshold: m365.message-action-overdue-days }
+    evidence: "{id} ({services}): act by {actionRequiredByDateTime} - {title}"
+
+  # ============================================================== SharePoint and OneDrive ===
+  - id: M365-SPO-ANYONE-LINKS
+    title: SharePoint allows anonymous 'Anyone' links
+    kind: misconfigured
+    category: IAM
+    severity: high
+    entity: sharepoint-tenant
+    lens: security
+    why: "Anyone links work without sign-in: whoever gets the link (forwarded mail, a pasted chat, a leaked log) opens the file, and there is no record of who did."
+    fix: "Set organisation-level sharing to 'New and existing guests' or more restrictive; allow Anyone links only on specific sites that need them."
+    refs: [CIS-M365-7.2.3, "NIST-800-53:AC-3", "NIST-800-53:AC-22"]
+    query:
+      protocol: graph
+      path: /admin/sharepoint/settings
+      key: id
+    each: { field: sharingCapability, op: eq, value: externalUserAndGuestSharing }
+    evidence: "sharingCapability = {sharingCapability}"
+
+  - id: M365-SPO-LEGACY-AUTH
+    title: SharePoint accepts apps that do not use modern authentication
+    kind: misconfigured
+    category: AUT
+    severity: high
+    entity: sharepoint-tenant
+    lens: security
+    why: "Legacy authentication to SharePoint cannot do MFA and is not covered by Conditional Access, so it is a password-only door into every site."
+    fix: "Block apps that don't use modern authentication in SharePoint access control (isLegacyAuthProtocolsEnabled = false)."
+    refs: [CIS-M365-7.2.1, "NIST-800-53:IA-2(1)"]
+    query:
+      protocol: graph
+      path: /admin/sharepoint/settings
+      key: id
+    each: { field: isLegacyAuthProtocolsEnabled, op: eq, value: true }
+    evidence: "isLegacyAuthProtocolsEnabled = {isLegacyAuthProtocolsEnabled}"
+
+  - id: M365-SPO-GUEST-RESHARING
+    title: Guests can reshare items they do not own
+    kind: misconfigured
+    category: IAM
+    severity: medium
+    entity: sharepoint-tenant
+    lens: security
+    why: "Resharing by guests passes your content on to people nobody inside invited."
+    fix: "Turn off 'Allow guests to share items they don't own'."
+    refs: ["NIST-800-53:AC-3", "NIST-800-53:AC-21"]
+    query:
+      protocol: graph
+      path: /admin/sharepoint/settings
+      key: id
+    each: { field: isResharingByExternalUsersEnabled, op: eq, value: true }
+    evidence: "isResharingByExternalUsersEnabled = {isResharingByExternalUsersEnabled}"
+
+  - id: M365-SPO-INVITE-ACCOUNT-MISMATCH
+    title: Guests can accept sharing invitations with a different account
+    kind: misconfigured
+    category: IAM
+    severity: medium
+    entity: sharepoint-tenant
+    lens: security
+    why: "If the accepting account need not match the invited address, a forwarded invitation gives access to whoever redeems it."
+    fix: "Require guests to sign in with the account the invitation was sent to."
+    refs: ["NIST-800-53:AC-2(9)", "NIST-800-53:IA-8"]
+    query:
+      protocol: graph
+      path: /admin/sharepoint/settings
+      key: id
+    each: { field: isRequireAcceptingUserToMatchInvitedUserEnabled, op: eq, value: false }
+    evidence: "isRequireAcceptingUserToMatchInvitedUserEnabled = {isRequireAcceptingUserToMatchInvitedUserEnabled}"
+
+  - id: M365-SPO-NO-DOMAIN-RESTRICTION
+    title: External sharing is open to every domain
+    kind: misconfigured
+    category: IAM
+    severity: low
+    entity: sharepoint-tenant
+    lens: security
+    why: "With external sharing on and no allow or block list, files can be shared with any outside address, including consumer mail services."
+    fix: "Use an allow list of partner domains, or at least a block list for consumer mail domains."
+    refs: ["NIST-800-53:AC-21", "NIST-800-53:AC-20"]
+    query:
+      protocol: graph
+      path: /admin/sharepoint/settings
+      key: id
+    each:
+      all:
+        - { field: sharingCapability, op: ne, value: disabled }
+        - { field: sharingDomainRestrictionMode, op: eq, value: none }
+    evidence: "sharingCapability = {sharingCapability}, sharingDomainRestrictionMode = {sharingDomainRestrictionMode}"
+
+  - id: M365-SPO-IDLE-SIGNOUT-OFF
+    title: Idle browser sessions on SharePoint and OneDrive never sign out
+    kind: misconfigured
+    category: AUT
+    severity: low
+    entity: sharepoint-tenant
+    lens: security
+    why: "On shared or unmanaged computers an idle SharePoint or OneDrive session stays open for the next person at the keyboard."
+    fix: "Enable idle session sign-out (for example warn after 3 hours, sign out shortly after)."
+    refs: ["NIST-800-53:AC-11", "NIST-800-53:AC-12"]
+    query:
+      protocol: graph
+      path: /admin/sharepoint/settings
+      key: id
+    each: { field: idleSessionSignOut.isEnabled, op: eq, value: false }
+    evidence: "idleSessionSignOut.isEnabled = {idleSessionSignOut.isEnabled}"
+
+  - id: M365-SPO-UNMANAGED-SYNC
+    title: OneDrive can sync on computers outside the organisation's domains
+    kind: misconfigured
+    category: CFG
+    severity: low
+    entity: sharepoint-tenant
+    lens: security
+    why: "Without the domain restriction the sync client copies whole libraries to home and personal PCs that the organisation does not manage."
+    fix: "Allow syncing only on PCs joined to the organisation's domains (allowedDomainGuidsForSyncApp), or enforce the same through Conditional Access."
+    refs: ["NIST-800-53:AC-19", "NIST-800-53:AC-20"]
+    query:
+      protocol: graph
+      path: /admin/sharepoint/settings
+      key: id
+    each: { field: isUnmanagedSyncAppForTenantRestricted, op: eq, value: false }
+    evidence: "isUnmanagedSyncAppForTenantRestricted = {isUnmanagedSyncAppForTenantRestricted}"
+
+  # ============================================================================ domains ===
+  - id: M365-DOMAIN-UNVERIFIED
+    title: Domain added to the tenant but never verified
+    kind: misconfigured
+    category: HYG
+    severity: low
+    entity: domain
+    why: "An unverified domain is an abandoned onboarding step or a typo; it blocks the real owner from adding it and confuses UPN and mail planning."
+    fix: "Verify the domain (DNS record) or remove it."
+    refs: ["NIST-800-53:CM-8"]
+    query:
+      protocol: graph
+      path: /domains
+      select: [id, authenticationType, isVerified, isDefault, isInitial, passwordValidityPeriodInDays, supportedServices]
+      key: id
+    each: { field: isVerified, op: eq, value: false }
+    evidence: "{id}: not verified"
+
+  - id: M365-DOMAIN-PASSWORD-EXPIRY
+    title: Domain still expires cloud passwords
+    kind: misconfigured
+    category: AUT
+    severity: low
+    entity: domain
+    lens: security
+    why: "Forced periodic expiry pushes users to predictable passwords and silently breaks room, device and service accounts when their passwords age out; current guidance is no expiry plus MFA and banned-password checks."
+    fix: "Set passwords to never expire for the managed domain once MFA is enforced."
+    refs: [CIS-M365-1.3.1, "NIST-800-53:IA-5(1)"]
+    query:
+      protocol: graph
+      path: /domains
+      select: [id, authenticationType, isVerified, isDefault, isInitial, passwordValidityPeriodInDays, supportedServices]
+      key: id
+    each:
+      all:
+        - { field: isVerified, op: eq, value: true }
+        - { field: authenticationType, op: eq, value: Managed }
+        - any:
+            - { field: passwordValidityPeriodInDays, op: absent }
+            - { field: passwordValidityPeriodInDays, op: ne, value: 2147483647 }
+    evidence: "{id}: passwordValidityPeriodInDays = {passwordValidityPeriodInDays}"
+
+  # ===================================================================== org settings ===
+  - id: M365-OFFICE-STORE-OR-TRIALS-OPEN
+    title: Users can use the Office Store or start trials for the organisation
+    kind: misconfigured
+    category: CFG
+    severity: medium
+    entity: org-setting
+    lens: security
+    why: "Store add-ins and user-started trials bring unvetted code and services into Office with access to the user's mail and documents. Only exposed in the beta API."
+    fix: "Turn off 'Let users access the Office Store' and 'Let users start trials on behalf of your organisation'."
+    refs: [CIS-M365-1.3.4, "NIST-800-53:CM-11"]
+    query:
+      protocol: graph
+      version: beta
+      path: /admin/appsAndServices
+      key: id
+    each:
+      any:
+        - all:
+            - { field: settings, op: exists }
+            - any:
+                - { field: settings.isOfficeStoreEnabled, op: eq, value: true }
+                - { field: settings.isAppAndServicesTrialEnabled, op: eq, value: true }
+        - all:
+            - { field: settings, op: absent }
+            - any:
+                - { field: value.settings.isOfficeStoreEnabled, op: eq, value: true }
+                - { field: value.settings.isAppAndServicesTrialEnabled, op: eq, value: true }
+    evidence: "Office Store {settings.isOfficeStoreEnabled}{value.settings.isOfficeStoreEnabled}, trials {settings.isAppAndServicesTrialEnabled}{value.settings.isAppAndServicesTrialEnabled}"
+
+  - id: M365-FORMS-PHISHING-SCAN-OFF
+    title: Microsoft Forms internal phishing protection is off
+    kind: misconfigured
+    category: CFG
+    severity: medium
+    entity: org-setting
+    lens: security
+    why: "Without the scan, a form inside the tenant asking for passwords or other credentials is not detected, which makes internal phishing through Forms easy. Only exposed in the beta API."
+    fix: "Turn on internal phishing protection in the Microsoft Forms settings."
+    refs: [CIS-M365-1.3.5, "NIST-800-53:SI-8"]
+    query:
+      protocol: graph
+      version: beta
+      path: /admin/forms
+      key: id
+    each:
+      any:
+        - all:
+            - { field: settings, op: exists }
+            - { field: settings.isInOrgFormsPhishingScanEnabled, op: eq, value: false }
+        - all:
+            - { field: settings, op: absent }
+            - { field: value.settings.isInOrgFormsPhishingScanEnabled, op: eq, value: false }
+    evidence: "isInOrgFormsPhishingScanEnabled = {settings.isInOrgFormsPhishingScanEnabled}{value.settings.isInOrgFormsPhishingScanEnabled}"

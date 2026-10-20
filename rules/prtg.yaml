@@ -1,0 +1,211 @@
+schema: keeper.rules/1
+system: prtg
+name: PRTG Network Monitor
+integration: prtg
+# Endpoint: the PRTG web server (https://prtg.example.org). The integration adds the API token; rules
+# only name GET paths. All sensor rules share one table query: /api/table.json answers
+# {"prtg-version": ..., "treesize": n, "sensors": [...]}, so items is "sensors". The table API pages
+# with start/count (count at most 50,000), mapped to the runner's offset paging.
+# Numeric columns come twice: "status" is the display text, "status_raw" the number, which does not
+# depend on the user interface language. Sensor status codes (filter_status in the PRTG API docs):
+#   1 Unknown, 2 Collecting, 3 Up, 4 Warning, 5 Down, 6 No probe, 7 Paused by user,
+#   8 Paused by dependency, 9 Paused by schedule, 10 Unusual, 11 Paused by licence, 12 Paused until,
+#   13 Down (acknowledged), 14 Down (partial).
+# downtimesince_raw is in seconds; priority_raw is 1 (lowest) to 5 (highest).
+defaults:
+  lens: maintenance
+  refresh: 1h
+  category: MON
+  entity: sensor
+rules:
+
+  - id: PRTG-SENSOR-DOWN
+    title: Sensor is down
+    kind: broken
+    severity:
+      field: priority_raw
+      ranges: [ { min: 5, value: critical }, { min: 4, value: high } ]
+      default: medium
+    why: A down sensor is a monitored thing that has stopped answering; priority says how much the owner said it matters.
+    fix: Fix the device or service, or acknowledge the alarm with a note while the fix is underway.
+    refs: [NIST-800-53:SI-4]
+    query:
+      protocol: http
+      path: /api/table.json
+      params: { content: sensors, columns: "objid,device,group,probe,sensor,status,message,downtimesince,priority,lastcheck" }
+      paging: offset
+      offsetParam: start
+      limitParam: count
+      pageSize: 5000
+      items: sensors
+      key: objid
+      name: sensor
+    each: { field: status_raw, op: in, value: [5, 14] }
+    evidence: "{probe} / {group} / {device} / {sensor}: {status} for {downtimesince} - {message}"
+
+  - id: PRTG-SENSOR-DOWN-ACKNOWLEDGED
+    title: Sensor is down and acknowledged
+    kind: broken
+    severity: medium
+    why: An acknowledged alarm is suppressed in PRTG's own views; acknowledged means somebody saw it, not that it was fixed.
+    fix: Fix it, or pause the sensor with a dated reason if the outage is planned; do not leave it acknowledged indefinitely.
+    refs: [NIST-800-53:SI-4]
+    query:
+      protocol: http
+      path: /api/table.json
+      params: { content: sensors, columns: "objid,device,group,probe,sensor,status,message,downtimesince,priority,lastcheck" }
+      paging: offset
+      offsetParam: start
+      limitParam: count
+      pageSize: 5000
+      items: sensors
+      key: objid
+      name: sensor
+    each: { field: status_raw, op: eq, value: 13 }
+    evidence: "{device} / {sensor}: {status} for {downtimesince} - {message}"
+
+  - id: PRTG-SENSOR-DOWN-LONG
+    title: Sensor has been down for more than a week
+    kind: broken
+    category: HYG
+    severity: medium
+    why: A sensor down for weeks is either a real outage nobody owns or monitoring of something that no longer exists - both teach people to ignore red.
+    fix: Fix the monitored service, or delete the sensor if the thing it watched is gone.
+    query:
+      protocol: http
+      path: /api/table.json
+      params: { content: sensors, columns: "objid,device,group,probe,sensor,status,message,downtimesince,priority,lastcheck" }
+      paging: offset
+      offsetParam: start
+      limitParam: count
+      pageSize: 5000
+      items: sensors
+      key: objid
+      name: sensor
+    each:
+      all:
+        - { field: status_raw, op: in, value: [5, 13, 14] }
+        - { field: downtimesince_raw, op: gt, value: 604800, threshold: prtg.down-max-seconds }
+    evidence: "{device} / {sensor}: {status} for {downtimesince}"
+
+  - id: PRTG-SENSOR-UNKNOWN
+    title: Sensor reports no data (unknown or no probe)
+    kind: broken
+    severity: medium
+    why: Unknown is neither green nor red, so no alert rule catches it - it is monitoring that is not monitoring, often a probe that lost its connection.
+    fix: Check the probe connection and the sensor's credentials or target; recreate sensors that never returned data.
+    refs: [NIST-800-53:SI-4]
+    query:
+      protocol: http
+      path: /api/table.json
+      params: { content: sensors, columns: "objid,device,group,probe,sensor,status,message,downtimesince,priority,lastcheck" }
+      paging: offset
+      offsetParam: start
+      limitParam: count
+      pageSize: 5000
+      items: sensors
+      key: objid
+      name: sensor
+    each: { field: status_raw, op: in, value: [1, 6] }
+    evidence: "{probe} / {device} / {sensor}: {status} - {message}"
+
+  - id: PRTG-SENSOR-PAUSED-BY-USER
+    title: Sensor paused by a user
+    kind: misconfigured
+    severity: low
+    why: A paused sensor raises no alerts at all. Pauses made for maintenance are routinely forgotten, and the sensor stays silent for months.
+    fix: Resume the sensor, delete it if the device is gone, or use a timed pause (pause until) so it comes back by itself.
+    query:
+      protocol: http
+      path: /api/table.json
+      params: { content: sensors, columns: "objid,device,group,probe,sensor,status,message,downtimesince,priority,lastcheck" }
+      paging: offset
+      offsetParam: start
+      limitParam: count
+      pageSize: 5000
+      items: sensors
+      key: objid
+      name: sensor
+    each: { field: status_raw, op: eq, value: 7 }
+    evidence: "{device} / {sensor}: {status} - {message}"
+
+  - id: PRTG-SENSOR-PAUSED-BY-DEPENDENCY
+    title: Sensor paused because a parent object is down
+    kind: broken
+    severity: low
+    why: A parent that goes down pauses its whole subtree, which is often a larger blind spot than the one alarm anybody noticed.
+    fix: Fix the parent object; the dependent sensors resume on their own.
+    query:
+      protocol: http
+      path: /api/table.json
+      params: { content: sensors, columns: "objid,device,group,probe,sensor,status,message,downtimesince,priority,lastcheck" }
+      paging: offset
+      offsetParam: start
+      limitParam: count
+      pageSize: 5000
+      items: sensors
+      key: objid
+      name: sensor
+    each: { field: status_raw, op: eq, value: 8 }
+    evidence: "{device} / {sensor}: {status}"
+
+  - id: PRTG-SENSOR-PAUSED-BY-LICENSE
+    title: Sensor paused because the licence limit is reached
+    kind: missing
+    severity: high
+    why: At the sensor limit PRTG pauses or refuses sensors without an alarm - the estate grows and monitoring does not.
+    fix: Remove unused sensors or extend the licence, then resume the paused sensors.
+    query:
+      protocol: http
+      path: /api/table.json
+      params: { content: sensors, columns: "objid,device,group,probe,sensor,status,message,downtimesince,priority,lastcheck" }
+      paging: offset
+      offsetParam: start
+      limitParam: count
+      pageSize: 5000
+      items: sensors
+      key: objid
+      name: sensor
+    each: { field: status_raw, op: eq, value: 11 }
+    evidence: "{device} / {sensor}: {status}"
+
+  - id: PRTG-SENSOR-WARNING
+    title: Sensor is in a warning state
+    kind: broken
+    severity: low
+    why: A warning crossed a limit someone set on purpose; left alone it either turns into an outage or into noise people learn to ignore.
+    fix: Fix the cause or adjust the limit with a reason.
+    query:
+      protocol: http
+      path: /api/table.json
+      params: { content: sensors, columns: "objid,device,group,probe,sensor,status,message,downtimesince,priority,lastcheck" }
+      paging: offset
+      offsetParam: start
+      limitParam: count
+      pageSize: 5000
+      items: sensors
+      key: objid
+      name: sensor
+    each: { field: status_raw, op: eq, value: 4 }
+    evidence: "{device} / {sensor}: {status} - {message}"
+
+  - id: PRTG-NO-SENSORS
+    title: PRTG returned no sensors
+    kind: missing
+    severity: medium
+    entity: instance
+    why: An empty sensor table means either the API account sees nothing or nothing is monitored - both look identical to a calm dashboard.
+    fix: Check the API user's group rights on the probes and groups, then rerun.
+    query:
+      protocol: http
+      path: /api/table.json
+      params: { content: sensors, columns: "objid,device,group,probe,sensor,status,message,downtimesince,priority,lastcheck" }
+      paging: offset
+      offsetParam: start
+      limitParam: count
+      pageSize: 5000
+      items: sensors
+      key: objid
+      name: sensor
+    count: none
+    evidence: "the sensor table is empty"

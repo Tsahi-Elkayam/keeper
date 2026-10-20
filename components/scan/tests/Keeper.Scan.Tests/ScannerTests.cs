@@ -122,8 +122,9 @@ public sealed class ScannerTests : IDisposable
         Drop("tool/t.json", """{ "results": [ { "id": "A-Krbtgt", "text": "krbtgt is old", "points": 60 } ] }""");
     }
 
+    // A run with nothing of a kind (no findings) has no file for it.
     private List<T> Read<T>(ScanReport report, string file) =>
-        JsonLines.Read<T>(Path.Combine(Runs, report.Manifest.RunId, file)).ToList();
+        File.Exists(Path.Combine(Runs, report.Manifest.RunId, file)) ? JsonLines.Read<T>(Path.Combine(Runs, report.Manifest.RunId, file)).ToList() : [];
 
     [Fact]
     public async Task A_scan_writes_a_verified_run_with_results_findings_and_coverage()
@@ -165,6 +166,136 @@ public sealed class ScannerTests : IDisposable
         var report = await Scan(name => name == "example.stale-days" ? "400" : null);
 
         Assert.DoesNotContain(Read<FindingRecord>(report, RunFolder.Findings), f => f.RuleId == "EX-USER-STALE");
+    }
+
+    [Theory]
+    [InlineData("""{ "policies": [ { "name": "p1", "state": "enabled", "mfa": false }, { "name": "p2", "state": "reportOnly", "mfa": true } ] }""", true)]
+    [InlineData("""{ "policies": [ { "name": "p1", "state": "enabled", "mfa": true } ] }""", false)]
+    [InlineData("""{ "policies": [ { "name": "p1", "mfa": true } ] }""", true)]     // state unreadable: not counted as enforced
+    [InlineData("""{ "policies": [] }""", true)]
+    public async Task A_must_exist_rule_counts_only_the_rows_that_satisfy_it(string policies, bool finding)
+    {
+        const string mustExist = """
+            schema: keeper.rules/1
+            system: example
+            integration: files
+            rules:
+              - id: EX-MFA-POLICY-MISSING
+                title: No enforced policy requires MFA
+                kind: missing
+                category: AUT
+                severity: high
+                entity: tenant
+                query: { protocol: file, path: "ca/*.json", items: policies, key: name }
+                count:
+                  op: lt
+                  value: 1
+                  where:
+                    all:
+                      - { field: state, op: eq, value: enabled }
+                      - { field: mfa, op: eq, value: true }
+            """;
+        var path = Path.Combine(_dir, "must.yaml");
+        File.WriteAllText(path, mustExist);
+        Drop("ca/p.json", policies);
+
+        var report = await new Scanner(Runners.Registry(), new Clock(Now)).RunAsync(new ScanRequest
+        {
+            Files = [RuleLoader.LoadFile(path, "test", Runners.Registry().Validators)],
+            Connection = new FilesConnection(),
+            RunsDir = Runs,
+            ImportsDir = Imports,
+        }, CancellationToken.None);
+
+        var found = Read<FindingRecord>(report, RunFolder.Findings).Where(f => f.RuleId == "EX-MFA-POLICY-MISSING").ToList();
+        var results = Read<ResultRecord>(report, RunFolder.Results).Where(r => r.RuleId == "EX-MFA-POLICY-MISSING").Select(r => $"{r.State} {r.Value} {r.Why}");
+        Assert.True(finding == (found.Count > 0), $"{report.Manifest.Status}: {string.Join("; ", found.Select(f => f.Evidence))} | {string.Join("; ", results)} | {string.Join("; ", report.Manifest.Notes)}");
+    }
+
+    /// <summary>A per-host runner with canned answers: each host's local Administrators members and hotfixes.</summary>
+    private sealed class HostsRunner : IRunner
+    {
+        public string Protocol => "hosts";
+        public bool PerTarget => true;
+        public IEnumerable<string> Validate(QuerySpec query) => [];
+
+        public Task<RunnerResult> RunAsync(QuerySpec query, RunnerContext context, CancellationToken cancellationToken)
+        {
+            JsonObject Row(string member) => new() { ["host"] = context.Target, ["member"] = member };
+            JsonObject Fix(int daysAgo) => new() { ["host"] = context.Target, ["installedOn"] = Iso.Utc(Now.AddDays(-daysAgo)) };
+            return Task.FromResult(query.Text("what") == "admins"
+                ? context.Target switch
+                {
+                    "pc1.example.org" => RunnerResult.Ok([Row("Administrator"), Row("Domain Admins"), Row("user7"), Row("user9")]),
+                    "pc2.example.org" => RunnerResult.Ok([Row("Administrator"), Row("Domain Admins")]),
+                    _ => RunnerResult.Failed("access denied"),
+                }
+                : context.Target switch
+                {
+                    "pc1.example.org" => RunnerResult.Ok([Fix(200), Fix(400)]),
+                    "pc2.example.org" => RunnerResult.Ok([Fix(10), Fix(300)]),
+                    _ => RunnerResult.Failed("access denied"),
+                });
+        }
+    }
+
+    [Fact]
+    public async Task Per_host_queries_count_per_host_and_composite_keys_keep_every_member()
+    {
+        const string hosts = """
+            schema: keeper.rules/1
+            system: hosts
+            integration: cim
+            targets: { list: [pc1.example.org, pc2.example.org, pc3.example.org] }
+            rules:
+              - id: EX-ADMIN-UNEXPECTED
+                title: Unexpected local administrator
+                kind: misconfigured
+                category: IAM
+                severity: high
+                entity: local-admin
+                query: { protocol: hosts, what: admins, key: "{host}|{member}" }
+                each: { field: member, op: notin, value: [Administrator, Domain Admins] }
+              - id: EX-ADMIN-MANY
+                title: Too many local administrators on one host
+                kind: misconfigured
+                category: IAM
+                severity: medium
+                entity: computer
+                query: { protocol: hosts, what: admins, key: "{host}|{member}" }
+                count: { op: gt, value: 3 }
+              - id: EX-NOT-PATCHED
+                title: No update installed for 45 days
+                kind: broken
+                category: LCM
+                severity: high
+                entity: computer
+                query: { protocol: hosts, what: fixes, key: "{host}|{installedOn}" }
+                count: { op: lt, value: 1, where: { field: installedOn, op: age-lt, value: 45 } }
+            """;
+        var path = Path.Combine(_dir, "hosts.yaml");
+        File.WriteAllText(path, hosts);
+        var registry = new RunnerRegistry([new HostsRunner()]);
+
+        var report = await new Scanner(registry, new Clock(Now)).RunAsync(new ScanRequest
+        {
+            Files = [RuleLoader.LoadFile(path, "test", registry.Validators)],
+            Connection = new FilesConnection(),
+            RunsDir = Runs,
+            ImportsDir = Imports,
+        }, CancellationToken.None);
+
+        var findings = Read<FindingRecord>(report, RunFolder.Findings);
+        Assert.Equal(new[] { "pc1.example.org|user7", "pc1.example.org|user9" },
+            findings.Where(f => f.RuleId == "EX-ADMIN-UNEXPECTED").Select(f => f.Target).Order(StringComparer.Ordinal));
+        Assert.Equal("pc1.example.org", Assert.Single(findings, f => f.RuleId == "EX-ADMIN-MANY").Target);
+        Assert.Equal("pc1.example.org", Assert.Single(findings, f => f.RuleId == "EX-NOT-PATCHED").Target);
+
+        // pc3 could not be read: unknown for the per-host counts, never a pass.
+        var results = Read<ResultRecord>(report, RunFolder.Results);
+        Assert.Equal("unknown", results.Single(r => r.RuleId == "EX-NOT-PATCHED" && r.EntityKey == "pc3.example.org").State);
+        Assert.Equal("pass", results.Single(r => r.RuleId == "EX-NOT-PATCHED" && r.EntityKey == "pc2.example.org").State);
+        Assert.Equal("partial", report.Manifest.Status);
     }
 
     [Fact]

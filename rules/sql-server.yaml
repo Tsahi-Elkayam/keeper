@@ -1,0 +1,1002 @@
+schema: keeper.rules/1
+system: sql-server
+name: SQL Server instances
+integration: sql
+# One read-only SELECT per instance from the integration's targets option. Per-database and per-object
+# rows build their own key (server name / object) so findings stay distinct across instances;
+# instance-level rows key on `instance`. msdb history needs SQLAgentReaderRole or equivalent read access.
+defaults:
+  lens: maintenance
+  refresh: 1d
+rules:
+
+  # ---- database state and options -------------------------------------------------------------
+
+  - id: SQL-DB-NOT-ONLINE
+    title: Database is not online
+    kind: broken
+    category: AVL
+    severity:
+      field: state_desc
+      map: { SUSPECT: critical, RECOVERY_PENDING: critical, EMERGENCY: critical, OFFLINE: medium, RESTORING: low }
+      default: high
+    entity: database
+    refresh: 6h
+    why: SUSPECT and RECOVERY_PENDING mean SQL Server could not bring the database up and the application on it is down; OFFLINE databases still get counted, licensed and backed up.
+    fix: For damage read the error log and storage, then restore from the last good backup; for OFFLINE decide to detach or drop. RESTORING is normal only on secondaries.
+    refs: [NIST-800-53:CP-10]
+    query:
+      protocol: sql
+      text: |-
+        SELECT CAST(SERVERPROPERTY('ServerName') AS nvarchar(256)) + N'/' + d.name AS target,
+               d.name AS database_name, d.database_id, d.state_desc, d.user_access_desc, d.recovery_model_desc,
+               d.is_read_only, d.is_auto_close_on, d.is_auto_shrink_on, d.is_trustworthy_on,
+               d.page_verify_option_desc, DATABASEPROPERTYEX(d.name, 'LastGoodCheckDbTime') AS last_good_checkdb
+        FROM sys.databases AS d
+        WHERE d.source_database_id IS NULL
+      key: target
+      name: database_name
+    each: { field: state_desc, op: ne, value: ONLINE }
+    evidence: "{target}: {state_desc}"
+
+  - id: SQL-DB-NOT-MULTI-USER
+    title: Database left in single-user or restricted mode
+    kind: broken
+    category: AVL
+    severity: medium
+    entity: database
+    refresh: 6h
+    why: A database left in SINGLE_USER or RESTRICTED_USER after maintenance refuses the application's connections.
+    fix: Set it back to MULTI_USER once maintenance is done.
+    query:
+      protocol: sql
+      text: |-
+        SELECT CAST(SERVERPROPERTY('ServerName') AS nvarchar(256)) + N'/' + d.name AS target,
+               d.name AS database_name, d.database_id, d.state_desc, d.user_access_desc, d.recovery_model_desc,
+               d.is_read_only, d.is_auto_close_on, d.is_auto_shrink_on, d.is_trustworthy_on,
+               d.page_verify_option_desc, DATABASEPROPERTYEX(d.name, 'LastGoodCheckDbTime') AS last_good_checkdb
+        FROM sys.databases AS d
+        WHERE d.source_database_id IS NULL
+      key: target
+      name: database_name
+    each:
+      all:
+        - { field: state_desc, op: eq, value: ONLINE }
+        - { field: user_access_desc, op: ne, value: MULTI_USER }
+    evidence: "{target}: {user_access_desc}"
+
+  - id: SQL-DB-AUTO-SHRINK
+    title: Auto-shrink is on
+    kind: misconfigured
+    category: HLT
+    severity: medium
+    entity: database
+    refresh: 7d
+    why: Automatic shrinking fragments indexes and fights autogrowth in a loop, costing I/O and CPU for nothing.
+    fix: Turn AUTO_SHRINK off; size files deliberately instead.
+    query:
+      protocol: sql
+      text: |-
+        SELECT CAST(SERVERPROPERTY('ServerName') AS nvarchar(256)) + N'/' + d.name AS target,
+               d.name AS database_name, d.database_id, d.state_desc, d.user_access_desc, d.recovery_model_desc,
+               d.is_read_only, d.is_auto_close_on, d.is_auto_shrink_on, d.is_trustworthy_on,
+               d.page_verify_option_desc, DATABASEPROPERTYEX(d.name, 'LastGoodCheckDbTime') AS last_good_checkdb
+        FROM sys.databases AS d
+        WHERE d.source_database_id IS NULL
+      key: target
+      name: database_name
+    each: { field: is_auto_shrink_on, op: eq, value: 1 }
+    evidence: "{target}: AUTO_SHRINK on"
+
+  - id: SQL-DB-AUTO-CLOSE
+    title: Auto-close is on
+    kind: misconfigured
+    category: HLT
+    severity: low
+    entity: database
+    refresh: 7d
+    why: Auto-close shuts the database after the last connection and reopens it on the next, adding latency and flushing caches.
+    fix: Turn AUTO_CLOSE off.
+    refs: [CIS-MSSQL:2.16]
+    query:
+      protocol: sql
+      text: |-
+        SELECT CAST(SERVERPROPERTY('ServerName') AS nvarchar(256)) + N'/' + d.name AS target,
+               d.name AS database_name, d.database_id, d.state_desc, d.user_access_desc, d.recovery_model_desc,
+               d.is_read_only, d.is_auto_close_on, d.is_auto_shrink_on, d.is_trustworthy_on,
+               d.page_verify_option_desc, DATABASEPROPERTYEX(d.name, 'LastGoodCheckDbTime') AS last_good_checkdb
+        FROM sys.databases AS d
+        WHERE d.source_database_id IS NULL
+      key: target
+      name: database_name
+    each: { field: is_auto_close_on, op: eq, value: 1 }
+    evidence: "{target}: AUTO_CLOSE on"
+
+  - id: SQL-DB-TRUSTWORTHY
+    title: Database marked TRUSTWORTHY
+    kind: misconfigured
+    lens: security
+    category: IAM
+    severity: high
+    entity: database
+    refresh: 7d
+    why: In a TRUSTWORTHY database owned by a privileged login, anyone who can create code there can act with the owner's server-level rights.
+    fix: Turn TRUSTWORTHY off; sign modules with certificates where cross-database access is needed.
+    refs: [CIS-MSSQL:2.9, NIST-800-53:AC-6]
+    query:
+      protocol: sql
+      text: |-
+        SELECT CAST(SERVERPROPERTY('ServerName') AS nvarchar(256)) + N'/' + d.name AS target,
+               d.name AS database_name, d.database_id, d.state_desc, d.user_access_desc, d.recovery_model_desc,
+               d.is_read_only, d.is_auto_close_on, d.is_auto_shrink_on, d.is_trustworthy_on,
+               d.page_verify_option_desc, DATABASEPROPERTYEX(d.name, 'LastGoodCheckDbTime') AS last_good_checkdb
+        FROM sys.databases AS d
+        WHERE d.source_database_id IS NULL
+      key: target
+      name: database_name
+    each:
+      all:
+        - { field: is_trustworthy_on, op: eq, value: 1 }
+        - { field: database_name, op: ne, value: msdb }
+    evidence: "{target}: TRUSTWORTHY on"
+
+  - id: SQL-DB-PAGE-VERIFY
+    title: Page verification is not CHECKSUM
+    kind: misconfigured
+    category: CFG
+    severity: medium
+    entity: database
+    refresh: 7d
+    why: Without CHECKSUM page verification, storage corruption goes undetected until a query or a restore fails.
+    fix: Set PAGE_VERIFY CHECKSUM; pages get checksums as they are rewritten.
+    query:
+      protocol: sql
+      text: |-
+        SELECT CAST(SERVERPROPERTY('ServerName') AS nvarchar(256)) + N'/' + d.name AS target,
+               d.name AS database_name, d.database_id, d.state_desc, d.user_access_desc, d.recovery_model_desc,
+               d.is_read_only, d.is_auto_close_on, d.is_auto_shrink_on, d.is_trustworthy_on,
+               d.page_verify_option_desc, DATABASEPROPERTYEX(d.name, 'LastGoodCheckDbTime') AS last_good_checkdb
+        FROM sys.databases AS d
+        WHERE d.source_database_id IS NULL
+      key: target
+      name: database_name
+    each:
+      all:
+        - { field: page_verify_option_desc, op: ne, value: CHECKSUM }
+        - { field: database_name, op: ne, value: tempdb }
+    evidence: "{target}: page verify {page_verify_option_desc}"
+
+  - id: SQL-DB-CHECKDB-OLD
+    title: No recent clean integrity check
+    kind: missing
+    category: HLT
+    severity: medium
+    entity: database
+    why: DBCC CHECKDB is the only full corruption check; without a recent clean run, backups may already contain the damage.
+    fix: Schedule integrity checks (weekly at least) and alert on failures. A date of 1900-01-01 means it never ran.
+    refs: [NIST-800-53:SI-7]
+    query:
+      protocol: sql
+      text: |-
+        SELECT CAST(SERVERPROPERTY('ServerName') AS nvarchar(256)) + N'/' + d.name AS target,
+               d.name AS database_name, d.database_id, d.state_desc, d.user_access_desc, d.recovery_model_desc,
+               d.is_read_only, d.is_auto_close_on, d.is_auto_shrink_on, d.is_trustworthy_on,
+               d.page_verify_option_desc, DATABASEPROPERTYEX(d.name, 'LastGoodCheckDbTime') AS last_good_checkdb
+        FROM sys.databases AS d
+        WHERE d.source_database_id IS NULL
+      key: target
+      name: database_name
+    each:
+      all:
+        - { field: state_desc, op: eq, value: ONLINE }
+        - { field: database_name, op: ne, value: tempdb }
+        - { field: last_good_checkdb, op: age-gt, value: 7, threshold: sql.checkdb-max-age-days }
+    evidence: "{target}: last clean CHECKDB {last_good_checkdb}"
+
+  # ---- backups ---------------------------------------------------------------------------------
+
+  - id: SQL-BACKUP-FULL-NEVER
+    title: Database has never had a full backup
+    kind: missing
+    category: BCK
+    severity: critical
+    entity: database
+    refresh: 6h
+    why: Without any full backup the database cannot be restored at all. Backups taken by other tools appear here too if they go through SQL Server.
+    fix: Add the database to the backup job and test a restore.
+    refs: [NIST-800-53:CP-9, CIS-CSC-v8:11.2]
+    query:
+      protocol: sql
+      text: |-
+        SELECT CAST(SERVERPROPERTY('ServerName') AS nvarchar(256)) + N'/' + d.name AS target,
+               d.name AS database_name, d.recovery_model_desc, f.last_full, i.last_diff,
+               DATEDIFF(hour, CASE WHEN i.last_diff > f.last_full THEN i.last_diff ELSE f.last_full END, GETDATE()) AS restorable_age_hours,
+               DATEDIFF(day, f.last_full, GETDATE()) AS full_age_days
+        FROM sys.databases AS d
+        LEFT JOIN (SELECT database_name, MAX(backup_finish_date) AS last_full
+                   FROM msdb.dbo.backupset WHERE type = 'D' GROUP BY database_name) AS f ON f.database_name = d.name
+        LEFT JOIN (SELECT database_name, MAX(backup_finish_date) AS last_diff
+                   FROM msdb.dbo.backupset WHERE type = 'I' GROUP BY database_name) AS i ON i.database_name = d.name
+        WHERE d.state_desc = 'ONLINE' AND d.name <> N'tempdb' AND d.source_database_id IS NULL
+          AND (d.replica_id IS NULL OR sys.fn_hadr_backup_is_preferred_replica(d.name) = 1)
+      key: target
+      name: database_name
+    each: { field: last_full, op: absent }
+    evidence: "{target}: no full backup recorded"
+
+  - id: SQL-BACKUP-RESTORABLE-OLD
+    title: Newest full or differential backup is older than the recovery point objective
+    kind: missing
+    category: BCK
+    severity:
+      field: restorable_age_hours
+      ranges: [ { min: 168, value: critical } ]
+      default: high
+    entity: database
+    refresh: 6h
+    why: A restore today would lose everything written since the newest full or differential backup.
+    fix: Find why the job skipped the database (job failure, exclusion, full disk) and take a backup now.
+    refs: [NIST-800-53:CP-9, CIS-CSC-v8:11.2]
+    query:
+      protocol: sql
+      text: |-
+        SELECT CAST(SERVERPROPERTY('ServerName') AS nvarchar(256)) + N'/' + d.name AS target,
+               d.name AS database_name, d.recovery_model_desc, f.last_full, i.last_diff,
+               DATEDIFF(hour, CASE WHEN i.last_diff > f.last_full THEN i.last_diff ELSE f.last_full END, GETDATE()) AS restorable_age_hours,
+               DATEDIFF(day, f.last_full, GETDATE()) AS full_age_days
+        FROM sys.databases AS d
+        LEFT JOIN (SELECT database_name, MAX(backup_finish_date) AS last_full
+                   FROM msdb.dbo.backupset WHERE type = 'D' GROUP BY database_name) AS f ON f.database_name = d.name
+        LEFT JOIN (SELECT database_name, MAX(backup_finish_date) AS last_diff
+                   FROM msdb.dbo.backupset WHERE type = 'I' GROUP BY database_name) AS i ON i.database_name = d.name
+        WHERE d.state_desc = 'ONLINE' AND d.name <> N'tempdb' AND d.source_database_id IS NULL
+          AND (d.replica_id IS NULL OR sys.fn_hadr_backup_is_preferred_replica(d.name) = 1)
+      key: target
+      name: database_name
+    each: { field: restorable_age_hours, op: gt, value: 26, threshold: sql.backup-rpo-hours }
+    evidence: "{target}: newest full {last_full}, newest differential {last_diff} ({restorable_age_hours} h)"
+
+  - id: SQL-BACKUP-FULL-OLD
+    title: Last full backup is old
+    kind: missing
+    category: BCK
+    severity: medium
+    entity: database
+    why: A long differential chain on top of an old full makes restores slow and fragile; one damaged full breaks them all.
+    fix: Take a full backup at least weekly.
+    refs: [NIST-800-53:CP-9]
+    query:
+      protocol: sql
+      text: |-
+        SELECT CAST(SERVERPROPERTY('ServerName') AS nvarchar(256)) + N'/' + d.name AS target,
+               d.name AS database_name, d.recovery_model_desc, f.last_full, i.last_diff,
+               DATEDIFF(hour, CASE WHEN i.last_diff > f.last_full THEN i.last_diff ELSE f.last_full END, GETDATE()) AS restorable_age_hours,
+               DATEDIFF(day, f.last_full, GETDATE()) AS full_age_days
+        FROM sys.databases AS d
+        LEFT JOIN (SELECT database_name, MAX(backup_finish_date) AS last_full
+                   FROM msdb.dbo.backupset WHERE type = 'D' GROUP BY database_name) AS f ON f.database_name = d.name
+        LEFT JOIN (SELECT database_name, MAX(backup_finish_date) AS last_diff
+                   FROM msdb.dbo.backupset WHERE type = 'I' GROUP BY database_name) AS i ON i.database_name = d.name
+        WHERE d.state_desc = 'ONLINE' AND d.name <> N'tempdb' AND d.source_database_id IS NULL
+          AND (d.replica_id IS NULL OR sys.fn_hadr_backup_is_preferred_replica(d.name) = 1)
+      key: target
+      name: database_name
+    each: { field: full_age_days, op: gt, value: 8, threshold: sql.full-backup-max-age-days }
+    evidence: "{target}: last full backup {last_full} ({full_age_days} days)"
+
+  - id: SQL-BACKUP-LOG-OLD
+    title: Full-recovery database without recent log backups
+    kind: missing
+    category: BCK
+    severity: high
+    entity: database
+    refresh: 6h
+    why: In FULL or BULK_LOGGED recovery the log only truncates after a log backup; without them it grows until the disk fills, and point-in-time restore does not work anyway.
+    fix: Schedule log backups (every 15 to 60 minutes) or switch the database to SIMPLE recovery if point-in-time restore is not needed. Do not just shrink the log.
+    refs: [NIST-800-53:CP-9]
+    query:
+      protocol: sql
+      text: |-
+        SELECT CAST(SERVERPROPERTY('ServerName') AS nvarchar(256)) + N'/' + d.name AS target,
+               d.name AS database_name, d.recovery_model_desc, l.last_log,
+               DATEDIFF(minute, l.last_log, GETDATE()) / 60.0 AS log_age_hours
+        FROM sys.databases AS d
+        LEFT JOIN (SELECT database_name, MAX(backup_finish_date) AS last_log
+                   FROM msdb.dbo.backupset WHERE type = 'L' GROUP BY database_name) AS l ON l.database_name = d.name
+        WHERE d.state_desc = 'ONLINE' AND d.is_read_only = 0 AND d.recovery_model_desc <> 'SIMPLE'
+          AND d.name NOT IN (N'tempdb', N'model') AND d.source_database_id IS NULL
+          AND (d.replica_id IS NULL OR sys.fn_hadr_backup_is_preferred_replica(d.name) = 1)
+      key: target
+      name: database_name
+    each:
+      any:
+        - { field: last_log, op: absent }
+        - { field: log_age_hours, op: gt, value: 4, threshold: sql.log-backup-rpo-hours }
+    evidence: "{target}: {recovery_model_desc} recovery, last log backup {last_log}"
+
+  # ---- SQL Agent and services ------------------------------------------------------------------
+
+  - id: SQL-AGENT-JOB-FAILING
+    title: Enabled Agent job failed on its last run
+    kind: broken
+    category: HLT
+    severity: high
+    entity: job
+    refresh: 6h
+    why: Backups, integrity checks, index maintenance and application batches live in Agent jobs; one that still fails (a backup to a full disk, for years) emails nobody unless an operator is set.
+    fix: Read the job step history for the error, fix it, and add a failure notification to an operator.
+    query:
+      protocol: sql
+      text: |-
+        SELECT CAST(SERVERPROPERTY('ServerName') AS nvarchar(256)) + N'/' + j.name AS target,
+               j.name AS job_name, j.enabled, SUSER_SNAME(j.owner_sid) AS owner_name,
+               (SELECT MAX(msdb.dbo.agent_datetime(h.run_date, h.run_time)) FROM msdb.dbo.sysjobhistory AS h
+                 WHERE h.job_id = j.job_id AND h.step_id = 0 AND h.run_status = 0) AS last_failed,
+               (SELECT TOP (1) h2.run_status FROM msdb.dbo.sysjobhistory AS h2
+                 WHERE h2.job_id = j.job_id AND h2.step_id = 0 ORDER BY h2.instance_id DESC) AS last_run_status
+        FROM msdb.dbo.sysjobs AS j
+      key: target
+      name: job_name
+    each:
+      all:
+        - { field: enabled, op: eq, value: 1 }
+        - { field: last_run_status, op: eq, value: 0 }
+    evidence: "{target}: last run failed (last failure {last_failed})"
+
+  - id: SQL-AGENT-JOB-FAILED-RECENT
+    title: Enabled Agent job failed within the window
+    kind: broken
+    category: HLT
+    severity: medium
+    entity: job
+    refresh: 6h
+    why: A job that failed and then succeeded is intermittent; the pattern (time of day, a dependency, a lock) shows before it fails for good.
+    fix: Compare the failed runs with the job schedule and dependencies.
+    query:
+      protocol: sql
+      text: |-
+        SELECT CAST(SERVERPROPERTY('ServerName') AS nvarchar(256)) + N'/' + j.name AS target,
+               j.name AS job_name, j.enabled, SUSER_SNAME(j.owner_sid) AS owner_name,
+               (SELECT MAX(msdb.dbo.agent_datetime(h.run_date, h.run_time)) FROM msdb.dbo.sysjobhistory AS h
+                 WHERE h.job_id = j.job_id AND h.step_id = 0 AND h.run_status = 0) AS last_failed,
+               (SELECT TOP (1) h2.run_status FROM msdb.dbo.sysjobhistory AS h2
+                 WHERE h2.job_id = j.job_id AND h2.step_id = 0 ORDER BY h2.instance_id DESC) AS last_run_status
+        FROM msdb.dbo.sysjobs AS j
+      key: target
+      name: job_name
+    each:
+      all:
+        - { field: enabled, op: eq, value: 1 }
+        - { field: last_failed, op: age-lt, value: 7, threshold: sql.job-failure-window-days }
+    evidence: "{target}: failed at {last_failed}"
+
+  - id: SQL-AGENT-JOB-OWNER-ORPHAN
+    title: Agent job owned by a login that no longer exists
+    kind: broken
+    category: IAM
+    severity: medium
+    entity: job
+    refresh: 7d
+    why: A job whose owner was deleted fails to start or runs with surprising rights; owners left behind by departed staff are a review gap.
+    fix: Change the owner to a dedicated low-privilege login or sa (disabled) per the organisation's standard.
+    query:
+      protocol: sql
+      text: |-
+        SELECT CAST(SERVERPROPERTY('ServerName') AS nvarchar(256)) + N'/' + j.name AS target,
+               j.name AS job_name, j.enabled, SUSER_SNAME(j.owner_sid) AS owner_name,
+               (SELECT MAX(msdb.dbo.agent_datetime(h.run_date, h.run_time)) FROM msdb.dbo.sysjobhistory AS h
+                 WHERE h.job_id = j.job_id AND h.step_id = 0 AND h.run_status = 0) AS last_failed,
+               (SELECT TOP (1) h2.run_status FROM msdb.dbo.sysjobhistory AS h2
+                 WHERE h2.job_id = j.job_id AND h2.step_id = 0 ORDER BY h2.instance_id DESC) AS last_run_status
+        FROM msdb.dbo.sysjobs AS j
+      key: target
+      name: job_name
+    each: { field: owner_name, op: absent }
+    evidence: "{target}: owner login not found"
+
+  - id: SQL-AGENT-NOT-RUNNING
+    title: SQL Server Agent is not running
+    kind: broken
+    category: AVL
+    severity: high
+    entity: service
+    refresh: 6h
+    why: With the Agent stopped no scheduled backup, integrity check or maintenance runs, and nobody is told.
+    fix: Start the Agent, set it to automatic start, and find why it stopped.
+    query:
+      protocol: sql
+      text: |-
+        SELECT CAST(SERVERPROPERTY('ServerName') AS nvarchar(256)) + N'/' + servicename AS target,
+               servicename, startup_type_desc, status_desc, service_account
+        FROM sys.dm_server_services
+      key: target
+      name: servicename
+    each:
+      all:
+        - { field: servicename, op: match, value: '^SQL Server Agent' }
+        - { field: status_desc, op: ne, value: Running }
+        - { field: startup_type_desc, op: ne, value: Disabled }
+    evidence: "{target}: {status_desc} (startup {startup_type_desc})"
+
+  - id: SQL-SVC-LOCALSYSTEM
+    title: SQL Server service runs as LocalSystem
+    kind: misconfigured
+    lens: security
+    category: IAM
+    severity: medium
+    entity: service
+    refresh: 7d
+    why: A compromise of the database engine or Agent under LocalSystem is a compromise of the whole host.
+    fix: Run the services under virtual accounts or a group managed service account with only the rights SQL Server needs.
+    refs: [NIST-800-53:AC-6]
+    query:
+      protocol: sql
+      text: |-
+        SELECT CAST(SERVERPROPERTY('ServerName') AS nvarchar(256)) + N'/' + servicename AS target,
+               servicename, startup_type_desc, status_desc, service_account
+        FROM sys.dm_server_services
+      key: target
+      name: servicename
+    each: { field: service_account, op: eq, value: LocalSystem }
+    evidence: "{target}: runs as {service_account}"
+
+  # ---- version and edition ---------------------------------------------------------------------
+
+  - id: SQL-VERSION-EOS
+    title: SQL Server version out of support or leaving it soon
+    kind: broken
+    lens: both
+    category: LCM
+    severity:
+      daysLeft: support_end
+      ranges: [ { max: 0, value: high }, { max: 180, value: medium } ]
+      default: low
+    entity: instance
+    deadline: support_end
+    refresh: 7d
+    why: After extended support ends there are no security fixes; SQL Server 2016 ended on 2026-07-14 and 2017 ends on 2027-10-12.
+    fix: Plan the upgrade or migration of the instance and its applications before the date.
+    refs: [NIST-800-53:SA-22, NIST-800-53:SI-2]
+    query:
+      protocol: sql
+      text: |-
+        SELECT CAST(SERVERPROPERTY('ProductVersion') AS nvarchar(128)) AS product_version,
+               CAST(SERVERPROPERTY('ProductLevel') AS nvarchar(128)) AS product_level,
+               CAST(SERVERPROPERTY('Edition') AS nvarchar(128)) AS edition,
+               v.major_version,
+               CASE v.major_version WHEN 9 THEN '2016-04-12' WHEN 10 THEN '2019-07-09' WHEN 11 THEN '2022-07-12'
+                    WHEN 12 THEN '2024-07-09' WHEN 13 THEN '2026-07-14' WHEN 14 THEN '2027-10-12'
+                    WHEN 15 THEN '2030-01-08' WHEN 16 THEN '2033-01-11' END AS support_end
+        FROM (SELECT CAST(PARSENAME(CAST(SERVERPROPERTY('ProductVersion') AS nvarchar(128)), 4) AS int) AS major_version) AS v
+      key: instance
+    each: { field: support_end, op: until-lt, value: 365, threshold: sql.eos-notice-days }
+    evidence: "{instance}: version {product_version} {product_level}, extended support ends {support_end}"
+
+  - id: SQL-BUILD-OLD
+    title: SQL Server build is below the minimum patch level
+    kind: missing
+    lens: both
+    category: LCM
+    severity: medium
+    entity: instance
+    refresh: 7d
+    why: Cumulative updates carry security and stability fixes; the default pattern flags 2017 below its final CU and 2016 below SP3. Add current minimums for newer versions in the threshold.
+    fix: Apply the latest cumulative update (and GDR) for the version.
+    refs: [NIST-800-53:SI-2]
+    query:
+      protocol: sql
+      text: |-
+        SELECT CAST(SERVERPROPERTY('ProductVersion') AS nvarchar(128)) AS product_version,
+               CAST(SERVERPROPERTY('ProductLevel') AS nvarchar(128)) AS product_level,
+               CAST(SERVERPROPERTY('Edition') AS nvarchar(128)) AS edition,
+               v.major_version,
+               CASE v.major_version WHEN 9 THEN '2016-04-12' WHEN 10 THEN '2019-07-09' WHEN 11 THEN '2022-07-12'
+                    WHEN 12 THEN '2024-07-09' WHEN 13 THEN '2026-07-14' WHEN 14 THEN '2027-10-12'
+                    WHEN 15 THEN '2030-01-08' WHEN 16 THEN '2033-01-11' END AS support_end
+        FROM (SELECT CAST(PARSENAME(CAST(SERVERPROPERTY('ProductVersion') AS nvarchar(128)), 4) AS int) AS major_version) AS v
+      key: instance
+    each: { field: product_version, op: match, value: '^(14\.0\.([0-2]\d{3}|3[0-3]\d\d|34[0-4]\d|345[0-5])\.|13\.0\.([0-5]\d{3}|6[0-2]\d\d)\.)', threshold: sql.outdated-build-pattern }
+    evidence: "{instance}: build {product_version} {product_level}"
+
+  - id: SQL-EVALUATION-EDITION
+    title: Evaluation edition in use
+    kind: broken
+    category: CST
+    severity: high
+    entity: instance
+    refresh: 7d
+    why: The Evaluation edition stops working 180 days after installation, taking the application down with it.
+    fix: Upgrade the edition in place with a licensed key before it expires.
+    query:
+      protocol: sql
+      text: |-
+        SELECT CAST(SERVERPROPERTY('ProductVersion') AS nvarchar(128)) AS product_version,
+               CAST(SERVERPROPERTY('ProductLevel') AS nvarchar(128)) AS product_level,
+               CAST(SERVERPROPERTY('Edition') AS nvarchar(128)) AS edition,
+               v.major_version,
+               CASE v.major_version WHEN 9 THEN '2016-04-12' WHEN 10 THEN '2019-07-09' WHEN 11 THEN '2022-07-12'
+                    WHEN 12 THEN '2024-07-09' WHEN 13 THEN '2026-07-14' WHEN 14 THEN '2027-10-12'
+                    WHEN 15 THEN '2030-01-08' WHEN 16 THEN '2033-01-11' END AS support_end
+        FROM (SELECT CAST(PARSENAME(CAST(SERVERPROPERTY('ProductVersion') AS nvarchar(128)), 4) AS int) AS major_version) AS v
+      key: instance
+    each: { field: edition, op: match, value: 'Evaluation' }
+    evidence: "{instance}: {edition}"
+
+  # ---- logins and permissions ------------------------------------------------------------------
+
+  - id: SQL-SA-ENABLED
+    title: The sa login is enabled
+    kind: misconfigured
+    lens: security
+    category: IAM
+    severity: high
+    entity: instance
+    refresh: 7d
+    why: sa is a known, all-powerful name and the first target of password guessing.
+    fix: Disable sa (and rename it); use named logins or Windows groups for administration.
+    refs: [CIS-MSSQL:2.13, CIS-MSSQL:2.14, NIST-800-53:AC-2]
+    query:
+      protocol: sql
+      text: |-
+        SELECT name, is_disabled FROM sys.server_principals WHERE principal_id = 1
+      key: instance
+    each: { field: is_disabled, op: eq, value: 0 }
+    evidence: "{instance}: login {name} is enabled"
+
+  - id: SQL-MIXED-AUTH
+    title: SQL Server accepts SQL logins (mixed authentication)
+    kind: misconfigured
+    lens: security
+    category: AUT
+    severity: medium
+    entity: instance
+    refresh: 7d
+    why: SQL logins have their own passwords outside the domain's policy and MFA, and are guessed over the network.
+    fix: Switch to Windows authentication only where applications allow it; otherwise keep SQL logins few, policy-checked and reviewed.
+    refs: [CIS-MSSQL:3.1, NIST-800-53:IA-2]
+    query:
+      protocol: sql
+      text: |-
+        SELECT CAST(SERVERPROPERTY('IsIntegratedSecurityOnly') AS int) AS windows_auth_only
+      key: instance
+    each: { field: windows_auth_only, op: eq, value: 0 }
+    evidence: "{instance}: mixed mode authentication"
+
+  - id: SQL-SYSADMIN-MANY
+    title: Too many enabled sysadmin members
+    kind: misconfigured
+    lens: security
+    category: IAM
+    severity: medium
+    entity: instance
+    refresh: 7d
+    why: Every sysadmin can read all data and run code on the host through the engine; the list grows and is rarely reviewed.
+    fix: Reduce sysadmin to a reviewed group; give application and support logins only the database roles they need.
+    refs: [NIST-800-53:AC-6, CIS-CSC-v8:5.4]
+    query:
+      protocol: sql
+      text: |-
+        SELECT COUNT(*) AS sysadmin_members
+        FROM sys.server_role_members AS rm
+        JOIN sys.server_principals AS r ON r.principal_id = rm.role_principal_id
+        JOIN sys.server_principals AS m ON m.principal_id = rm.member_principal_id
+        WHERE r.name = N'sysadmin' AND m.principal_id <> 1 AND m.is_disabled = 0
+          AND m.name NOT LIKE N'NT SERVICE\%' AND m.name NOT LIKE N'NT AUTHORITY\%'
+      key: instance
+    each: { field: sysadmin_members, op: gt, value: 5, threshold: sql.sysadmin-members-max }
+    evidence: "{instance}: {sysadmin_members} enabled sysadmin members besides sa and service identities"
+
+  - id: SQL-WINDOWS-GROUP-LOGIN
+    title: Built-in or local Windows group has a SQL login
+    kind: misconfigured
+    lens: security
+    category: IAM
+    severity: medium
+    entity: login
+    refresh: 7d
+    why: A login for BUILTIN\Administrators or a machine-local group lets anyone who becomes local admin on the host into SQL Server.
+    fix: Drop the login and grant access through domain groups that are reviewed.
+    refs: [CIS-MSSQL:3.9, CIS-MSSQL:3.10, NIST-800-53:AC-6]
+    query:
+      protocol: sql
+      text: |-
+        SELECT CAST(SERVERPROPERTY('ServerName') AS nvarchar(256)) + N'/' + name AS target, name AS login_name
+        FROM sys.server_principals
+        WHERE type_desc = 'WINDOWS_GROUP' AND is_disabled = 0
+          AND (name LIKE N'BUILTIN\%' OR name LIKE CAST(SERVERPROPERTY('MachineName') AS nvarchar(128)) + N'\%')
+      key: target
+      name: login_name
+    each: any
+    evidence: "{target}: group login {login_name}"
+
+  - id: SQL-LOGIN-POLICY-OFF
+    title: SQL login not subject to the password policy
+    kind: misconfigured
+    lens: security
+    category: IAM
+    severity: medium
+    entity: login
+    refresh: 7d
+    why: With CHECK_POLICY off the login accepts any password and is never locked out after failed guesses.
+    fix: Turn CHECK_POLICY on (and CHECK_EXPIRATION for interactive logins) and reset weak passwords.
+    refs: [CIS-MSSQL:4.3, NIST-800-53:IA-5]
+    query:
+      protocol: sql
+      text: |-
+        SELECT CAST(SERVERPROPERTY('ServerName') AS nvarchar(256)) + N'/' + name AS target, name AS login_name,
+               is_policy_checked, is_expiration_checked,
+               PWDCOMPARE(N'', password_hash) AS blank_password,
+               PWDCOMPARE(name, password_hash) AS password_is_name,
+               IS_SRVROLEMEMBER('sysadmin', name) AS is_sysadmin
+        FROM sys.sql_logins
+        WHERE is_disabled = 0 AND name NOT LIKE N'##%'
+      key: target
+      name: login_name
+    each: { field: is_policy_checked, op: eq, value: 0 }
+    evidence: "{target}: CHECK_POLICY off"
+
+  - id: SQL-LOGIN-SYSADMIN-NO-EXPIRY
+    title: Sysadmin SQL login without password expiration
+    kind: misconfigured
+    lens: security
+    category: IAM
+    severity: medium
+    entity: login
+    refresh: 7d
+    why: A sysadmin password that never expires stays valid forever once it leaks.
+    fix: Turn CHECK_EXPIRATION on for sysadmin SQL logins, or replace them with Windows logins.
+    refs: [CIS-MSSQL:4.2, NIST-800-53:IA-5]
+    query:
+      protocol: sql
+      text: |-
+        SELECT CAST(SERVERPROPERTY('ServerName') AS nvarchar(256)) + N'/' + name AS target, name AS login_name,
+               is_policy_checked, is_expiration_checked,
+               PWDCOMPARE(N'', password_hash) AS blank_password,
+               PWDCOMPARE(name, password_hash) AS password_is_name,
+               IS_SRVROLEMEMBER('sysadmin', name) AS is_sysadmin
+        FROM sys.sql_logins
+        WHERE is_disabled = 0 AND name NOT LIKE N'##%'
+      key: target
+      name: login_name
+    each:
+      all:
+        - { field: is_sysadmin, op: eq, value: 1 }
+        - { field: is_expiration_checked, op: eq, value: 0 }
+    evidence: "{target}: sysadmin, CHECK_EXPIRATION off"
+
+  - id: SQL-LOGIN-WEAK-PASSWORD
+    title: SQL login with an empty password or a password equal to its name
+    kind: misconfigured
+    lens: security
+    category: IAM
+    severity: critical
+    entity: login
+    refresh: 7d
+    why: These are the first passwords any attacker tries. The check compares hashes on the server; no password or hash leaves it.
+    fix: Set a strong password at once and turn CHECK_POLICY on.
+    refs: [NIST-800-53:IA-5]
+    query:
+      protocol: sql
+      text: |-
+        SELECT CAST(SERVERPROPERTY('ServerName') AS nvarchar(256)) + N'/' + name AS target, name AS login_name,
+               is_policy_checked, is_expiration_checked,
+               PWDCOMPARE(N'', password_hash) AS blank_password,
+               PWDCOMPARE(name, password_hash) AS password_is_name,
+               IS_SRVROLEMEMBER('sysadmin', name) AS is_sysadmin
+        FROM sys.sql_logins
+        WHERE is_disabled = 0 AND name NOT LIKE N'##%'
+      key: target
+      name: login_name
+    each:
+      any:
+        - { field: blank_password, op: eq, value: 1 }
+        - { field: password_is_name, op: eq, value: 1 }
+    evidence: "{target}: weak password (blank {blank_password}, equals name {password_is_name})"
+
+  - id: SQL-PUBLIC-SERVER-PERMISSION
+    title: Extra server-level permission granted to public
+    kind: misconfigured
+    lens: security
+    category: IAM
+    severity: medium
+    entity: permission
+    refresh: 7d
+    why: Every login is a member of public; a permission granted to it beyond the defaults is granted to everyone who can connect.
+    fix: Revoke the permission from public and grant it to the specific logins or roles that need it.
+    refs: [CIS-MSSQL:3.8, NIST-800-53:AC-6]
+    query:
+      protocol: sql
+      text: |-
+        SELECT CAST(SERVERPROPERTY('ServerName') AS nvarchar(256)) + N'/public/' + sp.class_desc + N'/' + sp.permission_name
+                 + N'/' + CAST(sp.major_id AS nvarchar(20)) AS target,
+               sp.class_desc, sp.permission_name, sp.state_desc
+        FROM sys.server_permissions AS sp
+        WHERE sp.grantee_principal_id = 2 AND sp.state IN ('G', 'W')
+          AND NOT (sp.class_desc = 'SERVER' AND sp.permission_name = 'VIEW ANY DATABASE')
+          AND NOT (sp.class_desc = 'ENDPOINT' AND sp.permission_name = 'CONNECT' AND sp.major_id BETWEEN 2 AND 5)
+      key: target
+    each: any
+    evidence: "{target}: public has {permission_name} on {class_desc}"
+
+  - id: SQL-LINKED-SERVER-STORED-LOGIN
+    title: Linked server uses a stored remote login
+    kind: misconfigured
+    lens: security
+    category: IAM
+    severity:
+      field: local_principal_id
+      map: { "0": high }
+      default: medium
+    entity: linked-server
+    refresh: 7d
+    why: A stored remote login lets local users act on the remote server with that login's rights; mapped for all local logins (principal 0) it is open to everyone.
+    fix: Use the caller's own credentials (self-mapping or Kerberos delegation) or map only the logins that need it to a least-privilege remote login.
+    refs: [NIST-800-53:AC-6, NIST-800-53:IA-5]
+    query:
+      protocol: sql
+      text: |-
+        SELECT CAST(SERVERPROPERTY('ServerName') AS nvarchar(256)) + N'/' + s.name + N'/' + CAST(ll.local_principal_id AS nvarchar(20)) AS target,
+               s.name AS linked_server, ll.local_principal_id, ll.remote_name
+        FROM sys.servers AS s
+        JOIN sys.linked_logins AS ll ON ll.server_id = s.server_id
+        WHERE s.is_linked = 1 AND ll.uses_self_credential = 0 AND ll.remote_name IS NOT NULL
+      key: target
+      name: linked_server
+    each: any
+    evidence: "{target}: maps local principal {local_principal_id} to remote login {remote_name}"
+
+  # ---- audit and configuration -----------------------------------------------------------------
+
+  - id: SQL-NO-SERVER-AUDIT
+    title: No enabled server audit
+    kind: missing
+    lens: security
+    category: MON
+    severity: medium
+    entity: instance
+    refresh: 7d
+    why: Without an audit, logins, permission changes and access to sensitive data leave no record to investigate.
+    fix: Create and enable a server audit with a specification for login failures and permission changes, written to a protected target.
+    refs: [CIS-MSSQL:5.4, NIST-800-53:AU-12]
+    query:
+      protocol: sql
+      text: |-
+        SELECT (SELECT COUNT(*) FROM sys.server_audits WHERE is_state_enabled = 1) AS enabled_audits
+      key: instance
+    each: { field: enabled_audits, op: eq, value: 0 }
+    evidence: "{instance}: no enabled server audit"
+
+  - id: SQL-CFG-SURFACE-AREA
+    title: Risky server feature is enabled
+    kind: misconfigured
+    lens: security
+    category: CFG
+    severity:
+      field: setting
+      map: { xp_cmdshell: high, Ole Automation Procedures: high }
+      default: medium
+    entity: setting
+    refresh: 7d
+    why: Command-shell access, OLE automation, CLR, ad hoc distributed queries, cross-database ownership chaining, remote access and startup procedures give an attacker in the engine a way to the host or other data.
+    fix: Turn the option off with sp_configure unless a documented application needs it; set the pattern to the options the organisation forbids.
+    refs: [CIS-MSSQL:2.1, CIS-MSSQL:2.2, CIS-MSSQL:2.3, CIS-MSSQL:2.5, CIS-MSSQL:2.6, CIS-MSSQL:2.8, CIS-MSSQL:2.15, NIST-800-53:CM-7]
+    query:
+      protocol: sql
+      text: |-
+        SELECT CAST(SERVERPROPERTY('ServerName') AS nvarchar(256)) + N'/' + name AS target,
+               name AS setting, CAST(value_in_use AS bigint) AS value_in_use
+        FROM sys.configurations
+        WHERE name IN (N'xp_cmdshell', N'Ole Automation Procedures', N'clr enabled', N'cross db ownership chaining',
+                       N'Ad Hoc Distributed Queries', N'remote access', N'scan for startup procs', N'Database Mail XPs',
+                       N'remote admin connections', N'default trace enabled', N'max server memory (MB)')
+      key: target
+      name: setting
+    each:
+      all:
+        - { field: setting, op: match, value: '^(xp_cmdshell|Ole Automation Procedures|clr enabled|cross db ownership chaining|Ad Hoc Distributed Queries|remote access|scan for startup procs)$', threshold: sql.surface-area-settings }
+        - { field: value_in_use, op: eq, value: 1 }
+    evidence: "{target}: {setting} = {value_in_use}"
+
+  - id: SQL-CFG-DEFAULT-TRACE-OFF
+    title: Default trace is disabled
+    kind: misconfigured
+    lens: security
+    category: MON
+    severity: medium
+    entity: setting
+    refresh: 7d
+    why: The default trace is the cheapest record of schema changes, permission changes and server events; with it off, recent history is gone.
+    fix: Enable 'default trace enabled' with sp_configure.
+    refs: [CIS-MSSQL:5.2, NIST-800-53:AU-12]
+    query:
+      protocol: sql
+      text: |-
+        SELECT CAST(SERVERPROPERTY('ServerName') AS nvarchar(256)) + N'/' + name AS target,
+               name AS setting, CAST(value_in_use AS bigint) AS value_in_use
+        FROM sys.configurations
+        WHERE name IN (N'xp_cmdshell', N'Ole Automation Procedures', N'clr enabled', N'cross db ownership chaining',
+                       N'Ad Hoc Distributed Queries', N'remote access', N'scan for startup procs', N'Database Mail XPs',
+                       N'remote admin connections', N'default trace enabled', N'max server memory (MB)')
+      key: target
+      name: setting
+    each:
+      all:
+        - { field: setting, op: eq, value: default trace enabled }
+        - { field: value_in_use, op: eq, value: 0 }
+    evidence: "{target}: default trace off"
+
+  - id: SQL-CFG-MAX-MEMORY-DEFAULT
+    title: Max server memory left at the default
+    kind: misconfigured
+    category: HLT
+    severity: medium
+    entity: setting
+    refresh: 7d
+    why: With no cap SQL Server takes almost all memory and starves the operating system and agents, which shows as paging and stalls.
+    fix: Set 'max server memory (MB)' leaving headroom for the OS and other services on the host.
+    query:
+      protocol: sql
+      text: |-
+        SELECT CAST(SERVERPROPERTY('ServerName') AS nvarchar(256)) + N'/' + name AS target,
+               name AS setting, CAST(value_in_use AS bigint) AS value_in_use
+        FROM sys.configurations
+        WHERE name IN (N'xp_cmdshell', N'Ole Automation Procedures', N'clr enabled', N'cross db ownership chaining',
+                       N'Ad Hoc Distributed Queries', N'remote access', N'scan for startup procs', N'Database Mail XPs',
+                       N'remote admin connections', N'default trace enabled', N'max server memory (MB)')
+      key: target
+      name: setting
+    each:
+      all:
+        - { field: setting, op: eq, value: max server memory (MB) }
+        - { field: value_in_use, op: ge, value: 2147483647 }
+    evidence: "{target}: max server memory {value_in_use} MB (default)"
+
+  # ---- capacity, corruption, availability, certificates ---------------------------------------
+
+  - id: SQL-TEMPDB-FILES
+    title: tempdb has fewer data files than recommended
+    kind: misconfigured
+    category: HLT
+    severity: low
+    entity: instance
+    refresh: 7d
+    why: With one tempdb data file on a multi-core server, allocation contention slows every workload that uses temporary objects.
+    fix: Add equally sized tempdb data files up to the number of cores, at most eight to start.
+    query:
+      protocol: sql
+      text: |-
+        SELECT i.cpu_count,
+               (SELECT COUNT(*) FROM sys.master_files WHERE database_id = 2 AND type = 0) AS tempdb_data_files,
+               CASE WHEN i.cpu_count < 8 THEN i.cpu_count ELSE 8 END
+                 - (SELECT COUNT(*) FROM sys.master_files WHERE database_id = 2 AND type = 0) AS tempdb_file_shortfall
+        FROM sys.dm_os_sys_info AS i
+      key: instance
+    each: { field: tempdb_file_shortfall, op: gt, value: 0 }
+    evidence: "{instance}: {tempdb_data_files} tempdb data files for {cpu_count} cores"
+
+  - id: SQL-VOLUME-LOW-FREE
+    title: Volume holding database files is low on free space
+    kind: broken
+    category: HLT
+    severity:
+      field: free_pct
+      ranges: [ { max: 5, value: critical } ]
+      default: high
+    entity: volume
+    refresh: 6h
+    why: When the data or log volume fills, autogrowth fails and the database stops accepting writes.
+    fix: Free space (old backups on the same volume, unused files) or extend the volume before it fills.
+    refs: [NIST-800-53:SC-5]
+    query:
+      protocol: sql
+      text: |-
+        SELECT DISTINCT CAST(SERVERPROPERTY('ServerName') AS nvarchar(256)) + N'/' + vs.volume_mount_point AS target,
+               vs.volume_mount_point, vs.total_bytes, vs.available_bytes,
+               CAST(vs.available_bytes * 100.0 / NULLIF(vs.total_bytes, 0) AS decimal(5,1)) AS free_pct
+        FROM sys.master_files AS mf
+        CROSS APPLY sys.dm_os_volume_stats(mf.database_id, mf.file_id) AS vs
+      key: target
+      name: volume_mount_point
+    each: { field: free_pct, op: lt, value: 15, threshold: sql.volume-free-pct-min }
+    evidence: "{target}: {free_pct}% free ({available_bytes} of {total_bytes} bytes)"
+
+  - id: SQL-SUSPECT-PAGES
+    title: Suspect pages recorded
+    kind: broken
+    category: HLT
+    severity: critical
+    entity: page
+    refresh: 6h
+    why: Entries for 823/824 errors, bad checksums or torn pages mean storage returned corrupt data; the next read may fail or spread the damage into backups.
+    fix: Run DBCC CHECKDB on the database, check the storage path, and restore damaged pages from backup.
+    refs: [NIST-800-53:SI-7]
+    query:
+      protocol: sql
+      text: |-
+        SELECT CAST(SERVERPROPERTY('ServerName') AS nvarchar(256)) + N'/' + DB_NAME(sp.database_id) + N'/'
+                 + CAST(sp.file_id AS nvarchar(10)) + N':' + CAST(sp.page_id AS nvarchar(20)) AS target,
+               DB_NAME(sp.database_id) AS database_name, sp.file_id, sp.page_id, sp.event_type, sp.error_count, sp.last_update_date
+        FROM msdb.dbo.suspect_pages AS sp
+        WHERE sp.event_type IN (1, 2, 3)
+      key: target
+      name: database_name
+    each: any
+    evidence: "{target}: event type {event_type}, {error_count} errors, last {last_update_date}"
+
+  - id: SQL-AG-REPLICA-UNHEALTHY
+    title: Availability group replica not healthy or disconnected
+    kind: broken
+    category: AVL
+    severity: high
+    entity: ag-replica
+    refresh: 6h
+    why: An unhealthy or disconnected replica means failover is not available or data is not being protected.
+    fix: Check the replica's connectivity, the endpoint and the AlwaysOn health events.
+    query:
+      protocol: sql
+      text: |-
+        SELECT ag.name + N'/' + ar.replica_server_name AS target, ag.name AS ag_name, ar.replica_server_name,
+               rs.role_desc, rs.connected_state_desc, rs.synchronization_health_desc
+        FROM sys.dm_hadr_availability_replica_states AS rs
+        JOIN sys.availability_replicas AS ar ON ar.replica_id = rs.replica_id
+        JOIN sys.availability_groups AS ag ON ag.group_id = rs.group_id
+      key: target
+      name: ag_name
+    each:
+      any:
+        - { field: synchronization_health_desc, op: ne, value: HEALTHY }
+        - { field: connected_state_desc, op: eq, value: DISCONNECTED }
+    evidence: "{target}: {role_desc}, {connected_state_desc}, {synchronization_health_desc}"
+
+  - id: SQL-AG-DB-UNHEALTHY
+    title: Availability database suspended or not healthy
+    kind: broken
+    category: AVL
+    severity: high
+    entity: ag-database
+    refresh: 6h
+    why: A suspended or unhealthy availability database stops sending or applying log; the secondary falls behind and the primary's log cannot truncate.
+    fix: Read the suspend reason, fix it and resume data movement.
+    query:
+      protocol: sql
+      text: |-
+        SELECT ag.name + N'/' + ar.replica_server_name + N'/' + DB_NAME(drs.database_id) AS target,
+               ag.name AS ag_name, ar.replica_server_name, DB_NAME(drs.database_id) AS database_name,
+               drs.synchronization_state_desc, drs.synchronization_health_desc, drs.is_suspended, drs.suspend_reason_desc
+        FROM sys.dm_hadr_database_replica_states AS drs
+        JOIN sys.availability_replicas AS ar ON ar.replica_id = drs.replica_id
+        JOIN sys.availability_groups AS ag ON ag.group_id = drs.group_id
+      key: target
+      name: database_name
+    each:
+      any:
+        - { field: is_suspended, op: eq, value: 1 }
+        - { field: synchronization_health_desc, op: ne, value: HEALTHY }
+    evidence: "{target}: {synchronization_state_desc}, {synchronization_health_desc}, suspended {is_suspended} {suspend_reason_desc}"
+
+  - id: SQL-CERT-EXPIRING
+    title: Server certificate expires soon
+    kind: broken
+    lens: both
+    category: PKI
+    severity:
+      daysLeft: expiry_date
+      ranges: [ { max: 0, value: high }, { max: 14, value: medium } ]
+      default: low
+    entity: certificate
+    deadline: expiry_date
+    refresh: 7d
+    why: Certificates in master protect encrypted backups, endpoints and transparent data encryption keys; expired ones break backup encryption and mirroring endpoints.
+    fix: Create a new certificate, re-protect what depends on it, and back up the certificate with its private key.
+    refs: [NIST-800-53:SC-12]
+    query:
+      protocol: sql
+      text: |-
+        SELECT CAST(SERVERPROPERTY('ServerName') AS nvarchar(256)) + N'/' + name AS target,
+               name AS certificate_name, subject, expiry_date
+        FROM master.sys.certificates
+        WHERE name NOT LIKE N'##%'
+      key: target
+      name: certificate_name
+    each: { field: expiry_date, op: until-lt, value: 30, threshold: sql.certificate-notice-days }
+    evidence: "{target}: expires {expiry_date}"

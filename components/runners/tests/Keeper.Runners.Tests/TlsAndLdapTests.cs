@@ -42,6 +42,19 @@ public sealed class TlsTests
         Assert.False(row["chainValid"]!.GetValue<bool>());
         Assert.Equal(2048, row["keySize"]!.GetValue<int>());
         Assert.InRange(row["daysLeft"]!.GetValue<double>(), 18, 20);
+        Assert.Equal("[]", row["eku"]!.ToJsonString());   // a self-signed certificate made without EKUs
+    }
+
+    [Fact]
+    public void Extended_key_usages_come_back_as_oids()
+    {
+        using var key = RSA.Create(2048);
+        var request = new CertificateRequest("CN=dc1.example.org", key, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
+        request.CertificateExtensions.Add(new X509EnhancedKeyUsageExtension(
+            [new Oid("1.3.6.1.5.5.7.3.1"), new Oid("1.3.6.1.5.2.3.5")], critical: false));
+        using var certificate = request.CreateSelfSigned(DateTimeOffset.UtcNow.AddDays(-1), DateTimeOffset.UtcNow.AddDays(30));
+
+        Assert.Equal(new[] { "1.3.6.1.5.5.7.3.1", "1.3.6.1.5.2.3.5" }, TlsRunner.Ekus(certificate));
     }
 
     [Fact]
