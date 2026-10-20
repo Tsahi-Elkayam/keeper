@@ -36,6 +36,7 @@ public static partial class IntegrationTypes
         ["oauth-client-credentials"] = ["clientSecret"],
         ["oauth-password"] = ["password"],
         ["vcenter-session"] = ["password"],
+        ["session-login"] = ["password"],
         ["entra-interactive"] = [],
         ["entra-certificate"] = [],
     };
@@ -64,7 +65,7 @@ public static partial class IntegrationTypes
         new("rubrik", "Rubrik Security Cloud GraphQL API", ["graphql", "http"], ["oauth-client-credentials"], ["*.my.rubrik.com"]),
         new("files", "Reports other tools wrote into imports\\", ["file"], ["none"], []),
         new("keeper", "Keeper's own registers", ["store"], ["none"], []),
-        new("http", "Any other JSON API", ["http"], ["none", "negotiate", "basic", "bearer", "api-key-header", "api-key-query", "oauth-client-credentials"], []),
+        new("http", "Any other JSON API", ["http"], ["none", "negotiate", "basic", "bearer", "api-key-header", "api-key-query", "oauth-client-credentials", "session-login"], []),
     ];
 
     public static IntegrationType? Find(string id) => All.FirstOrDefault(t => t.Id.Equals(id, StringComparison.OrdinalIgnoreCase));

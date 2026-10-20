@@ -23,6 +23,20 @@ public sealed class IntegrationTests : IDisposable
 
     private string DataDir => Path.Combine(_dir, "data");
 
+    [Theory]
+    [InlineData("https://fw.example.org", "/web_api/login", "https://fw.example.org/web_api/login")]
+    [InlineData("https://fw.example.org", "//evil.example.com/login", null)]
+    [InlineData("https://fw.example.org", "https://evil.example.com/login", null)]
+    [InlineData("http://fw.example.org", "/web_api/login", null)]
+    [InlineData("https://fw.example.org", null, null)]
+    public void A_session_login_goes_only_to_a_path_on_the_integrations_own_https_endpoint(string endpoint, string? path, string? expected)
+    {
+        if (expected is null)
+            Assert.Throws<IntegrationException>(() => IntegrationConnection.LoginUri(endpoint, path));
+        else
+            Assert.Equal(expected, IntegrationConnection.LoginUri(endpoint, path).ToString());
+    }
+
     private QueueReport Drain() =>
         new QueueManager(_db, Path.Combine(DataDir, "spool"), DataDir, Schemas, IntegrationHandlers.All()).DrainOnce();
 

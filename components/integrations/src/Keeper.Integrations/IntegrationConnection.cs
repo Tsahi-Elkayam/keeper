@@ -110,11 +110,15 @@ public sealed partial class IntegrationConnection : IConnection, IDisposable
             case "oauth-client-credentials":
             case "oauth-password":
             case "vcenter-session":
+            case "session-login":
             case "entra-interactive":
             case "entra-certificate":
                 var token = await TokenAsync(cancellationToken).ConfigureAwait(false);
                 if (_record.AuthKind == "vcenter-session")
                     request.Headers.TryAddWithoutValidation("vmware-api-session-id", token);
+                else if (_record.AuthKind == "session-login")
+                    request.Headers.TryAddWithoutValidation(_record.Options["header"]?.ToString() ?? "Authorization",
+                        (_record.Options["prefix"]?.ToString() ?? "") + token);
                 else
                     request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
                 return;
@@ -135,6 +139,7 @@ public sealed partial class IntegrationConnection : IConnection, IDisposable
                 "oauth-client-credentials" => await OAuthAsync(ClientCredentialsForm(), TokenUrl(), cancellationToken).ConfigureAwait(false),
                 "oauth-password" => await OAuthAsync(PasswordForm(), TokenUrl("/api/oauth2/token"), cancellationToken).ConfigureAwait(false),
                 "vcenter-session" => await VCenterSessionAsync(cancellationToken).ConfigureAwait(false),
+                "session-login" => await SessionLoginAsync(cancellationToken).ConfigureAwait(false),
                 "entra-interactive" => await EntraInteractiveAsync(cancellationToken).ConfigureAwait(false),
                 _ => await EntraCertificateAsync(cancellationToken).ConfigureAwait(false),
             };
@@ -210,6 +215,56 @@ public sealed partial class IntegrationConnection : IConnection, IDisposable
             throw new IntegrationException($"vCenter refused the sign-in ({(int)response.StatusCode}).");
         var token = (await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false)).Trim().Trim('"');
         return (token, DateTimeOffset.UtcNow.AddMinutes(25));
+    }
+
+    /// <summary>
+    /// session-login: products that sign in with a POST and then want the session token in a header (a
+    /// firewall manager's /web_api/login and its X-chkp-sid, say). The login goes to a path on the
+    /// integration's own endpoint - never another host - with the user and password as JSON (or a form);
+    /// the token is read from the answer by a field path. Options: loginPath (required), userField
+    /// (user), passwordField (password), body (json|form), tokenField (token), header, prefix,
+    /// lifetimeMinutes (25), plus any fixed loginFields.* the product needs.
+    /// </summary>
+    public static Uri LoginUri(string endpoint, string? loginPath)
+    {
+        if (loginPath is null || !loginPath.StartsWith('/') || loginPath.StartsWith("//", StringComparison.Ordinal) || loginPath.Contains("://", StringComparison.Ordinal))
+            throw new IntegrationException("session-login needs the option loginPath: a path on the integration's endpoint, such as /web_api/login.");
+        var root = new Uri(endpoint);
+        if (root.Scheme != "https")
+            throw new IntegrationException("session-login needs an https endpoint.");
+        return new Uri(root, loginPath);
+    }
+
+    private async Task<(string, DateTimeOffset)> SessionLoginAsync(CancellationToken cancellationToken)
+    {
+        var uri = LoginUri(_record.Endpoint, _record.Options["loginPath"]?.ToString());
+        var user = _record.Identity ?? throw new IntegrationException($"Integration {_record.Id} needs a user name as the identity.");
+        var fields = new Dictionary<string, string>
+        {
+            [_record.Options["userField"]?.ToString() ?? "user"] = user,
+            [_record.Options["passwordField"]?.ToString() ?? "password"] = RequiredSecret("password"),
+        };
+        foreach (var (name, value) in _record.Options.Where(o => o.Key.StartsWith("loginFields.", StringComparison.Ordinal)))
+            fields[name["loginFields.".Length..]] = value?.ToString() ?? "";
+
+        using var client = new HttpClient(new SocketsHttpHandler { AllowAutoRedirect = false }) { Timeout = TimeSpan.FromSeconds(30) };
+        using var request = new HttpRequestMessage(HttpMethod.Post, uri)
+        {
+            Content = _record.Options["body"]?.ToString() == "form"
+                ? new FormUrlEncodedContent(fields)
+                : new StringContent(new JsonObject(fields.Select(f => KeyValuePair.Create(f.Key, (JsonNode?)JsonValue.Create(f.Value)))).ToJsonString(),
+                    Encoding.UTF8, "application/json"),
+        };
+        using var response = await client.SendAsync(request, cancellationToken).ConfigureAwait(false);
+        if (!response.IsSuccessStatusCode)
+            throw new IntegrationException($"{uri.Host} refused the sign-in ({(int)response.StatusCode}).");
+        var body = JsonNode.Parse(await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false));
+        var tokenField = _record.Options["tokenField"]?.ToString() ?? "token";
+        var token = Keeper.Rules.FieldPath.First(body, tokenField)?.ToString();
+        if (string.IsNullOrEmpty(token))
+            throw new IntegrationException($"{uri.Host} answered the sign-in without {tokenField}.");
+        var minutes = int.TryParse(_record.Options["lifetimeMinutes"]?.ToString(), out var m) && m > 0 ? m : 25;
+        return (token, DateTimeOffset.UtcNow.AddMinutes(minutes));
     }
 
     // ---- Entra: interactive through the Windows broker (WAM), or an app certificate ----
