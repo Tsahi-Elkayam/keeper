@@ -1,0 +1,16 @@
+# Build output - binaries only. Tenant settings and data live in the Keeper home, outside this repo.
+build/
+bin/
+obj/
+TestResults/
+
+# Tenant files - a backstop in case one lands in the repo anyway
+settings.json
+denylist.txt
+*.db
+*.sqlite
+
+# IDE
+.vs/
+.vscode/
+*.user

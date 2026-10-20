@@ -1,0 +1,10 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <AssemblyName>keeper-qm</AssemblyName>
+    <RootNamespace>Keeper.Cli.Qm</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\Keeper.Queue\Keeper.Queue.csproj" />
+  </ItemGroup>
+</Project>

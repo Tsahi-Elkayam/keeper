@@ -1,0 +1,18 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/Keeper.Core/Keeper.Core.csproj" />
+    <Project Path="src/Keeper.Store/Keeper.Store.csproj" />
+    <Project Path="src/Keeper.Queue/Keeper.Queue.csproj" />
+    <Project Path="src/Keeper.Query/Keeper.Query.csproj" />
+    <Project Path="src/keeper-db/keeper-db.csproj" />
+    <Project Path="src/keeper-qm/keeper-qm.csproj" />
+    <Project Path="src/keeper-query/keeper-query.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/Keeper.Testing/Keeper.Testing.csproj" />
+    <Project Path="tests/Keeper.Core.Tests/Keeper.Core.Tests.csproj" />
+    <Project Path="tests/Keeper.Store.Tests/Keeper.Store.Tests.csproj" />
+    <Project Path="tests/Keeper.Queue.Tests/Keeper.Queue.Tests.csproj" />
+    <Project Path="tests/Keeper.Query.Tests/Keeper.Query.Tests.csproj" />
+  </Folder>
+</Solution>

@@ -1,0 +1,10 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <AssemblyName>keeper-db</AssemblyName>
+    <RootNamespace>Keeper.Cli.Db</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\Keeper.Store\Keeper.Store.csproj" />
+  </ItemGroup>
+</Project>
