@@ -70,6 +70,214 @@ rules:
     each: { field: Result, op: match, value: '^Error' }
     evidence: "{Control ID} {Result}: {Details}"
 
+  - id: SCUBA-OMITTED
+    title: ScubaGear control omitted as an accepted risk
+    kind: misconfigured
+    lens: security
+    category: CFG
+    severity: info
+    entity: scuba-control
+    why: >-
+      A control omitted in the ScubaGear configuration disappears from the failures. Each omission
+      is an accepted risk; listed here, it stays visible so that it is confirmed again rather than
+      forgotten.
+    fix: >-
+      Keep the omission's rationale and expiry date in the ScubaGear configuration and re-decide when
+      it expires. In Keeper, an exception on the finding records who accepted it and why.
+    refs: [NIST-800-53:CA-5, NIST-800-53:RA-7]
+    refresh: 1d
+    query:
+      protocol: file
+      key: Control ID
+      name: Requirement
+      path: "scubagear/ScubaResults*.csv"
+      format: csv
+    each: { field: Result, op: eq, value: Omitted }
+    emit:
+      check: "SCUBA-OMITTED-{Control ID}"
+      title: "Omitted: {Requirement}"
+    evidence: "{Control ID} omitted ({Criticality}): {Details}"
+
+  # Controls ScubaGear does not test itself (criticality .../Not-Implemented or .../3rd Party) come
+  # out as not applicable, which looks like nothing to do. Those it did evaluate are left out.
+  - id: SCUBA-MANUAL-CHECK
+    title: ScubaGear control needs a manual or third-party check
+    kind: missing
+    lens: security
+    category: CFG
+    severity: info
+    entity: scuba-control
+    why: >-
+      The baseline requires the control, but ScubaGear cannot test it - it is a policy decision or is
+      met by a third-party product - so it is reported as not applicable. Unless a person checks it,
+      nobody knows whether it is met.
+    fix: >-
+      Check the control by hand (or in the third-party product's own reports), then record the result
+      as an exception on this finding with the evidence, or fix the gap you find.
+    refs: [NIST-800-53:CA-7, NIST-800-53:CA-2]
+    refresh: 1d
+    query:
+      protocol: file
+      key: Control ID
+      name: Requirement
+      path: "scubagear/ScubaResults*.csv"
+      format: csv
+    each:
+      all:
+        - { field: Criticality, op: match, value: '(Not-Implemented|3rd Party)' }
+        - { field: Result, op: notmatch, value: '^(Pass|Fail|Warning|Error|Omitted)' }
+    emit:
+      check: "SCUBA-MANUAL-{Control ID}"
+      title: "Manual check: {Requirement}"
+    evidence: "{Control ID} ({Criticality}) reported {Result}: {Details}"
+
+  # One rule per product: a run with fewer -ProductNames silently drops every control of the missing
+  # product. Disable the rule of a product the tenant does not license with an override.
+  - id: SCUBA-PRODUCT-NOT-SCANNED-AAD
+    title: Newest ScubaGear run did not cover Entra ID
+    kind: missing
+    lens: security
+    category: MON
+    severity: medium
+    entity: scuba-report
+    why: >-
+      The newest results hold no Entra ID controls (MS.AAD), so every identity control has silently
+      dropped out of the findings - a run limited to other products looks like a clean identity
+      configuration.
+    fix: >-
+      Run Invoke-SCuBA with every licensed product in -ProductNames (aad included) and copy the new
+      ScubaResults.csv and ScubaResults_*.json into imports\scubagear\.
+    refs: [NIST-800-53:CA-7, NIST-800-53:CA-2]
+    refresh: 1d
+    query:
+      protocol: file
+      key: Control ID
+      name: Requirement
+      path: "scubagear/ScubaResults*.csv"
+      format: csv
+    count: { op: lt, value: 1, where: { field: Control ID, op: match, value: '^MS\.AAD\.' } }
+    evidence: "The newest ScubaGear results hold {rows} controls and none for Entra ID (MS.AAD)"
+
+  - id: SCUBA-PRODUCT-NOT-SCANNED-DEFENDER
+    title: Newest ScubaGear run did not cover Defender
+    kind: missing
+    lens: security
+    category: MON
+    severity: medium
+    entity: scuba-report
+    why: >-
+      The newest results hold no Defender controls (MS.DEFENDER), so the protection, alerting and
+      data-loss controls have silently dropped out of the findings.
+    fix: >-
+      Run Invoke-SCuBA with every licensed product in -ProductNames (defender included) and copy the
+      new ScubaResults.csv and ScubaResults_*.json into imports\scubagear\.
+    refs: [NIST-800-53:CA-7, NIST-800-53:CA-2]
+    refresh: 1d
+    query:
+      protocol: file
+      key: Control ID
+      name: Requirement
+      path: "scubagear/ScubaResults*.csv"
+      format: csv
+    count: { op: lt, value: 1, where: { field: Control ID, op: match, value: '^MS\.DEFENDER\.' } }
+    evidence: "The newest ScubaGear results hold {rows} controls and none for Defender (MS.DEFENDER)"
+
+  - id: SCUBA-PRODUCT-NOT-SCANNED-EXO
+    title: Newest ScubaGear run did not cover Exchange Online
+    kind: missing
+    lens: security
+    category: MON
+    severity: medium
+    entity: scuba-report
+    why: >-
+      The newest results hold no Exchange Online controls (MS.EXO), so every mail control -
+      forwarding, sender authentication, filtering - has silently dropped out of the findings.
+    fix: >-
+      Run Invoke-SCuBA with every licensed product in -ProductNames (exo included) and copy the new
+      ScubaResults.csv and ScubaResults_*.json into imports\scubagear\.
+    refs: [NIST-800-53:CA-7, NIST-800-53:CA-2]
+    refresh: 1d
+    query:
+      protocol: file
+      key: Control ID
+      name: Requirement
+      path: "scubagear/ScubaResults*.csv"
+      format: csv
+    count: { op: lt, value: 1, where: { field: Control ID, op: match, value: '^MS\.EXO\.' } }
+    evidence: "The newest ScubaGear results hold {rows} controls and none for Exchange Online (MS.EXO)"
+
+  - id: SCUBA-PRODUCT-NOT-SCANNED-SHAREPOINT
+    title: Newest ScubaGear run did not cover SharePoint and OneDrive
+    kind: missing
+    lens: security
+    category: MON
+    severity: medium
+    entity: scuba-report
+    why: >-
+      The newest results hold no SharePoint controls (MS.SHAREPOINT), so the external sharing and
+      link controls have silently dropped out of the findings.
+    fix: >-
+      Run Invoke-SCuBA with every licensed product in -ProductNames (sharepoint included) and copy the
+      new ScubaResults.csv and ScubaResults_*.json into imports\scubagear\.
+    refs: [NIST-800-53:CA-7, NIST-800-53:CA-2]
+    refresh: 1d
+    query:
+      protocol: file
+      key: Control ID
+      name: Requirement
+      path: "scubagear/ScubaResults*.csv"
+      format: csv
+    count: { op: lt, value: 1, where: { field: Control ID, op: match, value: '^MS\.SHAREPOINT\.' } }
+    evidence: "The newest ScubaGear results hold {rows} controls and none for SharePoint (MS.SHAREPOINT)"
+
+  - id: SCUBA-PRODUCT-NOT-SCANNED-TEAMS
+    title: Newest ScubaGear run did not cover Teams
+    kind: missing
+    lens: security
+    category: MON
+    severity: medium
+    entity: scuba-report
+    why: >-
+      The newest results hold no Teams controls (MS.TEAMS), so the external access, guest and meeting
+      controls have silently dropped out of the findings.
+    fix: >-
+      Run Invoke-SCuBA with every licensed product in -ProductNames (teams included) and copy the new
+      ScubaResults.csv and ScubaResults_*.json into imports\scubagear\.
+    refs: [NIST-800-53:CA-7, NIST-800-53:CA-2]
+    refresh: 1d
+    query:
+      protocol: file
+      key: Control ID
+      name: Requirement
+      path: "scubagear/ScubaResults*.csv"
+      format: csv
+    count: { op: lt, value: 1, where: { field: Control ID, op: match, value: '^MS\.TEAMS\.' } }
+    evidence: "The newest ScubaGear results hold {rows} controls and none for Teams (MS.TEAMS)"
+
+  - id: SCUBA-PRODUCT-NOT-SCANNED-POWERPLATFORM
+    title: Newest ScubaGear run did not cover Power Platform
+    kind: missing
+    lens: security
+    category: MON
+    severity: medium
+    entity: scuba-report
+    why: >-
+      The newest results hold no Power Platform controls (MS.POWERPLATFORM), so the environment and
+      data-policy controls have silently dropped out of the findings.
+    fix: >-
+      Run Invoke-SCuBA with every licensed product in -ProductNames (powerplatform included) and copy
+      the new ScubaResults.csv and ScubaResults_*.json into imports\scubagear\.
+    refs: [NIST-800-53:CA-7, NIST-800-53:CA-2]
+    refresh: 1d
+    query:
+      protocol: file
+      key: Control ID
+      name: Requirement
+      path: "scubagear/ScubaResults*.csv"
+      format: csv
+    count: { op: lt, value: 1, where: { field: Control ID, op: match, value: '^MS\.POWERPLATFORM\.' } }
+    evidence: "The newest ScubaGear results hold {rows} controls and none for Power Platform (MS.POWERPLATFORM)"
+
   - id: SCUBA-REPORT-STALE
     title: ScubaGear results are out of date
     kind: missing

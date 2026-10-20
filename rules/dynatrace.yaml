@@ -4,7 +4,9 @@ name: Dynatrace environment
 integration: dynatrace
 # Endpoint: the environment URL (https://<environment-id>.live.dynatrace.com, or an ActiveGate's
 # https://<activegate>:9999/e/<environment-id>). The integration adds "Authorization: Api-Token ...";
-# the token needs problems.read, oneAgents.read and activeGates.read.
+# the token needs problems.read, oneAgents.read, activeGates.read, apiTokens.read and settings.read.
+# The API token list documents the flag as "enabled" while the vendor's sample shows "disabled"; the
+# token rules accept either spelling.
 # Dynatrace pages with nextPageKey, which the runner does not follow, so each query asks for the
 # largest page the API allows. Timestamps in these APIs are epoch milliseconds, which the engine does
 # not read as dates; no rule here depends on one.
@@ -133,6 +135,99 @@ rules:
       name: title
     count: { op: ge, value: 500 }
     evidence: "{count} open problems returned - the list is probably cut off"
+
+  - id: DT-PROBLEM-OPEN-LONG
+    title: Problem has been open for more than a week
+    kind: broken
+    category: HYG
+    severity: medium
+    entity: problem
+    refresh: 1d
+    why: A problem open for a week is either worked by nobody or a permanent condition that belongs in a maintenance window or a tuned threshold - both teach people to ignore red. The API returns a problem when its start or end lies in the timeframe, and an open problem has no end, so a timeframe that stops seven days ago returns exactly the open problems older than that.
+    fix: Fix it and let it close, or replace it with a maintenance window or an adjusted threshold, with a comment on the problem.
+    refs: [NIST-800-53:IR-4, NIST-800-53:SI-4]
+    query:
+      protocol: http
+      path: /api/v2/problems
+      params: { problemSelector: 'status("open")', from: now-90d, to: now-7d, pageSize: "500" }
+      paging: none
+      items: problems
+      key: problemId
+      name: title
+    each: any
+    evidence: "{displayId} {title} ({severityLevel}) open more than 7 days on {affectedEntities[].name}"
+
+  # ---- alerting configuration (settings 2.0) -------------------------------------------------
+
+  - id: DT-NOTIFICATION-MISSING
+    title: No enabled problem notification exists
+    kind: missing
+    category: MON
+    severity: high
+    entity: instance
+    why: Without an enabled notification integration (e-mail, ticketing, chat, webhook) problems are seen only by whoever happens to open the web interface.
+    fix: Add an e-mail or ticketing notification bound to the default alerting profile, and test it.
+    refs: [NIST-800-53:IR-6, NIST-800-53:SI-4, CIS-Controls-v8:13.1]
+    query:
+      protocol: http
+      path: /api/v2/settings/objects
+      params: { schemaIds: "builtin:problem.notifications", scopes: environment, fields: "objectId,value", pageSize: "500" }
+      paging: none
+      items: items
+      key: objectId
+      name: value.displayName
+    count:
+      op: lt
+      value: 1
+      where: { field: value.enabled, op: eq, value: true }
+    evidence: "{count} enabled of {rows} problem notifications"
+
+  - id: DT-HOST-CONNECTION-LOST-DETECTION-OFF
+    title: Host connection-lost detection is switched off for the environment
+    kind: misconfigured
+    category: MON
+    severity: high
+    entity: setting
+    why: With connection-lost detection off, a host that goes down raises no problem at all; the agent rules see it only on their next run. An environment that never changed the setting returns no object and keeps the vendor default (on), which is a pass here.
+    fix: Turn the detection back on; for hosts that reboot on purpose, choose not to alert on graceful shutdowns instead.
+    refs: [NIST-800-53:SI-4, CIS-Controls-v8:13.1]
+    query:
+      protocol: http
+      path: /api/v2/settings/objects
+      params: { schemaIds: "builtin:anomaly-detection.infrastructure-hosts", fields: "objectId,scope,value", pageSize: "500" }
+      paging: none
+      items: items
+      key: objectId
+      name: scope
+    each:
+      all:
+        - { field: scope, op: eq, value: environment }
+        - { field: value.host.connectionLostDetection.enabled, op: eq, value: false }
+    evidence: "connection-lost detection disabled at {scope}"
+
+  - id: DT-HOST-CONNECTION-LOST-DETECTION-OVERRIDE
+    title: Host connection-lost detection is switched off for a host or host group
+    kind: misconfigured
+    category: MON
+    severity: low
+    entity: setting
+    refresh: 1d
+    why: A host or host-group override that disables connection-lost detection makes that host's outage silent while the environment setting looks right.
+    fix: Remove the override, or replace it with "do not alert on graceful shutdowns" for hosts that restart on schedule.
+    refs: [NIST-800-53:SI-4]
+    query:
+      protocol: http
+      path: /api/v2/settings/objects
+      params: { schemaIds: "builtin:anomaly-detection.infrastructure-hosts", fields: "objectId,scope,value", pageSize: "500" }
+      paging: none
+      items: items
+      key: objectId
+      name: scope
+    each:
+      all:
+        - { field: scope, op: ne, value: environment }
+        - { field: value.host.connectionLostDetection.enabled, op: eq, value: false }
+    evidence: "connection-lost detection disabled for {scope}"
 
   # ---- OneAgent on hosts (environment API v1) ------------------------------------------------
 
@@ -398,3 +493,119 @@ rules:
       name: hostname
     each: { field: "modules[].misconfigured", op: eq, value: true }
     evidence: "{hostname}: misconfigured module among {modules[].type}"
+
+  # ---- API tokens (environment API v2) -------------------------------------------------------
+  # One page of up to 10,000 tokens; dates are ISO 8601. An unset expirationDate means the token
+  # never expires. The list includes personal access tokens.
+
+  - id: DT-TOKEN-NO-EXPIRY
+    title: Enabled API token never expires
+    kind: misconfigured
+    lens: security
+    category: AUT
+    severity: medium
+    entity: api-token
+    why: Tokens are copied into scripts and pipelines and outlive the people who made them; one without an expiry stays valid until someone remembers to revoke it.
+    fix: Issue a replacement token with an expiry (it can only be set at creation), move the consumer to it and disable the old one.
+    refs: [NIST-800-53:IA-5, NIST-800-53:AC-2, CIS-Controls-v8:5.3]
+    query:
+      protocol: http
+      path: /api/v2/apiTokens
+      params: { pageSize: "10000", fields: "+expirationDate,+lastUsedDate,+scopes,+personalAccessToken" }
+      paging: none
+      items: apiTokens
+      key: id
+      name: name
+    each:
+      all:
+        - any:
+            - { field: enabled, op: eq, value: true }
+            - { field: disabled, op: eq, value: false }
+        - { field: expirationDate, op: absent }
+    evidence: "{name} (owner {owner}, created {creationDate}, last used {lastUsedDate}) has no expiry"
+
+  - id: DT-TOKEN-UNUSED
+    title: Enabled API token has not been used for months
+    kind: misconfigured
+    lens: security
+    category: AUT
+    severity: low
+    entity: api-token
+    refresh: 7d
+    why: A token nobody uses still works for whoever finds it; unused credentials are pure risk.
+    fix: Disable the token, and delete it after a quiet period if nothing breaks.
+    refs: [NIST-800-53:AC-2, CIS-Controls-v8:5.3]
+    query:
+      protocol: http
+      path: /api/v2/apiTokens
+      params: { pageSize: "10000", fields: "+expirationDate,+lastUsedDate,+scopes,+personalAccessToken" }
+      paging: none
+      items: apiTokens
+      key: id
+      name: name
+    each:
+      all:
+        - any:
+            - { field: enabled, op: eq, value: true }
+            - { field: disabled, op: eq, value: false }
+        - any:
+            - { field: lastUsedDate, op: age-gt, value: 90, threshold: dynatrace.token-unused-days }
+            - all:
+                - { field: lastUsedDate, op: absent }
+                - { field: creationDate, op: age-gt, value: 90, threshold: dynatrace.token-unused-days }
+    evidence: "{name} (owner {owner}, created {creationDate}): last used {lastUsedDate}"
+
+  - id: DT-TOKEN-EXPIRING
+    title: Enabled API token expires soon
+    kind: broken
+    category: AUT
+    severity:
+      daysLeft: expirationDate
+      ranges: [ { max: 7, value: high } ]
+      default: medium
+    entity: api-token
+    why: When a token expires, the integration behind it (ticketing, inventory sync, this review) stops without any Dynatrace problem opening.
+    fix: Issue the replacement token and update its consumer before the expiry date.
+    refs: [NIST-800-53:IA-5]
+    deadline: expirationDate
+    query:
+      protocol: http
+      path: /api/v2/apiTokens
+      params: { pageSize: "10000", fields: "+expirationDate,+lastUsedDate,+scopes,+personalAccessToken" }
+      paging: none
+      items: apiTokens
+      key: id
+      name: name
+    each:
+      all:
+        - any:
+            - { field: enabled, op: eq, value: true }
+            - { field: disabled, op: eq, value: false }
+        - { field: expirationDate, op: until-lt, value: 14, threshold: dynatrace.token-notice-days }
+    evidence: "{name} (owner {owner}) expires {expirationDate}, last used {lastUsedDate}"
+
+  - id: DT-TOKEN-CAN-MINT-TOKENS
+    title: Enabled API token can create other tokens
+    kind: misconfigured
+    lens: security
+    category: IAM
+    severity: medium
+    entity: api-token
+    why: A token with the token-write scope can create new tokens with the scopes it holds, so a leaked automation token becomes a way to mint fresh, unexpiring credentials.
+    fix: Reissue automation tokens without the token-write scope; keep token management with named administrators.
+    refs: [NIST-800-53:AC-6, CIS-Controls-v8:5.4, MITRE-ATTACK:T1098]
+    query:
+      protocol: http
+      path: /api/v2/apiTokens
+      params: { pageSize: "10000", fields: "+expirationDate,+lastUsedDate,+scopes,+personalAccessToken" }
+      paging: none
+      items: apiTokens
+      key: id
+      name: name
+    each:
+      all:
+        - any:
+            - { field: enabled, op: eq, value: true }
+            - { field: disabled, op: eq, value: false }
+        - { field: scopes, op: contains, value: apiTokens.write }
+    evidence: "{name} (owner {owner}) holds apiTokens.write among {scopes}"

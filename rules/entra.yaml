@@ -319,6 +319,30 @@ rules:
         - { field: incidentCount, op: gt, value: 0 }
     evidence: "{alertDefinition.displayName}: {incidentCount} incident(s), last scan {lastScannedDateTime}"
 
+  - id: ENTRA-ROLE-CUSTOM-DANGEROUS-ACTIONS
+    title: Custom directory role can manage credentials, passwords or role membership
+    kind: misconfigured
+    category: IAM
+    severity: high
+    entity: role-definition
+    why: "A custom role that may add app credentials or owners, reset passwords or authentication methods, grant app roles or change the members of groups is a path to tenant takeover, yet it never shows up in a review of the built-in admin roles. Attack-path tools walk exactly these actions."
+    fix: "Cut the role down to the actions the job needs. If it really needs these actions, treat every holder as tier 0: PIM eligibility, phishing-resistant MFA, separate admin accounts. Tune the action pattern with the threshold."
+    refs: ["MITRE-ATTACK:T1098.003", "NIST-800-53:AC-6(5)", "CIS-Controls-v8:6.8"]
+    query:
+      protocol: graph
+      path: /roleManagement/directory/roleDefinitions
+      filter: "isBuiltIn eq false"
+      key: id
+      name: displayName
+    each:
+      all:
+        - { field: isEnabled, op: eq, value: true }
+        - field: 'rolePermissions[].allowedResourceActions'
+          op: match
+          threshold: entra.custom-role-dangerous-action-pattern
+          value: '/(applications|servicePrincipals)/(credentials|owners)/update|/servicePrincipals/synchronizationCredentials/|/servicePrincipals/appRoleAssignedTo/update|/users/password/update|/users/authenticationMethods/|/roleAssignments/|/roleDefinitions/|/groups/(members|owners)/update|/allTasks$'
+    evidence: "{displayName}: allows {rolePermissions[].allowedResourceActions}"
+
   # ==================================================================== Conditional Access ===
   - id: ENTRA-CA-NONE
     title: The tenant has no Conditional Access policy
@@ -1008,6 +1032,189 @@ rules:
         - { field: sessionControls.persistentBrowser.mode, op: eq, value: always }
     evidence: "{displayName}: persistent browser {sessionControls.persistentBrowser.mode}"
 
+  - id: ENTRA-CA-MFA-EXCLUDES-ROLES
+    title: Enforced MFA policy excludes directory roles
+    kind: misconfigured
+    category: AUT
+    severity: medium
+    entity: conditional-access-policy
+    why: "An excluded role takes every holder of that role out of the MFA requirement, and the holders of roles are the accounts an attacker looks for first. Role exclusions are usually added for a migration or an outage and then stay."
+    fix: "Remove the role exclusion. If the role needs different treatment, give it its own policy with a stronger requirement (the phishing-resistant authentication strength), never none."
+    refs: [CIS-M365:5.2.2.1, "NIST-800-53:IA-2(1)", "NIST-800-53:AC-6(5)"]
+    query:
+      protocol: graph
+      path: /identity/conditionalAccess/policies
+      key: id
+      name: displayName
+    each:
+      all:
+        - { field: state, op: eq, value: enabled }
+        - any:
+            - { field: grantControls.builtInControls, op: contains, value: mfa }
+            - { field: grantControls.authenticationStrength.id, op: exists }
+        - { field: conditions.users.excludeRoles, op: notempty }
+    evidence: "{displayName}: excludes roles {conditions.users.excludeRoles}"
+
+  - id: ENTRA-CA-MFA-EXCLUDES-APPS
+    title: All-users MFA policy excludes named applications
+    kind: misconfigured
+    category: AUT
+    severity: medium
+    entity: conditional-access-policy
+    why: "Each excluded application can be signed in to with a password alone. The all-users baseline already refuses to count such a policy; this rule names the applications so each gap can be closed."
+    fix: "Remove the application exclusion, or cover the application with a policy of its own (device- or location-based) so it is never left with no control."
+    refs: [CIS-M365:5.2.2.2, "NIST-800-53:IA-2(1)"]
+    query:
+      protocol: graph
+      path: /identity/conditionalAccess/policies
+      key: id
+      name: displayName
+    each:
+      all:
+        - { field: state, op: eq, value: enabled }
+        - { field: conditions.users.includeUsers, op: contains, value: All }
+        - any:
+            - { field: grantControls.builtInControls, op: contains, value: mfa }
+            - { field: grantControls.authenticationStrength.id, op: exists }
+        - { field: conditions.applications.excludeApplications, op: notempty }
+    evidence: "{displayName}: MFA not required for applications {conditions.applications.excludeApplications}"
+
+  - id: ENTRA-CA-BASELINE-MFA-AZURE-MANAGEMENT
+    title: No enforced policy requires MFA for Azure management
+    kind: missing
+    category: AUT
+    severity: medium
+    entity: tenant
+    why: "The Azure portal, Azure CLI, PowerShell and ARM templates all sign in through the Windows Azure Service Management API (797f4846-ba00-4fd7-ba43-dac1f8f63013); whoever reaches it with a password alone can change subscriptions. A policy counts if it targets all users, includes that application or all resources without excluding it, grants MFA or an authentication strength, and is not limited to risky sign-ins."
+    fix: "Create a policy: users All (exclude emergency access), target resource Windows Azure Service Management API, grant Require MFA; require the phishing-resistant strength for subscription owners."
+    refs: ["NIST-800-53:IA-2(1)", "NIST-800-53:AC-17", "MITRE-ATTACK:T1078.004"]
+    query:
+      protocol: graph
+      path: /identity/conditionalAccess/policies
+      key: id
+      name: displayName
+    count:
+      op: lt
+      value: 1
+      where:
+        all:
+          - { field: state, op: eq, value: enabled }
+          - { field: conditions.users.includeUsers, op: contains, value: All }
+          - any:
+              - { field: conditions.applications.includeApplications, op: contains, value: 797f4846-ba00-4fd7-ba43-dac1f8f63013 }
+              - { field: conditions.applications.includeApplications, op: contains, value: All }
+          - { field: conditions.applications.excludeApplications, op: notcontains, value: 797f4846-ba00-4fd7-ba43-dac1f8f63013 }
+          - { field: conditions.signInRiskLevels, op: empty }
+          - { field: conditions.userRiskLevels, op: empty }
+          - any:
+              - { field: grantControls.builtInControls, op: contains, value: mfa }
+              - { field: grantControls.authenticationStrength.id, op: exists }
+    evidence: "{count} enforced MFA policies cover Azure management, among {rows} policies"
+
+  - id: ENTRA-CA-BASELINE-WORKLOAD-IDENTITY-BLOCK
+    title: No enforced policy limits where service principals may sign in from
+    kind: missing
+    category: AUT
+    severity: low
+    entity: tenant
+    why: "A leaked client secret works from anywhere unless a workload-identity policy limits the tenant's own service principals to known networks. A policy counts if it targets the service principals of this tenant, grants Block and excludes at least one named location. Needs Workload Identities Premium."
+    fix: "Create a workload-identity policy: include all service principals of the tenant, block access from all locations except the trusted egress named locations; exclude only the identities that must roam."
+    refs: ["NIST-800-53:AC-17", "NIST-800-53:SC-7", "MITRE-ATTACK:T1078.004"]
+    query:
+      protocol: graph
+      path: /identity/conditionalAccess/policies
+      key: id
+      name: displayName
+    count:
+      op: lt
+      value: 1
+      where:
+        all:
+          - { field: state, op: eq, value: enabled }
+          - { field: conditions.clientApplications, op: exists }
+          - { field: conditions.clientApplications.includeServicePrincipals, op: contains, value: ServicePrincipalsInMyTenant }
+          - { field: grantControls.builtInControls, op: contains, value: block }
+          - { field: conditions.locations.excludeLocations, op: notempty }
+    evidence: "{count} enforced workload-identity location policies among {rows} policies"
+
+  - id: ENTRA-CA-BASELINE-UNKNOWN-PLATFORMS-BLOCKED
+    title: No enforced policy blocks device platforms the organisation does not support
+    kind: missing
+    category: AUT
+    severity: low
+    entity: tenant
+    why: "Sign-ins from platforms nobody manages (Linux, unrecognised user agents) otherwise get the weakest treatment of all. A policy counts if it targets all users and all resources, includes all platforms, excludes the supported ones and grants Block."
+    fix: "Create the policy in report-only mode first (users All, resources All, platforms All except the supported ones, grant Block), read its impact, then enforce it."
+    refs: ["NIST-800-53:AC-19", "NIST-800-53:CM-7"]
+    query:
+      protocol: graph
+      path: /identity/conditionalAccess/policies
+      key: id
+      name: displayName
+    count:
+      op: lt
+      value: 1
+      where:
+        all:
+          - { field: state, op: eq, value: enabled }
+          - { field: conditions.platforms, op: exists }
+          - { field: conditions.users.includeUsers, op: contains, value: All }
+          - { field: conditions.applications.includeApplications, op: contains, value: All }
+          - { field: conditions.platforms.includePlatforms, op: contains, value: all }
+          - { field: conditions.platforms.excludePlatforms, op: notempty }
+          - { field: grantControls.builtInControls, op: contains, value: block }
+    evidence: "{count} enforced unknown-platform block policies among {rows} policies"
+
+  - id: ENTRA-CA-TARGETS-NOBODY
+    title: Enabled Conditional Access policy applies to nobody
+    kind: misconfigured
+    category: HYG
+    severity: low
+    entity: conditional-access-policy
+    lens: both
+    why: "A policy with no included user, group, role, external user or service principal (or users set to None) protects nothing but shows as an enabled control in every review."
+    fix: "Scope the policy to the users it was written for, or delete it."
+    refs: ["NIST-800-53:CM-3"]
+    query:
+      protocol: graph
+      path: /identity/conditionalAccess/policies
+      key: id
+      name: displayName
+    each:
+      all:
+        - { field: state, op: eq, value: enabled }
+        - any:
+            - { field: conditions.users.includeUsers, op: empty }
+            - all:
+                - { field: conditions.users.includeUsers, op: contains, value: None }
+                - { field: conditions.users.includeUsers, op: size-eq, value: 1 }
+        - { field: conditions.users.includeGroups, op: empty }
+        - { field: conditions.users.includeRoles, op: empty }
+        - { field: conditions.users.includeGuestsOrExternalUsers, op: absent }
+        - { field: conditions.clientApplications.includeServicePrincipals, op: empty }
+    evidence: "{displayName}: enabled, includes users {conditions.users.includeUsers} and no group, role or external user"
+
+  - id: ENTRA-CA-RESILIENCE-DEFAULTS-OFF
+    title: Conditional Access policy disables resilience defaults
+    kind: misconfigured
+    category: AVL
+    severity: low
+    entity: conditional-access-policy
+    lens: both
+    why: "During an Entra outage the backup authentication service keeps existing sessions working; a policy with resilience defaults disabled blocks its users instead."
+    fix: "Re-enable resilience defaults unless the policy depends on real-time evaluation that the backup service cannot do, and record that decision."
+    refs: ["NIST-800-53:CP-2", "NIST-800-53:CP-10"]
+    query:
+      protocol: graph
+      path: /identity/conditionalAccess/policies
+      key: id
+      name: displayName
+    each:
+      all:
+        - { field: state, op: eq, value: enabled }
+        - { field: sessionControls.disableResilienceDefaults, op: eq, value: true }
+    evidence: "{displayName}: disableResilienceDefaults = {sessionControls.disableResilienceDefaults}"
+
   - id: ENTRA-NAMEDLOC-WIDE-TRUSTED-RANGE
     title: Trusted named location contains a very wide IP range
     kind: misconfigured
@@ -1468,6 +1675,47 @@ rules:
     each: { field: registrationEnforcement.authenticationMethodsRegistrationCampaign.state, op: eq, value: disabled }
     evidence: "registration campaign state = {registrationEnforcement.authenticationMethodsRegistrationCampaign.state}"
 
+  - id: ENTRA-AUTHM-REPORT-SUSPICIOUS-OFF
+    title: Users cannot report an MFA prompt they did not start
+    kind: missing
+    category: AUT
+    severity: low
+    entity: policy
+    why: "With 'report suspicious activity' on for everyone, a user who receives an unexpected MFA prompt can report it, which raises the account to high user risk so the user-risk policy blocks it. Without it the only choices are approve or ignore. The setting is only exposed in the beta API."
+    fix: "Enable report suspicious activity for all users and make sure an enforced user-risk policy acts on high risk (ENTRA-CA-BASELINE-USER-RISK)."
+    refs: ["NIST-800-53:IR-6", "NIST-800-53:IA-2(1)", "MITRE-ATTACK:T1621"]
+    query:
+      protocol: graph
+      version: beta
+      path: /policies/authenticationMethodsPolicy
+      key: id
+    each:
+      any:
+        - { field: reportSuspiciousActivitySettings.state, op: ne, value: enabled }
+        - { field: reportSuspiciousActivitySettings.includeTarget.id, op: ne, value: all_users }
+    evidence: "report suspicious activity: state {reportSuspiciousActivitySettings.state}, target {reportSuspiciousActivitySettings.includeTarget.id}"
+
+  - id: ENTRA-AUTHSTRENGTH-CUSTOM-WEAK
+    title: Custom authentication strength accepts phone or email factors
+    kind: misconfigured
+    category: AUT
+    severity: medium
+    entity: authentication-strength
+    why: "A policy that requires an authentication strength looks strong in every review, but a custom strength that admits SMS, voice or email combinations accepts the factors that SIM swap and mailbox takeover defeat."
+    fix: "Remove the SMS, voice and email combinations from the custom strength, or replace it with a built-in strength (Multifactor or Phishing-resistant)."
+    refs: ["NIST-800-53:IA-2(1)", "NIST-800-53:IA-2(6)", "MITRE-ATTACK:T1621"]
+    query:
+      protocol: graph
+      path: /policies/authenticationStrengthPolicies
+      filter: "policyType eq 'custom'"
+      key: id
+      name: displayName
+    each:
+      all:
+        - { field: policyType, op: eq, value: custom }
+        - { field: allowedCombinations, op: match, value: '(^|,)(sms|voice|email)(,|$)', threshold: entra.authstrength-weak-combination-pattern }
+    evidence: "{displayName}: allows {allowedCombinations}"
+
   # ===================================================================== MFA registration ===
   - id: ENTRA-MFA-MEMBER-NOT-CAPABLE
     title: Member account has no usable MFA method
@@ -1857,6 +2105,76 @@ rules:
     each: { field: appRoleAssignments, op: size-gt, value: 0 }
     evidence: "disabled {userPrincipalName}: assigned to {appRoleAssignments[].resourceDisplayName}"
 
+  - id: ENTRA-USER-EXTERNAL-MEMBER
+    title: External account has member-level access
+    kind: misconfigured
+    category: IAM
+    severity: medium
+    entity: user
+    why: "An account invited from another tenant (UPN with #EXT#) whose userType is Member gets member directory access, can create groups and falls into every 'all members' policy and group, while its credentials and lifecycle stay with the other organisation."
+    fix: "Convert the account back to Guest, or give the person a real member account in this tenant if they work here."
+    refs: ["NIST-800-53:AC-2(9)", "NIST-800-53:AC-6", "MITRE-ATTACK:T1078.004"]
+    query:
+      protocol: graph
+      path: /users
+      select: [id, userPrincipalName, accountEnabled, userType, createdDateTime, onPremisesSyncEnabled, onPremisesSecurityIdentifier, signInActivity, assignedLicenses, mail, onPremisesSamAccountName]
+      top: 500
+      key: id
+      name: userPrincipalName
+    each:
+      all:
+        - { field: accountEnabled, op: eq, value: true }
+        - { field: userType, op: eq, value: Member }
+        - { field: userPrincipalName, op: contains, value: '#EXT#' }
+    evidence: "{userPrincipalName}: external account with userType Member (created {createdDateTime})"
+
+  - id: ENTRA-GUEST-CONSUMER-DOMAIN
+    title: Guest invited from a consumer mail service
+    kind: misconfigured
+    category: IAM
+    severity: low
+    entity: user
+    why: "A guest on a consumer mailbox has no organisation behind it: nobody else enforces its MFA, nobody offboards it, and it is often a former employee's or contractor's personal address. Extend the domain pattern with the threshold."
+    fix: "Replace it with a guest from the partner's own tenant, or record the exception and put the guest in a recurring access review."
+    refs: ["NIST-800-53:AC-2(9)", "NIST-800-53:AC-20", "CIS-Controls-v8:6.2"]
+    query:
+      protocol: graph
+      path: /users
+      select: [id, userPrincipalName, accountEnabled, userType, createdDateTime, onPremisesSyncEnabled, onPremisesSecurityIdentifier, signInActivity, assignedLicenses, mail, onPremisesSamAccountName]
+      top: 500
+      key: id
+      name: userPrincipalName
+    each:
+      all:
+        - { field: accountEnabled, op: eq, value: true }
+        - { field: userType, op: eq, value: Guest }
+        - { field: userPrincipalName, op: match, value: '_(gmail\.com|googlemail\.com|outlook\.com|hotmail\.com|hotmail\.co\.uk|live\.com|msn\.com|yahoo\.com|yahoo\.co\.uk|icloud\.com|me\.com|aol\.com|gmx\.(de|net|com)|proton\.me|protonmail\.com)#EXT#@', threshold: entra.consumer-mail-pattern }
+    evidence: "guest {userPrincipalName} (created {createdDateTime}, last successful sign-in {signInActivity.lastSuccessfulSignInDateTime})"
+
+  - id: ENTRA-GUEST-NO-SPONSOR
+    title: Enabled guest has no sponsor
+    kind: missing
+    category: HYG
+    severity: low
+    entity: user
+    lens: both
+    why: "Without a sponsor nobody inside the organisation answers for the guest: nobody renews, reviews or removes it when the collaboration ends."
+    fix: "Set the inviter or the owning team as sponsor, and make sponsors part of the invitation flow (entitlement management or the invite form)."
+    refs: ["NIST-800-53:AC-2(9)", "CIS-Controls-v8:6.2"]
+    query:
+      protocol: graph
+      path: /users
+      filter: "userType eq 'Guest'"
+      select: [id, userPrincipalName, accountEnabled, createdDateTime]
+      expand: sponsors($select=id)
+      key: id
+      name: userPrincipalName
+    each:
+      all:
+        - { field: accountEnabled, op: eq, value: true }
+        - { field: sponsors, op: empty }
+    evidence: "guest {userPrincipalName} (created {createdDateTime}) has no sponsor"
+
   - id: ENTRA-RISKY-USER-OPEN
     title: Risky user left unremediated
     kind: broken
@@ -2104,6 +2422,139 @@ rules:
     each: { field: disabledByMicrosoftStatus, op: eq, value: DisabledDueToViolationOfServicesAgreement }
     evidence: "{displayName} (appId {appId}): {disabledByMicrosoftStatus}"
 
+  - id: ENTRA-APP-SECRET-LONG-LIVED
+    title: App registration holds a client secret valid for more than two years
+    kind: misconfigured
+    category: PKI
+    severity: medium
+    entity: application
+    why: "A secret whose end date is years away will not be rotated: it outlives the project, its owner and the people who know where it is stored. The rule fires when any secret ends more than 730 days from today (or never). The threshold is an age in days and therefore negative: -730 means 'ends more than 730 days ahead'."
+    fix: "Replace the secret with a certificate or a federated credential; otherwise recreate it with a lifetime of 180 days or less, update the consumer, delete the old one, and cap lifetimes with the app management policy (ENTRA-APPPOLICY-NO-SECRET-LIFETIME)."
+    refs: [CIS-M365:5.1.5.4, "NIST-800-53:IA-5(1)", "MITRE-ATTACK:T1098.001"]
+    query:
+      protocol: graph
+      path: /applications
+      select: [id, appId, displayName, signInAudience, createdDateTime, passwordCredentials, keyCredentials, web, spa, isFallbackPublicClient, disabledByMicrosoftStatus]
+      top: 999
+      key: id
+      name: displayName
+    each:
+      all:
+        - { field: passwordCredentials, op: notempty }
+        - { field: 'passwordCredentials[].endDateTime', op: age-lt, value: -730, threshold: entra.secret-long-lived-age-days }
+    evidence: "{displayName} (appId {appId}): client secret end dates {passwordCredentials[].endDateTime}"
+
+  - id: ENTRA-APP-MANY-SECRETS
+    title: App registration carries more client secrets than rotation needs
+    kind: misconfigured
+    category: HYG
+    severity: low
+    entity: application
+    lens: both
+    why: "Two secrets cover a rotation (current and next). More means nobody knows which system uses which, and an extra secret is exactly what an attacker adds to keep access. Expired secrets count too: they should have been deleted."
+    fix: "Find the consumer of each secret, keep at most two, and delete the rest (expired ones first)."
+    refs: ["MITRE-ATTACK:T1098.001", "NIST-800-53:IA-5"]
+    query:
+      protocol: graph
+      path: /applications
+      select: [id, appId, displayName, signInAudience, createdDateTime, passwordCredentials, keyCredentials, web, spa, isFallbackPublicClient, disabledByMicrosoftStatus]
+      top: 999
+      key: id
+      name: displayName
+    each: { field: passwordCredentials, op: size-gt, value: 2, threshold: entra.app-max-secrets }
+    evidence: "{displayName} (appId {appId}): secrets {passwordCredentials[].displayName} ending {passwordCredentials[].endDateTime}"
+
+  - id: ENTRA-APP-TIER0-REQUESTED-WITH-OWNERS
+    title: App registration that requests a tenant-takeover permission has owners
+    kind: misconfigured
+    category: IAM
+    severity: high
+    entity: application
+    why: "An owner of an app registration can add a credential and then act with everything the app has been granted. When the app requests a takeover-capable Microsoft Graph application permission, each owner is in effect a tier-0 administrator who appears in no admin role review. Requested is not granted: ENTRA-APPPERM-TIER0 shows the grants."
+    fix: "Remove human owners from tier-0 apps and manage them through a PIM-held Application Administrator role, or keep owners few, named, on admin accounts and reviewed."
+    refs: ["MITRE-ATTACK:T1098.001", "NIST-800-53:AC-6(5)", "CIS-Controls-v8:6.8"]
+    query:
+      protocol: graph
+      path: /applications
+      select: [id, appId, displayName, requiredResourceAccess]
+      expand: owners($select=id,userPrincipalName,accountEnabled,userType)
+      key: id
+      name: displayName
+    each:
+      all:
+        - { field: owners, op: notempty }
+        - field: 'requiredResourceAccess[].resourceAccess[].id'
+          op: in
+          threshold: entra.graph-tier0-app-role-ids
+          value: [9e3f62cf-ca93-4989-b6ce-bf83c28f9fe8, 06b708a9-e830-4db3-a914-8e69da51d44f, 1bfefb4e-e0b5-418b-a88f-73c46d2cc8e9, 19dbc75e-c2e2-444c-a770-ec69d8559fc7, 01c0a623-fc9b-48e9-b794-0756f8e8f067, 29c18626-4985-4dcd-85c0-193eef327366, a402ca1c-2696-4531-972d-6e5ee4aa11ea, 50483e42-d915-4231-9639-7fdb7fd190e5, 8e8e4742-1d95-4f68-9d56-6ee75648c72a, 7e05723c-0bb0-42da-be95-ae9f08a6e53c, 292d869f-3427-49a8-9dab-8c70152b74e9, e330c4f0-4170-414e-a55a-2f022ec2b57b]
+    evidence: "{displayName} (appId {appId}): owners {owners[].userPrincipalName} {owners[].id}"
+
+  - id: ENTRA-APP-OWNER-DISABLED-OR-GUEST
+    title: App registration is owned by a disabled account or a guest
+    kind: misconfigured
+    category: IAM
+    severity: medium
+    entity: application
+    why: "Owning an app registration is the right to add credentials to it. A disabled owner is a leaver who keeps that right the moment the account is re-enabled; a guest owner is an outsider who keeps it. Inactive owners need the sign-in join (backlog)."
+    fix: "Replace the owner with a current member account (two owners per app), and make owner removal part of the leaver process."
+    refs: ["NIST-800-53:AC-2(3)", "NIST-800-53:AC-2(9)", "MITRE-ATTACK:T1098.001"]
+    query:
+      protocol: graph
+      path: /applications
+      select: [id, appId, displayName, requiredResourceAccess]
+      expand: owners($select=id,userPrincipalName,accountEnabled,userType)
+      key: id
+      name: displayName
+    each:
+      any:
+        - { field: 'owners[].accountEnabled', op: eq, value: false }
+        - { field: 'owners[].userType', op: eq, value: Guest }
+    evidence: "{displayName} (appId {appId}): owners {owners[].userPrincipalName}, enabled {owners[].accountEnabled}, type {owners[].userType}"
+
+  - id: ENTRA-APP-FEDERATED-CREDENTIAL-EXTERNAL
+    title: App registration trusts tokens from an external identity provider
+    kind: misconfigured
+    category: PKI
+    severity: medium
+    entity: application
+    why: "A federated identity credential lets an outside issuer (a CI/CD platform, another cloud, any OIDC provider) sign in as the app without a secret. It never expires and the app management policy does not cap it, so each one must be a known, exact trust. Entra's own issuers are allowed by the default pattern."
+    fix: "Keep the issuer, subject and audience exact (one repository and one branch or environment); delete credentials of pipelines no longer in use and record the owner of the rest."
+    refs: ["MITRE-ATTACK:T1098.001", "NIST-800-53:IA-5", "NIST-800-53:AC-20"]
+    query:
+      protocol: graph
+      path: /applications
+      select: [id, appId, displayName]
+      expand: federatedIdentityCredentials
+      key: id
+      name: displayName
+    each:
+      all:
+        - { field: federatedIdentityCredentials, op: notempty }
+        - { field: 'federatedIdentityCredentials[].issuer', op: notmatch, value: '^https://(login\.microsoftonline\.com|sts\.windows\.net)/', threshold: entra.federated-issuer-allow-pattern }
+    evidence: "{displayName} (appId {appId}): trusts issuers {federatedIdentityCredentials[].issuer} for subjects {federatedIdentityCredentials[].subject}"
+
+  - id: ENTRA-APP-FEDERATED-CREDENTIAL-BROAD-SUBJECT
+    title: Federated credential trusts a broad subject such as any pull request
+    kind: misconfigured
+    category: PKI
+    severity: high
+    entity: application
+    why: "A subject that ends in pull_request (GitHub Actions) or carries a wildcard lets every pull-request run of the repository, or every matching workload, sign in as the app - without anyone reviewing the code first."
+    fix: "Bind the credential to a protected branch, tag or deployment environment with required reviewers instead of pull requests; remove wildcard subjects."
+    refs: ["MITRE-ATTACK:T1195.002", "MITRE-ATTACK:T1098.001", "NIST-800-53:IA-5"]
+    query:
+      protocol: graph
+      path: /applications
+      select: [id, appId, displayName]
+      expand: federatedIdentityCredentials
+      key: id
+      name: displayName
+    each:
+      all:
+        - { field: federatedIdentityCredentials, op: notempty }
+        - { field: 'federatedIdentityCredentials[].subject', op: match, value: '(\*|:pull_request$)', threshold: entra.federated-subject-broad-pattern }
+    evidence: "{displayName} (appId {appId}): subjects {federatedIdentityCredentials[].subject} from {federatedIdentityCredentials[].issuer}"
+
   # ===================================================== enterprise apps (service principals) ===
   - id: ENTRA-SP-SAML-CERT-EXPIRY
     title: SAML signing certificate of an enterprise app expires soon
@@ -2255,6 +2706,85 @@ rules:
     each: { field: disabledByMicrosoftStatus, op: eq, value: DisabledDueToViolationOfServicesAgreement }
     evidence: "{displayName} (appId {appId}): {disabledByMicrosoftStatus}"
 
+  # Microsoft's own tenants (appOwnerOrganizationId of first-party apps), Microsoft constants:
+  #   f8cdef31-a31e-4b4a-93e4-5f571e91255a Microsoft Services
+  #   72f988bf-86f1-41af-91ab-2d7cd011db47 Microsoft
+  - id: ENTRA-SP-FIRST-PARTY-CREDENTIAL
+    title: Credential added to the service principal of a Microsoft application
+    kind: misconfigured
+    category: IAM
+    severity: critical
+    entity: service-principal
+    why: "Microsoft's first-party applications authenticate with Microsoft's own keys; a secret or certificate added in this tenant to one of their service principals lets whoever holds it sign in as that Microsoft app, with every permission the tenant already granted it, under a trusted name. It is a known persistence technique after a breach. Exchange hybrid's classic OAuth adds a certificate to the Exchange Online service principal: confirm such a case against the hybrid setup and move to the dedicated Exchange hybrid app."
+    fix: "Treat it as an incident until explained: find who added it (directory audit 'Update service principal' / 'Add service principal credentials'), remove the credential, revoke the app's sessions, and review that app's sign-ins and the data it reached."
+    refs: ["MITRE-ATTACK:T1098.001", "NIST-800-53:IA-5", "NIST-800-53:AC-6"]
+    query:
+      protocol: graph
+      path: /servicePrincipals
+      select: [id, appId, displayName, accountEnabled, servicePrincipalType, appOwnerOrganizationId, preferredSingleSignOnMode, passwordCredentials, keyCredentials, appRoleAssignmentRequired, notificationEmailAddresses, disabledByMicrosoftStatus]
+      top: 999
+      key: id
+      name: displayName
+    each:
+      all:
+        - field: appOwnerOrganizationId
+          op: in
+          threshold: entra.first-party-tenant-ids
+          value: [f8cdef31-a31e-4b4a-93e4-5f571e91255a, 72f988bf-86f1-41af-91ab-2d7cd011db47]
+        - any:
+            - { field: passwordCredentials, op: notempty }
+            - { field: keyCredentials, op: notempty }
+    evidence: "{displayName} (appId {appId}): secrets ending {passwordCredentials[].endDateTime}; certificates ending {keyCredentials[].endDateTime}"
+
+  - id: ENTRA-SP-SECRET-LONG-LIVED
+    title: Enterprise app (service principal) secret valid for more than two years
+    kind: misconfigured
+    category: PKI
+    severity: medium
+    entity: service-principal
+    why: "Secrets added straight to a service principal do not show on the app registration and are rotated even less often. The rule fires when any secret ends more than 730 days from today (or never); SAML apps are left out because their signing keys carry a paired password entry. The threshold is a negative age in days."
+    fix: "Move the consumer to a certificate or federated credential, or recreate the secret with a short lifetime and delete the old one."
+    refs: [CIS-M365:5.1.5.4, "NIST-800-53:IA-5(1)", "MITRE-ATTACK:T1098.001"]
+    query:
+      protocol: graph
+      path: /servicePrincipals
+      select: [id, appId, displayName, accountEnabled, servicePrincipalType, appOwnerOrganizationId, preferredSingleSignOnMode, passwordCredentials, keyCredentials, appRoleAssignmentRequired, notificationEmailAddresses, disabledByMicrosoftStatus]
+      top: 999
+      key: id
+      name: displayName
+    each:
+      all:
+        - any:
+            - { field: preferredSingleSignOnMode, op: absent }
+            - { field: preferredSingleSignOnMode, op: ne, value: saml }
+        - { field: passwordCredentials, op: notempty }
+        - { field: 'passwordCredentials[].endDateTime', op: age-lt, value: -730, threshold: entra.secret-long-lived-age-days }
+    evidence: "{displayName} (appId {appId}): secret end dates {passwordCredentials[].endDateTime}"
+
+  - id: ENTRA-SP-RISKY
+    title: Workload identity flagged as risky and left unremediated
+    kind: broken
+    category: IAM
+    severity:
+      field: riskLevel
+      map: { high: high, medium: medium }
+      default: medium
+    entity: service-principal
+    why: "Identity Protection flags service principals with leaked credentials, anomalous sign-ins or suspicious changes. A risky workload identity has no MFA prompt to stop the attacker; until someone confirms or dismisses the risk, assume the credential is in use by someone else. Needs Workload Identities Premium."
+    fix: "Rotate every credential of the app, review its recent sign-ins, grants and changes, then confirm compromised or dismiss the risk in Identity Protection."
+    refs: ["MITRE-ATTACK:T1078.004", "NIST-800-53:IR-4", "NIST-800-53:SI-4"]
+    query:
+      protocol: graph
+      path: /identityProtection/riskyServicePrincipals
+      select: [id, appId, displayName, servicePrincipalType, isEnabled, riskState, riskLevel, riskDetail, riskLastUpdatedDateTime]
+      key: id
+      name: displayName
+    each:
+      all:
+        - { field: riskState, op: in, value: [atRisk, confirmedCompromised] }
+        - { field: riskLevel, op: in, value: [high, medium] }
+    evidence: "{displayName} (appId {appId}): {riskLevel} risk, {riskState} since {riskLastUpdatedDateTime} ({riskDetail})"
+
   # Microsoft Graph application permission (app role) ids, Microsoft constants:
   #   9e3f62cf-ca93-4989-b6ce-bf83c28f9fe8 RoleManagement.ReadWrite.Directory
   #   06b708a9-e830-4db3-a914-8e69da51d44f AppRoleAssignment.ReadWrite.All
@@ -2328,6 +2858,60 @@ rules:
           threshold: entra.graph-data-app-role-ids
           value: [62a82d76-70ea-41e2-9197-370581804d09, dbaae8cf-10b5-4b86-a4a1-f871c94c6695, 741f803b-c850-494e-b5df-cde7c675a1ca, e2a3a72e-5f79-4c64-b1b1-878b674786c9, 810c84a8-4a9e-49e6-bf7d-12d183f40d01, b633e1c5-b582-4048-a93e-9f11b44c7e96, 6931bccd-447a-43d1-b442-00a195474933, 75359482-378d-4052-8f01-80520e7db3cd, 01d4889c-1287-42c6-ac1f-5d1e02578ef6, 9492366f-7969-46a4-8d15-ed1a20078fff, a82116e5-55eb-4c41-a434-62fe8a61c773, 243333ab-4d21-40cb-a475-36241daa0842, 9241abd9-d0e6-425a-bd4f-47ba86e767a4]
     evidence: "{principalDisplayName} holds Graph application permission {appRoleId} (granted {createdDateTime})"
+
+  # Exchange Online (00000002-0000-0ff1-ce00-000000000000) and SharePoint Online
+  # (00000003-0000-0ff1-ce00-000000000000) application permission ids, Microsoft constants:
+  #   dc890d15-9560-4a4c-9b7f-a736ec74ec40 full_access_as_app (Exchange: every mailbox through EWS)
+  #   dc50a0fb-09a3-484d-be87-e023b12c6440 Exchange.ManageAsApp (Exchange admin PowerShell as the app)
+  #   678536fe-1083-478a-9c59-b99265e6b0d3 Sites.FullControl.All (SharePoint)
+  #   fbcd29d2-fcca-4405-aded-518d457caae4 Sites.ReadWrite.All (SharePoint)
+  - id: ENTRA-APPPERM-EXCHANGE-APP-ACCESS
+    title: Application holds tenant-wide Exchange Online application access
+    kind: misconfigured
+    category: IAM
+    severity: high
+    entity: app-permission-grant
+    why: "These Exchange Online application permissions open every mailbox (full_access_as_app through EWS) or run Exchange administration as the app, without a signed-in user. The Graph permission rules do not see them because they sit on the Exchange resource, which is the other door to all mail."
+    fix: "Replace full mailbox access with Exchange application RBAC scoped to the mailboxes the app needs, or document the app and lock its owners and credentials down; remove grants of apps no longer used."
+    refs: ["MITRE-ATTACK:T1114.002", "MITRE-ATTACK:T1528", "NIST-800-53:AC-6", "NIST-800-53:AC-3"]
+    query:
+      protocol: graph
+      path: /servicePrincipals(appId='00000002-0000-0ff1-ce00-000000000000')/appRoleAssignedTo
+      top: 999
+      key: id
+      name: principalDisplayName
+    each:
+      all:
+        - { field: principalType, op: eq, value: ServicePrincipal }
+        - field: appRoleId
+          op: in
+          threshold: entra.exchange-app-role-ids
+          value: [dc890d15-9560-4a4c-9b7f-a736ec74ec40, dc50a0fb-09a3-484d-be87-e023b12c6440]
+    evidence: "{principalDisplayName} holds Exchange application permission {appRoleId} (granted {createdDateTime})"
+
+  - id: ENTRA-APPPERM-SHAREPOINT-FULL-CONTROL
+    title: Application holds tenant-wide SharePoint Online application access
+    kind: misconfigured
+    category: IAM
+    severity: high
+    entity: app-permission-grant
+    why: "Full control or read-write over every site, granted on the SharePoint resource rather than on Graph, lets the app read and change all document libraries and OneDrives without a signed-in user; the Graph permission rules do not see it."
+    fix: "Move the app to Sites.Selected with per-site grants; remove the grants of apps no longer used."
+    refs: ["MITRE-ATTACK:T1530", "NIST-800-53:AC-6", "NIST-800-53:AC-3"]
+    query:
+      protocol: graph
+      path: /servicePrincipals(appId='00000003-0000-0ff1-ce00-000000000000')/appRoleAssignedTo
+      top: 999
+      key: id
+      name: principalDisplayName
+    each:
+      all:
+        - { field: principalType, op: eq, value: ServicePrincipal }
+        - field: appRoleId
+          op: in
+          threshold: entra.sharepoint-app-role-ids
+          value: [678536fe-1083-478a-9c59-b99265e6b0d3, fbcd29d2-fcca-4405-aded-518d457caae4]
+    evidence: "{principalDisplayName} holds SharePoint application permission {appRoleId} (granted {createdDateTime})"
 
   - id: ENTRA-CONSENT-TENANT-WIDE-BROAD
     title: Tenant-wide delegated consent with broad write or mail scopes
@@ -2546,6 +3130,25 @@ rules:
         - { field: inboundTrust.isHybridAzureADJoinedDeviceAccepted, op: eq, value: true }
     evidence: "default inbound trust: compliant {inboundTrust.isCompliantDeviceAccepted}, hybrid-joined {inboundTrust.isHybridAzureADJoinedDeviceAccepted}"
 
+  - id: ENTRA-XTAP-DIRECT-CONNECT-INBOUND-OPEN
+    title: B2B direct connect is open inbound to every organisation
+    kind: misconfigured
+    category: IAM
+    severity: medium
+    entity: policy
+    why: "Microsoft's default blocks B2B direct connect (Teams shared channels with users who stay in their own tenant). When the default settings allow both users and applications inbound, any organisation's users can be added to shared channels without a guest account you can review."
+    fix: "Block direct connect inbound in the default cross-tenant settings and allow it per named partner organisation."
+    refs: ["NIST-800-53:AC-20", "NIST-800-53:AC-21", "MITRE-ATTACK:T1199"]
+    query:
+      protocol: graph
+      path: /policies/crossTenantAccessPolicy/default
+      key: id
+    each:
+      all:
+        - { field: b2bDirectConnectInbound.usersAndGroups.accessType, op: eq, value: allowed }
+        - { field: b2bDirectConnectInbound.applications.accessType, op: eq, value: allowed }
+    evidence: "default B2B direct connect inbound: users {b2bDirectConnectInbound.usersAndGroups.accessType}, applications {b2bDirectConnectInbound.applications.accessType}"
+
   # ================================================================= device registration ===
   - id: ENTRA-DEVREG-QUOTA-HIGH
     title: Users may register too many devices
@@ -2734,6 +3337,55 @@ rules:
       key: id
     count: none
     evidence: "no group lifecycle policy"
+
+  - id: ENTRA-GROUP-DYNAMIC-GUEST-CONTROLLED-ATTRIBUTE
+    title: Dynamic group rule keys on attributes a guest's home tenant controls
+    kind: misconfigured
+    category: IAM
+    severity: low
+    entity: group
+    why: "Mail, other mails, proxy addresses, display name, given name, surname and company name of a guest come from the guest's own organisation. A dynamic rule on them that does not exclude guests lets a partner place their account in the group, and in whatever the group grants."
+    fix: "Add (user.userType -eq \"Member\") to the rule, or key it on an attribute only your admins or HR set (employeeId, extension attributes, department from the HR feed). Tune both patterns with the thresholds."
+    refs: ["NIST-800-53:AC-2(9)", "NIST-800-53:AC-3", "MITRE-ATTACK:T1199"]
+    query:
+      protocol: graph
+      path: /groups
+      select: [id, displayName, groupTypes, membershipRule, membershipRuleProcessingState, visibility, securityEnabled, mailEnabled, isAssignableToRole, onPremisesSyncEnabled]
+      top: 999
+      key: id
+      name: displayName
+    each:
+      all:
+        - { field: groupTypes, op: contains, value: DynamicMembership }
+        - { field: membershipRule, op: match, value: 'user\.(mail|otherMails|proxyAddresses|displayName|givenName|surname|companyName)\b', threshold: entra.dynamic-rule-external-attribute-pattern }
+        - { field: membershipRule, op: notmatch, value: 'user\.userType\s+-eq\s+"?Member"?', threshold: entra.dynamic-rule-member-guard-pattern }
+    evidence: "{displayName}: rule {membershipRule}"
+
+  - id: ENTRA-GROUP-ONBOARDING-NOT-ASSIGNED
+    title: Group that onboarding fills is assigned to no application
+    kind: broken
+    category: IAM
+    severity: high
+    entity: group
+    lens: both
+    why: "When the group that the joiner process fills is no longer assigned to the application it was meant to grant, every new hire lands in it and silently never reaches the app (or its provisioning). The groups are tenant-specific: list their object ids in the threshold; with the list empty the rule checks nothing."
+    fix: "Assign the group to the application again, or point the onboarding step at the group that is assigned and retire this one."
+    refs: ["NIST-800-53:AC-2(1)", "CIS-Controls-v8:6.1"]
+    query:
+      protocol: graph
+      path: /groups
+      select: [id, displayName]
+      expand: appRoleAssignments($select=id,resourceDisplayName)
+      key: id
+      name: displayName
+    each:
+      all:
+        - field: id
+          op: in
+          threshold: entra.onboarding-group-ids
+          value: []
+        - { field: appRoleAssignments, op: empty }
+    evidence: "{displayName}: onboarding group with no application assignment"
 
   # ======================================================================= devices ===
   - id: ENTRA-DEVICE-STALE
@@ -2971,3 +3623,427 @@ rules:
       name: displayName
     each: { field: status, op: eq, value: active }
     evidence: "{displayName} ({recommendationType}, priority {priority})"
+
+  - id: ENTRA-DOMAIN-FEDERATED
+    title: Verified domain signs in through federation
+    kind: misconfigured
+    category: AUT
+    severity: medium
+    entity: domain
+    why: "For a federated domain the federation server's token-signing key can mint a sign-in for any user of the domain (golden SAML), and its MFA claims decide whether Entra asks for MFA at all. Not wrong in itself, but each federated domain must be a known, reviewed fact. Uses the same domain query as m365.yaml."
+    fix: "Record the federation server's owner, patch level and signing-certificate rotation date, check federatedIdpMfaBehavior (see backlog), and plan the move to password hash sync with cloud MFA."
+    refs: ["MITRE-ATTACK:T1606.002", "MITRE-ATTACK:T1484.002", "NIST-800-53:IA-5(2)", "NIST-800-53:SC-12"]
+    query:
+      protocol: graph
+      path: /domains
+      select: [id, authenticationType, isVerified, isDefault, isInitial, passwordValidityPeriodInDays, supportedServices]
+      key: id
+    each:
+      all:
+        - { field: isVerified, op: eq, value: true }
+        - { field: authenticationType, op: eq, value: Federated }
+    evidence: "{id}: authenticationType {authenticationType}"
+
+  - id: ENTRA-CUSTOM-AUTH-EXTENSION-PRESENT
+    title: Custom authentication extension calls out to an external endpoint
+    kind: misconfigured
+    category: AUT
+    severity: medium
+    entity: auth-extension
+    why: "A custom authentication extension (token issuance start, attribute collection, OTP send) makes Entra call an HTTP endpoint during sign-in and can put claims from it into every token issued to the apps that use it. Legitimate but rare; an extension nobody can explain is persistence."
+    fix: "Confirm the owner, the target URL and the apps that use it; delete extensions no app uses. Accept the documented ones."
+    refs: ["MITRE-ATTACK:T1556", "NIST-800-53:CM-6", "NIST-800-53:IA-5"]
+    query:
+      protocol: graph
+      path: /identity/customAuthenticationExtensions
+      key: id
+      name: displayName
+    each: any
+    evidence: "{displayName}: calls {endpointConfiguration.targetUrl} ({description})"
+
+  - id: ENTRA-AU-NO-RESTRICTED-MANAGEMENT
+    title: No restricted-management administrative unit exists
+    kind: missing
+    category: IAM
+    severity: low
+    entity: tenant
+    why: "Without a restricted-management administrative unit any User, Helpdesk or Authentication Administrator can reset the password and MFA methods of the emergency-access and other sensitive accounts. Restricted management is the Entra-native way to fence them off."
+    fix: "Create a restricted-management administrative unit holding the emergency-access and tier-0 admin accounts and assign the roles that may manage them at that scope only."
+    refs: ["NIST-800-53:AC-6(5)", "NIST-800-53:AC-2(7)", "MITRE-ATTACK:T1098"]
+    query:
+      protocol: graph
+      path: /directory/administrativeUnits
+      select: [id, displayName, isMemberManagementRestricted, visibility, membershipType]
+      key: id
+      name: displayName
+    count:
+      op: lt
+      value: 1
+      where: { field: isMemberManagementRestricted, op: eq, value: true }
+    evidence: "{count} restricted-management administrative units among {rows}"
+
+  - id: ENTRA-LIFECYCLE-NO-LEAVER-WORKFLOW
+    title: No enabled Lifecycle Workflow handles leavers
+    kind: missing
+    category: IAM
+    severity: low
+    entity: tenant
+    lens: both
+    why: "Without a leaver workflow offboarding is a manual checklist; the 'disabled account still has ...' findings elsewhere in this pack are what a skipped checklist leaves behind. Needs Microsoft Entra ID Governance; without it the query fails and the rule reports unknown."
+    fix: "Enable the leaver templates (real-time employee termination, post-offboarding) and scope them to the HR-driven employee population."
+    refs: ["NIST-800-53:PS-4", "NIST-800-53:AC-2(3)", "CIS-Controls-v8:6.2"]
+    query:
+      protocol: graph
+      path: /identityGovernance/lifecycleWorkflows/workflows
+      select: [id, displayName, category, isEnabled, isSchedulingEnabled]
+      key: id
+      name: displayName
+    count:
+      op: lt
+      value: 1
+      where:
+        all:
+          - { field: category, op: eq, value: leaver }
+          - { field: isEnabled, op: eq, value: true }
+    evidence: "{count} enabled leaver workflows among {rows} workflows"
+
+  # ============================================================ sign-in and audit logs ===
+  # Bounded with relative dates ({DAYS_AGO:n}). The sign-in log returns interactive sign-ins only, keeps
+  # 30 days (7 without Entra ID P1) and does not support $select. Each rule keys its rows so that one
+  # finding stands for one account and protocol (or one event); the row count per key is not exposed.
+  - id: ENTRA-SIGNIN-LEGACY-AUTH-SUCCESS-RECENT
+    title: Successful sign-in over a legacy protocol in the last week
+    kind: broken
+    category: AUT
+    severity: high
+    entity: sign-in
+    why: "A successful IMAP, POP, SMTP AUTH, ActiveSync basic, EWS or other legacy sign-in is proof that the legacy-authentication block is missing, excluded or bypassed for this account - the protocol carries no MFA, so a sprayed password is enough. One finding per account and protocol."
+    fix: "Find the client from the IP and app (often a printer, scanner, script or old mail app), move it to modern authentication or a scoped exception, then confirm the block policy covers the account."
+    refs: [CIS-M365:5.2.2.3, "MITRE-ATTACK:T1078.004", "MITRE-ATTACK:T1110.003", "NIST-800-53:IA-2(1)"]
+    query:
+      protocol: graph
+      path: /auditLogs/signIns
+      filter: "createdDateTime ge {DAYS_AGO:7} and status/errorCode eq 0 and (clientAppUsed eq 'Exchange ActiveSync' or clientAppUsed eq 'IMAP4' or clientAppUsed eq 'POP3' or clientAppUsed eq 'Authenticated SMTP' or clientAppUsed eq 'Exchange Web Services' or clientAppUsed eq 'MAPI Over HTTP' or clientAppUsed eq 'Offline Address Book' or clientAppUsed eq 'Outlook Anywhere (RPC over HTTP)' or clientAppUsed eq 'Exchange Online PowerShell' or clientAppUsed eq 'AutoDiscover' or clientAppUsed eq 'Reporting Web Services' or clientAppUsed eq 'Other clients')"
+      maxPages: 20
+      key: "{userId}|{clientAppUsed}"
+      name: userPrincipalName
+    each: any
+    evidence: "{userPrincipalName}: {clientAppUsed} sign-in to {appDisplayName} from {ipAddress} ({location.countryOrRegion}) at {createdDateTime}, Conditional Access {conditionalAccessStatus}"
+
+  - id: ENTRA-SIGNIN-RISKY-SUCCESS-RECENT
+    title: Risky sign-in succeeded and nobody remediated it
+    kind: broken
+    category: AUT
+    severity:
+      field: riskLevelDuringSignIn
+      map: { high: high, medium: medium }
+      default: medium
+    entity: sign-in
+    why: "A successful sign-in that Identity Protection scored medium or high, and that is still at risk (not remediated by MFA, dismissed or confirmed safe), means the risk-based policy did not act. Each one is an account to look at today. Real risk levels need Entra ID P2 (others see 'hidden')."
+    fix: "Review the sign-in; if it was not the user, reset the password, revoke sessions and review the MFA methods; then make sure an enforced sign-in risk policy covers the account (ENTRA-CA-BASELINE-SIGNIN-RISK)."
+    refs: [CIS-M365:5.2.2.7, "MITRE-ATTACK:T1078.004", "NIST-800-53:SI-4", "NIST-800-53:IR-4"]
+    query:
+      protocol: graph
+      path: /auditLogs/signIns
+      filter: "createdDateTime ge {DAYS_AGO:7} and status/errorCode eq 0 and (riskLevelDuringSignIn eq 'high' or riskLevelDuringSignIn eq 'medium')"
+      maxPages: 20
+      key: "{userId}|{riskLevelDuringSignIn}"
+      name: userPrincipalName
+    each: { field: riskState, op: in, value: [atRisk, confirmedCompromised] }
+    evidence: "{userPrincipalName}: {riskLevelDuringSignIn} risk ({riskEventTypes_v2}), {riskState}, to {appDisplayName} from {ipAddress} ({location.countryOrRegion}) at {createdDateTime}"
+
+  # Role grants: activityDisplayName covers direct assignments, scoped assignments and PIM assignments
+  # (eligible and active); PIM requests and routine activations are left out by the pattern. The tier-0
+  # test matches the role template ids anywhere in the JSON text of targetResources (the role's id for
+  # PIM events, its Role.TemplateId modified property for direct ones).
+  - id: ENTRA-AUDIT-ROLE-ASSIGNMENT-RECENT
+    title: Directory role granted in the last two days
+    kind: misconfigured
+    category: IAM
+    severity: low
+    entity: audit-event
+    why: "Granting a role is the step every tenant takeover ends with. A daily list of new grants, checked against change records, catches the one nobody asked for while it is still fresh. Tier-0 roles have their own rule."
+    fix: "Confirm each grant against a request or change record; remove the ones nobody can explain and find out who made them."
+    refs: ["MITRE-ATTACK:T1098.003", "NIST-800-53:AC-2(4)", "NIST-800-53:AU-6", "CIS-Controls-v8:8.11"]
+    query:
+      protocol: graph
+      path: /auditLogs/directoryAudits
+      filter: "activityDateTime ge {DAYS_AGO:2} and category eq 'RoleManagement' and result eq 'success'"
+      maxPages: 20
+      key: id
+      name: activityDisplayName
+    each:
+      all:
+        - { field: activityDisplayName, op: match, value: '^Add (eligible |scoped )?member to role(?!.*(request|activat))', threshold: entra.audit-role-activity-pattern }
+        - { field: targetResources, op: notmatch, value: '(62e90394-69f5-4237-9190-012177145e10|e8611ab8-c189-46e8-94e1-60213ab1f814|7be44c8a-adaf-4e2a-84d6-ab2649e08a13|194ae4cb-b126-40b2-bd5b-6091b380977d|8ac3fc64-6eca-42ea-9e69-59f4c7b60eb2|b1be1c3e-b65d-4f19-8427-f6fa0d97feb9|9b895d92-2cd3-44c7-9d02-a6ac2d5ea5c3|158c047a-c907-4556-b7ef-446551a6b5f7|be2f45a1-457d-42af-a067-6ec1fa63bc45|8329153b-31d0-4727-b945-745eb3bc5f31|3a2c62db-5318-420d-8d74-23affee5d9d5)', threshold: entra.tier0-role-id-pattern }
+    evidence: "{activityDateTime}: {activityDisplayName} by {initiatedBy.user.userPrincipalName}{initiatedBy.app.displayName} - {targetResources[].displayName} {targetResources[].userPrincipalName}"
+
+  - id: ENTRA-AUDIT-TIER0-ROLE-ASSIGNMENT-RECENT
+    title: Tier-0 directory role granted in the last two days
+    kind: misconfigured
+    category: IAM
+    severity: high
+    entity: audit-event
+    why: "A new holder of Global, Privileged Role, Privileged Authentication, Security, Hybrid Identity, Conditional Access, Application, Cloud Application, External Identity Provider, Domain Name or Intune Administrator can take over the tenant. Every such grant needs a named request behind it, checked the next morning."
+    fix: "Confirm the grant against a change record today; if nobody asked for it, remove it, revoke the account's sessions and investigate who granted it."
+    refs: ["MITRE-ATTACK:T1098.003", "NIST-800-53:AC-2(4)", "NIST-800-53:AC-6(5)", "CIS-Controls-v8:8.11"]
+    query:
+      protocol: graph
+      path: /auditLogs/directoryAudits
+      filter: "activityDateTime ge {DAYS_AGO:2} and category eq 'RoleManagement' and result eq 'success'"
+      maxPages: 20
+      key: id
+      name: activityDisplayName
+    each:
+      all:
+        - { field: activityDisplayName, op: match, value: '^Add (eligible |scoped )?member to role(?!.*(request|activat))', threshold: entra.audit-role-activity-pattern }
+        - { field: targetResources, op: match, value: '(62e90394-69f5-4237-9190-012177145e10|e8611ab8-c189-46e8-94e1-60213ab1f814|7be44c8a-adaf-4e2a-84d6-ab2649e08a13|194ae4cb-b126-40b2-bd5b-6091b380977d|8ac3fc64-6eca-42ea-9e69-59f4c7b60eb2|b1be1c3e-b65d-4f19-8427-f6fa0d97feb9|9b895d92-2cd3-44c7-9d02-a6ac2d5ea5c3|158c047a-c907-4556-b7ef-446551a6b5f7|be2f45a1-457d-42af-a067-6ec1fa63bc45|8329153b-31d0-4727-b945-745eb3bc5f31|3a2c62db-5318-420d-8d74-23affee5d9d5)', threshold: entra.tier0-role-id-pattern }
+    evidence: "{activityDateTime}: {activityDisplayName} by {initiatedBy.user.userPrincipalName}{initiatedBy.app.displayName} - {targetResources[].displayName} {targetResources[].userPrincipalName}"
+
+  # ================================================= SaaS provisioning (SCIM) jobs and logs ===
+  # The job rules share one per-object query: every enterprise app (service principals tagged
+  # WindowsAzureActiveDirectoryIntegratedApp, gallery and non-gallery, at most 1000) is asked for its
+  # provisioning jobs; apps without provisioning return an empty list. Row shape (entity
+  # provisioning-job): the synchronizationJob (id, templateId, schedule.{interval,state,expiration},
+  # status.{code, countSuccessiveCompleteFailures, quarantine.*, lastExecution.*,
+  # lastSuccessfulExecution.*, lastSuccessfulExecutionWithExports.*, steadyStateLastAchievedTime,
+  # troubleshootingUrl}, synchronizationJobSettings) plus parent.{id, appId, displayName,
+  # accountEnabled} = the service principal; key "{parent.id}|{id}". The job id is the jobId that the
+  # provisioning log rows below carry, so the two can be joined in the store.
+  - id: ENTRA-PROVISIONING-JOB-QUARANTINE
+    title: Provisioning job to a SaaS app is in quarantine
+    kind: broken
+    category: HLT
+    severity: high
+    entity: provisioning-job
+    lens: both
+    why: "In quarantine Entra retries at most once a day and stops creating, updating and disabling users in the app: joiners never arrive and leavers keep their access there. The warning mail goes to the job's notification address, often a person who has left."
+    fix: "Open the job's provisioning logs, fix the cause (expired or revoked credential, a mapping the target rejects, a burst of target errors), then restart the job to clear the quarantine; set a monitored mailbox as the notification address."
+    refs: ["NIST-800-53:AC-2", "NIST-800-53:SI-4", "CIS-Controls-v8:6.1", "CIS-Controls-v8:6.2"]
+    query:
+      protocol: graph
+      path: /servicePrincipals/{id}/synchronization/jobs
+      for_each:
+        path: /servicePrincipals
+        filter: "tags/any(t:t eq 'WindowsAzureActiveDirectoryIntegratedApp')"
+        select: [id, appId, displayName, accountEnabled]
+        field: id
+        max: 1000
+      key: "{parent.id}|{id}"
+      name: parent.displayName
+    each: { field: status.code, op: eq, value: Quarantine }
+    evidence: "{parent.displayName}: job {id} ({templateId}) in quarantine since {status.quarantine.seriesBegan}, reason {status.quarantine.reason}, re-evaluated {status.quarantine.seriesCount} times, next attempt {status.quarantine.nextAttempt}; error {status.quarantine.error.code} {status.quarantine.error.message}; {status.troubleshootingUrl}"
+
+  - id: ENTRA-PROVISIONING-JOB-FAILING
+    title: Provisioning job keeps failing (the step before quarantine)
+    kind: broken
+    category: HLT
+    severity:
+      field: status.countSuccessiveCompleteFailures
+      ranges: [ { min: 3, value: high } ]
+      default: medium
+    entity: provisioning-job
+    lens: both
+    why: "A job whose last run failed, or that failed several runs in a row, is about to be quarantined; fixing it now keeps joiners and leavers flowing to the app."
+    fix: "Read status.lastExecution.error and the provisioning log of the last cycle; fix the credential, the mapping or the target before the quarantine threshold is reached."
+    refs: ["NIST-800-53:SI-4", "NIST-800-53:AC-2"]
+    query:
+      protocol: graph
+      path: /servicePrincipals/{id}/synchronization/jobs
+      for_each:
+        path: /servicePrincipals
+        filter: "tags/any(t:t eq 'WindowsAzureActiveDirectoryIntegratedApp')"
+        select: [id, appId, displayName, accountEnabled]
+        field: id
+        max: 1000
+      key: "{parent.id}|{id}"
+      name: parent.displayName
+    each:
+      all:
+        - { field: status.code, op: eq, value: Active }
+        - any:
+            - { field: status.countSuccessiveCompleteFailures, op: gt, value: 0, threshold: entra.provisioning-max-successive-failures }
+            - { field: status.lastExecution.state, op: eq, value: Failed }
+            - { field: status.lastExecution.error.code, op: notempty }
+    evidence: "{parent.displayName}: job {id} last run {status.lastExecution.state} at {status.lastExecution.timeEnded}, {status.countSuccessiveCompleteFailures} successive failures; error {status.lastExecution.error.code} {status.lastExecution.error.message}"
+
+  - id: ENTRA-PROVISIONING-JOB-STALE-EXPORT
+    title: Active provisioning job has exported nothing for weeks
+    kind: broken
+    category: HLT
+    severity: medium
+    entity: provisioning-job
+    lens: both
+    why: "A job can look healthy while it skips every object: nobody new is in scope, or onboarding fills a group that is not the one assigned to the app. No export for weeks in an organisation that hires people is that symptom seen from the job. Tenants with no joiners for long periods raise the threshold."
+    fix: "Compare the app's assigned groups with the group onboarding fills; provision one recent hire on demand to prove the path; check the scoping filters."
+    refs: ["NIST-800-53:AC-2", "CIS-Controls-v8:6.1"]
+    query:
+      protocol: graph
+      path: /servicePrincipals/{id}/synchronization/jobs
+      for_each:
+        path: /servicePrincipals
+        filter: "tags/any(t:t eq 'WindowsAzureActiveDirectoryIntegratedApp')"
+        select: [id, appId, displayName, accountEnabled]
+        field: id
+        max: 1000
+      key: "{parent.id}|{id}"
+      name: parent.displayName
+    each:
+      all:
+        - { field: status.code, op: eq, value: Active }
+        - any:
+            - { field: status.lastSuccessfulExecutionWithExports.timeEnded, op: absent }
+            - { field: status.lastSuccessfulExecutionWithExports.timeEnded, op: age-gt, value: 14, threshold: entra.provisioning-export-max-age-days }
+    evidence: "{parent.displayName}: job {id} last exported {status.lastSuccessfulExecutionWithExports.timeEnded} ({status.lastSuccessfulExecutionWithExports.countExported} objects); last run {status.lastExecution.timeEnded}"
+
+  - id: ENTRA-PROVISIONING-JOB-PAUSED
+    title: Provisioning job to an enabled app is paused, never run or not configured
+    kind: misconfigured
+    category: CFG
+    severity:
+      field: status.code
+      map: { NotConfigured: low }
+      default: medium
+    entity: provisioning-job
+    lens: both
+    why: "Provisioning was set up and then stopped, or never started, while the app is still in use: its users are being created and removed by hand, or not at all, without anyone deciding that."
+    fix: "Start the job (and fix whatever made someone pause it), or delete it and record that the app is provisioned manually with an owner for joiners and leavers."
+    refs: ["NIST-800-53:AC-2", "NIST-800-53:CM-3"]
+    query:
+      protocol: graph
+      path: /servicePrincipals/{id}/synchronization/jobs
+      for_each:
+        path: /servicePrincipals
+        filter: "tags/any(t:t eq 'WindowsAzureActiveDirectoryIntegratedApp')"
+        select: [id, appId, displayName, accountEnabled]
+        field: id
+        max: 1000
+      key: "{parent.id}|{id}"
+      name: parent.displayName
+    each:
+      all:
+        - { field: parent.accountEnabled, op: eq, value: true }
+        - { field: status.code, op: ne, value: Quarantine }
+        - any:
+            - { field: status.code, op: in, value: [Paused, NotRun, NotConfigured] }
+            - { field: schedule.state, op: in, value: [Paused, Disabled] }
+    evidence: "{parent.displayName}: job {id} ({templateId}) status {status.code}, schedule {schedule.state}"
+
+  - id: ENTRA-PROVISIONING-JOB-REDUCED-SCHEDULE
+    title: Provisioning job runs less often than the normal cycle
+    kind: misconfigured
+    category: CFG
+    severity: low
+    entity: provisioning-job
+    lens: maintenance
+    why: "The normal cycle is about every 40 minutes; a job on a schedule of hours or days delivers joiners, changes and leavers to the app late. The rule accepts any interval of 40 minutes or less (tune the pattern with the threshold); quarantined jobs are left to their own rule."
+    fix: "Reset the job's schedule to the default interval, or record why the app needs a slower one."
+    refs: ["NIST-800-53:AC-2"]
+    query:
+      protocol: graph
+      path: /servicePrincipals/{id}/synchronization/jobs
+      for_each:
+        path: /servicePrincipals
+        filter: "tags/any(t:t eq 'WindowsAzureActiveDirectoryIntegratedApp')"
+        select: [id, appId, displayName, accountEnabled]
+        field: id
+        max: 1000
+      key: "{parent.id}|{id}"
+      name: parent.displayName
+    each:
+      all:
+        - { field: status.code, op: eq, value: Active }
+        - { field: schedule.state, op: eq, value: Active }
+        - { field: schedule.interval, op: notmatch, value: '^PT([1-9]|[1-3][0-9]|40)M$', threshold: entra.provisioning-interval-ok-pattern }
+    evidence: "{parent.displayName}: job {id} runs every {schedule.interval}"
+
+  # Provisioning log (last 7 days). Filters support eq, contains, gt and lt only, are case-sensitive and
+  # $select is not supported. Failures are keyed per job and error code, skips per job and source object.
+  # The failure patterns match the JSON text of errorInformation (errorCode and reason together).
+  - id: ENTRA-PROVISIONING-PAYLOAD-REJECTED-RECENT
+    title: SaaS app rejects what provisioning sends (attribute mapping)
+    kind: broken
+    category: HLT
+    severity: high
+    entity: provisioning-event
+    lens: both
+    why: "The target answered with a bad-request or invalid-payload error: one attribute mapping sends a value or an operation the app does not accept, and every object that carries it fails - often thousands at once, until the job is quarantined."
+    fix: "Open a failed event's steps to find the attribute; remove or correct that mapping (or its expression), test with provision on demand on one user, then restart the job."
+    refs: ["NIST-800-53:AC-2", "NIST-800-53:SI-4", "CIS-Controls-v8:6.1"]
+    query:
+      protocol: graph
+      path: /auditLogs/provisioning
+      filter: "activityDateTime gt {DAYS_AGO:7} and provisioningStatusInfo/status eq 'failure'"
+      maxPages: 100
+      key: "{jobId}|{provisioningStatusInfo.errorInformation.errorCode}"
+      name: servicePrincipal.displayName
+    each: { field: provisioningStatusInfo.errorInformation, op: match, value: '(BadRequest|InvalidPayload|InvalidPatch|invalid.{0,30}(patch|payload|request|value)|status code 400\b)', threshold: entra.provisioning-payload-error-pattern }
+    evidence: "{servicePrincipal.displayName}{servicePrincipal[].displayName} (job {jobId}): {provisioningStatusInfo.errorInformation.errorCode} on {provisioningAction} of {sourceIdentity.identityType} {sourceIdentity.displayName} at {activityDateTime}: {provisioningStatusInfo.errorInformation.reason}"
+
+  - id: ENTRA-PROVISIONING-MATCH-CONFLICT-RECENT
+    title: SaaS app already holds the object under another identity (matching conflict)
+    kind: broken
+    category: HLT
+    severity: medium
+    entity: provisioning-event
+    lens: both
+    why: "The target reports that a user or group with the same email or name already exists: the app holds the person under another username, and the job matches on an attribute that differs (UPN against email, for example), so it tries to create a duplicate and fails."
+    fix: "Add the target's key attribute (often email) as a matching attribute with the right precedence, or clean the duplicate in the app; then restart the job."
+    refs: ["NIST-800-53:AC-2", "NIST-800-53:IA-4", "CIS-Controls-v8:6.1"]
+    query:
+      protocol: graph
+      path: /auditLogs/provisioning
+      filter: "activityDateTime gt {DAYS_AGO:7} and provisioningStatusInfo/status eq 'failure'"
+      maxPages: 100
+      key: "{jobId}|{provisioningStatusInfo.errorInformation.errorCode}"
+      name: servicePrincipal.displayName
+    each: { field: provisioningStatusInfo.errorInformation, op: match, value: '(EntryConflict|Duplicate|AlreadyExists|already exists|status code 409\b)', threshold: entra.provisioning-conflict-error-pattern }
+    evidence: "{servicePrincipal.displayName}{servicePrincipal[].displayName} (job {jobId}): {provisioningStatusInfo.errorInformation.errorCode} on {provisioningAction} of {sourceIdentity.identityType} {sourceIdentity.displayName} at {activityDateTime}: {provisioningStatusInfo.errorInformation.reason}"
+
+  - id: ENTRA-PROVISIONING-FAILURES-RECENT
+    title: Provisioning to a SaaS app failed in the last week
+    kind: broken
+    category: HLT
+    severity: medium
+    entity: provisioning-event
+    lens: both
+    why: "Any other failure of the provisioning service to create, update or disable an object in the app (rejected mappings and matching conflicts have their own rules). One finding per app and error code; the latest event is the sample."
+    fix: "Read the reason and the event's steps, fix the cause in the app, the mapping or the source object, then retry with provision on demand."
+    refs: ["NIST-800-53:AC-2", "NIST-800-53:SI-4", "CIS-Controls-v8:6.1"]
+    query:
+      protocol: graph
+      path: /auditLogs/provisioning
+      filter: "activityDateTime gt {DAYS_AGO:7} and provisioningStatusInfo/status eq 'failure'"
+      maxPages: 100
+      key: "{jobId}|{provisioningStatusInfo.errorInformation.errorCode}"
+      name: servicePrincipal.displayName
+    each:
+      any:
+        - { field: provisioningStatusInfo.errorInformation, op: absent }
+        - all:
+            - { field: provisioningStatusInfo.errorInformation, op: notmatch, value: '(BadRequest|InvalidPayload|InvalidPatch|invalid.{0,30}(patch|payload|request|value)|status code 400\b)', threshold: entra.provisioning-payload-error-pattern }
+            - { field: provisioningStatusInfo.errorInformation, op: notmatch, value: '(EntryConflict|Duplicate|AlreadyExists|already exists|status code 409\b)', threshold: entra.provisioning-conflict-error-pattern }
+    evidence: "{servicePrincipal.displayName}{servicePrincipal[].displayName} (job {jobId}): {provisioningStatusInfo.errorInformation.errorCode} on {provisioningAction} of {sourceIdentity.identityType} {sourceIdentity.displayName} at {activityDateTime}: {provisioningStatusInfo.errorInformation.reason}"
+
+  - id: ENTRA-PROVISIONING-SKIPPED-NOT-ENTITLED-RECENT
+    title: Assigned user skipped by provisioning as "not effectively entitled"
+    kind: broken
+    category: IAM
+    severity: medium
+    entity: provisioning-event
+    lens: both
+    why: "Entra skips an object as not effectively entitled when its assignment to the app is broken or only carries the default-access role: the person was given the app, the job runs, and they still never arrive in it. Unassigned users are skipped for other reasons and are not matched by the default pattern."
+    fix: "Remove and re-add the user's (or group's) assignment with a real app role; if the app has only the default-access role, assign the role the provisioning mapping expects."
+    refs: ["NIST-800-53:AC-2", "CIS-Controls-v8:6.1"]
+    query:
+      protocol: graph
+      path: /auditLogs/provisioning
+      filter: "activityDateTime gt {DAYS_AGO:7} and provisioningStatusInfo/status eq 'skipped'"
+      maxPages: 100
+      key: "{jobId}|{sourceIdentity.id}"
+      name: sourceIdentity.displayName
+    each:
+      any:
+        - { field: 'provisioningSteps[].description', op: match, value: '(NotEffectivelyEntitled|not effectively entitled)', threshold: entra.provisioning-skip-not-entitled-pattern }
+        - { field: 'provisioningSteps[].details', op: match, value: '(NotEffectivelyEntitled|not effectively entitled)', threshold: entra.provisioning-skip-not-entitled-pattern }
+    evidence: "{servicePrincipal.displayName}{servicePrincipal[].displayName} (job {jobId}): {sourceIdentity.identityType} {sourceIdentity.displayName} skipped at {activityDateTime}: {provisioningSteps[].description}"

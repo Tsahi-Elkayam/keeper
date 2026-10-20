@@ -1,8 +1,9 @@
 # Backlog - certificates, registers, obligations and imported tools
 
-Checks that `rules/certificates.yaml`, `rules/registers.yaml`, `rules/obligations.yaml`,
-`rules/pingcastle.yaml`, `rules/maester.yaml`, `rules/scubagear.yaml` and `rules/prowler.yaml` cannot
-express yet. One line each: the check, what it needs, and where it came from.
+Checks that `rules/certificates.yaml`, `rules/domain-controller-certificates.yaml`,
+`rules/registers.yaml`, `rules/obligations.yaml`, `rules/pingcastle.yaml`, `rules/maester.yaml`,
+`rules/scubagear.yaml` and `rules/prowler.yaml` cannot express yet. One line each: the check, what it
+needs, and where it came from.
 
 Source labels: `tls-runner`, `file-runner`, `store-runner`, `evaluator`, `loader` = the engine code
 that sets the limit; `schema` = the review and register migrations and the register handler;
@@ -17,11 +18,14 @@ that sets the limit; `schema` = the review and register migrations and the regis
 - Revoked certificates: the handshake uses no revocation check, so a revoked certificate passes - needs an opt-in revocation mode (CRL/OCSP reachable from the scan host). Source: tls-runner.
 - Legacy protocol or weak suite *accepted* next to a modern one: only the negotiated protocol and suite are visible - needs per-version and per-suite probing. Source: tls-runner.
 - A server that offers only protocols Keeper's own host has disabled fails the handshake and appears as a failed query (unknown), not as TLS-LEGACY-PROTOCOL - needs the runner to report "no common protocol" as a row. Source: tls-runner.
-- TLS 1.3 support: the negotiated version also depends on Keeper's host TLS stack, so "no TLS 1.3" cannot be judged reliably - needs the probing above. Source: tls-runner.
+- A failed handshake is never a row: a domain controller that does not answer LDAPS at all (no usable certificate, so Schannel offers none) is only a failed target in coverage, although for DCs the absence is the finding - needs a `reachable: false` row with the failure text, or a store rule over `coverage` (scope target, state failed, newest run of each tls system). Source: tls-runner.
+- TLS 1.3 support: the negotiated version also depends on Keeper's host TLS stack, so "no TLS 1.3" cannot be judged reliably - needs the probing above (a TLS-PROTOCOL-NO-TLS13 rule waits for it). Source: tls-runner.
+- Weak signatures inside the chain: TLS-CHAIN-WEAK-SIGNATURE relies on the platform's HasWeakSignature chain status, which the scan host's crypto policy sets for MD5 but may not set for a SHA-1 intermediate - needs the signature algorithm of every chain certificate in the row. Source: tls-runner.
+- Internal names in SANs (unqualified host names, .local, .lan, .corp and similar): forbidden for public CAs but normal on a private CA, so a rule fires on every internal certificate - needs the issuer classified as public or private (per target, or a public-issuer pattern). Source: tls-runner.
+- The TLS hygiene checks exist twice: a per-target file sees only its own targets, so domain-controller-certificates.yaml repeats the protocol, key, SAN and issuer checks of certificates.yaml - needs a targets include or extends between files. Source: loader.
 - Missing intermediate sent by the server: the chain is the one Keeper's host builds (it may fetch intermediates itself), so TLS-CHAIN-INCOMPLETE can miss it - needs the count of certificates the server presented. Source: pki (TLS sweep defect).
 - IP-address SANs: `sans` holds DNS names only, so a certificate issued for IP addresses only is reported by TLS-NO-SAN - needs IP SANs in the row. Source: tls-runner.
-- Extended key usage: a domain controller certificate without the KDC Authentication EKU (clients log Kerberos event 19, smart-card and PKINIT logon fail), or a server certificate without Server Authentication, cannot be checked - needs an `eku` row field (LDAPS on 636 presents the DC certificate) or an ldap/eventlog rule. Source: field (a DC's KDC certificate lacked the KDC EKU).
-- TLS interception: an endpoint whose certificate comes from an inspection proxy's CA chains to a trusted root and looks valid; certificate-pinned agents (endpoint protection, sign-in) then fail - needs an expected-issuer pattern per target. TLS-CHAIN-UNTRUSTED-ROOT catches it only when Keeper's host does not trust the proxy CA. Source: field (security agent cloud traffic intercepted, agent offline for weeks).
+- TLS interception per target: TLS-ISSUER-UNEXPECTED and DC-CERT-ISSUER-UNEXPECTED judge one expected-issuer pattern per rule (a threshold, which an override can change per rule and entity), so "this endpoint must be issued by that CA" for many different endpoints needs per-target expected issuers (an issuer pattern on each targets entry, or a labels map). Source: tls-runner; field (security agent cloud traffic intercepted, agent offline for weeks).
 - Same certificate or key on many endpoints, and "certificate changed since the last scan" - needs cross-row and run-to-run comparison. Source: evaluator.
 - OCSP stapling, HSTS, Certificate Transparency SCTs and key usage are not in the row. Source: tls-runner.
 - Certificates no TLS scan reaches (appliance token-signing, federation, code-signing, CA certificates) can be tracked only as key dates (REG-KEY-CERTIFICATE-DUE). Source: vmware.
@@ -44,23 +48,36 @@ that sets the limit; `schema` = the review and register migrations and the regis
 - No purchase-order register: open orders and quotes waiting for a "needed or close" or seat-count decision are invisible. Source: field (open order and quote awaiting a decision).
 - Cap increases requested from a vendor have no state: a promised increase that never arrived shows only once seats or seats_used are updated. Source: field (free-tier user cap exceeded while an increase was believed done).
 - vendor has no legal-retention or data-export fields: a sole supplier holding records that must be kept for many years and migrated to any successor is prompted only through the exit_plan fix text. Source: field (sole supplier holding sensitive records under a short extension).
-- Initiative register has no rules yet (in-progress initiatives with no owner, savings measured only by estimate). Source: schema.
+- No as-of date per field: REG-LIC-USAGE-STALE and REG-VEN-ROW-STALE judge the whole row's updated_at, so any save of the row (even an unchanged one) counts as a fresh reading of seats_used or of the vendor's facts - needs seats_used_on on licence and a reviewed_on on vendor. Source: schema.
+- No cancellation terms: a licence that can be cancelled at any time needs an exception on REG-LIC-AUTORENEW-SHORT-NOTICE - needs a cancellation-notice (or cancellable-any-time) field on licence and contract. Source: schema.
 
 ## Obligations
 
-- No obligation catalogue: attestations for misspelt or unknown obligation ids cannot be flagged, and per-target obligations know only targets attested at least once - needs an obligation and expected-target list. Source: schema.
+- No obligation catalogue: OBL-ATTESTATION-UNKNOWN-ID finds attestations whose id maps to no rule only through the naming convention (obligation a.b-c -> rule OBL-A-B-C), and per-target obligations still know only the targets attested at least once - "never attested for the second CA" is invisible while the first CA is attested - needs an obligation table with its expected targets. Source: schema.
 - `count: none` cannot use a threshold because the interval is not visible in SQL, so each obligation reads one aggregate row per target instead. Source: store-runner, evaluator.
-- Machine proof belongs in other packs: krbtgt pwdLastSet (ldap), GPO backup output, system-state backup records (backup integrations); this pack reads attestations only. Source: obligations (ProvedBy column).
+- Machine proof belongs in other packs: PC-KRBTGT-AGE proves the krbtgt rotation from the PingCastle report (with the obligation's own threshold); an ldap rule on krbtgt pwdLastSet would prove it without PingCastle, and GPO backup output and system-state backup records still need backup integrations. This pack reads attestations only. Source: obligations (ProvedBy column).
 - change.code-review is per change, but Keeper cannot see which scripts and automations run in production, or whether they are signed - needs an inventory source (scheduled tasks and automation accounts with Authenticode status, or a CI pipeline integration). Source: field (security required review, a secrets check, a staging run and a signature before identity scripts run in production).
-- Further obligations suggested by the PKI catalogue were not added: CA key backup, CA restore test, certificate template review, CA access review. Source: pki.
 
 ## Imported tools
 
 - Newest file wins: one PingCastle report per domain, one Prowler file per account, or several tenants cannot be read by one rule - needs an all-files mode. Source: file-runner.
 - JSON items take the first match only: ScubaGear's JSON nests controls as Results.<product>[].Controls[], which cannot be flattened, so controls are read from ScubaResults.csv. Source: file-runner (RowValues.ItemsOf).
-- No file-level row: stale-report rules read a small metadata object (PingCastle GenerationDate, Maester PowerShellInfo, ScubaGear MetaData); Prowler's OCSF file is a bare array, so Prowler has no stale-report rule. Source: file-runner.
-- emit kind and category are fixed per rule: a tool's own per-row category (Prowler unmapped.categories, Maester tags) cannot set the Keeper category; PingCastle is split into rules by XPath instead. Source: loader.
+- No file-level row: stale-report rules read a small metadata object (PingCastle GenerationDate, ScubaGear MetaData) or the root object (Maester: the whole results file, tests included, becomes one row and is stored again in row_seen); Prowler's OCSF file is a bare array, so PROWLER-REPORT-STALE counts findings whose own event time is recent instead of reading a run time - needs one row per file (_file, _modified and the root's scalar fields). Source: file-runner.
+- emit kind, category and refs are fixed per rule: a tool's own per-row category or framework mapping (Prowler unmapped.categories and unmapped.compliance, Maester tags) cannot set the Keeper category or refs, so every imported finding carries the rule's static refs; PingCastle is split into rules by XPath instead. Source: loader.
+- No field-to-field comparison: a condition compares a field with a literal or a threshold, so "the Maester module that ran (CurrentVersion) is not the published one (LatestVersion)" cannot be written - needs a value that names another field. Source: evaluator.
+- Counts are absolute: "more than a tenth of the Maester tests skipped or not run" cannot be written, and an absolute limit fires on healthy tenants whose licences skip many tests - needs a share (`count: { pct: ... }`). Source: evaluator.
+- Exceptions do not expire: SCUBA-OMITTED and SCUBA-MANUAL-CHECK ask for an exception as the record of a person's decision, but an override has no expiry or review date, so the decision is never asked again. Source: schema.
 - PingCastle's domain name is on the report root, not on the risk rows, so evidence carries the file name; rule Details are exported only at the Full level. Source: file-runner, tool-docs.
 - Stale data inside a tool (an inventory showing week-old data) is judged only by report age; tools with an API need their own pack. Source: field (inventory tool data a week behind).
-- ScubaGear omissions (accepted risks with an expiry in its configuration) and Prowler MANUAL checks are not surfaced. Source: tool-docs.
 - Many Maester tests carry no severity; their failures default to medium. Source: tool-docs.
+
+## Proposals reviewed and not shipped
+
+From `docs/proposals/certificates-registers-imports.md`; the rest of that document is now rules.
+
+- PC-SCORE-STALE-OBJECTS, -PRIVILEGED, -TRUSTS, -ANOMALIES: a duplicate. The global score is the worst category score, so the worst category's rule restates PC-GLOBAL-SCORE, and each category's risk rules are already findings with points-based severity (PC-STALE-OBJECTS, PC-PRIVILEGED-ACCOUNTS, PC-TRUSTS, PC-ANOMALIES). If per-category targets are wanted, replace PC-GLOBAL-SCORE with them rather than add them. Source: pingcastle.yaml.
+- MAESTER-VERSION-OUTDATED: needs the field-to-field comparison above. Source: evaluator.
+- MAESTER-SKIPPED-MANY: needs the share-based count above; a fixed limit fires on tenants without the licences many tests need. Source: evaluator.
+- REG-VEN-REFERENCE-DANGLING: cannot occur. The store opens with foreign keys on and contract.vendor_id and licence.vendor_id reference vendor, so a dangling vendor id is refused on write. Source: schema.
+- TLS-SAN-INTERNAL-NAME: waits for the public/private issuer classification above. Source: tls-runner.
+- TLS-PROTOCOL-NO-TLS13: waits for per-version probing (see TLS 1.3 support above). Source: tls-runner.

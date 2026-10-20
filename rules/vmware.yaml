@@ -12,6 +12,10 @@ integration: vcenter
 #              bare string, boolean or map (appliance health colours, SSH, time sync, backup schedules and
 #              job details), because a bare value cannot become a row. The session id is the same for both.
 # Field names follow the vSphere Automation API reference (8.0.3 data structures).
+# Per-VM rules use for_each: the VM list (/api/vcenter/vm, powered-on only) is read first, then one GET per
+# VM; each row carries the VM summary as "parent". Capped at 2000 VMs - beyond that the result is partial.
+# Still not readable: a bare array of strings (/api/appliance/local-accounts, /rest/appliance/ntp) gives
+# no rows, so no rule counts one - an empty answer would look like a pass.
 defaults:
   lens: maintenance
   refresh: 1d
@@ -61,6 +65,43 @@ rules:
         - { field: power_state, op: ne, value: POWERED_ON }
     evidence: "{name}: power state {power_state}"
 
+  - id: VMW-HOST-NONE
+    title: vCenter returned no ESXi hosts
+    kind: missing
+    category: MON
+    severity: medium
+    entity: instance
+    why: An empty host list means the review account cannot read the inventory, or this vCenter manages no hosts; either way every other host rule stays silent and the result looks clean.
+    fix: Give the review account the read-only role on the vCenter root object with propagation, then rerun the scan.
+    refs: [NIST-800-53:CA-7]
+    query:
+      protocol: http
+      path: /api/vcenter/host
+      paging: none
+      key: host
+      name: name
+    count: none
+    evidence: "the host list is empty"
+
+  - id: VMW-HOST-STANDALONE
+    title: ESXi host is not in a cluster
+    kind: misconfigured
+    category: AVL
+    severity: low
+    entity: host
+    why: A host outside every cluster gets no HA restart of its VMs when it fails and no DRS evacuation before patching, so its VMs depend on that one machine.
+    fix: Move the host into a cluster, or record why it stands alone (witness, management or licensing host).
+    refs: [NIST-800-53:CP-10]
+    query:
+      protocol: http
+      path: /api/vcenter/host
+      params: { standalone: "true" }
+      paging: none
+      key: host
+      name: name
+    each: any
+    evidence: "{name}: not in a cluster, connection {connection_state}, power {power_state}"
+
   # ---- virtual machines ----------------------------------------------------------------------
 
   - id: VMW-VM-CONFIG-UNAVAILABLE
@@ -96,6 +137,124 @@ rules:
       name: name
     each: { field: power_state, op: eq, value: SUSPENDED }
     evidence: "{name}: suspended"
+
+  # ---- per VM (for_each over the powered-on VMs) ---------------------------------------------
+  # Tools: run_state NOT_RUNNING / RUNNING / EXECUTING_SCRIPTS; version_status NOT_INSTALLED, CURRENT,
+  # UNMANAGED (guest-managed open-vm-tools), TOO_OLD_UNSUPPORTED, SUPPORTED_OLD, SUPPORTED_NEW, TOO_NEW,
+  # BLACKLISTED. version_status can be missing when the Tools are too old to report it.
+
+  - id: VMW-VM-TOOLS-NOT-RUNNING
+    title: VMware Tools is installed but not running in a powered-on VM
+    kind: broken
+    category: AVL
+    severity: medium
+    entity: vm
+    why: Without running Tools the guest cannot be quiesced, so image-level backups are only crash-consistent while the job still reports success; guest shutdown and heartbeat monitoring stop working too.
+    fix: Start the Tools service in the guest (or reinstall it) and confirm the VM reports Tools running.
+    refs: [NIST-800-53:CP-9]
+    query:
+      protocol: http
+      path: /api/vcenter/vm/{vm}/tools
+      for_each: { path: /api/vcenter/vm, params: { power_states: POWERED_ON }, paging: none, field: vm, max: 2000 }
+      paging: none
+      key: "{parent.vm}"
+      name: parent.name
+    each:
+      all:
+        - { field: run_state, op: eq, value: NOT_RUNNING }
+        - any:
+            - { field: version_status, op: absent }
+            - { field: version_status, op: ne, value: NOT_INSTALLED }
+    evidence: "{parent.name}: Tools {run_state}, version {version} ({version_status})"
+
+  - id: VMW-VM-TOOLS-NOT-INSTALLED
+    title: Powered-on VM has no VMware Tools
+    kind: missing
+    category: AVL
+    severity: medium
+    entity: vm
+    why: A VM without Tools cannot be quiesced for backup, shut down cleanly by the host or watched by HA guest monitoring, and runs with the slower generic drivers.
+    fix: Install VMware Tools, or the distribution's open-vm-tools package on Linux.
+    refs: [NIST-800-53:CP-9]
+    query:
+      protocol: http
+      path: /api/vcenter/vm/{vm}/tools
+      for_each: { path: /api/vcenter/vm, params: { power_states: POWERED_ON }, paging: none, field: vm, max: 2000 }
+      paging: none
+      key: "{parent.vm}"
+      name: parent.name
+    each: { field: version_status, op: eq, value: NOT_INSTALLED }
+    evidence: "{parent.name}: VMware Tools not installed"
+
+  - id: VMW-VM-TOOLS-UNSUPPORTED
+    title: VM runs a VMware Tools version that is unsupported or flagged as defective
+    kind: broken
+    lens: both
+    category: LCM
+    severity:
+      field: version_status
+      map: { BLACKLISTED: high, TOO_OLD_UNSUPPORTED: medium, TOO_NEW: medium }
+      default: medium
+    entity: vm
+    refresh: 7d
+    why: The vendor marks a Tools version as defective when it has a serious bug, and as too old or too new when it no longer works correctly with the host; drivers and quiescing in the guest depend on it.
+    fix: Upgrade Tools to the version the host offers (or the current open-vm-tools package), in the VM's next maintenance window.
+    refs: [NIST-800-53:SI-2]
+    query:
+      protocol: http
+      path: /api/vcenter/vm/{vm}/tools
+      for_each: { path: /api/vcenter/vm, params: { power_states: POWERED_ON }, paging: none, field: vm, max: 2000 }
+      paging: none
+      key: "{parent.vm}"
+      name: parent.name
+    each: { field: version_status, op: in, value: [BLACKLISTED, TOO_OLD_UNSUPPORTED, TOO_NEW] }
+    evidence: "{parent.name}: Tools {version} is {version_status}"
+
+  - id: VMW-VM-TOOLS-OUTDATED
+    title: VM's VMware Tools has a newer version available
+    kind: broken
+    category: LCM
+    severity: low
+    entity: vm
+    refresh: 7d
+    why: Outdated Tools miss driver and security fixes; the gap grows with every host upgrade.
+    fix: Upgrade Tools in a maintenance window, or set the upgrade policy to upgrade at power cycle.
+    refs: [NIST-800-53:SI-2]
+    query:
+      protocol: http
+      path: /api/vcenter/vm/{vm}/tools
+      for_each: { path: /api/vcenter/vm, params: { power_states: POWERED_ON }, paging: none, field: vm, max: 2000 }
+      paging: none
+      key: "{parent.vm}"
+      name: parent.name
+    each: { field: version_status, op: eq, value: SUPPORTED_OLD }
+    evidence: "{parent.name}: Tools {version} ({version_status}), upgrade policy {upgrade_policy}"
+
+  - id: VMW-VM-ISO-CONNECTED
+    title: Powered-on VM has an ISO image connected
+    kind: misconfigured
+    category: HYG
+    severity: low
+    entity: vm
+    why: A connected ISO pins the VM - vMotion and DRS fail when the image sits on storage the target host cannot see, maintenance mode stalls on it, and installer media stays readable inside the guest.
+    fix: Disconnect the CD-ROM (and clear "connect at power on") once the installation or update is done.
+    refs: [NIST-800-53:CM-7]
+    # /rest is used because /api answers the VM's devices as a map keyed by device id; /rest renders it
+    # as [{key, value}]. Conditions over cdroms[] match any element: a VM with two CD-ROMs could pair one
+    # device's backing with the other's state (rare; see the backlog's element-wise gap).
+    query:
+      protocol: http
+      path: /rest/vcenter/vm/{vm}
+      for_each: { path: /api/vcenter/vm, params: { power_states: POWERED_ON }, paging: none, field: vm, max: 2000 }
+      paging: none
+      items: value
+      key: "{parent.vm}"
+      name: parent.name
+    each:
+      all:
+        - { field: "cdroms[].value.backing.type", op: eq, value: ISO_FILE }
+        - { field: "cdroms[].value.state", op: eq, value: CONNECTED }
+    evidence: "{parent.name}: CD-ROM connected to {cdroms[].value.backing.iso_file}"
 
   # ---- datastores ----------------------------------------------------------------------------
 
@@ -359,6 +518,181 @@ rules:
     each: { field: status, op: ne, value: HEALTHY }
     evidence: "database status {status}: {messages[].message.default_message}"
 
+  - id: VMW-VCSA-HEALTH-CHECK-STALE
+    title: Appliance health check has not run recently
+    kind: broken
+    category: MON
+    severity: low
+    entity: appliance
+    why: Every appliance health colour comes from the last health check; when the check stops running the colours stay green while nothing is being measured.
+    fix: Check the appliance management service (applmgmt) and restart it; the timestamp should move within minutes.
+    refs: [NIST-800-53:SI-4]
+    query:
+      protocol: http
+      path: /rest/appliance/health/system/lastcheck
+      paging: none
+      key: "-"
+    each: { field: value, op: age-gt, value: 1, threshold: vmware.health-check-max-age-days }
+    evidence: "last appliance health check {value}"
+
+  # ---- vCenter services (vcenter.services; /rest renders the map as [{key, value}]) --------------
+  # startup_type MANUAL / AUTOMATIC / DISABLED; state STARTING / STOPPING / STARTED / STOPPED;
+  # health DEGRADED / HEALTHY / HEALTHY_WITH_WARNINGS.
+
+  - id: VMW-VC-SERVICE-AUTO-STOPPED
+    title: vCenter service set to start automatically is not running
+    kind: broken
+    category: AVL
+    severity: high
+    entity: service
+    refresh: 6h
+    why: The API still answers while a stopped service quietly takes its feature with it - content library, lifecycle manager, the token service or the performance charts.
+    fix: Start the service from the appliance management interface and read its log for why it stopped.
+    refs: [NIST-800-53:SI-4]
+    query:
+      protocol: http
+      path: /rest/vcenter/services
+      paging: none
+      key: key
+      name: value.name_key
+    each:
+      all:
+        - { field: value.startup_type, op: eq, value: AUTOMATIC }
+        - { field: value.state, op: ne, value: STARTED }
+    evidence: "{key}: startup {value.startup_type}, state {value.state}"
+
+  - id: VMW-VC-SERVICE-UNHEALTHY
+    title: Running vCenter service reports degraded health or warnings
+    kind: broken
+    category: HLT
+    severity:
+      field: value.health
+      map: { DEGRADED: high, HEALTHY_WITH_WARNINGS: medium }
+      default: medium
+    entity: service
+    refresh: 6h
+    why: A degraded service is running but not functional; warnings usually precede it.
+    fix: Act on the service's health messages; restart it if the messages say so.
+    refs: [NIST-800-53:SI-4]
+    query:
+      protocol: http
+      path: /rest/vcenter/services
+      paging: none
+      key: key
+      name: value.name_key
+    each:
+      all:
+        - { field: value.state, op: eq, value: STARTED }
+        - { field: value.health, op: ne, value: HEALTHY }
+    evidence: "{key}: {value.health} - {value.health_messages[].default_message}"
+
+  # ---- Enhanced Linked Mode replication (an empty list on a single vCenter) ------------------
+
+  - id: VMW-VC-ELM-REPLICATION-BROKEN
+    title: Linked Mode replication with a partner vCenter is not working
+    kind: broken
+    category: AVL
+    severity: high
+    entity: replication-partner
+    refresh: 6h
+    why: When directory replication between linked vCenters stops, sign-on, roles, permissions and tags drift apart, and the longer it lasts the harder the repair.
+    fix: Check the partner's directory service and the network path between the appliances; re-establish the replication agreement if needed.
+    refs: [NIST-800-53:CP-10, NIST-800-53:SI-4]
+    query:
+      protocol: http
+      path: /api/vcenter/topology/replication-status
+      paging: none
+      key: "{node}|{replication_partner}"
+      name: node
+    each:
+      any:
+        - { field: replicating, op: eq, value: false }
+        - { field: partner_available, op: eq, value: false }
+        - { field: status_available, op: eq, value: false }
+    evidence: "{node} -> {replication_partner}: replicating {replicating}, partner available {partner_available}, status available {status_available}"
+
+  - id: VMW-VC-ELM-REPLICATION-LAG
+    title: Linked Mode replication is falling behind
+    kind: broken
+    category: HLT
+    severity: medium
+    entity: replication-partner
+    refresh: 6h
+    why: A replication backlog that does not drain means changes made on one vCenter are not yet on the other - usually a saturated link or a struggling partner.
+    fix: Check the link and the partner's load; a lag that keeps growing needs the same repair as broken replication.
+    refs: [NIST-800-53:SI-4]
+    query:
+      protocol: http
+      path: /api/vcenter/topology/replication-status
+      paging: none
+      key: "{node}|{replication_partner}"
+      name: node
+    each:
+      all:
+        - { field: replicating, op: eq, value: true }
+        - { field: change_lag, op: gt, value: 100, threshold: vmware.replication-max-lag }
+    evidence: "{node} -> {replication_partner}: {change_lag} changes behind"
+
+  # ---- appliance networking and logging ------------------------------------------------------
+
+  - id: VMW-VCSA-DNS-SINGLE-SERVER
+    title: Appliance has fewer than two static DNS servers
+    kind: misconfigured
+    category: AVL
+    severity: medium
+    entity: appliance
+    why: vCenter resolves its own name, its hosts and the identity source through DNS; with one resolver, one outage breaks sign-on, host connections and backups at once.
+    fix: Add a second DNS server on a different host or site.
+    refs: [NIST-800-53:CP-10, NIST-800-53:SC-5]
+    query:
+      protocol: http
+      path: /api/appliance/networking/dns/servers
+      paging: none
+      key: "-"
+    each:
+      all:
+        - { field: mode, op: eq, value: is_static }
+        - { field: servers, op: size-lt, value: 2 }
+    evidence: "DNS mode {mode}, servers {servers}"
+
+  - id: VMW-VCSA-SYSLOG-FORWARDING-MISSING
+    title: Appliance forwards its logs to no syslog server
+    kind: missing
+    lens: security
+    category: LOG
+    severity: medium
+    entity: appliance
+    why: Without forwarding, the only copy of vCenter's logs and audit trail is on the appliance itself - lost when its disk fills, and editable by whoever compromises it.
+    fix: Add the organisation's log collector as a forwarding target (TLS) and confirm the collector receives events.
+    refs: [NIST-800-53:AU-4, NIST-800-53:AU-9, CIS-Controls-v8:8.2, CIS-Controls-v8:8.9]
+    query:
+      protocol: http
+      path: /api/appliance/logging/forwarding
+      paging: none
+      key: "{hostname}:{port}"
+      name: hostname
+    count: none
+    evidence: "no syslog forwarding target is configured"
+
+  - id: VMW-VCSA-SYSLOG-UNENCRYPTED
+    title: Appliance syslog forwarding is not encrypted
+    kind: misconfigured
+    lens: security
+    category: LOG
+    severity: low
+    entity: syslog-target
+    why: Over UDP or plain TCP the log stream - user names, host names, commands - crosses the network readable, and UDP drops messages without anyone knowing.
+    fix: Switch the target to TLS (port 6514 by convention) once the collector accepts it.
+    refs: [NIST-800-53:AU-9, NIST-800-53:SC-8, CIS-Controls-v8:3.10]
+    query:
+      protocol: http
+      path: /api/appliance/logging/forwarding
+      paging: none
+      key: "{hostname}:{port}"
+      name: hostname
+    each: { field: protocol, op: ne, value: TLS }
+    evidence: "{hostname}:{port} over {protocol}"
+
   # ---- lifecycle -----------------------------------------------------------------------------
 
   - id: VMW-VCSA-VERSION-UNSUPPORTED
@@ -378,6 +712,25 @@ rules:
       paging: none
       key: "-"
     each: { field: version, op: match, value: '^(5|6|7)\.', threshold: vmware.unsupported-version-pattern }
+    evidence: "{product} {version} build {build}"
+
+  - id: VMW-VCSA-VERSION-SUPPORT-ENDING
+    title: vCenter runs a major version whose general support ends within the planning horizon
+    kind: broken
+    lens: both
+    category: LCM
+    severity: low
+    entity: appliance
+    refresh: 7d
+    why: The vendor's lifecycle notice (KB 456708) ends general support for vCenter Server 8 on 2027-10-11; a major upgrade needs hardware compatibility checks, licensing and months of lead time. Raise the severity as the date nears - the engine cannot attach a fixed deadline yet.
+    fix: Plan the upgrade to the next major version now, starting with the host hardware compatibility check. Move the pattern on when the next major version enters its last year.
+    refs: [NIST-800-53:SA-22, NIST-800-53:SI-2]
+    query:
+      protocol: http
+      path: /api/appliance/system/version
+      paging: none
+      key: "-"
+    each: { field: version, op: match, value: '^8\.', threshold: vmware.support-ending-version-pattern }
     evidence: "{product} {version} build {build}"
 
   - id: VMW-VCSA-UPDATE-FAILED
@@ -443,6 +796,25 @@ rules:
     each: { field: valid_to, op: until-lt, value: 60, threshold: vmware.cert-notice-days }
     evidence: "{subject_dn} issued by {issuer_dn} expires {valid_to}"
 
+  - id: VMW-VC-TLS-CERT-WEAK-SIGNATURE
+    title: vCenter machine TLS certificate uses a weak signature algorithm
+    kind: misconfigured
+    lens: security
+    category: PKI
+    severity: medium
+    entity: certificate
+    why: SHA-1 and MD5 signatures can be forged; current clients reject them, and a forged certificate lets an attacker impersonate the system that controls every VM.
+    fix: Replace the machine certificate with one signed with SHA-256 or stronger (VMCA or the enterprise CA).
+    refs: [NIST-800-53:SC-13, NIST-800-53:SC-17, CIS-Controls-v8:3.10]
+    query:
+      protocol: http
+      path: /api/vcenter/certificate-management/vcenter/tls
+      paging: none
+      key: serial_number
+      name: subject_dn
+    each: { field: signature_algorithm, op: match, value: 'sha-?1(?![0-9])|md[25]' }
+    evidence: "{subject_dn}: signed with {signature_algorithm}"
+
   - id: VMW-VCSA-ROOT-PASSWORD-EXPIRY
     title: Appliance root password expires soon
     kind: broken
@@ -467,6 +839,48 @@ rules:
         - { field: password_expires_at, op: exists }
         - { field: password_expires_at, op: until-lt, value: 30, threshold: vmware.root-password-notice-days }
     evidence: "root password expires {password_expires_at} (last changed {last_password_change})"
+
+  - id: VMW-VCSA-ROOT-PASSWORD-NEVER-EXPIRES
+    title: Appliance root password never expires
+    kind: misconfigured
+    lens: security
+    category: IAM
+    severity: low
+    entity: account
+    why: The API leaves the expiry unset when the root password never expires; a root password that is never rotated stays valid for anyone who ever learned it.
+    fix: Set a root password expiry (90 days or the vault's rotation period) and put the rotation in the vault's calendar.
+    refs: [NIST-800-53:IA-5, CIS-Controls-v8:5.2]
+    query:
+      protocol: http
+      path: /api/appliance/local-accounts/root
+      paging: none
+      key: "-"
+    each:
+      all:
+        - { field: enabled, op: eq, value: true }
+        - { field: password_expires_at, op: absent }
+    evidence: "root password has no expiry (last changed {last_password_change})"
+
+  - id: VMW-VCSA-PASSWORD-POLICY-MAX-DAYS
+    title: Appliance local-account password policy allows old or never-expiring passwords
+    kind: misconfigured
+    lens: security
+    category: IAM
+    severity: low
+    entity: appliance
+    why: The global policy sets the maximum password age for every local appliance account; the API leaves max_days unset when the limit is switched off.
+    fix: Set the maximum password age to 90 days or less, with a warning a week before expiry.
+    refs: [NIST-800-53:IA-5, CIS-Controls-v8:5.2]
+    query:
+      protocol: http
+      path: /api/appliance/local-accounts/global-policy
+      paging: none
+      key: "-"
+    each:
+      any:
+        - { field: max_days, op: absent }
+        - { field: max_days, op: gt, value: 90, threshold: vmware.local-password-max-days }
+    evidence: "local-account policy: max {max_days} days, min {min_days}, warn {warn_days}"
 
   - id: VMW-VCSA-SSH-ENABLED
     title: SSH is enabled on the appliance
@@ -557,6 +971,24 @@ rules:
       key: key
     each: { field: value.enable, op: eq, value: false }
     evidence: "schedule {key} to {value.location} is disabled"
+
+  - id: VMW-VCSA-BACKUP-PLAINTEXT-PROTOCOL
+    title: Appliance backup goes to a plain FTP or HTTP location
+    kind: misconfigured
+    lens: security
+    category: BCK
+    severity: medium
+    entity: backup-schedule
+    why: The file-based backup holds the vCenter database and its stored credentials; over FTP or HTTP both the backup and the location's login cross the network readable.
+    fix: Move the schedule to FTPS, HTTPS or SFTP (or SMB/NFS on a trusted segment) and set a backup encryption password.
+    refs: [NIST-800-53:SC-8, NIST-800-53:CP-9, CIS-Controls-v8:3.10, CIS-Controls-v8:11.3]
+    query:
+      protocol: http
+      path: /rest/appliance/recovery/backup/schedules
+      paging: none
+      key: key
+    each: { field: value.location, op: match, value: '^(ftp|http)://' }
+    evidence: "schedule {key} writes to {value.location}"
 
   - id: VMW-VCSA-BACKUP-FAILED
     title: Appliance file-based backup failed recently

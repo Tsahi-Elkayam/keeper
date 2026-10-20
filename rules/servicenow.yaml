@@ -11,6 +11,10 @@ integration: servicenow
 # into {display_value, value}, so their paths end in .value or .display_value.
 # Note: the Table API ignores an unknown field or query term instead of failing, so a typo here widens
 # a query silently.
+# One rule uses the Aggregate API (/api/now/stats/<table>, GET) to count distinct users: with
+# sysparm_group_by it answers one result row per group, {stats, groupby_fields: [{field, value}]}.
+# The sys_user inventory query (SNOW-USER-*) is also read by cross-system rules: keep its path,
+# params, field names and key unchanged.
 defaults:
   lens: maintenance
   refresh: 30m
@@ -119,6 +123,183 @@ rules:
     each: { field: sys_updated_on, op: age-gt, value: 1, threshold: servicenow.urgent-incident-stale-days }
     evidence: "{number} P{priority} last updated {sys_updated_on}: {short_description}"
 
+  # All open incidents (states 6 resolved, 7 closed, 8 canceled excluded). Out-of-the-box states:
+  # 1 new, 2 in progress, 3 on hold.
+
+  - id: SNOW-INCIDENT-NEW-UNTOUCHED
+    title: Incident still in state New a day after it was opened
+    kind: missing
+    category: AVL
+    severity:
+      field: priority
+      map: { "1": high, "2": high, "3": high }
+      default: medium
+    entity: incident
+    refresh: 1h
+    why: An incident nobody has accepted after a day is waiting in a queue that nobody watches, or in the wrong one.
+    fix: Assign it and move it to In Progress, or route it to the right group.
+    refs: [NIST-800-53:IR-4, NIST-800-53:IR-6]
+    query:
+      protocol: http
+      path: /api/now/table/incident
+      params:
+        sysparm_query: active=true^stateNOT IN6,7,8
+        sysparm_fields: sys_id,number,short_description,priority,state,assigned_to,assignment_group,opened_at,sys_updated_on,hold_reason,reopen_count
+        sysparm_display_value: "false"
+        sysparm_exclude_reference_link: "true"
+      paging: offset
+      pageSize: 1000
+      items: result
+      key: number
+      name: short_description
+    each:
+      all:
+        - { field: state, op: eq, value: 1 }
+        - { field: opened_at, op: age-gt, value: 1, threshold: servicenow.new-incident-max-days }
+    evidence: "{number} P{priority} new since {opened_at}: {short_description}"
+
+  - id: SNOW-INCIDENT-STALE
+    title: Open incident has not been updated for two weeks
+    kind: broken
+    category: HYG
+    severity:
+      field: priority
+      map: { "3": medium }
+      default: low
+    entity: incident
+    refresh: 1d
+    why: An open incident with no update for weeks is forgotten - either solved and never closed, or stuck with nobody saying so; a stale queue hides the real work. Priority 1 and 2 have their own one-day rule, on-hold incidents their own.
+    fix: Update, resolve or close it.
+    refs: [NIST-800-53:IR-4]
+    query:
+      protocol: http
+      path: /api/now/table/incident
+      params:
+        sysparm_query: active=true^stateNOT IN6,7,8
+        sysparm_fields: sys_id,number,short_description,priority,state,assigned_to,assignment_group,opened_at,sys_updated_on,hold_reason,reopen_count
+        sysparm_display_value: "false"
+        sysparm_exclude_reference_link: "true"
+      paging: offset
+      pageSize: 1000
+      items: result
+      key: number
+      name: short_description
+    each:
+      all:
+        - { field: priority, op: notin, value: [1, 2] }
+        - { field: state, op: ne, value: 3 }
+        - { field: sys_updated_on, op: age-gt, value: 14, threshold: servicenow.incident-stale-days }
+    evidence: "{number} P{priority} last updated {sys_updated_on}: {short_description}"
+
+  - id: SNOW-INCIDENT-ON-HOLD-LONG
+    title: Incident on hold for more than a week
+    kind: broken
+    category: HYG
+    severity: low
+    entity: incident
+    refresh: 1d
+    why: An incident on hold waits for a caller, a vendor or a change; after a week without an update nobody is chasing it.
+    fix: Chase the party it waits for, or resolve it as the hold policy says.
+    refs: [NIST-800-53:IR-4]
+    query:
+      protocol: http
+      path: /api/now/table/incident
+      params:
+        sysparm_query: active=true^stateNOT IN6,7,8
+        sysparm_fields: sys_id,number,short_description,priority,state,assigned_to,assignment_group,opened_at,sys_updated_on,hold_reason,reopen_count
+        sysparm_display_value: "false"
+        sysparm_exclude_reference_link: "true"
+      paging: offset
+      pageSize: 1000
+      items: result
+      key: number
+      name: short_description
+    each:
+      all:
+        - { field: state, op: eq, value: 3 }
+        - { field: sys_updated_on, op: age-gt, value: 7, threshold: servicenow.on-hold-max-days }
+    evidence: "{number} on hold (reason {hold_reason}) since {sys_updated_on}: {short_description}"
+
+  - id: SNOW-INCIDENT-REOPENED
+    title: Open incident has been reopened
+    kind: broken
+    category: HYG
+    severity: low
+    entity: incident
+    refresh: 1d
+    why: A reopened incident is a fix that did not hold; a repeat usually has a cause nobody has looked for.
+    fix: Look for the root cause and link a problem record if it recurs.
+    refs: [NIST-800-53:IR-4]
+    query:
+      protocol: http
+      path: /api/now/table/incident
+      params:
+        sysparm_query: active=true^stateNOT IN6,7,8
+        sysparm_fields: sys_id,number,short_description,priority,state,assigned_to,assignment_group,opened_at,sys_updated_on,hold_reason,reopen_count
+        sysparm_display_value: "false"
+        sysparm_exclude_reference_link: "true"
+      paging: offset
+      pageSize: 1000
+      items: result
+      key: number
+      name: short_description
+    each: { field: reopen_count, op: gt, value: 0 }
+    evidence: "{number} reopened {reopen_count} time(s): {short_description}"
+
+  # ---- problems and approvals ----------------------------------------------------------------
+
+  - id: SNOW-PROBLEM-UNASSIGNED
+    title: Open problem record has no assignee
+    kind: missing
+    category: HYG
+    severity: low
+    entity: problem
+    refresh: 1d
+    why: Root-cause work that nobody owns does not happen, and the incidents behind it keep coming back.
+    fix: Assign a problem owner.
+    refs: [NIST-800-53:IR-4]
+    query:
+      protocol: http
+      path: /api/now/table/problem
+      params:
+        sysparm_query: active=true
+        sysparm_fields: sys_id,number,short_description,state,priority,assigned_to,assignment_group,opened_at,sys_updated_on
+        sysparm_display_value: "false"
+        sysparm_exclude_reference_link: "true"
+      paging: offset
+      pageSize: 1000
+      items: result
+      key: number
+      name: short_description
+    each: { field: assigned_to, op: empty }
+    evidence: "{number} P{priority} opened {opened_at} has no assignee: {short_description}"
+
+  - id: SNOW-APPROVAL-PENDING-LONG
+    title: Approval request has waited more than three days
+    kind: broken
+    category: CFG
+    severity: medium
+    entity: approval
+    refresh: 6h
+    why: A change or request stalled on one approver delays the work behind it, and approvals tend to stall during absences.
+    fix: Remind the approver or delegate the approval; set up approval delegation for planned absences.
+    refs: [NIST-800-53:CM-3]
+    query:
+      protocol: http
+      path: /api/now/table/sysapproval_approver
+      params:
+        sysparm_query: state=requested
+        sysparm_fields: sys_id,approver,state,sysapproval,document_id,sys_created_on,due_date
+        sysparm_display_value: all
+        sysparm_exclude_reference_link: "true"
+      paging: offset
+      pageSize: 1000
+      items: result
+      key: sys_id.value
+      name: approver.display_value
+    each: { field: sys_created_on.value, op: age-gt, value: 3, threshold: servicenow.approval-max-wait-days }
+    evidence: "{sysapproval.display_value} waits for {approver.display_value} since {sys_created_on.display_value}"
+
   # ---- SLAs ----------------------------------------------------------------------------------
 
   - id: SNOW-SLA-BREACHED
@@ -175,6 +356,31 @@ rules:
       name: task.display_value
     each: { field: percentage.value, op: ge, value: 75, threshold: servicenow.sla-risk-percent }
     evidence: "{task.display_value}: SLA {sla.display_value} at {percentage.display_value}%, breaches {planned_end_time.display_value}"
+
+  - id: SNOW-SLA-DEFINITION-MISSING
+    title: No active SLA definition exists
+    kind: missing
+    category: MON
+    severity: medium
+    entity: instance
+    refresh: 7d
+    why: Without an active SLA definition the SLA rules can never fire, and "no breaches" means nothing.
+    fix: Define response and resolution SLAs per priority, at least for incidents.
+    refs: [NIST-800-53:IR-4]
+    query:
+      protocol: http
+      path: /api/now/table/contract_sla
+      params:
+        sysparm_query: active=true
+        sysparm_fields: sys_id,name,collection,type,duration,active
+        sysparm_display_value: "false"
+      paging: offset
+      pageSize: 1000
+      items: result
+      key: sys_id
+      name: name
+    count: none
+    evidence: "no active SLA definition"
 
   # ---- changes -------------------------------------------------------------------------------
   # Change states (database values): -5 new, -4 assess, -3 authorize, -2 scheduled, -1 implement,
@@ -297,6 +503,92 @@ rules:
         - { field: end_date, op: age-gt, value: 1, threshold: servicenow.change-close-grace-days }
     evidence: "{number} still scheduled, window ended {end_date}: {short_description}"
 
+  - id: SNOW-CHANGE-IMPLEMENTED-UNAPPROVED
+    title: Change is being implemented without approval
+    kind: broken
+    lens: both
+    category: CFG
+    severity: high
+    entity: change
+    refresh: 1h
+    why: A normal or emergency change in Implement whose approval is not "approved" either ran without approval or skipped the approval gate - both are what change control exists to stop.
+    fix: Stop or review the change now; record a retrospective approval with the change board and find how the state moved past the approval.
+    refs: [NIST-800-53:CM-3, NIST-800-53:CM-5, CIS-Controls-v8:4.1]
+    query:
+      protocol: http
+      path: /api/now/table/change_request
+      params:
+        sysparm_query: active=true^stateIN-4,-3,-2,-1
+        sysparm_fields: sys_id,number,short_description,state,approval,type,risk,start_date,end_date,assignment_group,assigned_to
+        sysparm_display_value: "false"
+        sysparm_exclude_reference_link: "true"
+      paging: offset
+      pageSize: 1000
+      items: result
+      key: number
+      name: short_description
+    each:
+      all:
+        - { field: state, op: eq, value: -1 }
+        - { field: type, op: ne, value: standard }
+        - { field: approval, op: ne, value: approved }
+    evidence: "{number} ({type}) in implement with approval {approval}: {short_description}"
+
+  - id: SNOW-CHANGE-EMERGENCY-OPEN
+    title: Emergency change is open
+    kind: broken
+    category: CFG
+    severity: info
+    entity: change
+    refresh: 6h
+    why: Every emergency change needs a review afterwards, and a steady stream of them means normal change planning is failing.
+    fix: Review it at the next change board; turn recurring emergencies into standard changes.
+    refs: [NIST-800-53:CM-3]
+    query:
+      protocol: http
+      path: /api/now/table/change_request
+      params:
+        sysparm_query: active=true^stateIN-4,-3,-2,-1
+        sysparm_fields: sys_id,number,short_description,state,approval,type,risk,start_date,end_date,assignment_group,assigned_to
+        sysparm_display_value: "false"
+        sysparm_exclude_reference_link: "true"
+      paging: offset
+      pageSize: 1000
+      items: result
+      key: number
+      name: short_description
+    each: { field: type, op: eq, value: emergency }
+    evidence: "{number} emergency change, state {state}, starts {start_date}: {short_description}"
+
+  - id: SNOW-CHANGE-HIGH-RISK-NO-BACKOUT-PLAN
+    title: High-risk change has no backout or test plan
+    kind: missing
+    category: CFG
+    severity: medium
+    entity: change
+    refresh: 6h
+    why: A high-risk change without a written backout plan is improvised the moment it goes wrong; without a test plan nobody can say it worked. Risk codes 1 and 2 are the out-of-the-box very high and high.
+    fix: Fill both plans before the change board; the board should not approve without them.
+    refs: [NIST-800-53:CM-3, NIST-800-53:CP-10]
+    query:
+      protocol: http
+      path: /api/now/table/change_request
+      params:
+        sysparm_query: active=true^stateIN-4,-3,-2,-1^riskIN1,2
+        sysparm_fields: sys_id,number,short_description,state,risk,type,start_date,backout_plan,test_plan,assigned_to
+        sysparm_display_value: "false"
+        sysparm_exclude_reference_link: "true"
+      paging: offset
+      pageSize: 1000
+      items: result
+      key: number
+      name: short_description
+    each:
+      any:
+        - { field: backout_plan, op: empty }
+        - { field: test_plan, op: empty }
+    evidence: "{number} (risk {risk}) starts {start_date} with a missing backout or test plan: {short_description}"
+
   # ---- catalog tasks -------------------------------------------------------------------------
 
   - id: SNOW-CATALOG-TASK-OVERDUE
@@ -376,3 +668,198 @@ rules:
       name: name
     each: { field: validated, op: ne, value: "true" }
     evidence: "{name}: validated {validated}, status {status}"
+
+  # ---- CMDB: operational, installed servers (choice 1 = Operational / Installed out of the box) ---
+
+  - id: SNOW-CMDB-SERVER-NO-SUPPORT-GROUP
+    title: Operational server CI has no support group
+    kind: missing
+    category: HYG
+    severity: medium
+    entity: ci
+    refresh: 1d
+    why: Without a support group no team is paged for the server's incidents and no change approval routes to anyone.
+    fix: Set the support group, and make the field mandatory for the class.
+    refs: [NIST-800-53:CM-8, CIS-Controls-v8:1.1]
+    query:
+      protocol: http
+      path: /api/now/table/cmdb_ci_server
+      params:
+        sysparm_query: operational_status=1^install_status=1
+        sysparm_fields: sys_id,name,sys_class_name,owned_by,managed_by,support_group,assigned_to,last_discovered,discovery_source,operational_status,install_status,sys_updated_on
+        sysparm_display_value: "false"
+        sysparm_exclude_reference_link: "true"
+      paging: offset
+      pageSize: 1000
+      items: result
+      key: sys_id
+      name: name
+    each: { field: support_group, op: empty }
+    evidence: "{name} ({sys_class_name}) has no support group"
+
+  - id: SNOW-CMDB-SERVER-NO-OWNER
+    title: Operational server CI has neither an owner nor a manager
+    kind: missing
+    category: HYG
+    severity: low
+    entity: ci
+    refresh: 1d
+    why: A server nobody owns or manages has no one to approve its changes, accept its risks or decide its retirement.
+    fix: Assign the business owner and the technical manager.
+    refs: [NIST-800-53:CM-8, CIS-Controls-v8:1.1]
+    query:
+      protocol: http
+      path: /api/now/table/cmdb_ci_server
+      params:
+        sysparm_query: operational_status=1^install_status=1
+        sysparm_fields: sys_id,name,sys_class_name,owned_by,managed_by,support_group,assigned_to,last_discovered,discovery_source,operational_status,install_status,sys_updated_on
+        sysparm_display_value: "false"
+        sysparm_exclude_reference_link: "true"
+      paging: offset
+      pageSize: 1000
+      items: result
+      key: sys_id
+      name: name
+    each:
+      all:
+        - { field: owned_by, op: empty }
+        - { field: managed_by, op: empty }
+    evidence: "{name} ({sys_class_name}) has no owner or manager"
+
+  - id: SNOW-CMDB-SERVER-NOT-DISCOVERED
+    title: Operational server CI not seen by discovery for a month
+    kind: broken
+    category: HYG
+    severity: low
+    entity: ci
+    refresh: 1d
+    why: A CI that discovery has not confirmed for weeks (or ever) is a guess - the server may be gone, renamed or changed. An estate without discovery sees every CI here; that is the finding (the CMDB is kept by hand) and can be accepted with an override.
+    fix: Run discovery over the server ranges, or retire the CI if the server is gone.
+    refs: [NIST-800-53:CM-8, CIS-Controls-v8:1.1]
+    query:
+      protocol: http
+      path: /api/now/table/cmdb_ci_server
+      params:
+        sysparm_query: operational_status=1^install_status=1
+        sysparm_fields: sys_id,name,sys_class_name,owned_by,managed_by,support_group,assigned_to,last_discovered,discovery_source,operational_status,install_status,sys_updated_on
+        sysparm_display_value: "false"
+        sysparm_exclude_reference_link: "true"
+      paging: offset
+      pageSize: 1000
+      items: result
+      key: sys_id
+      name: name
+    each:
+      any:
+        - { field: last_discovered, op: empty }
+        - { field: last_discovered, op: age-gt, value: 30, threshold: servicenow.ci-discovery-max-days }
+    evidence: "{name} ({sys_class_name}): last discovered {last_discovered} by {discovery_source}"
+
+  # ---- platform access ----------------------------------------------------------------------
+
+  - id: SNOW-ADMIN-ROLE-COUNT
+    title: Too many active users hold the admin role
+    kind: misconfigured
+    lens: security
+    category: IAM
+    severity: medium
+    entity: instance
+    refresh: 1d
+    why: The admin role can change any record, script and access control on the instance; every extra holder is another account whose compromise is a full takeover. Counted per distinct user, whether granted directly or through a group.
+    fix: Move people to scoped roles (the fulfiller and application-admin roles) and keep admin for a named few with strong authentication.
+    refs: [NIST-800-53:AC-6, NIST-800-53:AC-2, CIS-Controls-v8:5.4]
+    query:
+      protocol: http
+      path: /api/now/stats/sys_user_has_role
+      params:
+        sysparm_query: role.name=admin^user.active=true
+        sysparm_group_by: user
+        sysparm_count: "true"
+      paging: none
+      items: result
+      key: "groupby_fields[].value"
+    count: { op: gt, value: 10, threshold: servicenow.max-admins }
+    evidence: "{count} active users hold admin"
+
+  - id: SNOW-ADMIN-ROLE-DIRECT
+    title: Admin role granted directly to a user
+    kind: misconfigured
+    lens: security
+    category: IAM
+    severity: low
+    entity: role-grant
+    refresh: 1d
+    why: A direct grant bypasses the group that access reviews and joiner-leaver processes manage, so it tends to survive role changes and departures.
+    fix: Grant admin through a reviewed group and remove the direct grant.
+    refs: [NIST-800-53:AC-2, NIST-800-53:AC-6, CIS-Controls-v8:5.4]
+    query:
+      protocol: http
+      path: /api/now/table/sys_user_has_role
+      params:
+        sysparm_query: role.name=admin^user.active=true^inherited=false
+        sysparm_fields: sys_id,user,role,inherited,granted_by
+        sysparm_display_value: all
+        sysparm_exclude_reference_link: "true"
+      paging: offset
+      pageSize: 1000
+      items: result
+      key: sys_id.value
+      name: user.display_value
+    each: any
+    evidence: "{user.display_value} holds admin directly"
+
+  # ---- user inventory (also read by the cross-system rules; keep this query unchanged) --------
+
+  - id: SNOW-USER-NO-EMAIL
+    title: Active user account has no e-mail address
+    kind: misconfigured
+    category: IAM
+    severity: low
+    entity: user
+    refresh: 1d
+    why: An active account without e-mail gets no notifications or approval requests, and cannot be matched to a directory identity, so leaver processes miss it.
+    fix: Fill the e-mail from the directory, or deactivate the account; mark integration accounts as such.
+    refs: [NIST-800-53:AC-2, CIS-Controls-v8:5.1]
+    query:
+      protocol: http
+      path: /api/now/table/sys_user
+      params:
+        sysparm_query: active=true^ORDERBYsys_id
+        sysparm_fields: sys_id,user_name,email,active,source,last_login_time,sys_updated_on
+      paging: offset
+      pageSize: 1000
+      items: result
+      key: sys_id
+      name: user_name
+    each: { field: email, op: empty }
+    evidence: "{user_name} (source {source}) has no e-mail"
+
+  - id: SNOW-USER-DORMANT
+    title: Active user account has not signed in for 90 days
+    kind: misconfigured
+    lens: security
+    category: IAM
+    severity: low
+    entity: user
+    refresh: 1d
+    why: An account nobody uses still works for whoever learns its password; dormant accounts are the ones whose misuse nobody notices. Integration accounts that never sign in interactively appear here too.
+    fix: Deactivate the account, or mark it web-service-only with an owner if it is an integration account.
+    refs: [NIST-800-53:AC-2, CIS-Controls-v8:5.3]
+    query:
+      protocol: http
+      path: /api/now/table/sys_user
+      params:
+        sysparm_query: active=true^ORDERBYsys_id
+        sysparm_fields: sys_id,user_name,email,active,source,last_login_time,sys_updated_on
+      paging: offset
+      pageSize: 1000
+      items: result
+      key: sys_id
+      name: user_name
+    each:
+      any:
+        - { field: last_login_time, op: age-gt, value: 90, threshold: servicenow.user-dormant-days }
+        - all:
+            - { field: last_login_time, op: empty }
+            - { field: sys_updated_on, op: age-gt, value: 90, threshold: servicenow.user-dormant-days }
+    evidence: "{user_name}: last sign-in {last_login_time}, record updated {sys_updated_on}"

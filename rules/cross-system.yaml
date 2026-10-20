@@ -1,0 +1,3333 @@
+schema: keeper.rules/1
+system: cross-system
+name: Joins across systems
+integration: keeper
+# Rules that join what different scans saw. Each reads the newest runs of the other systems from the
+# store (row_seen by latest_run.system and entity_type, MAX() per attribute across an entity's rows,
+# because several queries return rows for the same entity and row_seen.query is only a fingerprint).
+#
+# Conventions every rule follows:
+# - Only newest runs that did not fail and are at most threshold.cross.max-scan-age-days old (default
+#   14) are used. A side with no such run contributes no rows, so a join with one side unscanned
+#   returns nothing; XS-COVERAGE-JOIN-UNAVAILABLE is the one row that says a join could not be made.
+# - "Present in A, absent from B" rules also need B to be complete: every newest run of B in the
+#   window either has status ok or completed B's inventory rule (coverage of AD-POP-USERS-NONE,
+#   AD-POP-COMPUTERS-NONE, ENTRA-USER-INACTIVE, ENTRA-DEVICE-STALE, SCCM-CLIENT-PUSH-FAILED,
+#   WSF-NO-CLIENT, VMW-VM-CONFIG-UNAVAILABLE, VEEAM-OBJECT-FEW-RESTORE-POINTS, PRTG-SENSOR-DOWN,
+#   DT-AGENT-NOT-MONITORING). A partial list never turns into "missing everywhere".
+# - "Gone from AD / vCenter" rules report only names Keeper saw there before and no longer sees
+#   (entity.gone_since), so machines that never belonged to a scanned directory are not reported.
+# - Host names are compared as the short name, upper-cased (text before the first dot; an IPv4
+#   address is kept whole); AD computer names drop the trailing $.
+# - List settings (role ids, SKU ids) are comma-separated, as the in/notin conditions read them.
+#
+# keeper run scans the store's systems after the others are loaded, so these rules see the same
+# day's data. Findings-level rules (XS-HOST-COMPOUND-RISK, XS-HOST-THREAT-MULTI-SOURCE,
+# XS-HOST-KEV-COMPOUND) read active_finding, i.e. the register as the previous apply left it.
+defaults:
+  lens: both
+  refresh: 1d
+rules:
+
+  # ================================================================= coverage of the joins ===
+
+  - id: XS-COVERAGE-JOIN-UNAVAILABLE
+    title: A join across two systems cannot be made because one side has no usable scan
+    kind: missing
+    lens: both
+    category: MON
+    severity: info
+    entity: join
+    why: >-
+      Every rule in this file stays silent when one of its two systems was never scanned, its newest
+      scan failed, or that scan is too old. Silence is then not "nothing wrong" but "not looked at";
+      this row names the join that could not be made and the rules that depend on it. Pairs where
+      neither system was ever scanned are left to KEEPER-SYSTEM-NEVER-SCANNED.
+    fix: >-
+      Add or repair the integration for the missing side (keeper scan <system> --test), or accept the
+      finding with keeper decide accept if the organisation does not run that system.
+    refs: [NIST-800-53:CA-7, NIST-800-53:SI-4]
+    query:
+      protocol: store
+      text: |
+        WITH max_age AS (
+          SELECT COALESCE((SELECT CAST(value AS REAL) FROM setting WHERE key = 'threshold.cross.max-scan-age-days'), 14) AS days
+        ),
+        pairs(join_id, left_system, right_system, rules) AS (
+          VALUES ('ad-entra', 'active-directory', 'entra', 'XS-USER-*, XS-KEEPER-APP-IDENTITY-TIER0-ROLE, XS-DEVICE-ENTRA-HYBRID-AD-GONE, XS-COMPUTER-AD-NOT-HYBRID-JOINED, XS-OWNER-ACCOUNT-LEFT'),
+                 ('ad-sccm', 'active-directory', 'sccm', 'XS-COMPUTER-AD-ACTIVE-NO-SCCM, XS-COMPUTER-SCCM-AD-GONE, XS-COMPUTER-SCCM-ACTIVE-AD-STALE, XS-SCCM-ADMIN-AD-DISABLED'),
+                 ('ad-intune', 'active-directory', 'intune', 'XS-DEVICE-INTUNE-AD-GONE, XS-INTUNE-PRIMARY-USER-LEAVER'),
+                 ('entra-intune', 'entra', 'intune', 'XS-ADMIN-DEVICE-NONCOMPLIANT, XS-INTUNE-PRIMARY-USER-LEAVER'),
+                 ('intune-sccm', 'intune', 'sccm', 'XS-COMPUTER-INTUNE-ACTIVE-SCCM-DEAD'),
+                 ('ad-prtg', 'active-directory', 'prtg', 'XS-SERVER-NOT-MONITORED, XS-MONITOR-TARGET-AD-GONE, XS-VEEAM-REPOSITORY-HOST-UNMANAGED'),
+                 ('ad-dynatrace', 'active-directory', 'dynatrace', 'XS-SERVER-NOT-MONITORED, XS-MONITOR-TARGET-AD-GONE'),
+                 ('ad-veeam', 'active-directory', 'veeam', 'XS-SERVER-AD-NO-BACKUP, XS-VEEAM-REPOSITORY-HOST-UNMANAGED'),
+                 ('vmware-veeam', 'vmware', 'veeam', 'XS-VM-NO-BACKUP, XS-BACKUP-OBJECT-VM-GONE'),
+                 ('vmware-prtg', 'vmware', 'prtg', 'XS-ESXI-HOST-NOT-MONITORED'),
+                 ('ad-wiz', 'active-directory', 'wiz', 'XS-HOST-KEV-COMPOUND, XS-HOST-EOL-EXPOSED'),
+                 ('entra-servicenow', 'entra', 'servicenow', 'XS-SCIM-DUPLICATE-TRAP, XS-SCIM-LEAVER-STILL-IN-APP')
+        ),
+        side AS (
+          SELECT lr.system,
+                 MAX(CASE WHEN lr.status <> 'failed' AND julianday(:now) - julianday(lr.started_at) <= m.days THEN 1 ELSE 0 END) AS usable,
+                 MAX(CASE WHEN lr.status <> 'failed' THEN 1 ELSE 0 END) AS ever_usable,
+                 MAX(lr.started_at) AS last_at
+          FROM latest_run lr CROSS JOIN max_age m
+          GROUP BY lr.system
+        ),
+        judged AS (
+          SELECT p.join_id, p.left_system, p.right_system, p.rules,
+                 COALESCE(l.usable, 0) AS left_ok, COALESCE(rt.usable, 0) AS right_ok,
+                 CASE WHEN l.system IS NULL THEN 'never scanned'
+                      WHEN l.usable = 1 THEN 'scanned'
+                      WHEN l.ever_usable = 0 THEN 'newest scan failed (' || l.last_at || ')'
+                      ELSE 'newest usable scan is too old (' || l.last_at || ')' END AS left_state,
+                 CASE WHEN rt.system IS NULL THEN 'never scanned'
+                      WHEN rt.usable = 1 THEN 'scanned'
+                      WHEN rt.ever_usable = 0 THEN 'newest scan failed (' || rt.last_at || ')'
+                      ELSE 'newest usable scan is too old (' || rt.last_at || ')' END AS right_state
+          FROM pairs p
+          LEFT JOIN side l ON l.system = p.left_system
+          LEFT JOIN side rt ON rt.system = p.right_system
+        )
+        SELECT join_id, left_system, right_system, rules, left_state, right_state
+        FROM judged
+        WHERE left_ok <> right_ok
+          AND NOT (left_state = 'never scanned' AND right_state = 'never scanned')
+      key: join_id
+    each: any
+    evidence: "{join_id}: {left_system} {left_state}; {right_system} {right_state} - {rules} cannot be judged"
+
+  # ======================================================= Keeper's own identities x AD and Entra ===
+
+  - id: XS-KEEPER-IDENTITY-PRIVILEGED
+    title: Keeper reads through an account that is privileged in Active Directory
+    kind: misconfigured
+    lens: security
+    category: IAM
+    severity:
+      field: sev
+      map: { critical: critical, high: high }
+      default: high
+    entity: integration
+    why: >-
+      Keeper only ever reads. A credential in its vault that can also change the whole domain turns a
+      leak of that vault, or of one scan host, into a domain compromise. The account is privileged when
+      it has adminCount 1, is a direct member of a privileged group (threshold
+      cross.privileged-group-pattern) or is trusted for unconstrained delegation. Until the AD pack
+      collects adminCount or memberOf the rule reports n/a, never a pass.
+    fix: >-
+      Create a dedicated read-only account (or gMSA) for Keeper with only the read rights the packs
+      need, take it out of every protected group, rotate the old credential and store the new one with
+      keeper integration set-secret.
+    refs: [NIST-800-53:AC-6(5), NIST-800-53:AC-6, CIS-Controls-v8:5.4]
+    query:
+      protocol: store
+      text: |
+        WITH max_age AS (
+          SELECT COALESCE((SELECT CAST(value AS REAL) FROM setting WHERE key = 'threshold.cross.max-scan-age-days'), 14) AS days
+        ),
+        live AS (
+          SELECT lr.run_id, lr.instance, lr.system, lr.status
+          FROM latest_run lr CROSS JOIN max_age m
+          WHERE lr.status <> 'failed' AND julianday(:now) - julianday(lr.started_at) <= m.days
+        ),
+        ad_users AS (
+          SELECT r.instance, s.entity_key AS account, LOWER(s.entity_key) AS account_l,
+                 LOWER(MAX(json_extract(s.attrs, '$.userPrincipalName'))) AS upn_l,
+                 MAX(json_extract(s.attrs, '$.distinguishedName')) AS dn,
+                 MAX(CAST(json_extract(s.attrs, '$.userAccountControl') AS INTEGER)) AS uac,
+                 MAX(CAST(json_extract(s.attrs, '$.adminCount') AS INTEGER)) AS admin_count,
+                 MAX(json_extract(s.attrs, '$.memberOf')) AS member_of
+          FROM live r JOIN row_seen s ON s.run_id = r.run_id
+          WHERE r.system = 'active-directory' AND s.entity_type = 'user'
+          GROUP BY r.instance, s.entity_key
+        ),
+        collected AS (
+          SELECT COUNT(*) AS n FROM ad_users WHERE admin_count IS NOT NULL OR member_of IS NOT NULL
+        ),
+        priv_groups AS (
+          SELECT COALESCE((SELECT value FROM setting WHERE key = 'threshold.cross.privileged-group-pattern'),
+                          '(?i)CN=(Domain Admins|Enterprise Admins|Schema Admins|Administrators|Account Operators|Backup Operators|Server Operators|Print Operators|DnsAdmins|Group Policy Creator Owners|Key Admins|Enterprise Key Admins),') AS pattern
+        ),
+        keeper_ids AS (
+          SELECT i.integration_id, i.type, i.identity, LOWER(TRIM(i.identity)) AS identity_l,
+                 LOWER(CASE WHEN instr(i.identity, '\') > 0 THEN substr(TRIM(i.identity), instr(TRIM(i.identity), '\') + 1) ELSE TRIM(i.identity) END) AS sam_l,
+                 CASE WHEN instr(i.identity, '@') > 0 THEN 1 ELSE 0 END AS is_upn
+          FROM integration i
+          WHERE i.enabled = 1 AND i.identity IS NOT NULL AND TRIM(i.identity) <> '' AND i.type <> 'keeper'
+        ),
+        matched AS (
+          SELECT k.integration_id, k.type, k.identity, a.instance AS ad_instance, a.account, a.dn, a.uac,
+                 a.admin_count, a.member_of
+          FROM keeper_ids k
+          JOIN ad_users a
+            ON (k.is_upn = 1 AND a.upn_l = k.identity_l)
+            OR (k.is_upn = 0 AND k.type IN ('ldap', 'cim', 'sccm', 'sql') AND (a.account_l = k.sam_l OR LOWER(a.dn) = k.identity_l))
+        )
+        SELECT m.integration_id || '|' || m.ad_instance || '/' || m.account AS id,
+               m.integration_id, m.type, m.identity, m.ad_instance, m.account, m.dn, m.uac,
+               CASE WHEN (COALESCE(m.uac, 0) & 524288) = 524288 THEN 'trusted for unconstrained delegation'
+                    WHEN m.admin_count = 1 THEN 'adminCount is 1 (in, or once in, a protected group)'
+                    WHEN m.member_of REGEXP (SELECT pattern FROM priv_groups) THEN 'direct member of a privileged group'
+                    WHEN (SELECT n FROM collected) = 0 THEN NULL
+                    ELSE 'ok' END AS priv_state,
+               CASE WHEN (COALESCE(m.uac, 0) & 524288) = 524288 THEN 'critical' ELSE 'high' END AS sev
+        FROM matched m
+      key: id
+      name: identity
+    each: { field: priv_state, op: ne, value: ok }
+    evidence: "{integration_id} ({type}) reads as {identity} = AD {ad_instance}/{account} ({dn}): {priv_state}"
+
+  - id: XS-KEEPER-IDENTITY-PASSWORD-NEVER-EXPIRES
+    title: The AD account Keeper reads with has a password that never expires or is not rotated
+    kind: misconfigured
+    lens: security
+    category: IAM
+    severity:
+      field: sev
+      map: { high: high, medium: medium }
+      default: medium
+    entity: integration
+    why: >-
+      A Keeper credential sits in a vault and is used by every scan; one that never has to change stays
+      valid after any leak. "Password not required" is worse: the account may have an empty password.
+      The age limit is threshold cross.keeper-password-max-age-days (default 365).
+    fix: >-
+      Clear "password never expires" and "password not required", rotate the password on a schedule
+      (or move to a gMSA), then store it again with keeper integration set-secret.
+    refs: [NIST-800-53:IA-5(1), CIS-Controls-v8:5.2]
+    query:
+      protocol: store
+      text: |
+        WITH max_age AS (
+          SELECT COALESCE((SELECT CAST(value AS REAL) FROM setting WHERE key = 'threshold.cross.max-scan-age-days'), 14) AS days
+        ),
+        live AS (
+          SELECT lr.run_id, lr.instance, lr.system, lr.status
+          FROM latest_run lr CROSS JOIN max_age m
+          WHERE lr.status <> 'failed' AND julianday(:now) - julianday(lr.started_at) <= m.days
+        ),
+        max_pwd AS (
+          SELECT COALESCE((SELECT CAST(value AS REAL) FROM setting WHERE key = 'threshold.cross.keeper-password-max-age-days'), 365) AS days
+        ),
+        ad_users AS (
+          SELECT r.instance, s.entity_key AS account, LOWER(s.entity_key) AS account_l,
+                 LOWER(MAX(json_extract(s.attrs, '$.userPrincipalName'))) AS upn_l,
+                 MAX(json_extract(s.attrs, '$.distinguishedName')) AS dn,
+                 MAX(CAST(json_extract(s.attrs, '$.userAccountControl') AS INTEGER)) AS uac,
+                 CASE WHEN MAX(json_extract(s.attrs, '$.pwdLastSet')) GLOB '[0-9][0-9][0-9][0-9]-*'
+                      THEN MAX(json_extract(s.attrs, '$.pwdLastSet')) END AS pwd_set
+          FROM live r JOIN row_seen s ON s.run_id = r.run_id
+          WHERE r.system = 'active-directory' AND s.entity_type = 'user'
+          GROUP BY r.instance, s.entity_key
+        ),
+        keeper_ids AS (
+          SELECT i.integration_id, i.type, i.identity, LOWER(TRIM(i.identity)) AS identity_l,
+                 LOWER(CASE WHEN instr(i.identity, '\') > 0 THEN substr(TRIM(i.identity), instr(TRIM(i.identity), '\') + 1) ELSE TRIM(i.identity) END) AS sam_l,
+                 CASE WHEN instr(i.identity, '@') > 0 THEN 1 ELSE 0 END AS is_upn
+          FROM integration i
+          WHERE i.enabled = 1 AND i.identity IS NOT NULL AND TRIM(i.identity) <> '' AND i.type <> 'keeper'
+        ),
+        matched AS (
+          SELECT k.integration_id, k.type, k.identity, a.instance AS ad_instance, a.account, a.dn, a.uac, a.pwd_set
+          FROM keeper_ids k
+          JOIN ad_users a
+            ON (k.is_upn = 1 AND a.upn_l = k.identity_l)
+            OR (k.is_upn = 0 AND k.type IN ('ldap', 'cim', 'sccm', 'sql') AND (a.account_l = k.sam_l OR LOWER(a.dn) = k.identity_l))
+        )
+        SELECT m.integration_id || '|' || m.ad_instance || '/' || m.account AS id,
+               m.integration_id, m.type, m.identity, m.ad_instance, m.account, m.uac, m.pwd_set,
+               CASE WHEN m.pwd_set IS NOT NULL THEN CAST(julianday(:now) - julianday(m.pwd_set) AS INTEGER) END AS pwd_age_days,
+               CASE WHEN m.uac IS NULL THEN NULL
+                    WHEN (m.uac & 32) = 32 THEN 'password not required'
+                    WHEN (m.uac & 65536) = 65536 THEN 'password never expires'
+                    WHEN m.pwd_set IS NOT NULL AND julianday(:now) - julianday(m.pwd_set) > p.days
+                      THEN 'password not changed for ' || CAST(julianday(:now) - julianday(m.pwd_set) AS INTEGER) || ' days'
+                    ELSE 'ok' END AS pwd_state,
+               CASE WHEN (COALESCE(m.uac, 0) & 32) = 32 THEN 'high' ELSE 'medium' END AS sev
+        FROM matched m CROSS JOIN max_pwd p
+      key: id
+      name: identity
+    each: { field: pwd_state, op: ne, value: ok }
+    evidence: "{integration_id} ({type}) reads as AD {ad_instance}/{account}: {pwd_state} (password set {pwd_set})"
+
+  - id: XS-KEEPER-SECRET-STALE
+    title: The AD password changed after Keeper stored it, and no scan has succeeded since
+    kind: broken
+    lens: maintenance
+    category: AUT
+    severity: high
+    entity: integration
+    why: >-
+      pwdLastSet in AD is newer than the secret in Keeper's vault, and no fully successful run of the
+      integration happened after the change, so the stored password is almost certainly the old one.
+      The next scans will fail or lock the account out; this names the cause before KEEPER-SCAN-FAILED
+      shows only the effect.
+    fix: >-
+      Store the current password with keeper integration set-secret <id> password, then run keeper
+      scan <system> --test.
+    refs: [NIST-800-53:IA-5, CIS-Controls-v8:5.2]
+    query:
+      protocol: store
+      text: |
+        WITH max_age AS (
+          SELECT COALESCE((SELECT CAST(value AS REAL) FROM setting WHERE key = 'threshold.cross.max-scan-age-days'), 14) AS days
+        ),
+        live AS (
+          SELECT lr.run_id, lr.instance, lr.system, lr.status
+          FROM latest_run lr CROSS JOIN max_age m
+          WHERE lr.status <> 'failed' AND julianday(:now) - julianday(lr.started_at) <= m.days
+        ),
+        ad_users AS (
+          SELECT r.instance, s.entity_key AS account, LOWER(s.entity_key) AS account_l,
+                 LOWER(MAX(json_extract(s.attrs, '$.userPrincipalName'))) AS upn_l,
+                 MAX(json_extract(s.attrs, '$.distinguishedName')) AS dn,
+                 CASE WHEN MAX(json_extract(s.attrs, '$.pwdLastSet')) GLOB '[0-9][0-9][0-9][0-9]-*'
+                      THEN MAX(json_extract(s.attrs, '$.pwdLastSet')) END AS pwd_set
+          FROM live r JOIN row_seen s ON s.run_id = r.run_id
+          WHERE r.system = 'active-directory' AND s.entity_type = 'user'
+          GROUP BY r.instance, s.entity_key
+        ),
+        keeper_ids AS (
+          SELECT i.integration_id, i.type, i.identity, LOWER(TRIM(i.identity)) AS identity_l,
+                 LOWER(CASE WHEN instr(i.identity, '\') > 0 THEN substr(TRIM(i.identity), instr(TRIM(i.identity), '\') + 1) ELSE TRIM(i.identity) END) AS sam_l,
+                 CASE WHEN instr(i.identity, '@') > 0 THEN 1 ELSE 0 END AS is_upn
+          FROM integration i
+          WHERE i.enabled = 1 AND i.identity IS NOT NULL AND TRIM(i.identity) <> '' AND i.type <> 'keeper'
+        ),
+        secrets AS (
+          SELECT integration_id, MAX(secret_set_at) AS secret_set_at
+          FROM integration_status
+          WHERE secret_name IS NOT NULL
+          GROUP BY integration_id
+        ),
+        matched AS (
+          SELECT k.integration_id, k.type, k.identity, a.instance AS ad_instance, a.account, a.pwd_set
+          FROM keeper_ids k
+          JOIN ad_users a
+            ON (k.is_upn = 1 AND a.upn_l = k.identity_l)
+            OR (k.is_upn = 0 AND k.type IN ('ldap', 'cim', 'sccm', 'sql') AND (a.account_l = k.sam_l OR LOWER(a.dn) = k.identity_l))
+        )
+        SELECT m.integration_id || '|' || m.ad_instance || '/' || m.account AS id,
+               m.integration_id, m.type, m.identity, m.ad_instance, m.account, m.pwd_set, sc.secret_set_at,
+               CASE WHEN m.pwd_set IS NOT NULL AND sc.secret_set_at IS NOT NULL
+                         AND julianday(m.pwd_set) - julianday(sc.secret_set_at) > 1.0 / 24
+                         AND NOT EXISTS (SELECT 1 FROM run x
+                                         WHERE x.instance = m.integration_id AND x.status = 'ok'
+                                           AND julianday(x.started_at) > julianday(m.pwd_set) + 1.0 / 24)
+                    THEN 1 ELSE 0 END AS secret_older
+        FROM matched m JOIN secrets sc ON sc.integration_id = m.integration_id
+      key: id
+      name: identity
+    each: { field: secret_older, op: eq, value: 1 }
+    evidence: "{integration_id} ({type}): AD {ad_instance}/{account} password set {pwd_set}, Keeper's secret stored {secret_set_at}, no successful scan since"
+
+  - id: XS-KEEPER-IDENTITY-UNUSABLE
+    title: The AD account Keeper reads with is disabled, expired, in a leavers OU, missing or unused
+    kind: broken
+    lens: maintenance
+    category: AUT
+    severity:
+      field: sev
+      map: { high: high, medium: medium }
+      default: high
+    entity: integration
+    why: >-
+      A scan that still works with an account the directory is retiring is a scan that is about to
+      stop. An identity of a Windows-authenticated integration (ldap, cim, sccm, sql) that matches no
+      account in a scanned, complete domain is a typo nobody noticed. And an account with no domain
+      logon for threshold cross.keeper-identity-idle-days (default 30) while scans through it succeed
+      means Keeper is not really signing in as the identity it records.
+    fix: >-
+      Re-enable or replace the account, or correct the integration's identity, then keeper scan
+      <system> --test.
+    refs: [NIST-800-53:AC-2(3), NIST-800-53:IA-4]
+    query:
+      protocol: store
+      text: |
+        WITH max_age AS (
+          SELECT COALESCE((SELECT CAST(value AS REAL) FROM setting WHERE key = 'threshold.cross.max-scan-age-days'), 14) AS days
+        ),
+        live AS (
+          SELECT lr.run_id, lr.instance, lr.system, lr.status
+          FROM latest_run lr CROSS JOIN max_age m
+          WHERE lr.status <> 'failed' AND julianday(:now) - julianday(lr.started_at) <= m.days
+        ),
+        ad_users_complete AS (
+          SELECT CASE WHEN COUNT(*) > 0 AND SUM(CASE WHEN lr.status = 'ok' OR EXISTS (
+                        SELECT 1 FROM coverage c WHERE c.run_id = lr.run_id AND c.scope = 'rule' AND c.item = 'AD-POP-USERS-NONE' AND c.state = 'ok')
+                      THEN 0 ELSE 1 END) = 0 THEN 1 ELSE 0 END AS ok
+          FROM latest_run lr CROSS JOIN max_age m
+          WHERE lr.system = 'active-directory' AND julianday(:now) - julianday(lr.started_at) <= m.days
+        ),
+        leaver AS (
+          SELECT COALESCE((SELECT value FROM setting WHERE key = 'threshold.ad.disabled-ou-pattern'),
+                          '(?i)OU=[^,]*(disable|leaver|terminat|former|departed|deprovision)') AS pattern
+        ),
+        idle AS (
+          SELECT COALESCE((SELECT CAST(value AS REAL) FROM setting WHERE key = 'threshold.cross.keeper-identity-idle-days'), 30) AS days
+        ),
+        ad_users AS (
+          SELECT r.instance, s.entity_key AS account, LOWER(s.entity_key) AS account_l,
+                 MAX(json_extract(s.attrs, '$.userPrincipalName')) AS upn,
+                 LOWER(MAX(json_extract(s.attrs, '$.userPrincipalName'))) AS upn_l,
+                 MAX(json_extract(s.attrs, '$.distinguishedName')) AS dn,
+                 MAX(CAST(json_extract(s.attrs, '$.userAccountControl') AS INTEGER)) AS uac,
+                 CASE WHEN MAX(json_extract(s.attrs, '$.lastLogonTimestamp')) GLOB '[0-9][0-9][0-9][0-9]-*'
+                      THEN MAX(json_extract(s.attrs, '$.lastLogonTimestamp')) END AS dc_logon,
+                 MAX(json_extract(s.attrs, '$.accountExpires')) AS expires
+          FROM live r JOIN row_seen s ON s.run_id = r.run_id
+          WHERE r.system = 'active-directory' AND s.entity_type = 'user'
+          GROUP BY r.instance, s.entity_key
+        ),
+        known AS (
+          SELECT DISTINCT LOWER(substr(upn, instr(upn, '@') + 1)) AS domain FROM ad_users WHERE instr(upn, '@') > 0
+          UNION
+          SELECT DISTINCT LOWER(CASE WHEN instr(rest, ',') > 0 THEN substr(rest, 1, instr(rest, ',') - 1) ELSE rest END)
+          FROM (SELECT substr(dn, instr(UPPER(dn), ',DC=') + 4) AS rest FROM ad_users WHERE instr(UPPER(dn), ',DC=') > 0)
+        ),
+        keeper_ids AS (
+          SELECT i.integration_id, i.type, i.identity, LOWER(TRIM(i.identity)) AS identity_l,
+                 LOWER(CASE WHEN instr(i.identity, '\') > 0 THEN substr(TRIM(i.identity), instr(TRIM(i.identity), '\') + 1) ELSE TRIM(i.identity) END) AS sam_l,
+                 CASE WHEN instr(i.identity, '@') > 0 THEN 1 ELSE 0 END AS is_upn,
+                 LOWER(CASE WHEN instr(i.identity, '@') > 0 THEN substr(TRIM(i.identity), instr(TRIM(i.identity), '@') + 1)
+                            WHEN instr(i.identity, '\') > 0 THEN substr(TRIM(i.identity), 1, instr(TRIM(i.identity), '\') - 1) END) AS id_domain
+          FROM integration i
+          WHERE i.enabled = 1 AND i.identity IS NOT NULL AND TRIM(i.identity) <> '' AND i.type <> 'keeper'
+        ),
+        judged AS (
+          SELECT k.integration_id || '|' || COALESCE(a.instance || '/' || a.account, 'no-match') AS id,
+                 k.integration_id, k.type, k.identity, a.instance AS ad_instance, a.account, a.dn, a.dc_logon,
+                 CASE WHEN a.account IS NULL THEN 'no AD account matches the identity'
+                      WHEN (COALESCE(a.uac, 0) & 2) = 2 THEN 'the AD account is disabled'
+                      WHEN a.expires GLOB '[0-9][0-9][0-9][0-9]-*' AND julianday(a.expires) < julianday(:now)
+                        THEN 'the AD account expired on ' || substr(a.expires, 1, 10)
+                      WHEN a.dn REGEXP (SELECT pattern FROM leaver) THEN 'the AD account is in a leavers OU'
+                      WHEN k.type IN ('ldap', 'cim', 'sccm', 'sql')
+                           AND (a.dc_logon IS NULL OR julianday(:now) - julianday(a.dc_logon) > w.days)
+                           AND EXISTS (SELECT 1 FROM run x
+                                       WHERE x.instance = k.integration_id AND x.status <> 'failed'
+                                         AND julianday(:now) - julianday(x.started_at) <= w.days)
+                        THEN 'no domain logon in ' || CAST(w.days AS INTEGER) || ' days although scans through it succeed'
+                      ELSE 'ok' END AS state
+          FROM keeper_ids k
+          CROSS JOIN idle w
+          LEFT JOIN ad_users a
+            ON (k.is_upn = 1 AND a.upn_l = k.identity_l)
+            OR (k.is_upn = 0 AND k.type IN ('ldap', 'cim', 'sccm', 'sql') AND (a.account_l = k.sam_l OR LOWER(a.dn) = k.identity_l))
+          WHERE EXISTS (SELECT 1 FROM ad_users)
+            AND (a.account IS NOT NULL
+                 OR (k.type IN ('ldap', 'cim', 'sccm', 'sql') AND k.id_domain IN (SELECT domain FROM known)
+                     AND (SELECT ok FROM ad_users_complete) = 1))
+        )
+        SELECT id, integration_id, type, identity, ad_instance, account, dn, dc_logon, state,
+               CASE WHEN state LIKE 'no domain logon%' THEN 'medium' ELSE 'high' END AS sev
+        FROM judged
+      key: id
+      name: identity
+    each: { field: state, op: ne, value: ok }
+    evidence: "{integration_id} ({type}) reads as {identity}: {state} (AD {ad_instance}/{account}, last domain logon {dc_logon})"
+
+  - id: XS-KEEPER-IDENTITY-SHARED
+    title: One identity is used by several Keeper integrations
+    kind: misconfigured
+    lens: security
+    category: IAM
+    severity: medium
+    entity: integration
+    why: >-
+      When several integrations sign in with the same account, one leak opens all of them and one
+      rotation breaks all of them; the account also needs the union of every system's rights, so the
+      directory reader ends up with server or database rights it does not need. The allowed number is
+      threshold cross.keeper-identity-max-integrations (default 1).
+    fix: >-
+      Give each integration its own service identity with only the rights that system's rules need,
+      and its own secret.
+    refs: [NIST-800-53:AC-2, NIST-800-53:IA-2, CIS-Controls-v8:5.5]
+    query:
+      protocol: store
+      text: |
+        WITH keeper_ids AS (
+          SELECT i.integration_id, i.type, i.identity, LOWER(TRIM(i.identity)) AS identity_l
+          FROM integration i
+          WHERE i.enabled = 1 AND i.identity IS NOT NULL AND TRIM(i.identity) <> '' AND i.type <> 'keeper'
+        )
+        SELECT k.integration_id, k.type, k.identity,
+               (SELECT COUNT(*) FROM keeper_ids o WHERE o.identity_l = k.identity_l) AS users_of_identity,
+               (SELECT GROUP_CONCAT(o.integration_id, ', ') FROM keeper_ids o
+                 WHERE o.identity_l = k.identity_l AND o.integration_id <> k.integration_id) AS shared_with
+        FROM keeper_ids k
+      key: integration_id
+      name: identity
+    each: { field: users_of_identity, op: gt, value: 1, threshold: cross.keeper-identity-max-integrations }
+    evidence: "{integration_id} ({type}) reads as {identity}, which {shared_with} also use ({users_of_identity} integrations)"
+
+  - id: XS-KEEPER-IDENTITY-PERSONAL
+    title: Keeper reads through what looks like a person's AD account
+    kind: misconfigured
+    lens: security
+    category: IAM
+    severity: medium
+    entity: integration
+    why: >-
+      An account with a first and last name, or with a user mailbox, belongs to a person: it leaves
+      with them, its password follows their habits, it is counted in licence and access reviews as a
+      user, and its rights grow with their job rather than with what Keeper needs.
+    fix: >-
+      Create a dedicated service account (or gMSA) for the integration, store its secret, and stop
+      using the personal account.
+    refs: [NIST-800-53:AC-2, NIST-800-53:IA-4, CIS-Controls-v8:5.5]
+    query:
+      protocol: store
+      text: |
+        WITH max_age AS (
+          SELECT COALESCE((SELECT CAST(value AS REAL) FROM setting WHERE key = 'threshold.cross.max-scan-age-days'), 14) AS days
+        ),
+        live AS (
+          SELECT lr.run_id, lr.instance, lr.system, lr.status
+          FROM latest_run lr CROSS JOIN max_age m
+          WHERE lr.status <> 'failed' AND julianday(:now) - julianday(lr.started_at) <= m.days
+        ),
+        ad_users AS (
+          SELECT r.instance, s.entity_key AS account, LOWER(s.entity_key) AS account_l,
+                 LOWER(MAX(json_extract(s.attrs, '$.userPrincipalName'))) AS upn_l,
+                 MAX(json_extract(s.attrs, '$.distinguishedName')) AS dn,
+                 MAX(json_extract(s.attrs, '$.givenName')) AS given_name,
+                 MAX(json_extract(s.attrs, '$.sn')) AS surname,
+                 MAX(CAST(json_extract(s.attrs, '$.msExchRecipientTypeDetails') AS INTEGER)) AS mailbox_type
+          FROM live r JOIN row_seen s ON s.run_id = r.run_id
+          WHERE r.system = 'active-directory' AND s.entity_type = 'user'
+          GROUP BY r.instance, s.entity_key
+        ),
+        keeper_ids AS (
+          SELECT i.integration_id, i.type, i.identity, LOWER(TRIM(i.identity)) AS identity_l,
+                 LOWER(CASE WHEN instr(i.identity, '\') > 0 THEN substr(TRIM(i.identity), instr(TRIM(i.identity), '\') + 1) ELSE TRIM(i.identity) END) AS sam_l,
+                 CASE WHEN instr(i.identity, '@') > 0 THEN 1 ELSE 0 END AS is_upn
+          FROM integration i
+          WHERE i.enabled = 1 AND i.identity IS NOT NULL AND TRIM(i.identity) <> '' AND i.type <> 'keeper'
+        )
+        SELECT k.integration_id || '|' || a.instance || '/' || a.account AS id,
+               k.integration_id, k.type, k.identity, a.instance AS ad_instance, a.account, a.given_name, a.surname, a.mailbox_type,
+               CASE WHEN a.given_name IS NOT NULL AND a.surname IS NOT NULL THEN 'has a first and last name (' || a.given_name || ' ' || a.surname || ')'
+                    WHEN a.mailbox_type IN (1, 2147483648) THEN 'has a user mailbox'
+                    ELSE 'ok' END AS person_state
+        FROM keeper_ids k
+        JOIN ad_users a
+          ON (k.is_upn = 1 AND a.upn_l = k.identity_l)
+          OR (k.is_upn = 0 AND k.type IN ('ldap', 'cim', 'sccm', 'sql') AND (a.account_l = k.sam_l OR LOWER(a.dn) = k.identity_l))
+      key: id
+      name: identity
+    each: { field: person_state, op: ne, value: ok }
+    evidence: "{integration_id} ({type}) reads as AD {ad_instance}/{account}, which {person_state}"
+
+  - id: XS-KEEPER-IDENTITY-KERBEROASTABLE
+    title: The AD account Keeper reads with has a service principal name
+    kind: misconfigured
+    lens: security
+    category: AUT
+    severity: high
+    entity: integration
+    why: >-
+      Any domain user can ask for a service ticket of an account with an SPN and crack its password
+      offline. Keeper's account is a known, high-value target: whoever cracks it reads everything
+      Keeper reads.
+    fix: >-
+      Use a plain user account without an SPN or a gMSA; if the SPN must stay, give the account a long
+      random password and AES-only Kerberos.
+    refs: [NIST-800-53:IA-5(1), CIS-Controls-v8:5.2]
+    query:
+      protocol: store
+      text: |
+        WITH max_age AS (
+          SELECT COALESCE((SELECT CAST(value AS REAL) FROM setting WHERE key = 'threshold.cross.max-scan-age-days'), 14) AS days
+        ),
+        live AS (
+          SELECT lr.run_id, lr.instance, lr.system, lr.status
+          FROM latest_run lr CROSS JOIN max_age m
+          WHERE lr.status <> 'failed' AND julianday(:now) - julianday(lr.started_at) <= m.days
+        ),
+        ad_users AS (
+          SELECT r.instance, s.entity_key AS account, LOWER(s.entity_key) AS account_l,
+                 LOWER(MAX(json_extract(s.attrs, '$.userPrincipalName'))) AS upn_l,
+                 MAX(json_extract(s.attrs, '$.distinguishedName')) AS dn,
+                 MAX(json_extract(s.attrs, '$.servicePrincipalName')) AS spn,
+                 CASE WHEN MAX(json_extract(s.attrs, '$.pwdLastSet')) GLOB '[0-9][0-9][0-9][0-9]-*'
+                      THEN MAX(json_extract(s.attrs, '$.pwdLastSet')) END AS pwd_set
+          FROM live r JOIN row_seen s ON s.run_id = r.run_id
+          WHERE r.system = 'active-directory' AND s.entity_type = 'user'
+          GROUP BY r.instance, s.entity_key
+        ),
+        keeper_ids AS (
+          SELECT i.integration_id, i.type, i.identity, LOWER(TRIM(i.identity)) AS identity_l,
+                 LOWER(CASE WHEN instr(i.identity, '\') > 0 THEN substr(TRIM(i.identity), instr(TRIM(i.identity), '\') + 1) ELSE TRIM(i.identity) END) AS sam_l,
+                 CASE WHEN instr(i.identity, '@') > 0 THEN 1 ELSE 0 END AS is_upn
+          FROM integration i
+          WHERE i.enabled = 1 AND i.identity IS NOT NULL AND TRIM(i.identity) <> '' AND i.type <> 'keeper'
+        )
+        SELECT k.integration_id || '|' || a.instance || '/' || a.account AS id,
+               k.integration_id, k.type, k.identity, a.instance AS ad_instance, a.account, a.spn, a.pwd_set,
+               CASE WHEN json_valid(a.spn) AND json_array_length(a.spn) > 0 THEN 1
+                    WHEN a.spn IS NOT NULL AND NOT json_valid(a.spn) AND TRIM(a.spn) <> '' THEN 1
+                    ELSE 0 END AS has_spn
+        FROM keeper_ids k
+        JOIN ad_users a
+          ON (k.is_upn = 1 AND a.upn_l = k.identity_l)
+          OR (k.is_upn = 0 AND k.type IN ('ldap', 'cim', 'sccm', 'sql') AND (a.account_l = k.sam_l OR LOWER(a.dn) = k.identity_l))
+      key: id
+      name: identity
+    each: { field: has_spn, op: eq, value: 1 }
+    evidence: "{integration_id} ({type}) reads as AD {ad_instance}/{account}, which has SPNs {spn} (password set {pwd_set})"
+
+  - id: XS-KEEPER-APP-IDENTITY-TIER0-ROLE
+    title: The application Keeper reads Microsoft Graph with holds a tier-0 directory role
+    kind: misconfigured
+    lens: security
+    category: IAM
+    severity: critical
+    entity: integration
+    why: >-
+      Keeper needs Graph application permissions to read, never a directory role. A tier-0 role
+      (threshold entra.tier0-role-ids, the same list as the Entra pack) on its app registration makes
+      the client secret or certificate in Keeper's vault a tenant takeover.
+    fix: >-
+      Remove the directory role from the service principal; keep only the read permissions listed in
+      docs\backlog\microsoft-cloud.md, section "Graph permissions".
+    refs: [NIST-800-53:AC-6(5), CIS-Controls-v8:5.4]
+    query:
+      protocol: store
+      text: |
+        WITH max_age AS (
+          SELECT COALESCE((SELECT CAST(value AS REAL) FROM setting WHERE key = 'threshold.cross.max-scan-age-days'), 14) AS days
+        ),
+        live AS (
+          SELECT lr.run_id, lr.instance, lr.system, lr.status
+          FROM latest_run lr CROSS JOIN max_age m
+          WHERE lr.status <> 'failed' AND julianday(:now) - julianday(lr.started_at) <= m.days
+        ),
+        tier0 AS (
+          SELECT ',' || LOWER(REPLACE(COALESCE((SELECT value FROM setting WHERE key = 'threshold.entra.tier0-role-ids'),
+                 '62e90394-69f5-4237-9190-012177145e10,e8611ab8-c189-46e8-94e1-60213ab1f814,7be44c8a-adaf-4e2a-84d6-ab2649e08a13,194ae4cb-b126-40b2-bd5b-6091b380977d,8ac3fc64-6eca-42ea-9e69-59f4c7b60eb2,b1be1c3e-b65d-4f19-8427-f6fa0d97feb9,9b895d92-2cd3-44c7-9d02-a6ac2d5ea5c3,158c047a-c907-4556-b7ef-446551a6b5f7,be2f45a1-457d-42af-a067-6ec1fa63bc45,8329153b-31d0-4727-b945-745eb3bc5f31,3a2c62db-5318-420d-8d74-23affee5d9d5'),
+                 ' ', '')) || ',' AS ids
+        ),
+        role_rows AS (
+          SELECT MAX(json_extract(s.attrs, '$.principalId')) AS principal_id,
+                 MAX(json_extract(s.attrs, '$.roleDefinitionId')) AS role_id,
+                 MAX(json_extract(s.attrs, '$.directoryScopeId')) AS scope_id,
+                 MAX(json_extract(s.attrs, '$.principal.appId')) AS app_id,
+                 MAX(json_extract(s.attrs, '$.principal.displayName')) AS principal_name
+          FROM live r JOIN row_seen s ON s.run_id = r.run_id
+          WHERE r.system = 'entra' AND s.entity_type = 'role-assignment'
+          GROUP BY s.entity_key
+        ),
+        apps AS (
+          SELECT integration_id, type, identity
+          FROM integration
+          WHERE enabled = 1 AND identity REGEXP '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}'
+        )
+        SELECT a.integration_id || '|' || ro.role_id || '|' || COALESCE(ro.scope_id, '/') AS id,
+               a.integration_id, a.type, a.identity, ro.role_id, ro.scope_id, ro.principal_name
+        FROM apps a
+        JOIN role_rows ro ON ro.app_id IS NOT NULL AND instr(LOWER(a.identity), LOWER(ro.app_id)) > 0
+        CROSS JOIN tier0 t
+        WHERE instr(t.ids, ',' || LOWER(ro.role_id) || ',') > 0
+        GROUP BY a.integration_id, ro.role_id, ro.scope_id
+      key: id
+      name: identity
+    each: any
+    evidence: "{integration_id} ({type}) reads as application {identity} ({principal_name}), which holds directory role {role_id} at scope {scope_id}"
+
+  - id: XS-KEEPER-RUN-IDENTITY-DRIFT
+    title: The newest scan of a system ran with a different identity than the integration now names
+    kind: misconfigured
+    lens: security
+    category: AUT
+    severity: low
+    entity: integration
+    why: >-
+      The findings on screen were collected as one account while the integration is now set to
+      another: someone edited the integration after the scan, or a scan ran with a different account.
+      The next scan may see a different scope, and the evidence cannot say whose rights produced it.
+    fix: >-
+      Rescan with the integration's current identity (keeper scan <system>); if the change was not
+      planned, find out who edited the integration and why.
+    refs: [NIST-800-53:AU-6, NIST-800-53:AC-6(9)]
+    query:
+      protocol: store
+      text: |
+        SELECT lr.instance || '/' || lr.system AS id, lr.instance, lr.system, lr.identity AS run_identity,
+               i.identity AS configured_identity, lr.started_at
+        FROM latest_run lr
+        JOIN integration i ON i.integration_id = lr.instance
+        WHERE lr.identity IS NOT NULL AND TRIM(lr.identity) <> ''
+          AND LOWER(TRIM(lr.identity)) <> LOWER(TRIM(COALESCE(i.identity, '')))
+      key: id
+    each: any
+    evidence: "{system} via {instance}: scanned {started_at} as {run_identity}, integration now names {configured_identity}"
+
+  # ============================================================== users: AD x Entra (on SID) ===
+
+  - id: XS-USER-AD-DISABLED-ENTRA-ENABLED
+    title: Account disabled in Active Directory is still enabled in Entra ID
+    kind: broken
+    lens: security
+    category: IAM
+    severity:
+      field: sev
+      map: { critical: critical, high: high }
+      default: high
+    entity: user
+    why: >-
+      With directory sync the cloud account follows AD within an hour; when it does not, sync is broken,
+      paused or filtered, and the leaver keeps mail, Teams and every SaaS app that trusts Entra. Without
+      sync it is a leaver process that stopped half-way. ENTRA-SYNC-STALE sees the sync lag, not the
+      accounts it stranded. A successful cloud sign-in in the last 7 days makes it critical.
+    fix: >-
+      Repair directory sync (see ENTRA-SYNC-STALE); disable the cloud account now and revoke its
+      sessions; then remove its licences.
+    refs: [NIST-800-53:AC-2(3), NIST-800-53:PS-4, CIS-Controls-v8:5.3, CIS-Controls-v8:6.2]
+    query:
+      protocol: store
+      text: |
+        WITH max_age AS (
+          SELECT COALESCE((SELECT CAST(value AS REAL) FROM setting WHERE key = 'threshold.cross.max-scan-age-days'), 14) AS days
+        ),
+        live AS (
+          SELECT lr.run_id, lr.instance, lr.system, lr.status
+          FROM latest_run lr CROSS JOIN max_age m
+          WHERE lr.status <> 'failed' AND julianday(:now) - julianday(lr.started_at) <= m.days
+        ),
+        ad_users AS (
+          SELECT r.instance, s.entity_key AS account,
+                 MAX(json_extract(s.attrs, '$.distinguishedName')) AS dn,
+                 MAX(json_extract(s.attrs, '$.objectSid')) AS sid,
+                 MAX(CAST(json_extract(s.attrs, '$.userAccountControl') AS INTEGER)) AS uac
+          FROM live r JOIN row_seen s ON s.run_id = r.run_id
+          WHERE r.system = 'active-directory' AND s.entity_type = 'user'
+          GROUP BY r.instance, s.entity_key
+        ),
+        entra_users AS (
+          SELECT s.entity_key AS id,
+                 MAX(json_extract(s.attrs, '$.userPrincipalName')) AS upn,
+                 MAX(CAST(json_extract(s.attrs, '$.accountEnabled') AS INTEGER)) AS enabled,
+                 MAX(CAST(json_extract(s.attrs, '$.onPremisesSyncEnabled') AS INTEGER)) AS synced,
+                 MAX(json_extract(s.attrs, '$.onPremisesSecurityIdentifier')) AS sid,
+                 MAX(json_extract(s.attrs, '$.signInActivity.lastSuccessfulSignInDateTime')) AS cloud_signin,
+                 MAX(json_extract(s.attrs, '$.assignedLicenses')) AS licences
+          FROM live r JOIN row_seen s ON s.run_id = r.run_id
+          WHERE r.system IN ('entra', 'm365') AND s.entity_type = 'user'
+          GROUP BY s.entity_key
+        )
+        SELECT a.instance || '/' || a.account AS id, a.account, a.dn, e.id AS entra_id, e.upn AS entra_upn,
+               COALESCE(e.synced, 0) AS synced, e.cloud_signin,
+               CASE WHEN json_valid(e.licences) THEN json_array_length(e.licences) ELSE 0 END AS licence_count,
+               CASE WHEN e.cloud_signin IS NOT NULL AND julianday(:now) - julianday(e.cloud_signin) <= 7 THEN 'critical' ELSE 'high' END AS sev
+        FROM ad_users a
+        JOIN entra_users e ON e.sid = a.sid
+        WHERE a.sid IS NOT NULL AND (COALESCE(a.uac, 0) & 2) = 2 AND e.enabled = 1
+      key: id
+      name: entra_upn
+    each: any
+    evidence: "AD {account} is disabled ({dn}); Entra {entra_upn} is enabled (synced {synced}, last successful cloud sign-in {cloud_signin}, {licence_count} licences)"
+
+  - id: XS-USER-AD-ENABLED-ENTRA-DISABLED
+    title: Synchronised account blocked in Entra ID is still enabled in Active Directory
+    kind: broken
+    lens: security
+    category: IAM
+    severity: high
+    entity: user
+    why: >-
+      Blocking sign-in in the cloud stops Entra, not the domain: the person, or whoever holds the
+      password, can still log on to every on-premises service, file share, VPN that checks AD, and RDP.
+      It is the usual trace of a cloud-side offboarding or compromise response that never reached AD.
+    fix: >-
+      Disable the AD account (sync then keeps the cloud side disabled), reset its password if the block
+      was a compromise response, and remove its group memberships.
+    refs: [NIST-800-53:AC-2(3), NIST-800-53:PS-4, CIS-Controls-v8:5.3, CIS-Controls-v8:6.2]
+    query:
+      protocol: store
+      text: |
+        WITH max_age AS (
+          SELECT COALESCE((SELECT CAST(value AS REAL) FROM setting WHERE key = 'threshold.cross.max-scan-age-days'), 14) AS days
+        ),
+        live AS (
+          SELECT lr.run_id, lr.instance, lr.system, lr.status
+          FROM latest_run lr CROSS JOIN max_age m
+          WHERE lr.status <> 'failed' AND julianday(:now) - julianday(lr.started_at) <= m.days
+        ),
+        ad_users AS (
+          SELECT r.instance, s.entity_key AS account,
+                 MAX(json_extract(s.attrs, '$.distinguishedName')) AS dn,
+                 MAX(json_extract(s.attrs, '$.objectSid')) AS sid,
+                 MAX(CAST(json_extract(s.attrs, '$.userAccountControl') AS INTEGER)) AS uac,
+                 CASE WHEN MAX(json_extract(s.attrs, '$.lastLogonTimestamp')) GLOB '[0-9][0-9][0-9][0-9]-*'
+                      THEN MAX(json_extract(s.attrs, '$.lastLogonTimestamp')) END AS dc_logon,
+                 MAX(json_extract(s.attrs, '$.accountExpires')) AS expires
+          FROM live r JOIN row_seen s ON s.run_id = r.run_id
+          WHERE r.system = 'active-directory' AND s.entity_type = 'user'
+          GROUP BY r.instance, s.entity_key
+        ),
+        entra_users AS (
+          SELECT s.entity_key AS id,
+                 MAX(json_extract(s.attrs, '$.userPrincipalName')) AS upn,
+                 MAX(CAST(json_extract(s.attrs, '$.accountEnabled') AS INTEGER)) AS enabled,
+                 MAX(CAST(json_extract(s.attrs, '$.onPremisesSyncEnabled') AS INTEGER)) AS synced,
+                 MAX(json_extract(s.attrs, '$.onPremisesSecurityIdentifier')) AS sid
+          FROM live r JOIN row_seen s ON s.run_id = r.run_id
+          WHERE r.system IN ('entra', 'm365') AND s.entity_type = 'user'
+          GROUP BY s.entity_key
+        )
+        SELECT a.instance || '/' || a.account AS id, a.account, a.dn, a.dc_logon, e.id AS entra_id, e.upn AS entra_upn
+        FROM ad_users a
+        JOIN entra_users e ON e.sid = a.sid
+        WHERE a.sid IS NOT NULL AND (COALESCE(a.uac, 0) & 2) = 0 AND e.enabled = 0 AND e.synced = 1
+          AND NOT (a.expires GLOB '[0-9][0-9][0-9][0-9]-*' AND julianday(a.expires) < julianday(:now))
+      key: id
+      name: entra_upn
+    each: any
+    evidence: "Entra {entra_upn} is blocked; AD {account} is enabled ({dn}), last domain logon {dc_logon}"
+
+  - id: XS-USER-SYNCED-AD-GONE
+    title: Synchronised cloud account whose AD account no longer exists
+    kind: broken
+    lens: both
+    category: IAM
+    severity:
+      field: sev
+      map: { high: high, medium: medium }
+      default: medium
+    entity: user
+    why: >-
+      Entra says the account comes from AD, but the newest complete scan of that AD domain (same domain
+      SID) has no account with its SID: it was deleted while sync stopped, was filtered out of sync
+      scope, or hit the sync deletion threshold. The orphan keeps its licences, mailbox and group
+      memberships, and nobody can disable it from AD any more. Accounts of domains Keeper does not scan
+      are not judged. Enabled and licensed makes it high.
+    fix: >-
+      Find the AD object (recycle bin, moved out of scope); restore it into sync scope, or delete the
+      cloud account deliberately after exporting what must be kept.
+    refs: [NIST-800-53:AC-2, CIS-Controls-v8:5.1]
+    query:
+      protocol: store
+      text: |
+        WITH max_age AS (
+          SELECT COALESCE((SELECT CAST(value AS REAL) FROM setting WHERE key = 'threshold.cross.max-scan-age-days'), 14) AS days
+        ),
+        live AS (
+          SELECT lr.run_id, lr.instance, lr.system, lr.status
+          FROM latest_run lr CROSS JOIN max_age m
+          WHERE lr.status <> 'failed' AND julianday(:now) - julianday(lr.started_at) <= m.days
+        ),
+        ad_users_complete AS (
+          SELECT CASE WHEN COUNT(*) > 0 AND SUM(CASE WHEN lr.status = 'ok' OR EXISTS (
+                        SELECT 1 FROM coverage c WHERE c.run_id = lr.run_id AND c.scope = 'rule' AND c.item = 'AD-POP-USERS-NONE' AND c.state = 'ok')
+                      THEN 0 ELSE 1 END) = 0 THEN 1 ELSE 0 END AS ok
+          FROM latest_run lr CROSS JOIN max_age m
+          WHERE lr.system = 'active-directory' AND julianday(:now) - julianday(lr.started_at) <= m.days
+        ),
+        ad_sids AS (
+          SELECT DISTINCT json_extract(s.attrs, '$.objectSid') AS sid
+          FROM live r JOIN row_seen s ON s.run_id = r.run_id
+          WHERE r.system = 'active-directory' AND s.entity_type = 'user' AND json_extract(s.attrs, '$.objectSid') IS NOT NULL
+        ),
+        ad_domains AS (
+          SELECT DISTINCT rtrim(sid, '0123456789') AS prefix FROM ad_sids
+        ),
+        entra_users AS (
+          SELECT s.entity_key AS id,
+                 MAX(json_extract(s.attrs, '$.userPrincipalName')) AS upn,
+                 MAX(CAST(json_extract(s.attrs, '$.accountEnabled') AS INTEGER)) AS enabled,
+                 MAX(CAST(json_extract(s.attrs, '$.onPremisesSyncEnabled') AS INTEGER)) AS synced,
+                 MAX(json_extract(s.attrs, '$.onPremisesSecurityIdentifier')) AS sid,
+                 MAX(json_extract(s.attrs, '$.signInActivity.lastSuccessfulSignInDateTime')) AS cloud_signin,
+                 MAX(json_extract(s.attrs, '$.assignedLicenses')) AS licences
+          FROM live r JOIN row_seen s ON s.run_id = r.run_id
+          WHERE r.system IN ('entra', 'm365') AND s.entity_type = 'user'
+          GROUP BY s.entity_key
+        ),
+        orphans AS (
+          SELECT e.id, e.upn, e.sid, e.enabled, e.cloud_signin,
+                 CASE WHEN json_valid(e.licences) THEN json_array_length(e.licences) ELSE 0 END AS licence_count
+          FROM entra_users e
+          WHERE e.synced = 1 AND e.sid IS NOT NULL
+            AND rtrim(e.sid, '0123456789') IN (SELECT prefix FROM ad_domains)
+            AND (SELECT ok FROM ad_users_complete) = 1
+            AND e.sid NOT IN (SELECT sid FROM ad_sids)
+        )
+        SELECT id, upn, sid, enabled, cloud_signin, licence_count,
+               CASE WHEN enabled = 1 AND licence_count > 0 THEN 'high' ELSE 'medium' END AS sev
+        FROM orphans
+      key: id
+      name: upn
+    each: any
+    evidence: "Entra {upn} (SID {sid}, enabled {enabled}, {licence_count} licences, last cloud sign-in {cloud_signin}) is synchronised, but AD has no account with that SID"
+
+  - id: XS-USER-LICENSED-LEAVER
+    title: Paid licence on a cloud account that Active Directory treats as a leaver
+    kind: misconfigured
+    lens: both
+    category: CST
+    severity: medium
+    entity: user
+    why: >-
+      The AD account has expired or sits in a leavers OU (threshold ad.disabled-ou-pattern), yet its
+      cloud account is enabled and holds a paid licence. Directory sync does not carry the expiry date,
+      and moving an account to a leavers OU changes nothing in the cloud, so the seat and the mailbox
+      stay. Disabled AD accounts are reported by XS-USER-AD-DISABLED-ENTRA-ENABLED and cloud-disabled
+      ones by M365-LICENSED-USER-DISABLED. Free SKUs (threshold m365.free-sku-ids) do not count;
+      shared, room and equipment mailbox objects are left out.
+    fix: >-
+      Finish the leaver process: disable the account, convert the mailbox to shared or inactive if it
+      must be kept, remove the licence, and make licensing groups exclude the leavers OU.
+    refs: [NIST-800-53:PM-3, NIST-800-53:AC-2(3), CIS-Controls-v8:5.3]
+    query:
+      protocol: store
+      text: |
+        WITH max_age AS (
+          SELECT COALESCE((SELECT CAST(value AS REAL) FROM setting WHERE key = 'threshold.cross.max-scan-age-days'), 14) AS days
+        ),
+        live AS (
+          SELECT lr.run_id, lr.instance, lr.system, lr.status
+          FROM latest_run lr CROSS JOIN max_age m
+          WHERE lr.status <> 'failed' AND julianday(:now) - julianday(lr.started_at) <= m.days
+        ),
+        leaver AS (
+          SELECT COALESCE((SELECT value FROM setting WHERE key = 'threshold.ad.disabled-ou-pattern'),
+                          '(?i)OU=[^,]*(disable|leaver|terminat|former|departed|deprovision)') AS pattern
+        ),
+        free AS (
+          SELECT ',' || LOWER(REPLACE(COALESCE((SELECT value FROM setting WHERE key = 'threshold.m365.free-sku-ids'),
+                 'f30db892-07e9-47e9-837c-80727f46fd3d,a403ebcc-fae0-4ca2-8c8c-7a907fd6c235,710779e8-3d4a-4c88-adb9-386c958d1fdf,dcb1a3ae-b33f-4487-846a-a640262fadf4,5b631642-bd26-49fe-bd20-1daaa972ef80,1f2f344a-700d-42c9-9427-5cea1d5d7ba6,6470687e-a428-4b7a-bef2-8a291ad947c9,8c4ce438-32a7-4ac5-91a6-e22ae08d9c8b,bc946dac-7877-4271-b2f7-99d2db13cd2c,440eaaa8-b3e0-484b-a8be-62870b9ba70a,94763226-9b3c-4e75-a931-5c89701abe66,314c4481-f395-4525-be8b-2ec4bb1e9d91'),
+                 ' ', '')) || ',' AS ids
+        ),
+        ad_users AS (
+          SELECT r.instance, s.entity_key AS account,
+                 MAX(json_extract(s.attrs, '$.distinguishedName')) AS dn,
+                 MAX(json_extract(s.attrs, '$.objectSid')) AS sid,
+                 MAX(CAST(json_extract(s.attrs, '$.userAccountControl') AS INTEGER)) AS uac,
+                 MAX(json_extract(s.attrs, '$.accountExpires')) AS expires,
+                 MAX(CAST(json_extract(s.attrs, '$.msExchRecipientTypeDetails') AS INTEGER)) AS mailbox_type
+          FROM live r JOIN row_seen s ON s.run_id = r.run_id
+          WHERE r.system = 'active-directory' AND s.entity_type = 'user'
+          GROUP BY r.instance, s.entity_key
+        ),
+        entra_users AS (
+          SELECT s.entity_key AS id,
+                 MAX(json_extract(s.attrs, '$.userPrincipalName')) AS upn,
+                 MAX(CAST(json_extract(s.attrs, '$.accountEnabled') AS INTEGER)) AS enabled,
+                 MAX(json_extract(s.attrs, '$.onPremisesSecurityIdentifier')) AS sid,
+                 MAX(json_extract(s.attrs, '$.assignedLicenses')) AS licences
+          FROM live r JOIN row_seen s ON s.run_id = r.run_id
+          WHERE r.system IN ('entra', 'm365') AND s.entity_type = 'user'
+          GROUP BY s.entity_key
+        ),
+        paid AS (
+          SELECT e.id, GROUP_CONCAT(json_extract(je.value, '$.skuId'), ', ') AS paid_skus
+          FROM entra_users e, free f, json_each(CASE WHEN json_valid(e.licences) THEN e.licences ELSE '[]' END) je
+          WHERE e.enabled = 1
+            AND json_extract(je.value, '$.skuId') IS NOT NULL
+            AND instr(f.ids, ',' || LOWER(json_extract(je.value, '$.skuId')) || ',') = 0
+          GROUP BY e.id
+        )
+        SELECT e.id, e.upn, pd.paid_skus, a.instance AS ad_instance, a.account, a.dn,
+               CASE WHEN (COALESCE(a.uac, 0) & 2) = 2 THEN 'ok'
+                    WHEN a.expires GLOB '[0-9][0-9][0-9][0-9]-*' AND julianday(a.expires) < julianday(:now)
+                      THEN 'AD account expired on ' || substr(a.expires, 1, 10)
+                    WHEN a.dn REGEXP (SELECT pattern FROM leaver) THEN 'AD account is in a leavers OU'
+                    ELSE 'ok' END AS ad_state
+        FROM entra_users e
+        JOIN paid pd ON pd.id = e.id
+        JOIN ad_users a ON a.sid = e.sid
+        WHERE e.sid IS NOT NULL
+          AND COALESCE(a.mailbox_type, 0) NOT IN (4, 16, 32, 8589934592, 17179869184, 34359738368)
+      key: id
+      name: upn
+    each: { field: ad_state, op: ne, value: ok }
+    evidence: "{upn} holds paid licences {paid_skus}; {ad_state} (AD {ad_instance}/{account}, {dn})"
+
+  - id: XS-USER-ENTRA-PRIVILEGED-AD-WEAK
+    title: Privileged Entra role on a synchronised account whose AD side is weak
+    kind: misconfigured
+    lens: security
+    category: IAM
+    severity:
+      field: sev
+      map: { critical: critical, high: high }
+      default: high
+    entity: user
+    why: >-
+      ENTRA-ROLE-SYNCED-HOLDER says a privileged role sits on a synchronised account; this says how
+      the on-premises side hands it over: the AD account is disabled while the cloud account is still
+      enabled (sync is not reaching it), sits in a leavers OU, or has a password that never expires or
+      is not required. Whoever controls that AD account controls the cloud role. The role list is
+      threshold entra.privileged-role-ids, as in the Entra pack.
+    fix: >-
+      Give administrators separate cloud-only accounts for Entra roles and remove the role from the
+      synchronised account; fix the AD account in the meantime.
+    refs: [NIST-800-53:AC-6(5), NIST-800-53:AC-2(3), CIS-Controls-v8:5.4]
+    query:
+      protocol: store
+      text: |
+        WITH max_age AS (
+          SELECT COALESCE((SELECT CAST(value AS REAL) FROM setting WHERE key = 'threshold.cross.max-scan-age-days'), 14) AS days
+        ),
+        live AS (
+          SELECT lr.run_id, lr.instance, lr.system, lr.status
+          FROM latest_run lr CROSS JOIN max_age m
+          WHERE lr.status <> 'failed' AND julianday(:now) - julianday(lr.started_at) <= m.days
+        ),
+        leaver AS (
+          SELECT COALESCE((SELECT value FROM setting WHERE key = 'threshold.ad.disabled-ou-pattern'),
+                          '(?i)OU=[^,]*(disable|leaver|terminat|former|departed|deprovision)') AS pattern
+        ),
+        priv AS (
+          SELECT ',' || LOWER(REPLACE(COALESCE((SELECT value FROM setting WHERE key = 'threshold.entra.privileged-role-ids'),
+                 '62e90394-69f5-4237-9190-012177145e10,e8611ab8-c189-46e8-94e1-60213ab1f814,7be44c8a-adaf-4e2a-84d6-ab2649e08a13,194ae4cb-b126-40b2-bd5b-6091b380977d,8ac3fc64-6eca-42ea-9e69-59f4c7b60eb2,b1be1c3e-b65d-4f19-8427-f6fa0d97feb9,9b895d92-2cd3-44c7-9d02-a6ac2d5ea5c3,158c047a-c907-4556-b7ef-446551a6b5f7,be2f45a1-457d-42af-a067-6ec1fa63bc45,8329153b-31d0-4727-b945-745eb3bc5f31,3a2c62db-5318-420d-8d74-23affee5d9d5,29232cdf-9323-42fd-ade2-1d097af3e4de,f28a1f50-f6e7-4571-818b-6a12f2af6b6c,69091246-20e8-4a56-aa4d-066075b2a7a8,fe930be7-5e62-47db-91af-98c3a49a38b1,c4e39bd9-1100-46d3-8c65-fb160da0071f,729827e3-9c14-49f7-bb1b-9608f156bbb8,966707d0-3269-4727-9be2-8c3a10f19b9d,b0f54661-2d74-4c50-afa3-1ec803f12efe,fdd7a751-b60b-444a-984c-02652fe8fa1c,f2ef992c-3afb-46b9-b7cf-a126ee74c451'),
+                 ' ', '')) || ',' AS ids
+        ),
+        role_rows AS (
+          SELECT MAX(json_extract(s.attrs, '$.principalId')) AS principal_id,
+                 MAX(json_extract(s.attrs, '$.roleDefinitionId')) AS role_id
+          FROM live r JOIN row_seen s ON s.run_id = r.run_id
+          WHERE r.system = 'entra' AND s.entity_type = 'role-assignment'
+          GROUP BY s.entity_key
+        ),
+        held AS (
+          SELECT ro.principal_id, GROUP_CONCAT(DISTINCT ro.role_id) AS role_ids
+          FROM role_rows ro CROSS JOIN priv p
+          WHERE ro.principal_id IS NOT NULL AND instr(p.ids, ',' || LOWER(ro.role_id) || ',') > 0
+          GROUP BY ro.principal_id
+        ),
+        entra_users AS (
+          SELECT s.entity_key AS id,
+                 MAX(json_extract(s.attrs, '$.userPrincipalName')) AS upn,
+                 MAX(CAST(json_extract(s.attrs, '$.accountEnabled') AS INTEGER)) AS enabled,
+                 MAX(json_extract(s.attrs, '$.onPremisesSecurityIdentifier')) AS sid
+          FROM live r JOIN row_seen s ON s.run_id = r.run_id
+          WHERE r.system IN ('entra', 'm365') AND s.entity_type = 'user'
+          GROUP BY s.entity_key
+        ),
+        ad_users AS (
+          SELECT r.instance, s.entity_key AS account,
+                 MAX(json_extract(s.attrs, '$.distinguishedName')) AS dn,
+                 MAX(json_extract(s.attrs, '$.objectSid')) AS sid,
+                 MAX(CAST(json_extract(s.attrs, '$.userAccountControl') AS INTEGER)) AS uac
+          FROM live r JOIN row_seen s ON s.run_id = r.run_id
+          WHERE r.system = 'active-directory' AND s.entity_type = 'user'
+          GROUP BY r.instance, s.entity_key
+        ),
+        judged AS (
+          SELECT h.principal_id, e.upn, e.enabled AS entra_enabled, h.role_ids, a.instance AS ad_instance, a.account, a.dn,
+                 CASE WHEN (COALESCE(a.uac, 0) & 2) = 2 AND e.enabled = 1 THEN 'AD account disabled but the cloud account is enabled'
+                      WHEN (COALESCE(a.uac, 0) & 2) = 2 THEN 'ok'
+                      WHEN a.dn REGEXP (SELECT pattern FROM leaver) THEN 'AD account is in a leavers OU'
+                      WHEN (COALESCE(a.uac, 0) & 32) = 32 THEN 'AD password not required'
+                      WHEN (COALESCE(a.uac, 0) & 65536) = 65536 THEN 'AD password never expires'
+                      ELSE 'ok' END AS ad_state
+          FROM held h
+          JOIN entra_users e ON e.id = h.principal_id
+          JOIN ad_users a ON a.sid = e.sid
+          WHERE e.sid IS NOT NULL
+        )
+        SELECT *, CASE WHEN ad_state LIKE 'AD account disabled%' OR ad_state LIKE '%leavers OU' THEN 'critical' ELSE 'high' END AS sev
+        FROM judged
+      key: principal_id
+      name: upn
+    each: { field: ad_state, op: ne, value: ok }
+    evidence: "{upn} holds Entra roles {role_ids}; {ad_state} (AD {ad_instance}/{account}, {dn})"
+
+  - id: XS-OWNER-ACCOUNT-LEFT
+    title: A register row is owned by someone whose account is disabled
+    kind: misconfigured
+    lens: maintenance
+    category: HYG
+    severity:
+      field: sev
+      map: { high: high, medium: medium }
+      default: medium
+    entity: register-row
+    why: >-
+      Licences, contracts, key dates, systems and initiatives name an owner; when that owner's AD or
+      Entra account is disabled (or the AD account sits in a leavers OU), renewal notices and decisions
+      go to nobody. The owner text is matched to an account by its UPN or mail address anywhere in the
+      text, or by an exact sAMAccountName; owner text that matches no account (a team name) is not
+      reported. A due date inside the row's notice period makes it high.
+    fix: >-
+      Name a new owner in the register; point vendor notices at a shared mailbox rather than a person.
+    refs: [NIST-800-53:PS-4, NIST-800-53:CM-8(4)]
+    query:
+      protocol: store
+      text: |
+        WITH max_age AS (
+          SELECT COALESCE((SELECT CAST(value AS REAL) FROM setting WHERE key = 'threshold.cross.max-scan-age-days'), 14) AS days
+        ),
+        live AS (
+          SELECT lr.run_id, lr.instance, lr.system, lr.status
+          FROM latest_run lr CROSS JOIN max_age m
+          WHERE lr.status <> 'failed' AND julianday(:now) - julianday(lr.started_at) <= m.days
+        ),
+        leaver AS (
+          SELECT COALESCE((SELECT value FROM setting WHERE key = 'threshold.ad.disabled-ou-pattern'),
+                          '(?i)OU=[^,]*(disable|leaver|terminat|former|departed|deprovision)') AS pattern
+        ),
+        owners AS (
+          SELECT 'licence' AS kind, licence_id AS row_id, product AS title, owner, expires_on AS due_on, notice_days
+          FROM licence WHERE owner IS NOT NULL AND TRIM(owner) <> ''
+          UNION ALL
+          SELECT 'contract', contract_id, title, owner, end_on, notice_days
+          FROM contract WHERE owner IS NOT NULL AND TRIM(owner) <> ''
+          UNION ALL
+          SELECT 'key-date', key_date_id, title, owner, due_on, notice_days
+          FROM key_date WHERE owner IS NOT NULL AND TRIM(owner) <> ''
+          UNION ALL
+          SELECT 'system', system_id, name, owner_person, NULL, NULL
+          FROM system WHERE active = 1 AND owner_person IS NOT NULL AND TRIM(owner_person) <> ''
+          UNION ALL
+          SELECT 'initiative', initiative_id, title, owner, NULL, NULL
+          FROM initiative WHERE status NOT IN ('done', 'dropped') AND owner IS NOT NULL AND TRIM(owner) <> ''
+        ),
+        owners_l AS (
+          SELECT o.*, LOWER(TRIM(o.owner)) AS owner_l FROM owners o
+        ),
+        ad_users AS (
+          SELECT r.instance, s.entity_key AS account, LOWER(s.entity_key) AS account_l,
+                 LOWER(MAX(json_extract(s.attrs, '$.userPrincipalName'))) AS upn_l,
+                 MAX(json_extract(s.attrs, '$.distinguishedName')) AS dn,
+                 MAX(CAST(json_extract(s.attrs, '$.userAccountControl') AS INTEGER)) AS uac
+          FROM live r JOIN row_seen s ON s.run_id = r.run_id
+          WHERE r.system = 'active-directory' AND s.entity_type = 'user'
+          GROUP BY r.instance, s.entity_key
+        ),
+        entra_users AS (
+          SELECT s.entity_key AS id,
+                 LOWER(MAX(json_extract(s.attrs, '$.userPrincipalName'))) AS upn_l,
+                 LOWER(MAX(json_extract(s.attrs, '$.mail'))) AS mail_l,
+                 MAX(CAST(json_extract(s.attrs, '$.accountEnabled') AS INTEGER)) AS enabled
+          FROM live r JOIN row_seen s ON s.run_id = r.run_id
+          WHERE r.system IN ('entra', 'm365') AND s.entity_type = 'user'
+          GROUP BY s.entity_key
+        ),
+        ad_gone AS (
+          SELECT o.kind, o.row_id,
+                 'AD ' || a.account || CASE WHEN (COALESCE(a.uac, 0) & 2) = 2 THEN ' is disabled' ELSE ' is in a leavers OU' END AS account_state
+          FROM owners_l o
+          JOIN ad_users a
+            ON o.owner_l = a.account_l
+            OR (a.upn_l IS NOT NULL AND instr(o.owner_l, a.upn_l) > 0
+                AND (instr(o.owner_l, a.upn_l) = 1 OR substr(o.owner_l, instr(o.owner_l, a.upn_l) - 1, 1) NOT GLOB '[a-z0-9._%+-]'))
+          WHERE (COALESCE(a.uac, 0) & 2) = 2 OR a.dn REGEXP (SELECT pattern FROM leaver)
+        ),
+        cloud_gone AS (
+          SELECT o.kind, o.row_id, 'Entra ' || e.upn_l || ' is disabled' AS account_state
+          FROM owners_l o
+          JOIN entra_users e
+            ON (e.upn_l IS NOT NULL AND instr(o.owner_l, e.upn_l) > 0
+                AND (instr(o.owner_l, e.upn_l) = 1 OR substr(o.owner_l, instr(o.owner_l, e.upn_l) - 1, 1) NOT GLOB '[a-z0-9._%+-]'))
+            OR (e.mail_l IS NOT NULL AND e.mail_l <> '' AND instr(o.owner_l, e.mail_l) > 0
+                AND (instr(o.owner_l, e.mail_l) = 1 OR substr(o.owner_l, instr(o.owner_l, e.mail_l) - 1, 1) NOT GLOB '[a-z0-9._%+-]'))
+          WHERE e.enabled = 0
+        ),
+        gone_owner AS (
+          SELECT kind, row_id, account_state FROM ad_gone
+          UNION
+          SELECT kind, row_id, account_state FROM cloud_gone
+        )
+        SELECT o.kind || '/' || o.row_id AS id, o.kind, o.row_id, o.title, o.owner, o.due_on,
+               GROUP_CONCAT(g.account_state, '; ') AS account_state,
+               CASE WHEN o.due_on IS NOT NULL AND julianday(o.due_on) - julianday(:today) <= COALESCE(o.notice_days, 30) THEN 'high' ELSE 'medium' END AS sev
+        FROM owners_l o
+        JOIN gone_owner g ON g.kind = o.kind AND g.row_id = o.row_id
+        GROUP BY o.kind, o.row_id
+      key: id
+      name: title
+    each: any
+    evidence: "{kind} {row_id} ({title}, due {due_on}) is owned by {owner}: {account_state}"
+
+  # ======================================= users x applications and devices (Entra, ServiceNow, Intune, SCCM) ===
+
+  - id: XS-SCIM-DUPLICATE-TRAP
+    title: The app already holds a user with this person's e-mail under another username
+    kind: broken
+    lens: maintenance
+    category: IAM
+    severity:
+      field: sev
+      map: { high: high, medium: medium }
+      default: medium
+    entity: user
+    why: >-
+      Provisioning from Entra creates the app user by username; when the app already has a record
+      with the same e-mail and a username that matches none of the person's identifiers (UPN, its
+      prefix, mail, on-premises sAMAccountName), the create fails as a duplicate or lands on the wrong
+      record, and the person cannot work in the app. Invisible from either side alone. A new joiner
+      (created in the last 30 days) makes it high.
+    fix: >-
+      Rename the app-side username to the identifier provisioning uses (or change the matching
+      attribute to mail), merge or retire the stray record, then provision the user on demand.
+    refs: [NIST-800-53:AC-2, NIST-800-53:IA-4, CIS-Controls-v8:6.1]
+    query:
+      protocol: store
+      text: |
+        WITH max_age AS (
+          SELECT COALESCE((SELECT CAST(value AS REAL) FROM setting WHERE key = 'threshold.cross.max-scan-age-days'), 14) AS days
+        ),
+        live AS (
+          SELECT lr.run_id, lr.instance, lr.system, lr.status
+          FROM latest_run lr CROSS JOIN max_age m
+          WHERE lr.status <> 'failed' AND julianday(:now) - julianday(lr.started_at) <= m.days
+        ),
+        sn_users AS (
+          SELECT r.instance, s.entity_key AS sys_id,
+                 LOWER(TRIM(MAX(COALESCE(json_extract(s.attrs, '$.user_name.value'), json_extract(s.attrs, '$.user_name'))))) AS user_name,
+                 LOWER(TRIM(MAX(COALESCE(json_extract(s.attrs, '$.email.value'), json_extract(s.attrs, '$.email'))))) AS email,
+                 LOWER(CAST(MAX(COALESCE(json_extract(s.attrs, '$.active.value'), json_extract(s.attrs, '$.active'))) AS TEXT)) AS active
+          FROM live r JOIN row_seen s ON s.run_id = r.run_id
+          WHERE r.system = 'servicenow' AND s.entity_type = 'user'
+          GROUP BY r.instance, s.entity_key
+        ),
+        entra_users AS (
+          SELECT s.entity_key AS id,
+                 MAX(json_extract(s.attrs, '$.userPrincipalName')) AS upn,
+                 LOWER(MAX(json_extract(s.attrs, '$.userPrincipalName'))) AS upn_l,
+                 LOWER(MAX(json_extract(s.attrs, '$.mail'))) AS mail_l,
+                 LOWER(MAX(json_extract(s.attrs, '$.onPremisesSamAccountName'))) AS sam_l,
+                 MAX(CAST(json_extract(s.attrs, '$.accountEnabled') AS INTEGER)) AS enabled,
+                 MAX(json_extract(s.attrs, '$.userType')) AS user_type,
+                 MAX(json_extract(s.attrs, '$.createdDateTime')) AS created
+          FROM live r JOIN row_seen s ON s.run_id = r.run_id
+          WHERE r.system IN ('entra', 'm365') AND s.entity_type = 'user'
+          GROUP BY s.entity_key
+        ),
+        people AS (
+          SELECT id, upn, upn_l, mail_l, created,
+                 COALESCE(sam_l, '') AS sam_l,
+                 CASE WHEN instr(upn_l, '@') > 1 THEN substr(upn_l, 1, instr(upn_l, '@') - 1) ELSE '' END AS upn_prefix
+          FROM entra_users
+          WHERE enabled = 1 AND COALESCE(user_type, 'Member') = 'Member' AND mail_l IS NOT NULL AND mail_l <> '' AND upn_l IS NOT NULL
+        )
+        SELECT p.id || '|' || u.instance || '/' || u.sys_id AS id, p.upn, p.mail_l AS mail, p.created,
+               u.instance AS app_instance, u.sys_id, u.user_name, u.active AS app_active,
+               CASE WHEN p.created IS NOT NULL AND julianday(:now) - julianday(p.created) <= 30 THEN 'high' ELSE 'medium' END AS sev
+        FROM people p
+        JOIN sn_users u ON u.email = p.mail_l
+        WHERE u.user_name IS NOT NULL AND u.user_name <> ''
+          AND u.user_name NOT IN (p.upn_l, p.upn_prefix, p.mail_l, p.sam_l)
+          AND NOT EXISTS (SELECT 1 FROM sn_users v
+                          WHERE v.instance = u.instance AND v.user_name IN (p.upn_l, p.upn_prefix, p.mail_l, p.sam_l))
+      key: id
+      name: upn
+    each: any
+    evidence: "Entra {upn} (mail {mail}, created {created}); the app ({app_instance}) has only user {user_name} (sys_id {sys_id}, active {app_active}) with that e-mail - provisioning by username will fail as a duplicate"
+
+  - id: XS-SCIM-LEAVER-STILL-IN-APP
+    title: Active app user whose Entra account is disabled or gone
+    kind: misconfigured
+    lens: security
+    category: IAM
+    severity:
+      field: sev
+      map: { high: high, medium: medium }
+      default: medium
+    entity: user
+    why: >-
+      Deprovisioning only reaches app users that Entra created and still links. An active ServiceNow
+      user whose Entra account is disabled, or who has an organisation e-mail address but no Entra
+      account at all (deleted leaver), keeps working in the app with a local password or an old
+      session. Users with external e-mail domains (vendors, system accounts) are not judged here. A
+      login to the app in the last 30 days makes it high.
+    fix: >-
+      Deactivate the app user; then find out why deprovisioning skipped it (not in the provisioning
+      scope, created locally) and link or remove such accounts.
+    refs: [NIST-800-53:AC-2(3), NIST-800-53:PS-4, CIS-Controls-v8:5.3, CIS-Controls-v8:6.2]
+    query:
+      protocol: store
+      text: |
+        WITH max_age AS (
+          SELECT COALESCE((SELECT CAST(value AS REAL) FROM setting WHERE key = 'threshold.cross.max-scan-age-days'), 14) AS days
+        ),
+        live AS (
+          SELECT lr.run_id, lr.instance, lr.system, lr.status
+          FROM latest_run lr CROSS JOIN max_age m
+          WHERE lr.status <> 'failed' AND julianday(:now) - julianday(lr.started_at) <= m.days
+        ),
+        entra_complete AS (
+          SELECT CASE WHEN COUNT(*) > 0 AND SUM(CASE WHEN lr.status = 'ok' OR EXISTS (
+                        SELECT 1 FROM coverage c WHERE c.run_id = lr.run_id AND c.scope = 'rule' AND c.item = 'ENTRA-USER-INACTIVE' AND c.state = 'ok')
+                      THEN 0 ELSE 1 END) = 0 THEN 1 ELSE 0 END AS ok
+          FROM latest_run lr CROSS JOIN max_age m
+          WHERE lr.system = 'entra' AND julianday(:now) - julianday(lr.started_at) <= m.days
+        ),
+        sn_users AS (
+          SELECT r.instance, s.entity_key AS sys_id,
+                 LOWER(TRIM(MAX(COALESCE(json_extract(s.attrs, '$.user_name.value'), json_extract(s.attrs, '$.user_name'))))) AS user_name,
+                 LOWER(TRIM(MAX(COALESCE(json_extract(s.attrs, '$.email.value'), json_extract(s.attrs, '$.email'))))) AS email,
+                 LOWER(CAST(MAX(COALESCE(json_extract(s.attrs, '$.active.value'), json_extract(s.attrs, '$.active'))) AS TEXT)) AS active,
+                 MAX(COALESCE(json_extract(s.attrs, '$.last_login_time.value'), json_extract(s.attrs, '$.last_login_time'))) AS last_login,
+                 MAX(COALESCE(json_extract(s.attrs, '$.source.value'), json_extract(s.attrs, '$.source'))) AS source
+          FROM live r JOIN row_seen s ON s.run_id = r.run_id
+          WHERE r.system = 'servicenow' AND s.entity_type = 'user'
+          GROUP BY r.instance, s.entity_key
+        ),
+        entra_users AS (
+          SELECT s.entity_key AS id,
+                 LOWER(MAX(json_extract(s.attrs, '$.userPrincipalName'))) AS upn_l,
+                 LOWER(MAX(json_extract(s.attrs, '$.mail'))) AS mail_l,
+                 LOWER(MAX(json_extract(s.attrs, '$.onPremisesSamAccountName'))) AS sam_l,
+                 MAX(CAST(json_extract(s.attrs, '$.accountEnabled') AS INTEGER)) AS enabled,
+                 MAX(json_extract(s.attrs, '$.userType')) AS user_type
+          FROM live r JOIN row_seen s ON s.run_id = r.run_id
+          WHERE r.system IN ('entra', 'm365') AND s.entity_type = 'user'
+          GROUP BY s.entity_key
+        ),
+        org_domains AS (
+          SELECT DISTINCT substr(upn_l, instr(upn_l, '@') + 1) AS domain FROM entra_users
+          WHERE instr(upn_l, '@') > 0 AND COALESCE(user_type, 'Member') = 'Member'
+          UNION
+          SELECT DISTINCT substr(mail_l, instr(mail_l, '@') + 1) FROM entra_users
+          WHERE instr(mail_l, '@') > 0 AND COALESCE(user_type, 'Member') = 'Member'
+        ),
+        active_app AS (
+          SELECT * FROM sn_users WHERE active IN ('true', '1')
+        ),
+        links AS (
+          SELECT u.instance, u.sys_id, e.id AS entra_id, e.upn_l, e.enabled FROM active_app u JOIN entra_users e ON e.upn_l = u.user_name
+          UNION
+          SELECT u.instance, u.sys_id, e.id, e.upn_l, e.enabled FROM active_app u JOIN entra_users e ON u.email IS NOT NULL AND u.email <> '' AND e.mail_l = u.email
+          UNION
+          SELECT u.instance, u.sys_id, e.id, e.upn_l, e.enabled FROM active_app u JOIN entra_users e ON e.sam_l = u.user_name
+        ),
+        judged AS (
+          SELECT u.instance, u.sys_id, u.user_name, u.email, u.last_login, u.source,
+                 (SELECT COUNT(*) FROM links l WHERE l.instance = u.instance AND l.sys_id = u.sys_id) AS entra_matches,
+                 (SELECT MAX(COALESCE(l.enabled, 0)) FROM links l WHERE l.instance = u.instance AND l.sys_id = u.sys_id) AS any_enabled,
+                 (SELECT MAX(l.upn_l) FROM links l WHERE l.instance = u.instance AND l.sys_id = u.sys_id) AS entra_upn
+          FROM active_app u
+        )
+        SELECT j.instance || '/' || j.sys_id AS id, j.user_name, j.email, j.last_login, j.source, j.entra_upn,
+               CASE WHEN j.entra_matches > 0 AND j.any_enabled = 0 THEN 'the Entra account is disabled'
+                    WHEN j.entra_matches > 0 THEN 'ok'
+                    WHEN (SELECT ok FROM entra_complete) = 1 AND instr(j.email, '@') > 0
+                         AND substr(j.email, instr(j.email, '@') + 1) IN (SELECT domain FROM org_domains)
+                      THEN 'no Entra account, although the e-mail is in an organisation domain'
+                    ELSE NULL END AS state,
+               CASE WHEN j.last_login IS NOT NULL AND julianday(:now) - julianday(j.last_login) <= 30 THEN 'high' ELSE 'medium' END AS sev
+        FROM judged j
+        WHERE EXISTS (SELECT 1 FROM entra_users)
+      key: id
+      name: user_name
+    each: { field: state, op: ne, value: ok }
+    evidence: "App user {user_name} ({email}, source {source}) is active, last login {last_login}: {state} {entra_upn}"
+
+  - id: XS-ADMIN-DEVICE-NONCOMPLIANT
+    title: A privileged role holder works on a noncompliant or unencrypted device
+    kind: misconfigured
+    lens: security
+    category: CFG
+    severity:
+      field: sev
+      map: { critical: critical, high: high }
+      default: high
+    entity: managed-device
+    why: >-
+      The device an administrator signs in from is part of the tier the role belongs to: malware on it
+      rides the admin's sessions. INTUNE-DEVICE-NONCOMPLIANT counts every device equally; this one
+      names the devices of people holding a privileged Entra role (threshold
+      entra.privileged-role-ids) that synced in the last 30 days and are noncompliant, or Windows and
+      macOS devices that are not encrypted. Tier-0 roles make it critical.
+    fix: >-
+      Bring the device into compliance or replace it; better, give administrators a privileged-access
+      workstation and require a compliant device for admin roles in Conditional Access.
+    refs: [NIST-800-53:AC-6(5), NIST-800-53:CM-6, CIS-Controls-v8:5.4]
+    query:
+      protocol: store
+      text: |
+        WITH max_age AS (
+          SELECT COALESCE((SELECT CAST(value AS REAL) FROM setting WHERE key = 'threshold.cross.max-scan-age-days'), 14) AS days
+        ),
+        live AS (
+          SELECT lr.run_id, lr.instance, lr.system, lr.status
+          FROM latest_run lr CROSS JOIN max_age m
+          WHERE lr.status <> 'failed' AND julianday(:now) - julianday(lr.started_at) <= m.days
+        ),
+        priv AS (
+          SELECT ',' || LOWER(REPLACE(COALESCE((SELECT value FROM setting WHERE key = 'threshold.entra.privileged-role-ids'),
+                 '62e90394-69f5-4237-9190-012177145e10,e8611ab8-c189-46e8-94e1-60213ab1f814,7be44c8a-adaf-4e2a-84d6-ab2649e08a13,194ae4cb-b126-40b2-bd5b-6091b380977d,8ac3fc64-6eca-42ea-9e69-59f4c7b60eb2,b1be1c3e-b65d-4f19-8427-f6fa0d97feb9,9b895d92-2cd3-44c7-9d02-a6ac2d5ea5c3,158c047a-c907-4556-b7ef-446551a6b5f7,be2f45a1-457d-42af-a067-6ec1fa63bc45,8329153b-31d0-4727-b945-745eb3bc5f31,3a2c62db-5318-420d-8d74-23affee5d9d5,29232cdf-9323-42fd-ade2-1d097af3e4de,f28a1f50-f6e7-4571-818b-6a12f2af6b6c,69091246-20e8-4a56-aa4d-066075b2a7a8,fe930be7-5e62-47db-91af-98c3a49a38b1,c4e39bd9-1100-46d3-8c65-fb160da0071f,729827e3-9c14-49f7-bb1b-9608f156bbb8,966707d0-3269-4727-9be2-8c3a10f19b9d,b0f54661-2d74-4c50-afa3-1ec803f12efe,fdd7a751-b60b-444a-984c-02652fe8fa1c,f2ef992c-3afb-46b9-b7cf-a126ee74c451'),
+                 ' ', '')) || ',' AS ids
+        ),
+        tier0 AS (
+          SELECT ',' || LOWER(REPLACE(COALESCE((SELECT value FROM setting WHERE key = 'threshold.entra.tier0-role-ids'),
+                 '62e90394-69f5-4237-9190-012177145e10,e8611ab8-c189-46e8-94e1-60213ab1f814,7be44c8a-adaf-4e2a-84d6-ab2649e08a13,194ae4cb-b126-40b2-bd5b-6091b380977d,8ac3fc64-6eca-42ea-9e69-59f4c7b60eb2,b1be1c3e-b65d-4f19-8427-f6fa0d97feb9,9b895d92-2cd3-44c7-9d02-a6ac2d5ea5c3,158c047a-c907-4556-b7ef-446551a6b5f7,be2f45a1-457d-42af-a067-6ec1fa63bc45,8329153b-31d0-4727-b945-745eb3bc5f31,3a2c62db-5318-420d-8d74-23affee5d9d5'),
+                 ' ', '')) || ',' AS ids
+        ),
+        role_rows AS (
+          SELECT MAX(json_extract(s.attrs, '$.principalId')) AS principal_id,
+                 MAX(json_extract(s.attrs, '$.roleDefinitionId')) AS role_id,
+                 LOWER(MAX(json_extract(s.attrs, '$.principal.userPrincipalName'))) AS upn_l
+          FROM live r JOIN row_seen s ON s.run_id = r.run_id
+          WHERE r.system = 'entra' AND s.entity_type = 'role-assignment'
+          GROUP BY s.entity_key
+        ),
+        admins AS (
+          SELECT ro.principal_id, MAX(ro.upn_l) AS upn_l, GROUP_CONCAT(DISTINCT ro.role_id) AS role_ids,
+                 MAX(CASE WHEN instr(t.ids, ',' || LOWER(ro.role_id) || ',') > 0 THEN 1 ELSE 0 END) AS tier0_holder
+          FROM role_rows ro CROSS JOIN priv p CROSS JOIN tier0 t
+          WHERE ro.upn_l IS NOT NULL AND instr(p.ids, ',' || LOWER(ro.role_id) || ',') > 0
+          GROUP BY ro.principal_id
+        ),
+        intune AS (
+          SELECT s.entity_key AS id,
+                 MAX(json_extract(s.attrs, '$.deviceName')) AS device_name,
+                 MAX(json_extract(s.attrs, '$.operatingSystem')) AS os,
+                 MAX(json_extract(s.attrs, '$.complianceState')) AS compliance,
+                 MAX(CAST(json_extract(s.attrs, '$.isEncrypted') AS INTEGER)) AS encrypted,
+                 MAX(json_extract(s.attrs, '$.lastSyncDateTime')) AS last_sync,
+                 LOWER(MAX(json_extract(s.attrs, '$.userPrincipalName'))) AS upn_l
+          FROM live r JOIN row_seen s ON s.run_id = r.run_id
+          WHERE r.system = 'intune' AND s.entity_type = 'managed-device'
+          GROUP BY s.entity_key
+        )
+        SELECT ad.principal_id || '|' || d.id AS id, ad.upn_l AS admin_upn, ad.role_ids, d.id AS device_id, d.device_name,
+               d.os, d.compliance, d.encrypted, d.last_sync,
+               CASE WHEN d.compliance IN ('noncompliant', 'error', 'conflict') THEN 'noncompliant (' || d.compliance || ')'
+                    WHEN d.encrypted = 0 AND (d.os LIKE 'Windows%' OR d.os LIKE 'mac%') THEN 'not encrypted'
+                    ELSE 'ok' END AS state,
+               CASE WHEN ad.tier0_holder = 1 THEN 'critical' ELSE 'high' END AS sev
+        FROM admins ad
+        JOIN intune d ON d.upn_l = ad.upn_l
+        WHERE d.last_sync IS NOT NULL AND julianday(:now) - julianday(d.last_sync) <= 30
+      key: id
+      name: device_name
+    each: { field: state, op: ne, value: ok }
+    evidence: "{device_name} ({os}, last sync {last_sync}) of {admin_upn}, who holds roles {role_ids}: {state}"
+
+  - id: XS-INTUNE-PRIMARY-USER-LEAVER
+    title: Managed device whose primary user is disabled or gone
+    kind: misconfigured
+    lens: security
+    category: HYG
+    severity:
+      field: sev
+      map: { high: high, medium: medium }
+      default: medium
+    entity: managed-device
+    why: >-
+      The device is still enrolled, still receives policy and apps and still holds the person's data,
+      but its primary user has no enabled account: no Entra account with that UPN (in a complete Entra
+      scan), a disabled Entra account, or a disabled or leavers-OU AD account (when AD is scanned). It
+      was never wiped or handed over. A sync in the last 30 days (someone is using it) makes it high.
+    fix: >-
+      Collect the device and retire or wipe it, or set the new primary user if it was handed on.
+    refs: [NIST-800-53:AC-2(3), NIST-800-53:CM-8, CIS-Controls-v8:1.1]
+    query:
+      protocol: store
+      text: |
+        WITH max_age AS (
+          SELECT COALESCE((SELECT CAST(value AS REAL) FROM setting WHERE key = 'threshold.cross.max-scan-age-days'), 14) AS days
+        ),
+        live AS (
+          SELECT lr.run_id, lr.instance, lr.system, lr.status
+          FROM latest_run lr CROSS JOIN max_age m
+          WHERE lr.status <> 'failed' AND julianday(:now) - julianday(lr.started_at) <= m.days
+        ),
+        entra_complete AS (
+          SELECT CASE WHEN COUNT(*) > 0 AND SUM(CASE WHEN lr.status = 'ok' OR EXISTS (
+                        SELECT 1 FROM coverage c WHERE c.run_id = lr.run_id AND c.scope = 'rule' AND c.item = 'ENTRA-USER-INACTIVE' AND c.state = 'ok')
+                      THEN 0 ELSE 1 END) = 0 THEN 1 ELSE 0 END AS ok
+          FROM latest_run lr CROSS JOIN max_age m
+          WHERE lr.system = 'entra' AND julianday(:now) - julianday(lr.started_at) <= m.days
+        ),
+        leaver AS (
+          SELECT COALESCE((SELECT value FROM setting WHERE key = 'threshold.ad.disabled-ou-pattern'),
+                          '(?i)OU=[^,]*(disable|leaver|terminat|former|departed|deprovision)') AS pattern
+        ),
+        intune AS (
+          SELECT s.entity_key AS id,
+                 MAX(json_extract(s.attrs, '$.deviceName')) AS device_name,
+                 MAX(json_extract(s.attrs, '$.operatingSystem')) AS os,
+                 MAX(json_extract(s.attrs, '$.lastSyncDateTime')) AS last_sync,
+                 MAX(json_extract(s.attrs, '$.managedDeviceOwnerType')) AS owner_type,
+                 MAX(json_extract(s.attrs, '$.userPrincipalName')) AS upn,
+                 LOWER(MAX(json_extract(s.attrs, '$.userPrincipalName'))) AS upn_l
+          FROM live r JOIN row_seen s ON s.run_id = r.run_id
+          WHERE r.system = 'intune' AND s.entity_type = 'managed-device'
+          GROUP BY s.entity_key
+        ),
+        entra_users AS (
+          SELECT s.entity_key AS id,
+                 LOWER(MAX(json_extract(s.attrs, '$.userPrincipalName'))) AS upn_l,
+                 MAX(CAST(json_extract(s.attrs, '$.accountEnabled') AS INTEGER)) AS enabled,
+                 MAX(json_extract(s.attrs, '$.onPremisesSecurityIdentifier')) AS sid
+          FROM live r JOIN row_seen s ON s.run_id = r.run_id
+          WHERE r.system IN ('entra', 'm365') AND s.entity_type = 'user'
+          GROUP BY s.entity_key
+        ),
+        ad_users AS (
+          SELECT r.instance, s.entity_key AS account,
+                 MAX(json_extract(s.attrs, '$.distinguishedName')) AS dn,
+                 MAX(json_extract(s.attrs, '$.objectSid')) AS sid,
+                 MAX(CAST(json_extract(s.attrs, '$.userAccountControl') AS INTEGER)) AS uac
+          FROM live r JOIN row_seen s ON s.run_id = r.run_id
+          WHERE r.system = 'active-directory' AND s.entity_type = 'user'
+          GROUP BY r.instance, s.entity_key
+        )
+        SELECT d.id, d.device_name, d.os, d.owner_type, d.upn, d.last_sync, a.instance AS ad_instance, a.account,
+               CASE WHEN e.id IS NULL AND (SELECT ok FROM entra_complete) = 1 THEN 'no Entra account has this UPN'
+                    WHEN e.id IS NULL THEN NULL
+                    WHEN e.enabled = 0 THEN 'the Entra account is disabled'
+                    WHEN (COALESCE(a.uac, 0) & 2) = 2 THEN 'the AD account is disabled'
+                    WHEN a.dn REGEXP (SELECT pattern FROM leaver) THEN 'the AD account is in a leavers OU'
+                    ELSE 'ok' END AS state,
+               CASE WHEN a.account IS NOT NULL THEN 'Entra and AD'
+                    WHEN EXISTS (SELECT 1 FROM ad_users) THEN 'Entra (no AD account with its SID)'
+                    ELSE 'Entra only - no usable AD scan' END AS seen_in,
+               CASE WHEN d.last_sync IS NOT NULL AND julianday(:now) - julianday(d.last_sync) <= 30 THEN 'high' ELSE 'medium' END AS sev
+        FROM intune d
+        LEFT JOIN entra_users e ON e.upn_l = d.upn_l
+        LEFT JOIN ad_users a ON e.sid IS NOT NULL AND a.sid = e.sid
+        WHERE d.upn_l IS NOT NULL AND d.upn_l <> '' AND EXISTS (SELECT 1 FROM entra_users)
+      key: id
+      name: device_name
+    each: { field: state, op: ne, value: ok }
+    evidence: "{device_name} ({os}, {owner_type}, last sync {last_sync}), primary user {upn}: {state} ({seen_in})"
+
+  - id: XS-SCCM-ADMIN-AD-DISABLED
+    title: Configuration Manager administrator whose AD account is disabled, leaving or unused
+    kind: misconfigured
+    lens: security
+    category: IAM
+    severity:
+      field: sev
+      map: { high: high, medium: medium }
+      default: medium
+    entity: admin
+    why: >-
+      An administrative user in Configuration Manager runs code on every client it can target.
+      SCCM-RBAC-DELETED-ACCOUNT sees only deleted accounts; an account that is disabled, in a leavers
+      OU or has not logged on to the domain for threshold cross.admin-stale-days (default 90) keeps its
+      grant and gets it back the day someone re-enables it. Grants to groups are not judged here. Full
+      Administrator makes it high.
+    fix: >-
+      Remove the administrative user; grant access through one reviewed AD group instead of
+      individual accounts.
+    refs: [NIST-800-53:AC-2(3), NIST-800-53:AC-6(7), CIS-Controls-v8:5.3]
+    query:
+      protocol: store
+      text: |
+        WITH max_age AS (
+          SELECT COALESCE((SELECT CAST(value AS REAL) FROM setting WHERE key = 'threshold.cross.max-scan-age-days'), 14) AS days
+        ),
+        live AS (
+          SELECT lr.run_id, lr.instance, lr.system, lr.status
+          FROM latest_run lr CROSS JOIN max_age m
+          WHERE lr.status <> 'failed' AND julianday(:now) - julianday(lr.started_at) <= m.days
+        ),
+        leaver AS (
+          SELECT COALESCE((SELECT value FROM setting WHERE key = 'threshold.ad.disabled-ou-pattern'),
+                          '(?i)OU=[^,]*(disable|leaver|terminat|former|departed|deprovision)') AS pattern
+        ),
+        stale AS (
+          SELECT COALESCE((SELECT CAST(value AS REAL) FROM setting WHERE key = 'threshold.cross.admin-stale-days'), 90) AS days
+        ),
+        admins AS (
+          SELECT r.instance, s.entity_key AS admin_id,
+                 MAX(json_extract(s.attrs, '$.LogonName')) AS logon_name,
+                 MAX(CAST(json_extract(s.attrs, '$.IsGroup') AS INTEGER)) AS is_group,
+                 MAX(CAST(json_extract(s.attrs, '$.IsDeleted') AS INTEGER)) AS is_deleted,
+                 MAX(json_extract(s.attrs, '$.RoleNames')) AS roles
+          FROM live r JOIN row_seen s ON s.run_id = r.run_id
+          WHERE r.system = 'sccm' AND s.entity_type = 'admin'
+          GROUP BY r.instance, s.entity_key
+        ),
+        admins_l AS (
+          SELECT m.*, LOWER(CASE WHEN instr(m.logon_name, '\') > 0 THEN substr(m.logon_name, instr(m.logon_name, '\') + 1) ELSE m.logon_name END) AS sam_l
+          FROM admins m
+          WHERE COALESCE(m.is_group, 0) = 0 AND COALESCE(m.is_deleted, 0) = 0 AND m.logon_name IS NOT NULL
+        ),
+        ad_users AS (
+          SELECT r.instance, s.entity_key AS account, LOWER(s.entity_key) AS account_l,
+                 MAX(json_extract(s.attrs, '$.distinguishedName')) AS dn,
+                 MAX(CAST(json_extract(s.attrs, '$.userAccountControl') AS INTEGER)) AS uac,
+                 CASE WHEN MAX(json_extract(s.attrs, '$.lastLogonTimestamp')) GLOB '[0-9][0-9][0-9][0-9]-*'
+                      THEN MAX(json_extract(s.attrs, '$.lastLogonTimestamp')) END AS dc_logon
+          FROM live r JOIN row_seen s ON s.run_id = r.run_id
+          WHERE r.system = 'active-directory' AND s.entity_type = 'user'
+          GROUP BY r.instance, s.entity_key
+        )
+        SELECT m.instance || '/' || m.admin_id || '|' || a.instance || '/' || a.account AS id,
+               m.logon_name, m.roles, a.instance AS ad_instance, a.account, a.dn, a.dc_logon,
+               CASE WHEN (COALESCE(a.uac, 0) & 2) = 2 THEN 'the AD account is disabled'
+                    WHEN a.dn REGEXP (SELECT pattern FROM leaver) THEN 'the AD account is in a leavers OU'
+                    WHEN a.dc_logon IS NULL OR julianday(:now) - julianday(a.dc_logon) > w.days
+                      THEN 'no domain logon in ' || CAST(w.days AS INTEGER) || ' days'
+                    ELSE 'ok' END AS state,
+               CASE WHEN m.roles LIKE '%Full Administrator%' THEN 'high' ELSE 'medium' END AS sev
+        FROM admins_l m
+        JOIN ad_users a ON a.account_l = m.sam_l
+        CROSS JOIN stale w
+      key: id
+      name: logon_name
+    each: { field: state, op: ne, value: ok }
+    evidence: "SCCM administrator {logon_name} (roles {roles}) = AD {ad_instance}/{account} ({dn}): {state}, last domain logon {dc_logon}"
+
+  # ==================================================== computers: AD x SCCM x Intune x Entra devices ===
+
+  - id: XS-COMPUTER-AD-ACTIVE-NO-SCCM
+    title: Windows computer active in AD that Configuration Manager does not know or does not manage
+    kind: missing
+    lens: both
+    category: LCM
+    severity:
+      field: sev
+      map: { high: high, medium: medium }
+      default: medium
+    entity: computer
+    why: >-
+      WSF-NO-CLIENT and SCCM-SERVER-NO-CLIENT see only machines Configuration Manager's own discovery
+      found. A computer that logs on to the domain (within threshold cross.computer-active-days,
+      default 30) but has no SCCM record at all sits in an OU or forest outside discovery and is
+      patched and inventoried by nothing. For servers a record whose client is missing, inactive or
+      failing its health check is reported too (workstations have their own WSF rules). Servers need a
+      complete scan of the sccm system; workstations either sccm or workstations-sccm.
+    fix: >-
+      Extend AD system discovery to the OU, add the subnet to a boundary group and push or repair the
+      client; machines patched by another tool are accepted one by one.
+    refs: [NIST-800-53:CM-8, NIST-800-53:SI-2, CIS-Controls-v8:1.1, CIS-Controls-v8:7.3]
+    query:
+      protocol: store
+      text: |
+        WITH max_age AS (
+          SELECT COALESCE((SELECT CAST(value AS REAL) FROM setting WHERE key = 'threshold.cross.max-scan-age-days'), 14) AS days
+        ),
+        live AS (
+          SELECT lr.run_id, lr.instance, lr.system, lr.status
+          FROM latest_run lr CROSS JOIN max_age m
+          WHERE lr.status <> 'failed' AND julianday(:now) - julianday(lr.started_at) <= m.days
+        ),
+        sccm_all_complete AS (
+          SELECT CASE WHEN COUNT(*) > 0 AND SUM(CASE WHEN lr.status = 'ok' OR EXISTS (
+                        SELECT 1 FROM coverage c WHERE c.run_id = lr.run_id AND c.scope = 'rule' AND c.item = 'SCCM-CLIENT-PUSH-FAILED' AND c.state = 'ok')
+                      THEN 0 ELSE 1 END) = 0 THEN 1 ELSE 0 END AS ok
+          FROM latest_run lr CROSS JOIN max_age m
+          WHERE lr.system = 'sccm' AND julianday(:now) - julianday(lr.started_at) <= m.days
+        ),
+        sccm_ws_complete AS (
+          SELECT CASE WHEN COUNT(*) > 0 AND SUM(CASE WHEN lr.status = 'ok' OR EXISTS (
+                        SELECT 1 FROM coverage c WHERE c.run_id = lr.run_id AND c.scope = 'rule' AND c.item = 'WSF-NO-CLIENT' AND c.state = 'ok')
+                      THEN 0 ELSE 1 END) = 0 THEN 1 ELSE 0 END AS ok
+          FROM latest_run lr CROSS JOIN max_age m
+          WHERE lr.system = 'workstations-sccm' AND julianday(:now) - julianday(lr.started_at) <= m.days
+        ),
+        active_days AS (
+          SELECT COALESCE((SELECT CAST(value AS REAL) FROM setting WHERE key = 'threshold.cross.computer-active-days'), 30) AS days
+        ),
+        ad_computers AS (
+          SELECT r.instance, s.entity_key AS account, UPPER(RTRIM(s.entity_key, '$')) AS short_name,
+                 MAX(json_extract(s.attrs, '$.dNSHostName')) AS dns_name,
+                 MAX(json_extract(s.attrs, '$.operatingSystem')) AS os,
+                 CASE WHEN MAX(json_extract(s.attrs, '$.lastLogonTimestamp')) GLOB '[0-9][0-9][0-9][0-9]-*'
+                      THEN MAX(json_extract(s.attrs, '$.lastLogonTimestamp')) END AS dc_logon
+          FROM live r JOIN row_seen s ON s.run_id = r.run_id
+          WHERE r.system = 'active-directory' AND s.entity_type = 'computer'
+          GROUP BY r.instance, s.entity_key
+        ),
+        sccm_rows AS (
+          SELECT r.system, r.instance, s.entity_key AS resource_id,
+                 MAX(json_extract(s.attrs, '$.Name')) AS name,
+                 MAX(COALESCE(CAST(json_extract(s.attrs, '$.IsClient') AS INTEGER), CAST(json_extract(s.attrs, '$.Client') AS INTEGER))) AS has_client,
+                 MAX(COALESCE(CAST(json_extract(s.attrs, '$.IsActive') AS INTEGER), CAST(json_extract(s.attrs, '$.Active') AS INTEGER))) AS active,
+                 MAX(COALESCE(CAST(json_extract(s.attrs, '$.IsObsolete') AS INTEGER), CAST(json_extract(s.attrs, '$.Obsolete') AS INTEGER))) AS obsolete,
+                 MAX(CAST(json_extract(s.attrs, '$.ClientCheckPass') AS INTEGER)) AS client_check,
+                 MAX(json_extract(s.attrs, '$.LastActiveTime')) AS last_active
+          FROM live r JOIN row_seen s ON s.run_id = r.run_id
+          WHERE r.system IN ('sccm', 'workstations-sccm') AND s.entity_type = 'computer'
+          GROUP BY r.system, r.instance, s.entity_key
+        ),
+        sccm_names AS (
+          SELECT UPPER(CASE WHEN instr(TRIM(name), '.') > 0 THEN substr(TRIM(name), 1, instr(TRIM(name), '.') - 1) ELSE TRIM(name) END) AS short_name,
+                 MAX(CASE WHEN COALESCE(obsolete, 0) <> 1 AND has_client = 1 AND COALESCE(active, 1) = 1
+                           AND COALESCE(client_check, 1) <> 2 THEN 1 ELSE 0 END) AS any_healthy,
+                 MAX(last_active) AS last_active
+          FROM sccm_rows
+          WHERE name IS NOT NULL AND TRIM(name) <> ''
+          GROUP BY 1
+        ),
+        judged AS (
+          SELECT a.instance || '/' || a.account AS id, a.account, a.dns_name, a.os, a.dc_logon,
+                 CASE WHEN a.os LIKE '%Server%' THEN 1 ELSE 0 END AS is_server,
+                 n.short_name AS sccm_name, n.any_healthy, n.last_active
+          FROM ad_computers a
+          CROSS JOIN active_days w
+          LEFT JOIN sccm_names n ON n.short_name = a.short_name
+          WHERE a.os LIKE 'Windows%' AND a.dc_logon IS NOT NULL AND julianday(:now) - julianday(a.dc_logon) <= w.days
+        )
+        SELECT id, account, dns_name, os, dc_logon, is_server, last_active,
+               CASE WHEN sccm_name IS NULL THEN 'unknown to Configuration Manager'
+                    WHEN is_server = 1 AND any_healthy = 0 THEN 'known, but its client is missing, inactive or failing the health check'
+                    ELSE 'ok' END AS sccm_state,
+               CASE WHEN is_server = 1 THEN 'high' ELSE 'medium' END AS sev
+        FROM judged
+        WHERE (is_server = 1 AND (SELECT ok FROM sccm_all_complete) = 1)
+           OR (is_server = 0 AND ((SELECT ok FROM sccm_all_complete) = 1 OR (SELECT ok FROM sccm_ws_complete) = 1))
+      key: id
+      name: dns_name
+    each: { field: sccm_state, op: ne, value: ok }
+    evidence: "AD {dns_name} ({os}) logged on {dc_logon}; Configuration Manager: {sccm_state}"
+
+  - id: XS-COMPUTER-SCCM-AD-GONE
+    title: Configuration Manager still manages a machine whose AD computer object is gone
+    kind: misconfigured
+    lens: maintenance
+    category: HYG
+    severity:
+      field: sev
+      map: { medium: medium, low: low }
+      default: low
+    entity: computer
+    why: >-
+      The SCCM record has a client, but the name was an enabled AD computer in an earlier Keeper scan
+      and is not in the newest complete one (deleted or disabled). The record keeps counting in
+      compliance figures and receiving deployments; if its client is still active, a machine is
+      running outside the directory's control. Names Keeper never saw in a scanned AD are not judged,
+      so workgroup machines and unscanned forests produce nothing.
+    fix: >-
+      Delete the SCCM record (or let the obsolete-record clean-up do it); if the client is still
+      active, find the machine and rejoin or retire it.
+    refs: [NIST-800-53:CM-8(3), CIS-Controls-v8:1.2]
+    query:
+      protocol: store
+      text: |
+        WITH max_age AS (
+          SELECT COALESCE((SELECT CAST(value AS REAL) FROM setting WHERE key = 'threshold.cross.max-scan-age-days'), 14) AS days
+        ),
+        live AS (
+          SELECT lr.run_id, lr.instance, lr.system, lr.status
+          FROM latest_run lr CROSS JOIN max_age m
+          WHERE lr.status <> 'failed' AND julianday(:now) - julianday(lr.started_at) <= m.days
+        ),
+        ad_computers_complete AS (
+          SELECT CASE WHEN COUNT(*) > 0 AND SUM(CASE WHEN lr.status = 'ok' OR EXISTS (
+                        SELECT 1 FROM coverage c WHERE c.run_id = lr.run_id AND c.scope = 'rule' AND c.item = 'AD-POP-COMPUTERS-NONE' AND c.state = 'ok')
+                      THEN 0 ELSE 1 END) = 0 THEN 1 ELSE 0 END AS ok
+          FROM latest_run lr CROSS JOIN max_age m
+          WHERE lr.system = 'active-directory' AND julianday(:now) - julianday(lr.started_at) <= m.days
+        ),
+        ad_now AS (
+          SELECT DISTINCT UPPER(RTRIM(s.entity_key, '$')) AS short_name
+          FROM live r JOIN row_seen s ON s.run_id = r.run_id
+          WHERE r.system = 'active-directory' AND s.entity_type = 'computer'
+        ),
+        ad_gone AS (
+          SELECT UPPER(RTRIM(e.entity_key, '$')) AS short_name, MAX(e.gone_since) AS gone_since
+          FROM entity e
+          WHERE e.entity_type = 'computer' AND e.entity_key GLOB '*$' AND e.gone_since IS NOT NULL
+            AND e.instance IN (SELECT x.instance FROM run x WHERE x.system = 'active-directory')
+          GROUP BY UPPER(RTRIM(e.entity_key, '$'))
+        ),
+        sccm_rows AS (
+          SELECT r.system, r.instance, s.entity_key AS resource_id,
+                 MAX(json_extract(s.attrs, '$.Name')) AS name,
+                 MAX(COALESCE(CAST(json_extract(s.attrs, '$.IsClient') AS INTEGER), CAST(json_extract(s.attrs, '$.Client') AS INTEGER))) AS has_client,
+                 MAX(COALESCE(CAST(json_extract(s.attrs, '$.IsActive') AS INTEGER), CAST(json_extract(s.attrs, '$.Active') AS INTEGER))) AS active,
+                 MAX(COALESCE(CAST(json_extract(s.attrs, '$.IsObsolete') AS INTEGER), CAST(json_extract(s.attrs, '$.Obsolete') AS INTEGER))) AS obsolete,
+                 MAX(json_extract(s.attrs, '$.LastActiveTime')) AS last_active,
+                 MAX(json_extract(s.attrs, '$.ClientVersion')) AS client_version,
+                 MAX(COALESCE(json_extract(s.attrs, '$.DeviceOS'), json_extract(s.attrs, '$.OperatingSystemNameandVersion'))) AS os
+          FROM live r JOIN row_seen s ON s.run_id = r.run_id
+          WHERE r.system IN ('sccm', 'workstations-sccm') AND s.entity_type = 'computer'
+          GROUP BY r.system, r.instance, s.entity_key
+        ),
+        devices AS (
+          SELECT UPPER(CASE WHEN instr(TRIM(name), '.') > 0 THEN substr(TRIM(name), 1, instr(TRIM(name), '.') - 1) ELSE TRIM(name) END) AS short_name,
+                 GROUP_CONCAT(DISTINCT resource_id) AS resource_ids,
+                 MAX(CASE WHEN COALESCE(obsolete, 0) <> 1 AND has_client = 1 THEN 1 ELSE 0 END) AS any_client,
+                 MAX(CASE WHEN COALESCE(obsolete, 0) <> 1 AND has_client = 1 AND active = 1 THEN 1 ELSE 0 END) AS any_active,
+                 MAX(last_active) AS last_active, MAX(client_version) AS client_version, MAX(os) AS os
+          FROM sccm_rows
+          WHERE name IS NOT NULL AND TRIM(name) <> ''
+          GROUP BY 1
+        )
+        SELECT d.short_name, d.resource_ids, d.os, d.client_version, d.any_active, d.last_active, g.gone_since,
+               CASE WHEN d.any_active = 1 THEN 'medium' ELSE 'low' END AS sev
+        FROM devices d
+        JOIN ad_gone g ON g.short_name = d.short_name
+        WHERE d.any_client = 1
+          AND (SELECT ok FROM ad_computers_complete) = 1
+          AND d.short_name NOT IN (SELECT short_name FROM ad_now)
+      key: short_name
+      name: short_name
+    each: any
+    evidence: "SCCM {short_name} (resources {resource_ids}, {os}, client {client_version}, active {any_active}, last active {last_active}); AD: no enabled computer object since {gone_since}"
+
+  - id: XS-COMPUTER-SCCM-ACTIVE-AD-STALE
+    title: Configuration Manager sees the machine alive while AD calls it stale
+    kind: broken
+    lens: maintenance
+    category: HYG
+    severity:
+      field: sev
+      map: { medium: medium, low: low }
+      default: low
+    entity: computer
+    why: >-
+      The client is active (and, where reported, was active in the last 7 days) but the computer has
+      not logged on to a domain controller for threshold cross.ad-stale-days (default 90). Either the
+      machine never reaches a DC (always remote), its secure channel is broken, or it was rejoined under
+      another object. AD-COMP-STALE would have it deleted; this list stops that mistake. A machine
+      password older than 60 days means the domain trust itself is broken.
+    fix: >-
+      Exclude these machines from stale-computer clean-up; reset the secure channel where the machine
+      password is stuck; move always-remote devices to Entra join.
+    refs: [NIST-800-53:CM-8, NIST-800-53:IA-3]
+    query:
+      protocol: store
+      text: |
+        WITH max_age AS (
+          SELECT COALESCE((SELECT CAST(value AS REAL) FROM setting WHERE key = 'threshold.cross.max-scan-age-days'), 14) AS days
+        ),
+        live AS (
+          SELECT lr.run_id, lr.instance, lr.system, lr.status
+          FROM latest_run lr CROSS JOIN max_age m
+          WHERE lr.status <> 'failed' AND julianday(:now) - julianday(lr.started_at) <= m.days
+        ),
+        stale AS (
+          SELECT COALESCE((SELECT CAST(value AS REAL) FROM setting WHERE key = 'threshold.cross.ad-stale-days'), 90) AS days
+        ),
+        ad_computers AS (
+          SELECT r.instance, s.entity_key AS account, UPPER(RTRIM(s.entity_key, '$')) AS short_name,
+                 MAX(json_extract(s.attrs, '$.dNSHostName')) AS dns_name,
+                 MAX(json_extract(s.attrs, '$.operatingSystem')) AS os,
+                 CASE WHEN MAX(json_extract(s.attrs, '$.lastLogonTimestamp')) GLOB '[0-9][0-9][0-9][0-9]-*'
+                      THEN MAX(json_extract(s.attrs, '$.lastLogonTimestamp')) END AS dc_logon,
+                 CASE WHEN MAX(json_extract(s.attrs, '$.pwdLastSet')) GLOB '[0-9][0-9][0-9][0-9]-*'
+                      THEN MAX(json_extract(s.attrs, '$.pwdLastSet')) END AS pwd_set
+          FROM live r JOIN row_seen s ON s.run_id = r.run_id
+          WHERE r.system = 'active-directory' AND s.entity_type = 'computer'
+          GROUP BY r.instance, s.entity_key
+        ),
+        sccm_rows AS (
+          SELECT r.system, r.instance, s.entity_key AS resource_id,
+                 MAX(json_extract(s.attrs, '$.Name')) AS name,
+                 MAX(COALESCE(CAST(json_extract(s.attrs, '$.IsClient') AS INTEGER), CAST(json_extract(s.attrs, '$.Client') AS INTEGER))) AS has_client,
+                 MAX(COALESCE(CAST(json_extract(s.attrs, '$.IsActive') AS INTEGER), CAST(json_extract(s.attrs, '$.Active') AS INTEGER))) AS active,
+                 MAX(COALESCE(CAST(json_extract(s.attrs, '$.IsObsolete') AS INTEGER), CAST(json_extract(s.attrs, '$.Obsolete') AS INTEGER))) AS obsolete,
+                 MAX(json_extract(s.attrs, '$.LastActiveTime')) AS last_active
+          FROM live r JOIN row_seen s ON s.run_id = r.run_id
+          WHERE r.system IN ('sccm', 'workstations-sccm') AND s.entity_type = 'computer'
+          GROUP BY r.system, r.instance, s.entity_key
+        ),
+        sccm_names AS (
+          SELECT UPPER(CASE WHEN instr(TRIM(name), '.') > 0 THEN substr(TRIM(name), 1, instr(TRIM(name), '.') - 1) ELSE TRIM(name) END) AS short_name,
+                 MAX(CASE WHEN COALESCE(obsolete, 0) <> 1 AND has_client = 1 AND active = 1 THEN 1 ELSE 0 END) AS active_client,
+                 MAX(last_active) AS last_active
+          FROM sccm_rows
+          WHERE name IS NOT NULL AND TRIM(name) <> ''
+          GROUP BY 1
+        )
+        SELECT a.instance || '/' || a.account AS id, a.account, a.dns_name, a.os, a.dc_logon, a.pwd_set, n.last_active,
+               CASE WHEN a.pwd_set IS NULL OR julianday(:now) - julianday(a.pwd_set) > 60 THEN 'medium' ELSE 'low' END AS sev
+        FROM ad_computers a
+        JOIN sccm_names n ON n.short_name = a.short_name
+        CROSS JOIN stale w
+        WHERE n.active_client = 1
+          AND (n.last_active IS NULL OR julianday(:now) - julianday(n.last_active) <= 7)
+          AND (a.dc_logon IS NULL OR julianday(:now) - julianday(a.dc_logon) > w.days)
+      key: id
+      name: dns_name
+    each: any
+    evidence: "AD {dns_name} ({os}): last domain logon {dc_logon}, machine password set {pwd_set}; SCCM client active, last active {last_active}"
+
+  - id: XS-COMPUTER-INTUNE-ACTIVE-SCCM-DEAD
+    title: Co-managed device syncs with Intune but its Configuration Manager client is dead
+    kind: broken
+    lens: maintenance
+    category: HLT
+    severity: medium
+    entity: managed-device
+    why: >-
+      The Intune half of co-management works (synced in the last 7 days) while the SCCM half has no
+      client, an inactive one or one failing its health check. Updates and apps whose workloads still
+      sit with Configuration Manager never arrive, while every cloud dashboard shows the device as
+      managed.
+    fix: >-
+      Repair or reinstall the Configuration Manager client (it can be redeployed from Intune), or move
+      the remaining workloads to Intune and retire the client.
+    refs: [NIST-800-53:SI-2, CIS-Controls-v8:7.3]
+    query:
+      protocol: store
+      text: |
+        WITH max_age AS (
+          SELECT COALESCE((SELECT CAST(value AS REAL) FROM setting WHERE key = 'threshold.cross.max-scan-age-days'), 14) AS days
+        ),
+        live AS (
+          SELECT lr.run_id, lr.instance, lr.system, lr.status
+          FROM latest_run lr CROSS JOIN max_age m
+          WHERE lr.status <> 'failed' AND julianday(:now) - julianday(lr.started_at) <= m.days
+        ),
+        intune AS (
+          SELECT s.entity_key AS id,
+                 MAX(json_extract(s.attrs, '$.deviceName')) AS device_name,
+                 MAX(json_extract(s.attrs, '$.operatingSystem')) AS os,
+                 MAX(json_extract(s.attrs, '$.lastSyncDateTime')) AS last_sync,
+                 MAX(json_extract(s.attrs, '$.managementAgent')) AS mgmt_agent
+          FROM live r JOIN row_seen s ON s.run_id = r.run_id
+          WHERE r.system = 'intune' AND s.entity_type = 'managed-device'
+          GROUP BY s.entity_key
+        ),
+        sccm_rows AS (
+          SELECT r.system, r.instance, s.entity_key AS resource_id,
+                 MAX(json_extract(s.attrs, '$.Name')) AS name,
+                 MAX(COALESCE(CAST(json_extract(s.attrs, '$.IsClient') AS INTEGER), CAST(json_extract(s.attrs, '$.Client') AS INTEGER))) AS has_client,
+                 MAX(COALESCE(CAST(json_extract(s.attrs, '$.IsActive') AS INTEGER), CAST(json_extract(s.attrs, '$.Active') AS INTEGER))) AS active,
+                 MAX(COALESCE(CAST(json_extract(s.attrs, '$.IsObsolete') AS INTEGER), CAST(json_extract(s.attrs, '$.Obsolete') AS INTEGER))) AS obsolete,
+                 MAX(CAST(json_extract(s.attrs, '$.ClientCheckPass') AS INTEGER)) AS client_check
+          FROM live r JOIN row_seen s ON s.run_id = r.run_id
+          WHERE r.system IN ('sccm', 'workstations-sccm') AND s.entity_type = 'computer'
+          GROUP BY r.system, r.instance, s.entity_key
+        ),
+        sccm_names AS (
+          SELECT UPPER(CASE WHEN instr(TRIM(name), '.') > 0 THEN substr(TRIM(name), 1, instr(TRIM(name), '.') - 1) ELSE TRIM(name) END) AS short_name,
+                 MAX(CASE WHEN COALESCE(obsolete, 0) <> 1 AND has_client = 1 THEN 1 ELSE 0 END) AS any_client,
+                 MAX(CASE WHEN COALESCE(obsolete, 0) <> 1 AND has_client = 1 AND COALESCE(active, 1) = 1 THEN 1 ELSE 0 END) AS any_active,
+                 MAX(CASE WHEN COALESCE(obsolete, 0) <> 1 AND has_client = 1 AND COALESCE(active, 1) = 1
+                           AND COALESCE(client_check, 1) <> 2 THEN 1 ELSE 0 END) AS any_healthy
+          FROM sccm_rows
+          WHERE name IS NOT NULL AND TRIM(name) <> ''
+          GROUP BY 1
+        )
+        SELECT d.id, d.device_name, d.os, d.last_sync, d.mgmt_agent,
+               CASE WHEN n.any_client = 0 THEN 'no Configuration Manager client'
+                    WHEN n.any_active = 0 THEN 'Configuration Manager client inactive'
+                    WHEN n.any_healthy = 0 THEN 'Configuration Manager client fails its health check'
+                    ELSE 'ok' END AS sccm_state
+        FROM intune d
+        JOIN sccm_names n ON n.short_name = UPPER(TRIM(d.device_name))
+        WHERE d.os LIKE 'Windows%' AND d.mgmt_agent LIKE 'configurationManager%'
+          AND d.last_sync IS NOT NULL AND julianday(:now) - julianday(d.last_sync) <= 7
+      key: id
+      name: device_name
+    each: { field: sccm_state, op: ne, value: ok }
+    evidence: "{device_name} ({mgmt_agent}) synced with Intune {last_sync}; {sccm_state}"
+
+  - id: XS-DEVICE-INTUNE-AD-GONE
+    title: Domain-joined device still syncs with Intune but its AD computer object is gone
+    kind: broken
+    lens: both
+    category: HYG
+    severity: medium
+    entity: managed-device
+    why: >-
+      A company Windows device that is co-managed, or whose Entra device object is hybrid joined,
+      synced with Intune in the last 30 days, yet the computer was an enabled AD object in an earlier
+      Keeper scan and is not in the newest complete one. It runs on a cached domain identity: Kerberos
+      and Group Policy fail quietly, and it is a common trace of a device re-imaged outside the process.
+      Entra-joined-only devices and names Keeper never saw in AD are not judged.
+    fix: >-
+      Rejoin the device to the domain (or re-image it through the normal process) and delete the stale
+      Intune record if the device was replaced.
+    refs: [NIST-800-53:CM-8, CIS-Controls-v8:1.1]
+    query:
+      protocol: store
+      text: |
+        WITH max_age AS (
+          SELECT COALESCE((SELECT CAST(value AS REAL) FROM setting WHERE key = 'threshold.cross.max-scan-age-days'), 14) AS days
+        ),
+        live AS (
+          SELECT lr.run_id, lr.instance, lr.system, lr.status
+          FROM latest_run lr CROSS JOIN max_age m
+          WHERE lr.status <> 'failed' AND julianday(:now) - julianday(lr.started_at) <= m.days
+        ),
+        ad_computers_complete AS (
+          SELECT CASE WHEN COUNT(*) > 0 AND SUM(CASE WHEN lr.status = 'ok' OR EXISTS (
+                        SELECT 1 FROM coverage c WHERE c.run_id = lr.run_id AND c.scope = 'rule' AND c.item = 'AD-POP-COMPUTERS-NONE' AND c.state = 'ok')
+                      THEN 0 ELSE 1 END) = 0 THEN 1 ELSE 0 END AS ok
+          FROM latest_run lr CROSS JOIN max_age m
+          WHERE lr.system = 'active-directory' AND julianday(:now) - julianday(lr.started_at) <= m.days
+        ),
+        ad_now AS (
+          SELECT DISTINCT UPPER(RTRIM(s.entity_key, '$')) AS short_name
+          FROM live r JOIN row_seen s ON s.run_id = r.run_id
+          WHERE r.system = 'active-directory' AND s.entity_type = 'computer'
+        ),
+        ad_gone AS (
+          SELECT UPPER(RTRIM(e.entity_key, '$')) AS short_name, MAX(e.gone_since) AS gone_since
+          FROM entity e
+          WHERE e.entity_type = 'computer' AND e.entity_key GLOB '*$' AND e.gone_since IS NOT NULL
+            AND e.instance IN (SELECT x.instance FROM run x WHERE x.system = 'active-directory')
+          GROUP BY UPPER(RTRIM(e.entity_key, '$'))
+        ),
+        hybrid AS (
+          SELECT DISTINCT UPPER(CASE WHEN instr(n, '.') > 0 THEN substr(n, 1, instr(n, '.') - 1) ELSE n END) AS short_name
+          FROM (SELECT TRIM(json_extract(s.attrs, '$.displayName')) AS n
+                FROM live r JOIN row_seen s ON s.run_id = r.run_id
+                WHERE r.system = 'entra' AND s.entity_type = 'device' AND json_extract(s.attrs, '$.trustType') = 'ServerAd')
+          WHERE n IS NOT NULL AND n <> ''
+        ),
+        intune AS (
+          SELECT s.entity_key AS id,
+                 MAX(json_extract(s.attrs, '$.deviceName')) AS device_name,
+                 UPPER(TRIM(MAX(json_extract(s.attrs, '$.deviceName')))) AS short_name,
+                 MAX(json_extract(s.attrs, '$.operatingSystem')) AS os,
+                 MAX(json_extract(s.attrs, '$.lastSyncDateTime')) AS last_sync,
+                 MAX(json_extract(s.attrs, '$.managedDeviceOwnerType')) AS owner_type,
+                 MAX(json_extract(s.attrs, '$.managementAgent')) AS mgmt_agent
+          FROM live r JOIN row_seen s ON s.run_id = r.run_id
+          WHERE r.system = 'intune' AND s.entity_type = 'managed-device'
+          GROUP BY s.entity_key
+        )
+        SELECT d.id, d.device_name, d.os, d.owner_type, d.mgmt_agent, d.last_sync, g.gone_since,
+               CASE WHEN d.short_name IN (SELECT short_name FROM hybrid) THEN 'hybrid joined in Entra' ELSE 'co-managed' END AS join_evidence
+        FROM intune d
+        JOIN ad_gone g ON g.short_name = d.short_name
+        WHERE d.os LIKE 'Windows%' AND COALESCE(d.owner_type, 'company') = 'company'
+          AND d.last_sync IS NOT NULL AND julianday(:now) - julianday(d.last_sync) <= 30
+          AND (d.mgmt_agent LIKE 'configurationManager%' OR d.short_name IN (SELECT short_name FROM hybrid))
+          AND (SELECT ok FROM ad_computers_complete) = 1
+          AND d.short_name NOT IN (SELECT short_name FROM ad_now)
+      key: id
+      name: device_name
+    each: any
+    evidence: "{device_name} ({os}, {join_evidence}) synced with Intune {last_sync}; AD: no enabled computer object since {gone_since}"
+
+  - id: XS-DEVICE-ENTRA-HYBRID-AD-GONE
+    title: Hybrid-joined Entra device object whose AD computer is gone
+    kind: misconfigured
+    lens: security
+    category: HYG
+    severity:
+      field: sev
+      map: { medium: medium, low: low }
+      default: low
+    entity: device
+    why: >-
+      An enabled Entra device object of trust type ServerAd (hybrid joined) satisfies "require a
+      hybrid-joined device" in Conditional Access, but the computer behind it was an enabled AD object
+      in an earlier Keeper scan and is not in the newest complete one. Sync should have removed it.
+      ENTRA-DEVICE-STALE sees only the sign-in date. A sign-in in the last 30 days (something still
+      uses it) makes it medium.
+    fix: >-
+      Disable and then delete the device object; check the sync scope for devices so leftovers stop
+      appearing.
+    refs: [NIST-800-53:CM-8(3), CIS-Controls-v8:1.2]
+    query:
+      protocol: store
+      text: |
+        WITH max_age AS (
+          SELECT COALESCE((SELECT CAST(value AS REAL) FROM setting WHERE key = 'threshold.cross.max-scan-age-days'), 14) AS days
+        ),
+        live AS (
+          SELECT lr.run_id, lr.instance, lr.system, lr.status
+          FROM latest_run lr CROSS JOIN max_age m
+          WHERE lr.status <> 'failed' AND julianday(:now) - julianday(lr.started_at) <= m.days
+        ),
+        ad_computers_complete AS (
+          SELECT CASE WHEN COUNT(*) > 0 AND SUM(CASE WHEN lr.status = 'ok' OR EXISTS (
+                        SELECT 1 FROM coverage c WHERE c.run_id = lr.run_id AND c.scope = 'rule' AND c.item = 'AD-POP-COMPUTERS-NONE' AND c.state = 'ok')
+                      THEN 0 ELSE 1 END) = 0 THEN 1 ELSE 0 END AS ok
+          FROM latest_run lr CROSS JOIN max_age m
+          WHERE lr.system = 'active-directory' AND julianday(:now) - julianday(lr.started_at) <= m.days
+        ),
+        ad_now AS (
+          SELECT DISTINCT UPPER(RTRIM(s.entity_key, '$')) AS short_name
+          FROM live r JOIN row_seen s ON s.run_id = r.run_id
+          WHERE r.system = 'active-directory' AND s.entity_type = 'computer'
+        ),
+        ad_gone AS (
+          SELECT UPPER(RTRIM(e.entity_key, '$')) AS short_name, MAX(e.gone_since) AS gone_since
+          FROM entity e
+          WHERE e.entity_type = 'computer' AND e.entity_key GLOB '*$' AND e.gone_since IS NOT NULL
+            AND e.instance IN (SELECT x.instance FROM run x WHERE x.system = 'active-directory')
+          GROUP BY UPPER(RTRIM(e.entity_key, '$'))
+        ),
+        entra_devices AS (
+          SELECT s.entity_key AS id,
+                 MAX(json_extract(s.attrs, '$.displayName')) AS name,
+                 MAX(json_extract(s.attrs, '$.trustType')) AS trust_type,
+                 MAX(CAST(json_extract(s.attrs, '$.accountEnabled') AS INTEGER)) AS enabled,
+                 MAX(json_extract(s.attrs, '$.operatingSystem')) AS os,
+                 MAX(json_extract(s.attrs, '$.approximateLastSignInDateTime')) AS last_signin
+          FROM live r JOIN row_seen s ON s.run_id = r.run_id
+          WHERE r.system = 'entra' AND s.entity_type = 'device'
+          GROUP BY s.entity_key
+        ),
+        named AS (
+          SELECT x.*, UPPER(CASE WHEN instr(TRIM(x.name), '.') > 0 THEN substr(TRIM(x.name), 1, instr(TRIM(x.name), '.') - 1) ELSE TRIM(x.name) END) AS short_name
+          FROM entra_devices x
+          WHERE x.trust_type = 'ServerAd' AND x.enabled = 1 AND x.name IS NOT NULL
+        )
+        SELECT n.id, n.name, n.os, n.last_signin, g.gone_since,
+               CASE WHEN n.last_signin IS NOT NULL AND julianday(:now) - julianday(n.last_signin) <= 30 THEN 'medium' ELSE 'low' END AS sev
+        FROM named n
+        JOIN ad_gone g ON g.short_name = n.short_name
+        WHERE (SELECT ok FROM ad_computers_complete) = 1
+          AND n.short_name NOT IN (SELECT short_name FROM ad_now)
+      key: id
+      name: name
+    each: any
+    evidence: "Entra device {name} ({os}, hybrid joined, last sign-in {last_signin}); AD: no enabled computer object since {gone_since}"
+
+  - id: XS-COMPUTER-AD-NOT-HYBRID-JOINED
+    title: Active domain computer that never registered as hybrid joined
+    kind: missing
+    lens: both
+    category: CFG
+    severity: medium
+    entity: computer
+    why: >-
+      The tenant uses hybrid join (at least one ServerAd device exists), but this domain computer,
+      active in the window and older than 3 days, has no hybrid-joined Entra device object. It gets no
+      device-based Conditional Access, no co-management enrolment and no Windows Hello for Business, and
+      a "require compliant or hybrid-joined device" policy locks its users out the day it is enforced.
+      Operating systems in scope: threshold cross.hybrid-join-expected-os-pattern (default Windows 10
+      and 11). Needs a complete Entra device scan.
+    fix: >-
+      Check that the computer's OU is in the sync scope for devices, that the device-registration
+      Group Policy and service connection point are in place, and the registration task's result on
+      the machine.
+    refs: [NIST-800-53:IA-3, NIST-800-53:AC-19]
+    query:
+      protocol: store
+      text: |
+        WITH max_age AS (
+          SELECT COALESCE((SELECT CAST(value AS REAL) FROM setting WHERE key = 'threshold.cross.max-scan-age-days'), 14) AS days
+        ),
+        live AS (
+          SELECT lr.run_id, lr.instance, lr.system, lr.status
+          FROM latest_run lr CROSS JOIN max_age m
+          WHERE lr.status <> 'failed' AND julianday(:now) - julianday(lr.started_at) <= m.days
+        ),
+        entra_devices_complete AS (
+          SELECT CASE WHEN COUNT(*) > 0 AND SUM(CASE WHEN lr.status = 'ok' OR EXISTS (
+                        SELECT 1 FROM coverage c WHERE c.run_id = lr.run_id AND c.scope = 'rule' AND c.item = 'ENTRA-DEVICE-STALE' AND c.state = 'ok')
+                      THEN 0 ELSE 1 END) = 0 THEN 1 ELSE 0 END AS ok
+          FROM latest_run lr CROSS JOIN max_age m
+          WHERE lr.system = 'entra' AND julianday(:now) - julianday(lr.started_at) <= m.days
+        ),
+        os_scope AS (
+          SELECT COALESCE((SELECT value FROM setting WHERE key = 'threshold.cross.hybrid-join-expected-os-pattern'), '(?i)^Windows (10|11)') AS pattern
+        ),
+        active_days AS (
+          SELECT COALESCE((SELECT CAST(value AS REAL) FROM setting WHERE key = 'threshold.cross.computer-active-days'), 30) AS days
+        ),
+        ad_computers AS (
+          SELECT r.instance, s.entity_key AS account, UPPER(RTRIM(s.entity_key, '$')) AS short_name,
+                 MAX(json_extract(s.attrs, '$.dNSHostName')) AS dns_name,
+                 MAX(json_extract(s.attrs, '$.operatingSystem')) AS os,
+                 CASE WHEN MAX(json_extract(s.attrs, '$.lastLogonTimestamp')) GLOB '[0-9][0-9][0-9][0-9]-*'
+                      THEN MAX(json_extract(s.attrs, '$.lastLogonTimestamp')) END AS dc_logon,
+                 CASE WHEN MAX(json_extract(s.attrs, '$.whenCreated')) GLOB '[0-9][0-9][0-9][0-9]-*'
+                      THEN MAX(json_extract(s.attrs, '$.whenCreated')) END AS created
+          FROM live r JOIN row_seen s ON s.run_id = r.run_id
+          WHERE r.system = 'active-directory' AND s.entity_type = 'computer'
+          GROUP BY r.instance, s.entity_key
+        ),
+        entra_devices AS (
+          SELECT UPPER(CASE WHEN instr(n, '.') > 0 THEN substr(n, 1, instr(n, '.') - 1) ELSE n END) AS short_name, trust_type
+          FROM (SELECT TRIM(MAX(json_extract(s.attrs, '$.displayName'))) AS n, MAX(json_extract(s.attrs, '$.trustType')) AS trust_type
+                FROM live r JOIN row_seen s ON s.run_id = r.run_id
+                WHERE r.system = 'entra' AND s.entity_type = 'device'
+                GROUP BY s.entity_key)
+          WHERE n IS NOT NULL AND n <> ''
+        ),
+        hybrid AS (
+          SELECT DISTINCT short_name FROM entra_devices WHERE trust_type = 'ServerAd'
+        )
+        SELECT a.instance || '/' || a.account AS id, a.account, a.dns_name, a.os, a.dc_logon, a.created,
+               (SELECT GROUP_CONCAT(DISTINCT x.trust_type) FROM entra_devices x WHERE x.short_name = a.short_name) AS other_records
+        FROM ad_computers a
+        CROSS JOIN active_days w
+        WHERE a.os REGEXP (SELECT pattern FROM os_scope)
+          AND a.dc_logon IS NOT NULL AND julianday(:now) - julianday(a.dc_logon) <= w.days
+          AND (a.created IS NULL OR julianday(:now) - julianday(a.created) > 3)
+          AND (SELECT ok FROM entra_devices_complete) = 1
+          AND EXISTS (SELECT 1 FROM hybrid)
+          AND a.short_name NOT IN (SELECT short_name FROM hybrid)
+      key: id
+      name: dns_name
+    each: any
+    evidence: "AD {dns_name} ({os}, logged on {dc_logon}) has no hybrid-joined Entra device; other Entra records with its name: {other_records}"
+
+  # ======================================================= backup: vCenter x AD x Veeam x registers ===
+
+  - id: XS-VM-NO-BACKUP
+    title: Powered-on VM with no Veeam backup object
+    kind: missing
+    lens: both
+    category: BCK
+    severity:
+      field: sev
+      map: { critical: critical, high: high }
+      default: high
+    entity: vm
+    why: >-
+      The VM nobody added to a job is found at restore time. The VEEAM-* rules see only objects that
+      exist in Veeam; this compares the vCenter inventory with a complete list of Veeam backup objects
+      (VM, agent or any other platform with the same name). VMs are matched by name, so a VM renamed
+      after it was added to a job shows here too. System VMs (threshold
+      cross.vm-no-backup-exclude-pattern, default vCLS and replicas) are left out. A domain controller
+      or a host of a criticality-1 system makes it critical.
+    fix: >-
+      Add the VM to a backup job, preferably one that selects by folder or tag so new VMs are covered;
+      VMs that must not be backed up are accepted one by one.
+    refs: [NIST-800-53:CP-9, CIS-Controls-v8:11.2]
+    query:
+      protocol: store
+      text: |
+        WITH max_age AS (
+          SELECT COALESCE((SELECT CAST(value AS REAL) FROM setting WHERE key = 'threshold.cross.max-scan-age-days'), 14) AS days
+        ),
+        live AS (
+          SELECT lr.run_id, lr.instance, lr.system, lr.status
+          FROM latest_run lr CROSS JOIN max_age m
+          WHERE lr.status <> 'failed' AND julianday(:now) - julianday(lr.started_at) <= m.days
+        ),
+        veeam_complete AS (
+          SELECT CASE WHEN COUNT(*) > 0 AND SUM(CASE WHEN lr.status = 'ok' OR EXISTS (
+                        SELECT 1 FROM coverage c WHERE c.run_id = lr.run_id AND c.scope = 'rule' AND c.item = 'VEEAM-OBJECT-FEW-RESTORE-POINTS' AND c.state = 'ok')
+                      THEN 0 ELSE 1 END) = 0 THEN 1 ELSE 0 END AS ok
+          FROM latest_run lr CROSS JOIN max_age m
+          WHERE lr.system = 'veeam' AND julianday(:now) - julianday(lr.started_at) <= m.days
+        ),
+        excl AS (
+          SELECT COALESCE((SELECT value FROM setting WHERE key = 'threshold.cross.vm-no-backup-exclude-pattern'), '(?i)^vCLS|_replica$') AS pattern
+        ),
+        vms AS (
+          SELECT instance, vm, name, power_state,
+                 UPPER(CASE WHEN name GLOB '[0-9]*.[0-9]*.[0-9]*.[0-9]*' THEN name
+                            WHEN instr(name, '.') > 0 THEN substr(name, 1, instr(name, '.') - 1) ELSE name END) AS short_name
+          FROM (SELECT r.instance, s.entity_key AS vm,
+                       TRIM(MAX(json_extract(s.attrs, '$.name'))) AS name,
+                       MAX(json_extract(s.attrs, '$.power_state')) AS power_state
+                FROM live r JOIN row_seen s ON s.run_id = r.run_id
+                WHERE r.system = 'vmware' AND s.entity_type = 'vm'
+                GROUP BY r.instance, s.entity_key)
+          WHERE name IS NOT NULL AND name <> ''
+        ),
+        veeam_names AS (
+          SELECT DISTINCT UPPER(CASE WHEN n GLOB '[0-9]*.[0-9]*.[0-9]*.[0-9]*' THEN n
+                                     WHEN instr(n, '.') > 0 THEN substr(n, 1, instr(n, '.') - 1) ELSE n END) AS short_name,
+                 UPPER(n) AS full_name
+          FROM (SELECT TRIM(json_extract(s.attrs, '$.name')) AS n
+                FROM live r JOIN row_seen s ON s.run_id = r.run_id
+                WHERE r.system = 'veeam' AND s.entity_type = 'backup-object')
+          WHERE n IS NOT NULL AND n <> ''
+        ),
+        dcs AS (
+          SELECT DISTINCT UPPER(RTRIM(s.entity_key, '$')) AS short_name
+          FROM live r JOIN row_seen s ON s.run_id = r.run_id
+          WHERE r.system = 'active-directory' AND s.entity_type = 'computer'
+            AND (COALESCE(CAST(json_extract(s.attrs, '$.userAccountControl') AS INTEGER), 0) & 8192) = 8192
+        ),
+        crit AS (
+          SELECT DISTINCT UPPER(CASE WHEN n GLOB '[0-9]*.[0-9]*.[0-9]*.[0-9]*' THEN n
+                                     WHEN instr(n, '.') > 0 THEN substr(n, 1, instr(n, '.') - 1) ELSE n END) AS short_name
+          FROM (SELECT TRIM(RTRIM(COALESCE(NULLIF(e.entity_name, ''), e.entity_key), '$')) AS n
+                FROM entity e JOIN system sy ON sy.system_id = e.system_id
+                WHERE sy.criticality = 1 AND sy.active = 1 AND e.gone_since IS NULL AND e.entity_type IN ('computer', 'vm', 'host'))
+          WHERE n IS NOT NULL AND n <> ''
+        )
+        SELECT v.instance || '/' || v.vm AS id, v.vm, v.name, v.power_state,
+               CASE WHEN v.short_name IN (SELECT short_name FROM dcs) THEN 'domain controller'
+                    WHEN v.short_name IN (SELECT short_name FROM crit) THEN 'host of a criticality-1 system'
+                    ELSE 'VM' END AS role_text,
+               CASE WHEN v.short_name IN (SELECT short_name FROM dcs) OR v.short_name IN (SELECT short_name FROM crit)
+                    THEN 'critical' ELSE 'high' END AS sev
+        FROM vms v
+        WHERE v.power_state = 'POWERED_ON'
+          AND (SELECT ok FROM veeam_complete) = 1
+          AND NOT (v.name REGEXP (SELECT pattern FROM excl))
+          AND NOT EXISTS (SELECT 1 FROM veeam_names o WHERE o.short_name = v.short_name OR o.full_name = UPPER(v.name))
+      key: id
+      name: name
+    each: any
+    evidence: "vCenter VM {name} ({role_text}, {power_state}); Veeam: no backup object with that name"
+
+  - id: XS-SERVER-AD-NO-BACKUP
+    title: Active server with no Veeam backup object
+    kind: missing
+    lens: both
+    category: BCK
+    severity:
+      field: sev
+      map: { critical: critical, high: high }
+      default: high
+    entity: computer
+    why: >-
+      XS-VM-NO-BACKUP covers vCenter VMs; physical servers, VMs on other platforms and cloud servers
+      show only here. A server that logged on to the domain within threshold
+      cross.computer-active-days (default 30) has no backup object of any kind with its name in a
+      complete Veeam scan. Servers that are VMs in a scanned vCenter are left to XS-VM-NO-BACKUP. A
+      domain controller (which also needs a directory-aware backup, OBL-AD-SYSTEM-STATE-BACKUP) or a
+      host of a criticality-1 system makes it critical.
+    fix: >-
+      Add the server to a job (agent-based for physical machines); servers that hold no data worth
+      restoring are accepted one by one with the reason.
+    refs: [NIST-800-53:CP-9, CIS-Controls-v8:11.2]
+    query:
+      protocol: store
+      text: |
+        WITH max_age AS (
+          SELECT COALESCE((SELECT CAST(value AS REAL) FROM setting WHERE key = 'threshold.cross.max-scan-age-days'), 14) AS days
+        ),
+        live AS (
+          SELECT lr.run_id, lr.instance, lr.system, lr.status
+          FROM latest_run lr CROSS JOIN max_age m
+          WHERE lr.status <> 'failed' AND julianday(:now) - julianday(lr.started_at) <= m.days
+        ),
+        veeam_complete AS (
+          SELECT CASE WHEN COUNT(*) > 0 AND SUM(CASE WHEN lr.status = 'ok' OR EXISTS (
+                        SELECT 1 FROM coverage c WHERE c.run_id = lr.run_id AND c.scope = 'rule' AND c.item = 'VEEAM-OBJECT-FEW-RESTORE-POINTS' AND c.state = 'ok')
+                      THEN 0 ELSE 1 END) = 0 THEN 1 ELSE 0 END AS ok
+          FROM latest_run lr CROSS JOIN max_age m
+          WHERE lr.system = 'veeam' AND julianday(:now) - julianday(lr.started_at) <= m.days
+        ),
+        active_days AS (
+          SELECT COALESCE((SELECT CAST(value AS REAL) FROM setting WHERE key = 'threshold.cross.computer-active-days'), 30) AS days
+        ),
+        ad_computers AS (
+          SELECT r.instance, s.entity_key AS account, UPPER(RTRIM(s.entity_key, '$')) AS short_name,
+                 MAX(json_extract(s.attrs, '$.dNSHostName')) AS dns_name,
+                 MAX(json_extract(s.attrs, '$.operatingSystem')) AS os,
+                 MAX(CAST(json_extract(s.attrs, '$.userAccountControl') AS INTEGER)) AS uac,
+                 CASE WHEN MAX(json_extract(s.attrs, '$.lastLogonTimestamp')) GLOB '[0-9][0-9][0-9][0-9]-*'
+                      THEN MAX(json_extract(s.attrs, '$.lastLogonTimestamp')) END AS dc_logon
+          FROM live r JOIN row_seen s ON s.run_id = r.run_id
+          WHERE r.system = 'active-directory' AND s.entity_type = 'computer'
+          GROUP BY r.instance, s.entity_key
+        ),
+        veeam_names AS (
+          SELECT DISTINCT UPPER(CASE WHEN n GLOB '[0-9]*.[0-9]*.[0-9]*.[0-9]*' THEN n
+                                     WHEN instr(n, '.') > 0 THEN substr(n, 1, instr(n, '.') - 1) ELSE n END) AS short_name,
+                 UPPER(n) AS full_name
+          FROM (SELECT TRIM(json_extract(s.attrs, '$.name')) AS n
+                FROM live r JOIN row_seen s ON s.run_id = r.run_id
+                WHERE r.system = 'veeam' AND s.entity_type = 'backup-object')
+          WHERE n IS NOT NULL AND n <> ''
+        ),
+        vm_names AS (
+          SELECT DISTINCT UPPER(CASE WHEN n GLOB '[0-9]*.[0-9]*.[0-9]*.[0-9]*' THEN n
+                                     WHEN instr(n, '.') > 0 THEN substr(n, 1, instr(n, '.') - 1) ELSE n END) AS short_name
+          FROM (SELECT TRIM(json_extract(s.attrs, '$.name')) AS n
+                FROM live r JOIN row_seen s ON s.run_id = r.run_id
+                WHERE r.system = 'vmware' AND s.entity_type = 'vm')
+          WHERE n IS NOT NULL AND n <> ''
+        ),
+        crit AS (
+          SELECT DISTINCT UPPER(CASE WHEN n GLOB '[0-9]*.[0-9]*.[0-9]*.[0-9]*' THEN n
+                                     WHEN instr(n, '.') > 0 THEN substr(n, 1, instr(n, '.') - 1) ELSE n END) AS short_name
+          FROM (SELECT TRIM(RTRIM(COALESCE(NULLIF(e.entity_name, ''), e.entity_key), '$')) AS n
+                FROM entity e JOIN system sy ON sy.system_id = e.system_id
+                WHERE sy.criticality = 1 AND sy.active = 1 AND e.gone_since IS NULL AND e.entity_type IN ('computer', 'vm', 'host'))
+          WHERE n IS NOT NULL AND n <> ''
+        )
+        SELECT a.instance || '/' || a.account AS id, a.account, a.dns_name, a.os, a.dc_logon,
+               CASE WHEN (COALESCE(a.uac, 0) & 8192) = 8192 THEN 'domain controller'
+                    WHEN a.short_name IN (SELECT short_name FROM crit) THEN 'host of a criticality-1 system'
+                    ELSE 'server' END AS role_text,
+               CASE WHEN (COALESCE(a.uac, 0) & 8192) = 8192 OR a.short_name IN (SELECT short_name FROM crit)
+                    THEN 'critical' ELSE 'high' END AS sev
+        FROM ad_computers a
+        CROSS JOIN active_days w
+        WHERE a.os LIKE '%Server%'
+          AND a.dc_logon IS NOT NULL AND julianday(:now) - julianday(a.dc_logon) <= w.days
+          AND (SELECT ok FROM veeam_complete) = 1
+          AND a.short_name NOT IN (SELECT short_name FROM vm_names)
+          AND NOT EXISTS (SELECT 1 FROM veeam_names o WHERE o.short_name = a.short_name OR o.full_name = UPPER(COALESCE(a.dns_name, '')))
+      key: id
+      name: dns_name
+    each: any
+    evidence: "AD {dns_name} ({os}, {role_text}, logged on {dc_logon}); Veeam: no backup object with that name"
+
+  - id: XS-BACKUP-OBJECT-VM-GONE
+    title: Veeam still protects a VMware VM that no longer exists in vCenter
+    kind: misconfigured
+    lens: maintenance
+    category: BCK
+    severity: low
+    entity: backup-object
+    why: >-
+      The backup object's VM was in an earlier vCenter scan and is not in the newest complete one. Its
+      job warns about a missing object forever, its restore points hold repository space, and if the
+      VM was renamed it is now backed up under neither name (see XS-VM-NO-BACKUP). Names Keeper never
+      saw in a scanned vCenter are not judged.
+    fix: >-
+      Remove the object from its job and let retention expire the chain; keep an archive restore point
+      if the VM was decommissioned on purpose.
+    refs: [NIST-800-53:CP-9, CIS-Controls-v8:11.1]
+    query:
+      protocol: store
+      text: |
+        WITH max_age AS (
+          SELECT COALESCE((SELECT CAST(value AS REAL) FROM setting WHERE key = 'threshold.cross.max-scan-age-days'), 14) AS days
+        ),
+        live AS (
+          SELECT lr.run_id, lr.instance, lr.system, lr.status
+          FROM latest_run lr CROSS JOIN max_age m
+          WHERE lr.status <> 'failed' AND julianday(:now) - julianday(lr.started_at) <= m.days
+        ),
+        vmware_complete AS (
+          SELECT CASE WHEN COUNT(*) > 0 AND SUM(CASE WHEN lr.status = 'ok' OR EXISTS (
+                        SELECT 1 FROM coverage c WHERE c.run_id = lr.run_id AND c.scope = 'rule' AND c.item = 'VMW-VM-CONFIG-UNAVAILABLE' AND c.state = 'ok')
+                      THEN 0 ELSE 1 END) = 0 THEN 1 ELSE 0 END AS ok
+          FROM latest_run lr CROSS JOIN max_age m
+          WHERE lr.system = 'vmware' AND julianday(:now) - julianday(lr.started_at) <= m.days
+        ),
+        vm_now AS (
+          SELECT DISTINCT UPPER(CASE WHEN n GLOB '[0-9]*.[0-9]*.[0-9]*.[0-9]*' THEN n
+                                     WHEN instr(n, '.') > 0 THEN substr(n, 1, instr(n, '.') - 1) ELSE n END) AS short_name
+          FROM (SELECT TRIM(json_extract(s.attrs, '$.name')) AS n
+                FROM live r JOIN row_seen s ON s.run_id = r.run_id
+                WHERE r.system = 'vmware' AND s.entity_type = 'vm')
+          WHERE n IS NOT NULL AND n <> ''
+        ),
+        vm_gone AS (
+          SELECT UPPER(CASE WHEN n GLOB '[0-9]*.[0-9]*.[0-9]*.[0-9]*' THEN n
+                            WHEN instr(n, '.') > 0 THEN substr(n, 1, instr(n, '.') - 1) ELSE n END) AS short_name,
+                 MAX(gone_since) AS gone_since
+          FROM (SELECT TRIM(e.entity_name) AS n, e.gone_since
+                FROM entity e
+                WHERE e.entity_type = 'vm' AND e.gone_since IS NOT NULL AND e.entity_name IS NOT NULL
+                  AND e.instance IN (SELECT x.instance FROM run x WHERE x.system = 'vmware'))
+          WHERE n <> ''
+          GROUP BY 1
+        ),
+        objects AS (
+          SELECT instance, object_id, name, type, platform, rp_count,
+                 UPPER(CASE WHEN name GLOB '[0-9]*.[0-9]*.[0-9]*.[0-9]*' THEN name
+                            WHEN instr(name, '.') > 0 THEN substr(name, 1, instr(name, '.') - 1) ELSE name END) AS short_name
+          FROM (SELECT r.instance, s.entity_key AS object_id,
+                       TRIM(MAX(json_extract(s.attrs, '$.name'))) AS name,
+                       MAX(json_extract(s.attrs, '$.type')) AS type,
+                       MAX(json_extract(s.attrs, '$.platformName')) AS platform,
+                       MAX(CAST(json_extract(s.attrs, '$.restorePointsCount') AS INTEGER)) AS rp_count
+                FROM live r JOIN row_seen s ON s.run_id = r.run_id
+                WHERE r.system = 'veeam' AND s.entity_type = 'backup-object'
+                GROUP BY r.instance, s.entity_key)
+          WHERE name IS NOT NULL AND name <> ''
+        )
+        SELECT o.instance || '/' || o.object_id AS id, o.name, o.type, o.platform, o.rp_count, g.gone_since
+        FROM objects o
+        JOIN vm_gone g ON g.short_name = o.short_name
+        WHERE o.platform LIKE '%VMware%'
+          AND (SELECT ok FROM vmware_complete) = 1
+          AND o.short_name NOT IN (SELECT short_name FROM vm_now)
+      key: id
+      name: name
+    each: any
+    evidence: "Veeam object {name} ({type}, {platform}, {rp_count} restore points); vCenter: no VM with that name since {gone_since}"
+
+  - id: XS-SYSTEM-CRITICAL-NO-BACKUP
+    title: A host of a criticality-1 system has no Veeam backup object
+    kind: missing
+    lens: both
+    category: BCK
+    severity: critical
+    entity: computer
+    why: >-
+      The organisation said this system stops it when it is down, yet one of its computers or VMs (as
+      mapped with keeper system map) has no backup object with its name in a complete Veeam scan.
+      Active AD servers and vCenter VMs are reported by XS-SERVER-AD-NO-BACKUP and XS-VM-NO-BACKUP;
+      this covers the rest (appliances, non-domain and non-vCenter hosts). Without system mappings and
+      criticality the rule has nothing to judge.
+    fix: >-
+      Back the host up, or record why the system can be rebuilt without it and lower its criticality
+      with a reason.
+    refs: [NIST-800-53:CP-9, NIST-800-53:CP-2, CIS-Controls-v8:11.2]
+    query:
+      protocol: store
+      text: |
+        WITH max_age AS (
+          SELECT COALESCE((SELECT CAST(value AS REAL) FROM setting WHERE key = 'threshold.cross.max-scan-age-days'), 14) AS days
+        ),
+        live AS (
+          SELECT lr.run_id, lr.instance, lr.system, lr.status
+          FROM latest_run lr CROSS JOIN max_age m
+          WHERE lr.status <> 'failed' AND julianday(:now) - julianday(lr.started_at) <= m.days
+        ),
+        veeam_complete AS (
+          SELECT CASE WHEN COUNT(*) > 0 AND SUM(CASE WHEN lr.status = 'ok' OR EXISTS (
+                        SELECT 1 FROM coverage c WHERE c.run_id = lr.run_id AND c.scope = 'rule' AND c.item = 'VEEAM-OBJECT-FEW-RESTORE-POINTS' AND c.state = 'ok')
+                      THEN 0 ELSE 1 END) = 0 THEN 1 ELSE 0 END AS ok
+          FROM latest_run lr CROSS JOIN max_age m
+          WHERE lr.system = 'veeam' AND julianday(:now) - julianday(lr.started_at) <= m.days
+        ),
+        crit_hosts AS (
+          SELECT UPPER(CASE WHEN n GLOB '[0-9]*.[0-9]*.[0-9]*.[0-9]*' THEN n
+                            WHEN instr(n, '.') > 0 THEN substr(n, 1, instr(n, '.') - 1) ELSE n END) AS short_name,
+                 MIN(system_id) AS system_id, MIN(system_name) AS system_name
+          FROM (SELECT TRIM(RTRIM(CASE WHEN instr(raw, '|') > 0 THEN substr(raw, 1, instr(raw, '|') - 1) ELSE raw END, '$')) AS n,
+                       system_id, system_name
+                FROM (SELECT COALESCE(NULLIF(e.entity_name, ''), e.entity_key) AS raw, sy.system_id, sy.name AS system_name
+                      FROM entity e JOIN system sy ON sy.system_id = e.system_id
+                      WHERE sy.criticality = 1 AND sy.active = 1 AND e.gone_since IS NULL AND e.entity_type IN ('computer', 'vm')))
+          WHERE n IS NOT NULL AND n <> '' AND n GLOB '*[^0-9]*'
+          GROUP BY 1
+        ),
+        veeam_names AS (
+          SELECT DISTINCT UPPER(CASE WHEN n GLOB '[0-9]*.[0-9]*.[0-9]*.[0-9]*' THEN n
+                                     WHEN instr(n, '.') > 0 THEN substr(n, 1, instr(n, '.') - 1) ELSE n END) AS short_name
+          FROM (SELECT TRIM(json_extract(s.attrs, '$.name')) AS n
+                FROM live r JOIN row_seen s ON s.run_id = r.run_id
+                WHERE r.system = 'veeam' AND s.entity_type = 'backup-object')
+          WHERE n IS NOT NULL AND n <> ''
+        ),
+        covered AS (
+          SELECT UPPER(CASE WHEN n GLOB '[0-9]*.[0-9]*.[0-9]*.[0-9]*' THEN n
+                            WHEN instr(n, '.') > 0 THEN substr(n, 1, instr(n, '.') - 1) ELSE n END) AS short_name
+          FROM (SELECT TRIM(json_extract(s.attrs, '$.name')) AS n
+                FROM live r JOIN row_seen s ON s.run_id = r.run_id
+                WHERE r.system = 'vmware' AND s.entity_type = 'vm')
+          WHERE n IS NOT NULL AND n <> ''
+          UNION
+          SELECT UPPER(RTRIM(s.entity_key, '$'))
+          FROM live r JOIN row_seen s ON s.run_id = r.run_id
+          WHERE r.system = 'active-directory' AND s.entity_type = 'computer'
+            AND json_extract(s.attrs, '$.operatingSystem') LIKE '%Server%'
+        )
+        SELECT h.short_name, h.system_id, h.system_name
+        FROM crit_hosts h
+        WHERE (SELECT ok FROM veeam_complete) = 1
+          AND h.short_name NOT IN (SELECT short_name FROM covered)
+          AND h.short_name NOT IN (SELECT short_name FROM veeam_names)
+      key: short_name
+      name: short_name
+    each: any
+    evidence: "{short_name} belongs to {system_name} ({system_id}, criticality 1); Veeam: no backup object with that name"
+
+  - id: XS-VEEAM-REPOSITORY-HOST-UNMANAGED
+    title: Backup repository host is a weakly defended domain member, or a non-member nobody monitors
+    kind: misconfigured
+    lens: security
+    category: BCK
+    severity:
+      field: sev
+      map: { high: high, medium: medium }
+      default: medium
+    entity: repository
+    why: >-
+      Ransomware goes for the backups first. A repository host that is a domain member and has open
+      high or critical Windows-server findings is reachable with stolen domain credentials and weakly
+      defended; a repository host outside the domain (often a deliberate hardened repository) that no
+      complete monitor (PRTG, Dynatrace) watches can fill up, fail or be tampered with unseen.
+    fix: >-
+      Take repositories out of the production domain (workgroup or a separate management domain) or
+      fix the open server findings first; add every repository host to monitoring.
+    refs: [NIST-800-53:CP-9, NIST-800-53:SC-7, CIS-Controls-v8:11.3]
+    query:
+      protocol: store
+      text: |
+        WITH max_age AS (
+          SELECT COALESCE((SELECT CAST(value AS REAL) FROM setting WHERE key = 'threshold.cross.max-scan-age-days'), 14) AS days
+        ),
+        live AS (
+          SELECT lr.run_id, lr.instance, lr.system, lr.status
+          FROM latest_run lr CROSS JOIN max_age m
+          WHERE lr.status <> 'failed' AND julianday(:now) - julianday(lr.started_at) <= m.days
+        ),
+        prtg_complete AS (
+          SELECT CASE WHEN COUNT(*) > 0 AND SUM(CASE WHEN lr.status = 'ok' OR EXISTS (
+                        SELECT 1 FROM coverage c WHERE c.run_id = lr.run_id AND c.scope = 'rule' AND c.item = 'PRTG-SENSOR-DOWN' AND c.state = 'ok')
+                      THEN 0 ELSE 1 END) = 0 THEN 1 ELSE 0 END AS ok
+          FROM latest_run lr CROSS JOIN max_age m
+          WHERE lr.system = 'prtg' AND julianday(:now) - julianday(lr.started_at) <= m.days
+        ),
+        dt_complete AS (
+          SELECT CASE WHEN COUNT(*) > 0 AND SUM(CASE WHEN lr.status = 'ok' OR EXISTS (
+                        SELECT 1 FROM coverage c WHERE c.run_id = lr.run_id AND c.scope = 'rule' AND c.item = 'DT-AGENT-NOT-MONITORING' AND c.state = 'ok')
+                      THEN 0 ELSE 1 END) = 0 THEN 1 ELSE 0 END AS ok
+          FROM latest_run lr CROSS JOIN max_age m
+          WHERE lr.system = 'dynatrace' AND julianday(:now) - julianday(lr.started_at) <= m.days
+        ),
+        repos AS (
+          SELECT UPPER(CASE WHEN h GLOB '[0-9]*.[0-9]*.[0-9]*.[0-9]*' THEN h
+                            WHEN instr(h, '.') > 0 THEN substr(h, 1, instr(h, '.') - 1) ELSE h END) AS short_name,
+                 MAX(h) AS host_name, GROUP_CONCAT(DISTINCT repo) AS repositories
+          FROM (SELECT TRIM(json_extract(s.attrs, '$.hostName')) AS h, json_extract(s.attrs, '$.name') AS repo
+                FROM live r JOIN row_seen s ON s.run_id = r.run_id
+                WHERE r.system = 'veeam' AND s.entity_type = 'repository')
+          WHERE h IS NOT NULL AND h <> ''
+          GROUP BY 1
+        ),
+        ad_names AS (
+          SELECT DISTINCT UPPER(RTRIM(s.entity_key, '$')) AS short_name
+          FROM live r JOIN row_seen s ON s.run_id = r.run_id
+          WHERE r.system = 'active-directory' AND s.entity_type = 'computer'
+        ),
+        monitored AS (
+          SELECT DISTINCT UPPER(CASE WHEN n GLOB '[0-9]*.[0-9]*.[0-9]*.[0-9]*' THEN n
+                                     WHEN instr(n, '.') > 0 THEN substr(n, 1, instr(n, '.') - 1) ELSE n END) AS short_name
+          FROM (SELECT TRIM(json_extract(s.attrs, '$.device')) AS n
+                FROM live r JOIN row_seen s ON s.run_id = r.run_id
+                WHERE r.system = 'prtg' AND s.entity_type = 'sensor'
+                UNION ALL
+                SELECT TRIM(json_extract(s.attrs, '$.hostInfo.displayName'))
+                FROM live r JOIN row_seen s ON s.run_id = r.run_id
+                WHERE r.system = 'dynatrace' AND s.entity_type = 'host')
+          WHERE n IS NOT NULL AND n <> ''
+        ),
+        hardening AS (
+          SELECT UPPER(CASE WHEN h GLOB '[0-9]*.[0-9]*.[0-9]*.[0-9]*' THEN h
+                            WHEN instr(h, '.') > 0 THEN substr(h, 1, instr(h, '.') - 1) ELSE h END) AS short_name,
+                 COUNT(*) AS open_high
+          FROM (SELECT TRIM(CASE WHEN instr(f.target, '|') > 0 THEN substr(f.target, 1, instr(f.target, '|') - 1) ELSE f.target END) AS h
+                FROM active_finding f
+                WHERE f.system = 'windows-server' AND f.severity IN ('critical', 'high'))
+          WHERE h IS NOT NULL AND h <> ''
+          GROUP BY 1
+        ),
+        judged AS (
+          SELECT p.short_name, p.host_name, p.repositories,
+                 CASE WHEN p.short_name IN (SELECT short_name FROM ad_names) THEN 1 ELSE 0 END AS domain_member,
+                 COALESCE((SELECT h.open_high FROM hardening h WHERE h.short_name = p.short_name), 0) AS open_high,
+                 CASE WHEN p.short_name IN (SELECT short_name FROM monitored) THEN 1
+                      WHEN (SELECT ok FROM prtg_complete) = 1 OR (SELECT ok FROM dt_complete) = 1 THEN 0 END AS is_monitored
+          FROM repos p
+          WHERE EXISTS (SELECT 1 FROM ad_names)
+        )
+        SELECT short_name, host_name, repositories, domain_member, open_high, is_monitored,
+               CASE WHEN domain_member = 1 AND open_high > 0 THEN 'domain member with ' || open_high || ' open high or critical server findings'
+                    WHEN domain_member = 0 AND is_monitored = 0 THEN 'not a domain member and watched by no monitor'
+                    WHEN domain_member = 0 AND is_monitored IS NULL THEN NULL
+                    ELSE 'ok' END AS state,
+               CASE WHEN domain_member = 1 THEN 'high' ELSE 'medium' END AS sev
+        FROM judged
+      key: short_name
+      name: host_name
+    each: { field: state, op: ne, value: ok }
+    evidence: "Repository host {host_name} ({repositories}): {state}"
+
+  # ======================================================== monitoring: AD x vCenter x PRTG x Dynatrace ===
+
+  - id: XS-SERVER-NOT-MONITORED
+    title: Active server that no monitoring tool watches
+    kind: missing
+    lens: both
+    category: MON
+    severity:
+      field: sev
+      map: { high: high, medium: medium }
+      default: medium
+    entity: computer
+    why: >-
+      A server that logged on to the domain within threshold cross.computer-active-days (default 30)
+      appears neither as a PRTG device nor as a Dynatrace host; its outages are reported by users. At
+      least one of the two monitors must have a complete scan, and the evidence says which were
+      consulted. Matching is by short name, so a PRTG device named by IP address or a free-text label
+      shows up here until it is renamed. Domain controllers and hosts of criticality-1 systems make it
+      high.
+    fix: >-
+      Add the server to monitoring (a PRTG auto-discovery group, OneAgent through the deployment tool);
+      appliances monitored by another tool are accepted one by one.
+    refs: [NIST-800-53:SI-4, NIST-800-53:CM-8, CIS-Controls-v8:13.1]
+    query:
+      protocol: store
+      text: |
+        WITH max_age AS (
+          SELECT COALESCE((SELECT CAST(value AS REAL) FROM setting WHERE key = 'threshold.cross.max-scan-age-days'), 14) AS days
+        ),
+        live AS (
+          SELECT lr.run_id, lr.instance, lr.system, lr.status
+          FROM latest_run lr CROSS JOIN max_age m
+          WHERE lr.status <> 'failed' AND julianday(:now) - julianday(lr.started_at) <= m.days
+        ),
+        prtg_complete AS (
+          SELECT CASE WHEN COUNT(*) > 0 AND SUM(CASE WHEN lr.status = 'ok' OR EXISTS (
+                        SELECT 1 FROM coverage c WHERE c.run_id = lr.run_id AND c.scope = 'rule' AND c.item = 'PRTG-SENSOR-DOWN' AND c.state = 'ok')
+                      THEN 0 ELSE 1 END) = 0 THEN 1 ELSE 0 END AS ok
+          FROM latest_run lr CROSS JOIN max_age m
+          WHERE lr.system = 'prtg' AND julianday(:now) - julianday(lr.started_at) <= m.days
+        ),
+        dt_complete AS (
+          SELECT CASE WHEN COUNT(*) > 0 AND SUM(CASE WHEN lr.status = 'ok' OR EXISTS (
+                        SELECT 1 FROM coverage c WHERE c.run_id = lr.run_id AND c.scope = 'rule' AND c.item = 'DT-AGENT-NOT-MONITORING' AND c.state = 'ok')
+                      THEN 0 ELSE 1 END) = 0 THEN 1 ELSE 0 END AS ok
+          FROM latest_run lr CROSS JOIN max_age m
+          WHERE lr.system = 'dynatrace' AND julianday(:now) - julianday(lr.started_at) <= m.days
+        ),
+        active_days AS (
+          SELECT COALESCE((SELECT CAST(value AS REAL) FROM setting WHERE key = 'threshold.cross.computer-active-days'), 30) AS days
+        ),
+        ad_computers AS (
+          SELECT r.instance, s.entity_key AS account, UPPER(RTRIM(s.entity_key, '$')) AS short_name,
+                 MAX(json_extract(s.attrs, '$.dNSHostName')) AS dns_name,
+                 MAX(json_extract(s.attrs, '$.operatingSystem')) AS os,
+                 MAX(CAST(json_extract(s.attrs, '$.userAccountControl') AS INTEGER)) AS uac,
+                 CASE WHEN MAX(json_extract(s.attrs, '$.lastLogonTimestamp')) GLOB '[0-9][0-9][0-9][0-9]-*'
+                      THEN MAX(json_extract(s.attrs, '$.lastLogonTimestamp')) END AS dc_logon
+          FROM live r JOIN row_seen s ON s.run_id = r.run_id
+          WHERE r.system = 'active-directory' AND s.entity_type = 'computer'
+          GROUP BY r.instance, s.entity_key
+        ),
+        monitored AS (
+          SELECT DISTINCT UPPER(CASE WHEN n GLOB '[0-9]*.[0-9]*.[0-9]*.[0-9]*' THEN n
+                                     WHEN instr(n, '.') > 0 THEN substr(n, 1, instr(n, '.') - 1) ELSE n END) AS short_name,
+                 UPPER(n) AS full_name
+          FROM (SELECT TRIM(json_extract(s.attrs, '$.device')) AS n
+                FROM live r JOIN row_seen s ON s.run_id = r.run_id
+                WHERE r.system = 'prtg' AND s.entity_type = 'sensor'
+                UNION ALL
+                SELECT TRIM(json_extract(s.attrs, '$.hostInfo.displayName'))
+                FROM live r JOIN row_seen s ON s.run_id = r.run_id
+                WHERE r.system = 'dynatrace' AND s.entity_type = 'host')
+          WHERE n IS NOT NULL AND n <> ''
+        ),
+        crit AS (
+          SELECT DISTINCT UPPER(CASE WHEN n GLOB '[0-9]*.[0-9]*.[0-9]*.[0-9]*' THEN n
+                                     WHEN instr(n, '.') > 0 THEN substr(n, 1, instr(n, '.') - 1) ELSE n END) AS short_name
+          FROM (SELECT TRIM(RTRIM(COALESCE(NULLIF(e.entity_name, ''), e.entity_key), '$')) AS n
+                FROM entity e JOIN system sy ON sy.system_id = e.system_id
+                WHERE sy.criticality = 1 AND sy.active = 1 AND e.gone_since IS NULL AND e.entity_type IN ('computer', 'vm', 'host'))
+          WHERE n IS NOT NULL AND n <> ''
+        )
+        SELECT a.instance || '/' || a.account AS id, a.account, a.dns_name, a.os, a.dc_logon,
+               CASE WHEN (SELECT ok FROM prtg_complete) = 1 THEN 'not in PRTG' ELSE 'PRTG not consulted (no complete scan)' END AS prtg_state,
+               CASE WHEN (SELECT ok FROM dt_complete) = 1 THEN 'not in Dynatrace' ELSE 'Dynatrace not consulted (no complete scan)' END AS dt_state,
+               CASE WHEN (COALESCE(a.uac, 0) & 8192) = 8192 THEN 'domain controller'
+                    WHEN a.short_name IN (SELECT short_name FROM crit) THEN 'host of a criticality-1 system'
+                    ELSE 'server' END AS role_text,
+               CASE WHEN (COALESCE(a.uac, 0) & 8192) = 8192 OR a.short_name IN (SELECT short_name FROM crit)
+                    THEN 'high' ELSE 'medium' END AS sev
+        FROM ad_computers a
+        CROSS JOIN active_days w
+        WHERE a.os LIKE '%Server%'
+          AND a.dc_logon IS NOT NULL AND julianday(:now) - julianday(a.dc_logon) <= w.days
+          AND ((SELECT ok FROM prtg_complete) = 1 OR (SELECT ok FROM dt_complete) = 1)
+          AND a.short_name NOT IN (SELECT short_name FROM monitored)
+          AND UPPER(COALESCE(a.dns_name, '')) NOT IN (SELECT full_name FROM monitored)
+      key: id
+      name: dns_name
+    each: any
+    evidence: "AD {dns_name} ({os}, {role_text}, logged on {dc_logon}): {prtg_state}; {dt_state}"
+
+  - id: XS-MONITOR-TARGET-AD-GONE
+    title: Monitoring still watches a machine whose AD computer object is gone
+    kind: misconfigured
+    lens: maintenance
+    category: HYG
+    severity:
+      field: sev
+      map: { medium: medium, low: low }
+      default: low
+    entity: monitor-target
+    why: >-
+      A PRTG device or Dynatrace host carries the name of a computer that was an enabled AD object in
+      an earlier Keeper scan and is not in the newest complete one. Its sensors go red and teach people
+      to ignore red (PRTG-SENSOR-DOWN-LONG), and a Dynatrace host keeps consuming licence. Switches,
+      printers, Linux hosts and anything else Keeper never saw in AD are not judged. Down sensors or a
+      lost host make it medium.
+    fix: >-
+      Delete the monitoring object, or pause it with a dated reason while the machine is being
+      replaced; free the licence.
+    refs: [NIST-800-53:CM-8(3), CIS-Controls-v8:1.2]
+    query:
+      protocol: store
+      text: |
+        WITH max_age AS (
+          SELECT COALESCE((SELECT CAST(value AS REAL) FROM setting WHERE key = 'threshold.cross.max-scan-age-days'), 14) AS days
+        ),
+        live AS (
+          SELECT lr.run_id, lr.instance, lr.system, lr.status
+          FROM latest_run lr CROSS JOIN max_age m
+          WHERE lr.status <> 'failed' AND julianday(:now) - julianday(lr.started_at) <= m.days
+        ),
+        ad_computers_complete AS (
+          SELECT CASE WHEN COUNT(*) > 0 AND SUM(CASE WHEN lr.status = 'ok' OR EXISTS (
+                        SELECT 1 FROM coverage c WHERE c.run_id = lr.run_id AND c.scope = 'rule' AND c.item = 'AD-POP-COMPUTERS-NONE' AND c.state = 'ok')
+                      THEN 0 ELSE 1 END) = 0 THEN 1 ELSE 0 END AS ok
+          FROM latest_run lr CROSS JOIN max_age m
+          WHERE lr.system = 'active-directory' AND julianday(:now) - julianday(lr.started_at) <= m.days
+        ),
+        ad_now AS (
+          SELECT DISTINCT UPPER(RTRIM(s.entity_key, '$')) AS short_name
+          FROM live r JOIN row_seen s ON s.run_id = r.run_id
+          WHERE r.system = 'active-directory' AND s.entity_type = 'computer'
+        ),
+        ad_gone AS (
+          SELECT UPPER(RTRIM(e.entity_key, '$')) AS short_name, MAX(e.gone_since) AS gone_since
+          FROM entity e
+          WHERE e.entity_type = 'computer' AND e.entity_key GLOB '*$' AND e.gone_since IS NOT NULL
+            AND e.instance IN (SELECT x.instance FROM run x WHERE x.system = 'active-directory')
+          GROUP BY UPPER(RTRIM(e.entity_key, '$'))
+        ),
+        prtg_rows AS (
+          SELECT UPPER(CASE WHEN n GLOB '[0-9]*.[0-9]*.[0-9]*.[0-9]*' THEN n
+                            WHEN instr(n, '.') > 0 THEN substr(n, 1, instr(n, '.') - 1) ELSE n END) AS short_name, n, st
+          FROM (SELECT TRIM(json_extract(s.attrs, '$.device')) AS n, CAST(json_extract(s.attrs, '$.status_raw') AS INTEGER) AS st
+                FROM live r JOIN row_seen s ON s.run_id = r.run_id
+                WHERE r.system = 'prtg' AND s.entity_type = 'sensor')
+          WHERE n IS NOT NULL AND n <> ''
+        ),
+        dt_rows AS (
+          SELECT UPPER(CASE WHEN n GLOB '[0-9]*.[0-9]*.[0-9]*.[0-9]*' THEN n
+                            WHEN instr(n, '.') > 0 THEN substr(n, 1, instr(n, '.') - 1) ELSE n END) AS short_name, n, av
+          FROM (SELECT TRIM(MAX(json_extract(s.attrs, '$.hostInfo.displayName'))) AS n, MAX(json_extract(s.attrs, '$.availabilityState')) AS av
+                FROM live r JOIN row_seen s ON s.run_id = r.run_id
+                WHERE r.system = 'dynatrace' AND s.entity_type = 'host'
+                GROUP BY s.entity_key)
+          WHERE n IS NOT NULL AND n <> ''
+        ),
+        targets AS (
+          SELECT 'prtg' AS source, short_name, MAX(n) AS display_name, COUNT(*) AS sensors,
+                 SUM(CASE WHEN st IN (5, 13, 14) THEN 1 ELSE 0 END) AS down
+          FROM prtg_rows GROUP BY short_name
+          UNION ALL
+          SELECT 'dynatrace', short_name, MAX(n), NULL,
+                 MAX(CASE WHEN av IN ('LOST', 'CRASHED', 'UNMONITORED', 'UNEXPECTED_SHUTDOWN') THEN 1 ELSE 0 END)
+          FROM dt_rows GROUP BY short_name
+        )
+        SELECT t.source || '|' || t.short_name AS id, t.source, t.short_name, t.display_name, t.sensors, t.down, g.gone_since,
+               CASE WHEN COALESCE(t.down, 0) > 0 THEN 'medium' ELSE 'low' END AS sev
+        FROM targets t
+        JOIN ad_gone g ON g.short_name = t.short_name
+        WHERE (SELECT ok FROM ad_computers_complete) = 1
+          AND t.short_name NOT IN (SELECT short_name FROM ad_now)
+      key: id
+      name: display_name
+    each: any
+    evidence: "{source} watches {display_name} ({sensors} sensors, {down} down or lost); AD: no enabled computer object since {gone_since}"
+
+  - id: XS-ESXI-HOST-NOT-MONITORED
+    title: Connected ESXi host that PRTG does not watch
+    kind: missing
+    lens: maintenance
+    category: MON
+    severity: medium
+    entity: host
+    why: >-
+      vCenter alarms stop with vCenter, and hardware, datastore and time problems on a hypervisor take
+      every VM on it down together. A connected ESXi host that is no PRTG device (by short name, full
+      name or IP) in a complete PRTG scan is watched only from inside vCenter.
+    fix: >-
+      Add the host to PRTG (an SNMP or REST sensor group for ESXi), or accept it with the name of the
+      tool that watches it.
+    refs: [NIST-800-53:SI-4, CIS-Controls-v8:13.1]
+    query:
+      protocol: store
+      text: |
+        WITH max_age AS (
+          SELECT COALESCE((SELECT CAST(value AS REAL) FROM setting WHERE key = 'threshold.cross.max-scan-age-days'), 14) AS days
+        ),
+        live AS (
+          SELECT lr.run_id, lr.instance, lr.system, lr.status
+          FROM latest_run lr CROSS JOIN max_age m
+          WHERE lr.status <> 'failed' AND julianday(:now) - julianday(lr.started_at) <= m.days
+        ),
+        prtg_complete AS (
+          SELECT CASE WHEN COUNT(*) > 0 AND SUM(CASE WHEN lr.status = 'ok' OR EXISTS (
+                        SELECT 1 FROM coverage c WHERE c.run_id = lr.run_id AND c.scope = 'rule' AND c.item = 'PRTG-SENSOR-DOWN' AND c.state = 'ok')
+                      THEN 0 ELSE 1 END) = 0 THEN 1 ELSE 0 END AS ok
+          FROM latest_run lr CROSS JOIN max_age m
+          WHERE lr.system = 'prtg' AND julianday(:now) - julianday(lr.started_at) <= m.days
+        ),
+        hosts AS (
+          SELECT instance, host_id, name, connection_state,
+                 UPPER(CASE WHEN name GLOB '[0-9]*.[0-9]*.[0-9]*.[0-9]*' THEN name
+                            WHEN instr(name, '.') > 0 THEN substr(name, 1, instr(name, '.') - 1) ELSE name END) AS short_name
+          FROM (SELECT r.instance, s.entity_key AS host_id,
+                       TRIM(MAX(json_extract(s.attrs, '$.name'))) AS name,
+                       MAX(json_extract(s.attrs, '$.connection_state')) AS connection_state
+                FROM live r JOIN row_seen s ON s.run_id = r.run_id
+                WHERE r.system = 'vmware' AND s.entity_type = 'host'
+                GROUP BY r.instance, s.entity_key)
+          WHERE name IS NOT NULL AND name <> ''
+        ),
+        prtg_names AS (
+          SELECT DISTINCT UPPER(CASE WHEN n GLOB '[0-9]*.[0-9]*.[0-9]*.[0-9]*' THEN n
+                                     WHEN instr(n, '.') > 0 THEN substr(n, 1, instr(n, '.') - 1) ELSE n END) AS short_name,
+                 UPPER(n) AS full_name
+          FROM (SELECT TRIM(json_extract(s.attrs, '$.device')) AS n
+                FROM live r JOIN row_seen s ON s.run_id = r.run_id
+                WHERE r.system = 'prtg' AND s.entity_type = 'sensor')
+          WHERE n IS NOT NULL AND n <> ''
+        )
+        SELECT h.instance || '/' || h.host_id AS id, h.name, h.connection_state
+        FROM hosts h
+        WHERE h.connection_state = 'CONNECTED'
+          AND (SELECT ok FROM prtg_complete) = 1
+          AND h.short_name NOT IN (SELECT short_name FROM prtg_names)
+          AND UPPER(h.name) NOT IN (SELECT full_name FROM prtg_names)
+      key: id
+      name: name
+    each: any
+    evidence: "ESXi host {name} ({connection_state} to vCenter) is not a PRTG device"
+
+  - id: XS-SYSTEM-CRITICAL-UNMONITORED
+    title: A host of a criticality-1 system is watched by no monitoring tool
+    kind: missing
+    lens: both
+    category: MON
+    severity: high
+    entity: computer
+    why: >-
+      The organisation said this system stops it when it is down, yet one of its computers, VMs or
+      hosts (as mapped with keeper system map) is neither a PRTG device nor a Dynatrace host. Active AD
+      servers are reported by XS-SERVER-NOT-MONITORED; this covers the rest. At least one monitor must
+      have a complete scan. Without system mappings and criticality the rule has nothing to judge.
+    fix: >-
+      Add the host to monitoring, or record why the system is watched another way and lower its
+      criticality with a reason.
+    refs: [NIST-800-53:SI-4, NIST-800-53:CP-2, CIS-Controls-v8:13.1]
+    query:
+      protocol: store
+      text: |
+        WITH max_age AS (
+          SELECT COALESCE((SELECT CAST(value AS REAL) FROM setting WHERE key = 'threshold.cross.max-scan-age-days'), 14) AS days
+        ),
+        live AS (
+          SELECT lr.run_id, lr.instance, lr.system, lr.status
+          FROM latest_run lr CROSS JOIN max_age m
+          WHERE lr.status <> 'failed' AND julianday(:now) - julianday(lr.started_at) <= m.days
+        ),
+        prtg_complete AS (
+          SELECT CASE WHEN COUNT(*) > 0 AND SUM(CASE WHEN lr.status = 'ok' OR EXISTS (
+                        SELECT 1 FROM coverage c WHERE c.run_id = lr.run_id AND c.scope = 'rule' AND c.item = 'PRTG-SENSOR-DOWN' AND c.state = 'ok')
+                      THEN 0 ELSE 1 END) = 0 THEN 1 ELSE 0 END AS ok
+          FROM latest_run lr CROSS JOIN max_age m
+          WHERE lr.system = 'prtg' AND julianday(:now) - julianday(lr.started_at) <= m.days
+        ),
+        dt_complete AS (
+          SELECT CASE WHEN COUNT(*) > 0 AND SUM(CASE WHEN lr.status = 'ok' OR EXISTS (
+                        SELECT 1 FROM coverage c WHERE c.run_id = lr.run_id AND c.scope = 'rule' AND c.item = 'DT-AGENT-NOT-MONITORING' AND c.state = 'ok')
+                      THEN 0 ELSE 1 END) = 0 THEN 1 ELSE 0 END AS ok
+          FROM latest_run lr CROSS JOIN max_age m
+          WHERE lr.system = 'dynatrace' AND julianday(:now) - julianday(lr.started_at) <= m.days
+        ),
+        crit_hosts AS (
+          SELECT UPPER(CASE WHEN n GLOB '[0-9]*.[0-9]*.[0-9]*.[0-9]*' THEN n
+                            WHEN instr(n, '.') > 0 THEN substr(n, 1, instr(n, '.') - 1) ELSE n END) AS short_name,
+                 MIN(system_id) AS system_id, MIN(system_name) AS system_name
+          FROM (SELECT TRIM(RTRIM(CASE WHEN instr(raw, '|') > 0 THEN substr(raw, 1, instr(raw, '|') - 1) ELSE raw END, '$')) AS n,
+                       system_id, system_name
+                FROM (SELECT COALESCE(NULLIF(e.entity_name, ''), e.entity_key) AS raw, sy.system_id, sy.name AS system_name
+                      FROM entity e JOIN system sy ON sy.system_id = e.system_id
+                      WHERE sy.criticality = 1 AND sy.active = 1 AND e.gone_since IS NULL AND e.entity_type IN ('computer', 'vm', 'host')))
+          WHERE n IS NOT NULL AND n <> '' AND n GLOB '*[^0-9]*'
+          GROUP BY 1
+        ),
+        monitored AS (
+          SELECT DISTINCT UPPER(CASE WHEN n GLOB '[0-9]*.[0-9]*.[0-9]*.[0-9]*' THEN n
+                                     WHEN instr(n, '.') > 0 THEN substr(n, 1, instr(n, '.') - 1) ELSE n END) AS short_name
+          FROM (SELECT TRIM(json_extract(s.attrs, '$.device')) AS n
+                FROM live r JOIN row_seen s ON s.run_id = r.run_id
+                WHERE r.system = 'prtg' AND s.entity_type = 'sensor'
+                UNION ALL
+                SELECT TRIM(json_extract(s.attrs, '$.hostInfo.displayName'))
+                FROM live r JOIN row_seen s ON s.run_id = r.run_id
+                WHERE r.system = 'dynatrace' AND s.entity_type = 'host')
+          WHERE n IS NOT NULL AND n <> ''
+        ),
+        ad_servers AS (
+          SELECT DISTINCT UPPER(RTRIM(s.entity_key, '$')) AS short_name
+          FROM live r JOIN row_seen s ON s.run_id = r.run_id
+          WHERE r.system = 'active-directory' AND s.entity_type = 'computer'
+            AND json_extract(s.attrs, '$.operatingSystem') LIKE '%Server%'
+        )
+        SELECT h.short_name, h.system_id, h.system_name,
+               CASE WHEN (SELECT ok FROM prtg_complete) = 1 THEN 'not in PRTG' ELSE 'PRTG not consulted' END AS prtg_state,
+               CASE WHEN (SELECT ok FROM dt_complete) = 1 THEN 'not in Dynatrace' ELSE 'Dynatrace not consulted' END AS dt_state
+        FROM crit_hosts h
+        WHERE ((SELECT ok FROM prtg_complete) = 1 OR (SELECT ok FROM dt_complete) = 1)
+          AND h.short_name NOT IN (SELECT short_name FROM ad_servers)
+          AND h.short_name NOT IN (SELECT short_name FROM monitored)
+      key: short_name
+      name: short_name
+    each: any
+    evidence: "{short_name} belongs to {system_name} ({system_id}, criticality 1): {prtg_state}; {dt_state}"
+
+  # ============================================================ risk on one host, across sources ===
+
+  - id: XS-HOST-COMPOUND-RISK
+    title: One host fails rules of several risk classes at once
+    kind: broken
+    lens: both
+    category: HYG
+    severity:
+      field: classes
+      ranges: [ { min: 5, value: critical }, { min: 4, value: high }, { min: 3, value: medium } ]
+      default: low
+    entity: computer
+    why: >-
+      Ten separate medium findings on one machine are one critical machine. This groups the open
+      findings of every pack by host (short name) and counts the risk classes they fall into:
+      patching, end of life, local administrators, perimeter (firewall, RDP, SMB), protection
+      (antivirus, EDR, disk encryption), delegation, missing backup, known-exploited or exposed
+      vulnerabilities, active threats. A class that was never checked does not count; the evidence
+      lists the classes that did. The minimum is threshold cross.compound-min-classes (default 3).
+    fix: >-
+      Treat the host as one work item: patch or retire it first, then the rest. The single findings
+      stay open underneath and resolve on their own as their checks pass.
+    refs: [NIST-800-53:RA-3, NIST-800-53:RA-5, CIS-Controls-v8:7.2]
+    query:
+      protocol: store
+      text: |
+        WITH max_age AS (
+          SELECT COALESCE((SELECT CAST(value AS REAL) FROM setting WHERE key = 'threshold.cross.max-scan-age-days'), 14) AS days
+        ),
+        live AS (
+          SELECT lr.run_id, lr.instance, lr.system, lr.status
+          FROM latest_run lr CROSS JOIN max_age m
+          WHERE lr.status <> 'failed' AND julianday(:now) - julianday(lr.started_at) <= m.days
+        ),
+        sccm_names AS (
+          SELECT s.entity_key AS resource_id, MAX(json_extract(s.attrs, '$.Name')) AS name
+          FROM live r JOIN row_seen s ON s.run_id = r.run_id
+          WHERE r.system IN ('sccm', 'workstations-sccm') AND s.entity_type = 'computer'
+          GROUP BY s.entity_key
+        ),
+        wiz_assets AS (
+          SELECT s.entity_key AS finding_id, MAX(json_extract(s.attrs, '$.vulnerableAsset.name')) AS name
+          FROM live r JOIN row_seen s ON s.run_id = r.run_id
+          WHERE r.system = 'wiz' AND s.entity_type = 'vulnerability-finding'
+          GROUP BY s.entity_key
+        ),
+        hits AS (
+          SELECT f.rule_id, f.severity,
+                 TRIM(RTRIM(CASE
+                   WHEN f.system IN ('windows-server', 'workstations', 'active-directory')
+                     THEN CASE WHEN instr(f.target, '|') > 0 THEN substr(f.target, 1, instr(f.target, '|') - 1) ELSE f.target END
+                   WHEN f.system = 'wiz' THEN (SELECT w.name FROM wiz_assets w WHERE w.finding_id = f.target)
+                   WHEN f.system IN ('sccm', 'workstations-sccm')
+                     THEN COALESCE(NULLIF(f.entity_name, ''), (SELECT sn.name FROM sccm_names sn WHERE sn.resource_id = f.target))
+                   ELSE f.entity_name END, '$')) AS host_raw,
+                 CASE
+                   WHEN f.rule_id GLOB '*-PATCH-NONE-RECENT' OR f.rule_id GLOB '*-CCM-UPDATE-OVERDUE' OR f.rule_id GLOB '*-SVC-UPDATE-DISABLED'
+                        OR f.rule_id IN ('WS-CCM-UPDATE-FAILED', 'WSF-SUM-NONCOMPLIANT', 'WSF-SUM-DEPLOY-ERROR', 'WINSRV-CCM-UPDATE-RESTART-WAIT', 'WIZ-VULN-CRITICAL-FIX-OVERDUE')
+                     THEN 'patching'
+                   WHEN f.rule_id IN ('WINSRV-OS-UNSUPPORTED', 'WS-OS-WIN10', 'WS-OS-BUILD-UNSUPPORTED', 'WSF-OS-WIN10', 'WSF-OS-BUILD-UNSUPPORTED',
+                                      'AD-COMP-OS-SERVER-2012', 'AD-COMP-OS-LEGACY', 'AD-COMP-OS-WIN10', 'AD-COMP-OS-WIN11',
+                                      'INTUNE-DEVICE-WINDOWS-UNSUPPORTED', 'ENTRA-DEVICE-WINDOWS-UNSUPPORTED')
+                     THEN 'end-of-life'
+                   WHEN f.rule_id GLOB '*-LOCALADMIN-UNEXPECTED' OR f.rule_id GLOB '*-LOCALADMIN-BROAD' OR f.rule_id GLOB '*-LOCALADMIN-COUNT'
+                        OR f.rule_id IN ('AD-COMP-LAPS-MISSING', 'AD-COMP-LAPS-OVERDUE', 'WS-LOCAL-ACCOUNT-WEAK', 'WINSRV-GPO-ALWAYS-ELEVATED')
+                     THEN 'local-admin'
+                   WHEN f.rule_id GLOB '*-FW-PROFILE-OFF' OR f.rule_id GLOB '*-GPO-FIREWALL-OFF' OR f.rule_id GLOB '*-RDP-NO-NLA'
+                        OR f.rule_id IN ('WINSRV-FW-INBOUND-ALLOW', 'WINSRV-RDP-WEAK-SECURITY', 'WINSRV-SMB1-SERVER-ON', 'WINSRV-SMB-SIGNING-NOT-REQUIRED',
+                                         'WS-SMB-CLIENT-SIGNING-OFF', 'WS-SMB-INSECURE-GUEST')
+                     THEN 'perimeter'
+                   WHEN f.rule_id GLOB '*-DEFENDER-RTP-OFF' OR f.rule_id GLOB '*-DEFENDER-SIG-OLD' OR f.rule_id GLOB '*-AV-UNAPPROVED'
+                        OR f.rule_id GLOB '*-SVC-AGENT-STOPPED'
+                        OR f.rule_id IN ('WS-AV-DEFS-OUTDATED', 'WS-BITLOCKER-OS-OFF', 'WSF-BITLOCKER-OFF', 'INTUNE-DEVICE-NOT-ENCRYPTED',
+                                         'WS-CREDGUARD-OFF', 'WS-HVCI-OFF')
+                     THEN 'protection'
+                   WHEN f.rule_id IN ('AD-COMP-UNCONSTRAINED-DELEGATION', 'AD-COMP-PROTOCOL-TRANSITION', 'AD-COMP-DELEGATION-SENSITIVE-SPN')
+                     THEN 'delegation'
+                   WHEN f.rule_id IN ('XS-VM-NO-BACKUP', 'XS-SERVER-AD-NO-BACKUP', 'XS-SYSTEM-CRITICAL-NO-BACKUP')
+                     THEN 'backup'
+                   WHEN f.rule_id IN ('WIZ-VULN-KEV', 'WIZ-VULN-EXPLOIT-INTERNET', 'XS-HOST-EOL-EXPOSED')
+                     THEN 'exploited-or-exposed'
+                   WHEN f.rule_id IN ('WINSRV-DEFENDER-ACTIVE-THREAT', 'INTUNE-DEVICE-THREAT-REPORTED', 'VEEAM-MALWARE-INFECTED',
+                                      'VEEAM-MALWARE-SUSPICIOUS', 'XS-HOST-THREAT-MULTI-SOURCE')
+                     THEN 'active-threat'
+                   ELSE NULL END AS risk_class
+          FROM active_finding f
+        ),
+        per_host AS (
+          SELECT UPPER(CASE WHEN host_raw GLOB '[0-9]*.[0-9]*.[0-9]*.[0-9]*' THEN host_raw
+                            WHEN instr(host_raw, '.') > 0 THEN substr(host_raw, 1, instr(host_raw, '.') - 1) ELSE host_raw END) AS host,
+                 COUNT(DISTINCT risk_class) AS classes,
+                 GROUP_CONCAT(DISTINCT risk_class) AS class_list,
+                 COUNT(*) AS findings,
+                 SUM(CASE WHEN severity IN ('critical', 'high') THEN 1 ELSE 0 END) AS high_or_worse
+          FROM hits
+          WHERE risk_class IS NOT NULL AND host_raw IS NOT NULL AND host_raw NOT IN ('', '-')
+          GROUP BY 1
+        )
+        SELECT host, classes, class_list, findings, high_or_worse FROM per_host
+      key: host
+      name: host
+    each: { field: classes, op: ge, value: 3, threshold: cross.compound-min-classes }
+    evidence: "{host}: {classes} risk classes open at once ({class_list}) - {findings} findings, {high_or_worse} high or critical"
+
+  - id: XS-HOST-THREAT-MULTI-SOURCE
+    title: Two or more independent detectors report an active threat on the same host
+    kind: broken
+    lens: security
+    category: MON
+    severity: critical
+    entity: computer
+    why: >-
+      One detector alone is triaged as noise; two independent sources naming the same machine is an
+      incident. Sources: Veeam malware detection (not marked false positive, within threshold
+      veeam.malware-window-days, default 30), open Wiz threat-detection issues, Intune devices whose
+      threat-defence partner reports compromised, high or medium, and open Defender active-threat
+      findings on servers. Sources that were not scanned simply do not count. The minimum is threshold
+      cross.threat-min-sources (default 2).
+    fix: >-
+      Isolate the host and open an incident; restore only from a restore point older than the first
+      detection, once the way in is known.
+    refs: [NIST-800-53:IR-4, NIST-800-53:SI-4, CIS-Controls-v8:17.4]
+    query:
+      protocol: store
+      text: |
+        WITH max_age AS (
+          SELECT COALESCE((SELECT CAST(value AS REAL) FROM setting WHERE key = 'threshold.cross.max-scan-age-days'), 14) AS days
+        ),
+        live AS (
+          SELECT lr.run_id, lr.instance, lr.system, lr.status
+          FROM latest_run lr CROSS JOIN max_age m
+          WHERE lr.status <> 'failed' AND julianday(:now) - julianday(lr.started_at) <= m.days
+        ),
+        win AS (
+          SELECT COALESCE((SELECT CAST(value AS REAL) FROM setting WHERE key = 'threshold.veeam.malware-window-days'), 30) AS days
+        ),
+        named AS (
+          SELECT 'veeam' AS source, TRIM(json_extract(s.attrs, '$.machine.displayName')) AS h
+          FROM live r JOIN row_seen s ON s.run_id = r.run_id CROSS JOIN win w
+          WHERE r.system = 'veeam' AND s.entity_type = 'malware-event'
+            AND COALESCE(json_extract(s.attrs, '$.state'), '') <> 'FalsePositive'
+            AND julianday(:now) - julianday(json_extract(s.attrs, '$.detectionTimeUtc')) <= w.days
+          UNION ALL
+          SELECT 'wiz', TRIM(json_extract(s.attrs, '$.entitySnapshot.name'))
+          FROM live r JOIN row_seen s ON s.run_id = r.run_id
+          WHERE r.system = 'wiz' AND s.entity_type = 'issue' AND json_extract(s.attrs, '$.type') = 'THREAT_DETECTION'
+          UNION ALL
+          SELECT 'intune', TRIM(json_extract(s.attrs, '$.deviceName'))
+          FROM live r JOIN row_seen s ON s.run_id = r.run_id
+          WHERE r.system = 'intune' AND s.entity_type = 'managed-device'
+            AND json_extract(s.attrs, '$.partnerReportedThreatState') IN ('compromised', 'highSeverity', 'mediumSeverity')
+          UNION ALL
+          SELECT 'defender', TRIM(CASE WHEN instr(f.target, '|') > 0 THEN substr(f.target, 1, instr(f.target, '|') - 1) ELSE f.target END)
+          FROM active_finding f
+          WHERE f.rule_id = 'WINSRV-DEFENDER-ACTIVE-THREAT'
+        ),
+        per_host AS (
+          SELECT UPPER(CASE WHEN h GLOB '[0-9]*.[0-9]*.[0-9]*.[0-9]*' THEN h
+                            WHEN instr(h, '.') > 0 THEN substr(h, 1, instr(h, '.') - 1) ELSE h END) AS host,
+                 COUNT(DISTINCT source) AS sources,
+                 GROUP_CONCAT(DISTINCT source) AS source_list,
+                 COUNT(*) AS detections
+          FROM named
+          WHERE h IS NOT NULL AND h <> ''
+          GROUP BY 1
+        )
+        SELECT host, sources, source_list, detections FROM per_host
+      key: host
+      name: host
+    each: { field: sources, op: ge, value: 2, threshold: cross.threat-min-sources }
+    evidence: "{host}: active threat reported by {sources} sources ({source_list}), {detections} detections"
+
+  - id: XS-HOST-KEV-COMPOUND
+    title: Host with a known-exploited vulnerability that is also exposed, unpatched or without backup
+    kind: broken
+    lens: security
+    category: LCM
+    severity:
+      field: sev
+      map: { critical: critical, high: high }
+      default: high
+    entity: computer
+    why: >-
+      A CISA KEV finding from Wiz (open WIZ-VULN-KEV) on a host that is also widely exposed to the
+      internet, confirmed unpatched by an independent source (WINSRV-/WS-PATCH-NONE-RECENT or
+      CCM-UPDATE-OVERDUE on the same host), or a server or VM with no Veeam backup object: the
+      ransomware picture - exploited, reachable, unpatched, unrecoverable. One finding per host, the
+      facts side by side. Exposure or no backup makes it critical.
+    fix: >-
+      Patch today or remove the exposure; take a backup before anything else if there is none.
+    refs: [NIST-800-53:SI-2, NIST-800-53:RA-5, NIST-800-53:CP-9, CIS-Controls-v8:7.7]
+    query:
+      protocol: store
+      text: |
+        WITH max_age AS (
+          SELECT COALESCE((SELECT CAST(value AS REAL) FROM setting WHERE key = 'threshold.cross.max-scan-age-days'), 14) AS days
+        ),
+        live AS (
+          SELECT lr.run_id, lr.instance, lr.system, lr.status
+          FROM latest_run lr CROSS JOIN max_age m
+          WHERE lr.status <> 'failed' AND julianday(:now) - julianday(lr.started_at) <= m.days
+        ),
+        veeam_complete AS (
+          SELECT CASE WHEN COUNT(*) > 0 AND SUM(CASE WHEN lr.status = 'ok' OR EXISTS (
+                        SELECT 1 FROM coverage c WHERE c.run_id = lr.run_id AND c.scope = 'rule' AND c.item = 'VEEAM-OBJECT-FEW-RESTORE-POINTS' AND c.state = 'ok')
+                      THEN 0 ELSE 1 END) = 0 THEN 1 ELSE 0 END AS ok
+          FROM latest_run lr CROSS JOIN max_age m
+          WHERE lr.system = 'veeam' AND julianday(:now) - julianday(lr.started_at) <= m.days
+        ),
+        kev AS (
+          SELECT DISTINCT f.target AS finding_id FROM active_finding f WHERE f.rule_id = 'WIZ-VULN-KEV'
+        ),
+        assets AS (
+          SELECT s.entity_key AS finding_id,
+                 TRIM(MAX(json_extract(s.attrs, '$.vulnerableAsset.name'))) AS asset_name,
+                 MAX(json_extract(s.attrs, '$.vulnerableAsset.type')) AS asset_type,
+                 MAX(CAST(json_extract(s.attrs, '$.vulnerableAsset.hasWideInternetExposure') AS INTEGER)) AS exposed,
+                 MAX(json_extract(s.attrs, '$.name')) AS cve
+          FROM live r JOIN row_seen s ON s.run_id = r.run_id
+          WHERE r.system = 'wiz' AND s.entity_type = 'vulnerability-finding'
+          GROUP BY s.entity_key
+        ),
+        per_host AS (
+          SELECT UPPER(CASE WHEN asset_name GLOB '[0-9]*.[0-9]*.[0-9]*.[0-9]*' THEN asset_name
+                            WHEN instr(asset_name, '.') > 0 THEN substr(asset_name, 1, instr(asset_name, '.') - 1) ELSE asset_name END) AS host,
+                 MAX(asset_name) AS asset_name, MAX(asset_type) AS asset_type, MAX(COALESCE(exposed, 0)) AS exposed,
+                 COUNT(*) AS kev_findings, GROUP_CONCAT(DISTINCT cve) AS cves
+          FROM assets
+          WHERE finding_id IN (SELECT finding_id FROM kev) AND asset_name IS NOT NULL AND asset_name <> ''
+          GROUP BY 1
+        ),
+        patch_open AS (
+          SELECT UPPER(CASE WHEN h GLOB '[0-9]*.[0-9]*.[0-9]*.[0-9]*' THEN h
+                            WHEN instr(h, '.') > 0 THEN substr(h, 1, instr(h, '.') - 1) ELSE h END) AS host,
+                 COUNT(*) AS n
+          FROM (SELECT TRIM(CASE WHEN instr(f.target, '|') > 0 THEN substr(f.target, 1, instr(f.target, '|') - 1) ELSE f.target END) AS h
+                FROM active_finding f
+                WHERE f.system IN ('windows-server', 'workstations')
+                  AND (f.rule_id GLOB '*-PATCH-NONE-RECENT' OR f.rule_id GLOB '*-CCM-UPDATE-OVERDUE'))
+          WHERE h IS NOT NULL AND h <> ''
+          GROUP BY 1
+        ),
+        servers AS (
+          SELECT DISTINCT UPPER(RTRIM(s.entity_key, '$')) AS short_name
+          FROM live r JOIN row_seen s ON s.run_id = r.run_id
+          WHERE r.system = 'active-directory' AND s.entity_type = 'computer'
+            AND json_extract(s.attrs, '$.operatingSystem') LIKE '%Server%'
+          UNION
+          SELECT UPPER(CASE WHEN n GLOB '[0-9]*.[0-9]*.[0-9]*.[0-9]*' THEN n
+                            WHEN instr(n, '.') > 0 THEN substr(n, 1, instr(n, '.') - 1) ELSE n END)
+          FROM (SELECT TRIM(json_extract(s.attrs, '$.name')) AS n
+                FROM live r JOIN row_seen s ON s.run_id = r.run_id
+                WHERE r.system = 'vmware' AND s.entity_type = 'vm')
+          WHERE n IS NOT NULL AND n <> ''
+        ),
+        veeam_names AS (
+          SELECT DISTINCT UPPER(CASE WHEN n GLOB '[0-9]*.[0-9]*.[0-9]*.[0-9]*' THEN n
+                                     WHEN instr(n, '.') > 0 THEN substr(n, 1, instr(n, '.') - 1) ELSE n END) AS short_name
+          FROM (SELECT TRIM(json_extract(s.attrs, '$.name')) AS n
+                FROM live r JOIN row_seen s ON s.run_id = r.run_id
+                WHERE r.system = 'veeam' AND s.entity_type = 'backup-object')
+          WHERE n IS NOT NULL AND n <> ''
+        ),
+        judged AS (
+          SELECT p.host, p.asset_name, p.asset_type, p.exposed, p.kev_findings, p.cves,
+                 COALESCE((SELECT po.n FROM patch_open po WHERE po.host = p.host), 0) AS unpatched_elsewhere,
+                 CASE WHEN (SELECT ok FROM veeam_complete) = 1
+                           AND p.host IN (SELECT short_name FROM servers)
+                           AND p.host NOT IN (SELECT short_name FROM veeam_names) THEN 1 ELSE 0 END AS no_backup
+          FROM per_host p
+        )
+        SELECT host, asset_name, asset_type, exposed, kev_findings, cves, unpatched_elsewhere, no_backup,
+               CASE WHEN exposed = 1 OR no_backup = 1 THEN 'critical' ELSE 'high' END AS sev
+        FROM judged
+      key: host
+      name: asset_name
+    each:
+      any:
+        - { field: exposed, op: eq, value: 1 }
+        - { field: unpatched_elsewhere, op: gt, value: 0 }
+        - { field: no_backup, op: eq, value: 1 }
+    evidence: "{asset_name} ({asset_type}): {kev_findings} known-exploited CVEs ({cves}); wide internet exposure {exposed}; open patch findings from other sources {unpatched_elsewhere}; no backup object {no_backup}"
+
+  - id: XS-HOST-EOL-EXPOSED
+    title: End-of-life computer that Wiz sees exposed to the internet
+    kind: broken
+    lens: security
+    category: LCM
+    severity: critical
+    entity: computer
+    why: >-
+      An operating system that gets no security fixes (threshold cross.eol-os-pattern, default
+      Windows XP to 8.1 and Server 2000 to 2012 R2) on a machine Wiz reports with wide internet
+      exposure is reachable by anyone and cannot be patched. Wiz rows exist only for assets with
+      vulnerability findings, so an exposed machine Wiz reports nothing about is not seen here.
+    fix: >-
+      Remove the exposure today (firewall, security group, private endpoint), then migrate or retire
+      the machine.
+    refs: [NIST-800-53:SA-22, NIST-800-53:SC-7, CIS-Controls-v8:2.2]
+    query:
+      protocol: store
+      text: |
+        WITH max_age AS (
+          SELECT COALESCE((SELECT CAST(value AS REAL) FROM setting WHERE key = 'threshold.cross.max-scan-age-days'), 14) AS days
+        ),
+        live AS (
+          SELECT lr.run_id, lr.instance, lr.system, lr.status
+          FROM latest_run lr CROSS JOIN max_age m
+          WHERE lr.status <> 'failed' AND julianday(:now) - julianday(lr.started_at) <= m.days
+        ),
+        eol AS (
+          SELECT COALESCE((SELECT value FROM setting WHERE key = 'threshold.cross.eol-os-pattern'),
+                          '(?i)Windows (XP|Vista|7|8)|Server (2000|2003|2008|2012)') AS pattern
+        ),
+        ad_computers AS (
+          SELECT r.instance, s.entity_key AS account, UPPER(RTRIM(s.entity_key, '$')) AS short_name,
+                 MAX(json_extract(s.attrs, '$.dNSHostName')) AS dns_name,
+                 MAX(json_extract(s.attrs, '$.operatingSystem')) AS os
+          FROM live r JOIN row_seen s ON s.run_id = r.run_id
+          WHERE r.system = 'active-directory' AND s.entity_type = 'computer'
+          GROUP BY r.instance, s.entity_key
+        ),
+        exposed AS (
+          SELECT UPPER(CASE WHEN n GLOB '[0-9]*.[0-9]*.[0-9]*.[0-9]*' THEN n
+                            WHEN instr(n, '.') > 0 THEN substr(n, 1, instr(n, '.') - 1) ELSE n END) AS short_name,
+                 MAX(n) AS asset_name, MAX(t) AS asset_type, COUNT(*) AS findings
+          FROM (SELECT TRIM(json_extract(s.attrs, '$.vulnerableAsset.name')) AS n,
+                       json_extract(s.attrs, '$.vulnerableAsset.type') AS t,
+                       CAST(json_extract(s.attrs, '$.vulnerableAsset.hasWideInternetExposure') AS INTEGER) AS wide
+                FROM live r JOIN row_seen s ON s.run_id = r.run_id
+                WHERE r.system = 'wiz' AND s.entity_type = 'vulnerability-finding')
+          WHERE wide = 1 AND n IS NOT NULL AND n <> ''
+          GROUP BY 1
+        )
+        SELECT a.instance || '/' || a.account AS id, a.account, a.dns_name, a.os, x.asset_name, x.asset_type, x.findings
+        FROM ad_computers a
+        JOIN exposed x ON x.short_name = a.short_name
+        WHERE a.os REGEXP (SELECT pattern FROM eol)
+      key: id
+      name: dns_name
+    each: any
+    evidence: "AD {dns_name} runs {os}; Wiz sees {asset_name} ({asset_type}) with wide internet exposure ({findings} vulnerability findings)"
+
+  # ================================================================ registers x scanned data ===
+
+  - id: XS-LICENCE-REGISTER-DRIFT
+    title: The licence register disagrees with the tenant's own licence counts
+    kind: misconfigured
+    lens: maintenance
+    category: CST
+    severity: low
+    entity: licence
+    why: >-
+      A register row whose product is a Microsoft 365 SKU part number (or whose notes contain
+      sku:<PART_NUMBER>) records seats or seats used that differ from the tenant's enabled and consumed
+      units by more than threshold cross.licence-register-tolerance (default 5). The register is
+      behind, so every renewal and cost decision built on it is too.
+    fix: >-
+      Update the register row from the tenant's numbers, and review it again before each renewal.
+    refs: [NIST-800-53:CM-10, NIST-800-53:CM-8]
+    query:
+      protocol: store
+      text: |
+        WITH max_age AS (
+          SELECT COALESCE((SELECT CAST(value AS REAL) FROM setting WHERE key = 'threshold.cross.max-scan-age-days'), 14) AS days
+        ),
+        live AS (
+          SELECT lr.run_id, lr.instance, lr.system, lr.status
+          FROM latest_run lr CROSS JOIN max_age m
+          WHERE lr.status <> 'failed' AND julianday(:now) - julianday(lr.started_at) <= m.days
+        ),
+        tol AS (
+          SELECT COALESCE((SELECT CAST(value AS REAL) FROM setting WHERE key = 'threshold.cross.licence-register-tolerance'), 5) AS n
+        ),
+        skus AS (
+          SELECT s.entity_key AS sku_id,
+                 MAX(json_extract(s.attrs, '$.skuPartNumber')) AS part,
+                 MAX(CAST(json_extract(s.attrs, '$.prepaidUnits.enabled') AS INTEGER)) AS enabled_units,
+                 MAX(CAST(json_extract(s.attrs, '$.consumedUnits') AS INTEGER)) AS consumed
+          FROM live r JOIN row_seen s ON s.run_id = r.run_id
+          WHERE r.system = 'm365' AND s.entity_type = 'sku'
+          GROUP BY s.entity_key
+        )
+        SELECT l.licence_id || '|' || k.part AS id, l.licence_id, l.product, l.seats, l.seats_used,
+               k.part, k.enabled_units, k.consumed,
+               CASE WHEN (l.seats IS NOT NULL AND k.enabled_units IS NOT NULL AND ABS(l.seats - k.enabled_units) > t.n)
+                      OR (l.seats_used IS NOT NULL AND k.consumed IS NOT NULL AND ABS(l.seats_used - k.consumed) > t.n)
+                    THEN 1 ELSE 0 END AS drifted
+        FROM licence l
+        JOIN skus k ON k.part IS NOT NULL
+                   AND (UPPER(TRIM(k.part)) = UPPER(TRIM(l.product))
+                        OR instr(UPPER(COALESCE(l.notes, '')), 'SKU:' || UPPER(k.part)) > 0)
+        CROSS JOIN tol t
+      key: id
+      name: product
+    each: { field: drifted, op: eq, value: 1 }
+    evidence: "Register {licence_id} ({product}): {seats} seats, {seats_used} used; tenant SKU {part}: {enabled_units} enabled, {consumed} assigned"

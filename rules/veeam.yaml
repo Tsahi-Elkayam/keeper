@@ -138,6 +138,169 @@ rules:
         - { field: lastRun, op: absent }
     evidence: "{name} ({type}): no run recorded, status {status}"
 
+  - id: VEEAM-JOB-NONE
+    title: The backup server returned no jobs
+    kind: missing
+    category: BCK
+    severity: medium
+    entity: instance
+    why: An empty job list means the review account cannot read the jobs, or nothing is backed up; every other job rule stays silent either way.
+    fix: Give the review account the Backup Viewer role; if the list really is empty, the estate has no backups from this server.
+    refs: [NIST-800-53:CA-7, NIST-800-53:CP-9]
+    query:
+      protocol: http
+      path: /api/v1/jobs/states
+      headers: { x-api-version: 1.2-rev0 }
+      paging: offset
+      offsetParam: skip
+      limitParam: limit
+      pageSize: 200
+      items: data
+      key: id
+      name: name
+    count: none
+    evidence: "the job list is empty"
+
+  # ---- job configuration (/api/v1/jobs) ------------------------------------------------------
+  # Revision 1.2 lists the job types the REST API manages (Backup, VSphereReplica, CloudDirectorBackup,
+  # EntraIDTenantBackup, EntraIDAuditLogBackup, FileBackupCopy); paths below are those of the Backup
+  # job model. A job type without the field is n/a, never a pass.
+
+  - id: VEEAM-JOB-ENCRYPTION-OFF
+    title: Backup job writes unencrypted backup files
+    kind: misconfigured
+    lens: security
+    category: BCK
+    severity: high
+    entity: job
+    why: Anyone who can read the repository - a stolen disk, a leaked share, a compromised repository host, a copied bucket - can restore every machine in an unencrypted backup.
+    fix: Enable backup file encryption on the job with a password kept in the privileged-access vault (and in the key-recovery set, or a lost password is lost data); the next full backup is encrypted.
+    refs: [NIST-800-53:SC-28, NIST-800-53:CP-9, CIS-Controls-v8:3.11, CIS-Controls-v8:11.3]
+    query:
+      protocol: http
+      path: /api/v1/jobs
+      headers: { x-api-version: 1.2-rev0 }
+      paging: offset
+      offsetParam: skip
+      limitParam: limit
+      pageSize: 200
+      items: data
+      key: id
+      name: name
+    each:
+      all:
+        - { field: isDisabled, op: eq, value: false }
+        - { field: type, op: eq, value: Backup }
+        - { field: storage.advancedSettings.storageData.encryption.isEnabled, op: eq, value: false }
+    evidence: "{name} ({type}): backup encryption off"
+
+  - id: VEEAM-JOB-APP-AWARE-OFF
+    title: Backup job runs without application-aware processing
+    kind: misconfigured
+    category: BCK
+    severity: medium
+    entity: job
+    why: Without application-aware processing, restore points of domain controllers, databases and mail servers are only crash-consistent; the job is green while the restore may not be.
+    fix: Enable application-aware processing with guest credentials from the vault; for jobs whose machines run no application, record a per-job override.
+    refs: [NIST-800-53:CP-9, CIS-Controls-v8:11.2]
+    query:
+      protocol: http
+      path: /api/v1/jobs
+      headers: { x-api-version: 1.2-rev0 }
+      paging: offset
+      offsetParam: skip
+      limitParam: limit
+      pageSize: 200
+      items: data
+      key: id
+      name: name
+    each:
+      all:
+        - { field: isDisabled, op: eq, value: false }
+        - { field: type, op: eq, value: Backup }
+        - { field: guestProcessing.appAwareProcessing.isEnabled, op: eq, value: false }
+    evidence: "{name}: application-aware processing off"
+
+  - id: VEEAM-JOB-NOT-SCHEDULED
+    title: Enabled job runs only when started by hand
+    kind: misconfigured
+    category: BCK
+    severity: medium
+    entity: job
+    why: A job that does not run automatically (no schedule and no chaining) protects nothing unless someone remembers it; VEEAM-JOB-STALE sees the symptom days later, this is the cause.
+    fix: Give the job a schedule or chain it after another job; manual-only jobs are for one-off copies, not protection.
+    refs: [NIST-800-53:CP-9, CIS-Controls-v8:11.2]
+    query:
+      protocol: http
+      path: /api/v1/jobs
+      headers: { x-api-version: 1.2-rev0 }
+      paging: offset
+      offsetParam: skip
+      limitParam: limit
+      pageSize: 200
+      items: data
+      key: id
+      name: name
+    each:
+      all:
+        - { field: isDisabled, op: eq, value: false }
+        - { field: schedule.runAutomatically, op: eq, value: false }
+    evidence: "{name} ({type}): runs only when started manually"
+
+  - id: VEEAM-JOB-RETRY-OFF
+    title: Scheduled job does not retry after a failure
+    kind: misconfigured
+    category: BCK
+    severity: low
+    entity: job
+    why: Without automatic retry, one transient snapshot or network error loses that run's restore point.
+    fix: Enable retry on the job's schedule (a few attempts, several minutes apart).
+    refs: [NIST-800-53:CP-9]
+    query:
+      protocol: http
+      path: /api/v1/jobs
+      headers: { x-api-version: 1.2-rev0 }
+      paging: offset
+      offsetParam: skip
+      limitParam: limit
+      pageSize: 200
+      items: data
+      key: id
+      name: name
+    each:
+      all:
+        - { field: isDisabled, op: eq, value: false }
+        - { field: schedule.runAutomatically, op: eq, value: true }
+        - { field: schedule.retry.isEnabled, op: eq, value: false }
+    evidence: "{name}: automatic retry off"
+
+  - id: VEEAM-JOB-SHORT-RETENTION
+    title: Backup job keeps too few restore points and no long-term points
+    kind: misconfigured
+    category: BCK
+    severity: medium
+    entity: job
+    why: Corruption or ransomware encryption is often noticed after a week or more; with short retention and no weekly or monthly points there is nothing clean left to go back to.
+    fix: Raise retention (two weeks or more), or enable long-term (GFS) points on the job or on its backup copy.
+    refs: [NIST-800-53:CP-9, CIS-Controls-v8:11.2]
+    query:
+      protocol: http
+      path: /api/v1/jobs
+      headers: { x-api-version: 1.2-rev0 }
+      paging: offset
+      offsetParam: skip
+      limitParam: limit
+      pageSize: 200
+      items: data
+      key: id
+      name: name
+    each:
+      all:
+        - { field: isDisabled, op: eq, value: false }
+        - { field: storage.retentionPolicy.quantity, op: lt, value: 7, threshold: veeam.min-retention-quantity }
+        - { field: storage.gfsPolicy.isEnabled, op: eq, value: false }
+    evidence: "{name}: keeps {storage.retentionPolicy.quantity} {storage.retentionPolicy.type}, long-term points off"
+
   # ---- sessions ------------------------------------------------------------------------------
 
   - id: VEEAM-SESSION-FAILED
@@ -194,6 +357,38 @@ rules:
       name: name
     each: { field: creationTime, op: age-gt, value: 0.5, threshold: veeam.session-max-run-days }
     evidence: "{name} ({sessionType}) working since {creationTime}, {progressPercent}% done"
+
+  - id: VEEAM-SUREBACKUP-NO-RECENT-RUN
+    title: No restore verification (SureBackup) has succeeded in the last 90 days
+    kind: missing
+    category: BCK
+    severity: medium
+    entity: instance
+    refresh: 7d
+    why: Until a restore point has been booted and tested, nobody knows that it restores; restore verification is the only check that does not trust the job's own green status. The window is fixed in the query (DAYS_AGO), not a tenant setting.
+    fix: Create a SureBackup job with an application group for the critical systems and schedule it at least monthly; fix whatever its first run reports.
+    refs: [NIST-800-53:CP-4, NIST-800-53:CP-9, CIS-Controls-v8:11.5]
+    query:
+      protocol: http
+      path: /api/v1/sessions
+      headers: { x-api-version: 1.2-rev0 }
+      params: { typeFilter: SureBackup, createdAfterFilter: "{DAYS_AGO:90}", orderColumn: CreationTime, orderAsc: "false" }
+      paging: offset
+      offsetParam: skip
+      limitParam: limit
+      pageSize: 200
+      maxPages: 5
+      items: data
+      key: id
+      name: name
+    count:
+      op: lt
+      value: 1
+      where:
+        all:
+          - { field: sessionType, op: eq, value: SureBackup }
+          - { field: result.result, op: in, value: [Success, Warning] }
+    evidence: "no successful restore-verification session in 90 days ({rows} SureBackup sessions read)"
 
   # ---- repositories --------------------------------------------------------------------------
 
@@ -273,6 +468,36 @@ rules:
         - { field: freeGB, op: lt, value: 200, threshold: veeam.repository-free-gb-min }
     evidence: "{name} ({type}): {freeGB} GB free of {capacityGB} GB"
 
+  - id: VEEAM-REPOSITORY-NO-IMMUTABLE-CAPABLE
+    title: No backup repository of a kind that can hold immutable backups
+    kind: missing
+    lens: security
+    category: BCK
+    severity: high
+    entity: instance
+    why: Ransomware operators delete restore points before they encrypt. Plain Windows, Linux, SMB and NFS repositories cannot refuse that deletion; only a hardened Linux repository, object storage with object lock or a deduplicating appliance with its own retention lock can. This rule only proves that no such target exists - whether immutability is switched on in the ones that do is not readable in REST revision 1.2.
+    fix: Add a hardened Linux repository or object storage with immutability, and point at least a backup copy of the critical jobs at it.
+    refs: [NIST-800-53:CP-9, NIST-800-53:SI-7, CIS-Controls-v8:11.4, MITRE-ATTACK:T1490]
+    query:
+      protocol: http
+      path: /api/v1/backupInfrastructure/repositories
+      headers: { x-api-version: 1.2-rev0 }
+      paging: offset
+      offsetParam: skip
+      limitParam: limit
+      pageSize: 200
+      items: data
+      key: id
+      name: name
+    count:
+      op: lt
+      value: 1
+      where:
+        field: type
+        op: in
+        value: [LinuxHardened, AmazonS3, S3Compatible, AzureBlob, WasabiCloud, GoogleCloud, IBMCloud, DDBoost, ExaGrid, HPStoreOnceIntegration, Quantum, Infinidat, Fujitsu]
+    evidence: "none of the {rows} repositories is of an immutable-capable type"
+
   # ---- licence -------------------------------------------------------------------------------
 
   - id: VEEAM-LICENSE-STATUS
@@ -292,6 +517,45 @@ rules:
       key: "-"
     each: { field: status, op: ne, value: Valid }
     evidence: "licence status {status}, edition {edition}, type {type}"
+
+  - id: VEEAM-LICENSE-EVALUATION
+    title: Backup server runs on an evaluation or not-for-resale licence
+    kind: misconfigured
+    category: LCM
+    severity: medium
+    entity: license
+    why: An evaluation licence stops after its trial period and a not-for-resale licence is not meant for production; either way the jobs depend on a licence that will not be renewed.
+    fix: Install the purchased licence file.
+    refs: [NIST-800-53:SA-4]
+    query:
+      protocol: http
+      path: /api/v1/license
+      headers: { x-api-version: 1.2-rev0 }
+      paging: none
+      key: "-"
+    each: { field: type, op: in, value: [Evaluation, NFR] }
+    evidence: "{edition} {type} licence, expires {expirationDate}"
+
+  - id: VEEAM-LICENSE-AUTO-UPDATE-OFF
+    title: Automatic licence update is off for a term licence
+    kind: misconfigured
+    category: LCM
+    severity: low
+    entity: license
+    why: A subscription or rental licence that is not refreshed automatically lapses on its end date even when the renewal was paid, and the jobs stop.
+    fix: Enable automatic licence update (it needs outbound access to the vendor's licensing service), or put the manual licence install in the renewal checklist.
+    refs: [NIST-800-53:SA-4]
+    query:
+      protocol: http
+      path: /api/v1/license
+      headers: { x-api-version: 1.2-rev0 }
+      paging: none
+      key: "-"
+    each:
+      all:
+        - { field: type, op: in, value: [Subscription, Rental] }
+        - { field: autoUpdateEnabled, op: eq, value: false }
+    evidence: "{type} licence expires {expirationDate}, automatic update off"
 
   - id: VEEAM-LICENSE-EXPIRY
     title: Backup licence expires soon
@@ -441,6 +705,50 @@ rules:
       key: "-"
     each: { field: encryption.isEnabled, op: eq, value: false }
     evidence: "configuration backup encryption is off"
+
+  # ---- notifications (global options) --------------------------------------------------------
+
+  - id: VEEAM-EMAIL-NOTIFICATIONS-OFF
+    title: Backup failure e-mail notifications are off
+    kind: missing
+    category: MON
+    severity: medium
+    entity: backup-server
+    why: With global e-mail notification off (or off for failures), a failed job reaches nobody who is not looking at the console.
+    fix: Enable e-mail notifications to a monitored mailbox or the ticketing intake, at least on failure and on the last retry.
+    refs: [NIST-800-53:SI-4, NIST-800-53:IR-6, CIS-Controls-v8:13.1]
+    query:
+      protocol: http
+      path: /api/v1/generalOptions
+      headers: { x-api-version: 1.2-rev0 }
+      paging: none
+      key: "-"
+    each:
+      any:
+        - { field: emailSettings.isEnabled, op: eq, value: false }
+        - { field: emailSettings.notifyOnFailure, op: eq, value: false }
+    evidence: "e-mail notifications {emailSettings.isEnabled}, on failure {emailSettings.notifyOnFailure}"
+
+  - id: VEEAM-STORAGE-SPACE-WARNING-OFF
+    title: Low repository space warning is off or set too low
+    kind: misconfigured
+    category: MON
+    severity: low
+    entity: backup-server
+    why: The global free-space warning is the only percentage-based space alarm the backup server raises; off or set very low, the first sign of a full repository is a failed job.
+    fix: Enable the storage space warning at 10 percent free or more.
+    refs: [NIST-800-53:SI-4]
+    query:
+      protocol: http
+      path: /api/v1/generalOptions
+      headers: { x-api-version: 1.2-rev0 }
+      paging: none
+      key: "-"
+    each:
+      any:
+        - { field: notifications.storageSpaceThresholdEnabled, op: eq, value: false }
+        - { field: notifications.storageSpaceThreshold, op: lt, value: 10, threshold: veeam.storage-warning-min-percent }
+    evidence: "space warning {notifications.storageSpaceThresholdEnabled} at {notifications.storageSpaceThreshold}%"
 
   # ---- malware detection and security analyzer -----------------------------------------------
 
@@ -601,3 +909,30 @@ rules:
       name: name
     each: { field: restorePointsCount, op: lt, value: 2, threshold: veeam.min-restore-points }
     evidence: "{name} ({type}, {platformName}): {restorePointsCount} restore points"
+
+  - id: VEEAM-BACKUP-ORPHANED
+    title: Backup has no parent job
+    kind: misconfigured
+    category: HYG
+    severity: low
+    entity: backup
+    refresh: 7d
+    why: A backup without a job (imported, or left behind when its job was deleted) gets no retention - it fills the repository and nobody knows whether it is still needed.
+    fix: Map it to a job, export what must be kept, or delete it from disk with a note.
+    refs: [NIST-800-53:CP-9]
+    query:
+      protocol: http
+      path: /api/v1/backups
+      headers: { x-api-version: 1.2-rev0 }
+      paging: offset
+      offsetParam: skip
+      limitParam: limit
+      pageSize: 200
+      items: data
+      key: id
+      name: name
+    each:
+      any:
+        - { field: jobId, op: absent }
+        - { field: jobId, op: eq, value: 00000000-0000-0000-0000-000000000000 }
+    evidence: "{name} ({platformName}) created {creationTime} has no job"

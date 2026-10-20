@@ -618,6 +618,39 @@ rules:
     each: { field: isUnmanagedSyncAppForTenantRestricted, op: eq, value: false }
     evidence: "isUnmanagedSyncAppForTenantRestricted = {isUnmanagedSyncAppForTenantRestricted}"
 
+  - id: M365-SPO-DELETED-ONEDRIVE-RETENTION-SHORT
+    title: A deleted user's OneDrive is kept only briefly
+    kind: misconfigured
+    category: BCK
+    severity: low
+    entity: sharepoint-tenant
+    why: "When an account is deleted its OneDrive goes after the retention period (Microsoft's default is 30 days); a manager who asks for a leaver's files later finds nothing. The minimum here is 90 days; tune it with the threshold."
+    fix: "Set the deleted users' OneDrive retention to 90-365 days, and hand files over as part of the leaver process."
+    refs: ["NIST-800-53:CP-9", "NIST-800-53:PS-4"]
+    query:
+      protocol: graph
+      path: /admin/sharepoint/settings
+      key: id
+    each: { field: deletedUserPersonalSiteRetentionPeriodInDays, op: lt, value: 90, threshold: m365.onedrive-deleted-retention-min-days }
+    evidence: "deletedUserPersonalSiteRetentionPeriodInDays = {deletedUserPersonalSiteRetentionPeriodInDays}"
+
+  - id: M365-SPO-USER-SITE-CREATION
+    title: Any user can create SharePoint sites
+    kind: misconfigured
+    category: HYG
+    severity: low
+    entity: sharepoint-tenant
+    lens: both
+    why: "User-created sites multiply: each one is another place for files with its own sharing settings, usually without a second owner or an end date."
+    fix: "Turn user site creation off and route requests through a provisioning process that sets owners, sharing and lifecycle."
+    refs: ["NIST-800-53:AC-6", "NIST-800-53:CM-11"]
+    query:
+      protocol: graph
+      path: /admin/sharepoint/settings
+      key: id
+    each: { field: isSiteCreationEnabled, op: eq, value: true }
+    evidence: "isSiteCreationEnabled = {isSiteCreationEnabled}"
+
   # ============================================================================ domains ===
   - id: M365-DOMAIN-UNVERIFIED
     title: Domain added to the tenant but never verified
@@ -659,6 +692,26 @@ rules:
             - { field: passwordValidityPeriodInDays, op: absent }
             - { field: passwordValidityPeriodInDays, op: ne, value: 2147483647 }
     evidence: "{id}: passwordValidityPeriodInDays = {passwordValidityPeriodInDays}"
+
+  - id: M365-DOMAIN-DEFAULT-IS-INITIAL
+    title: The default domain is still the initial onmicrosoft.com domain
+    kind: misconfigured
+    category: CFG
+    severity: low
+    entity: domain
+    why: "New users and groups get addresses on the default domain unless someone remembers to change them, so accounts and mail addresses end up on onmicrosoft.com and later need renaming."
+    fix: "Set the organisation's verified domain as the default domain."
+    refs: ["NIST-800-53:CM-6"]
+    query:
+      protocol: graph
+      path: /domains
+      select: [id, authenticationType, isVerified, isDefault, isInitial, passwordValidityPeriodInDays, supportedServices]
+      key: id
+    each:
+      all:
+        - { field: isDefault, op: eq, value: true }
+        - { field: isInitial, op: eq, value: true }
+    evidence: "{id} is both the initial and the default domain"
 
   # ===================================================================== org settings ===
   - id: M365-OFFICE-STORE-OR-TRIALS-OPEN
@@ -714,3 +767,92 @@ rules:
             - { field: settings, op: absent }
             - { field: value.settings.isInOrgFormsPhishingScanEnabled, op: eq, value: false }
     evidence: "isInOrgFormsPhishingScanEnabled = {settings.isInOrgFormsPhishingScanEnabled}{value.settings.isInOrgFormsPhishingScanEnabled}"
+
+  - id: M365-TEAMS-RSC-USER-CONSENT
+    title: Users may grant Teams apps resource-specific consent
+    kind: misconfigured
+    category: IAM
+    severity: low
+    entity: org-setting
+    lens: security
+    why: "With resource-specific consent open, a user who installs a Teams app in a chat, meeting or their personal scope grants it access to that conversation's content with one click, outside admin consent. The chat setting is only exposed in the beta API."
+    fix: "Turn resource-specific consent off for chats and meetings and for the personal scope; publish approved apps through the Teams app catalogue with admin-granted permissions."
+    refs: ["NIST-800-53:AC-6", "NIST-800-53:CM-11", "MITRE-ATTACK:T1528"]
+    query:
+      protocol: graph
+      version: beta
+      path: /teamwork/teamsAppSettings
+      key: id
+    each:
+      any:
+        - { field: isChatResourceSpecificConsentEnabled, op: eq, value: true }
+        - { field: isUserPersonalScopeResourceSpecificConsentEnabled, op: eq, value: true }
+    evidence: "chat and meeting RSC {isChatResourceSpecificConsentEnabled}, personal scope RSC {isUserPersonalScopeResourceSpecificConsentEnabled}"
+
+  - id: M365-APPS-UPDATE-CHANNEL-SLOW
+    title: Microsoft 365 Apps are on the Semi-Annual channel
+    kind: misconfigured
+    category: LCM
+    severity: low
+    entity: org-setting
+    why: "The Semi-Annual Enterprise channel receives new features twice a year and is meant for a small set of devices that need extensive testing; as the tenant-wide default it keeps every user's Office further from current builds."
+    fix: "Make Monthly Enterprise (or Current) the default channel and keep Semi-Annual for the few devices that need it, through a cloud update policy."
+    refs: ["NIST-800-53:SI-2", "CIS-Controls-v8:7.4"]
+    query:
+      protocol: graph
+      path: /admin/microsoft365Apps/installationOptions
+      key: id
+    each: { field: updateChannel, op: eq, value: semiAnnual }
+    evidence: "default update channel = {updateChannel}"
+
+  # ===================================================================== Defender XDR ===
+  # Incidents and alerts from Microsoft Defender XDR (Graph v1.0; $select is not supported).
+  - id: M365-SECURITY-INCIDENT-OPEN
+    title: Active Defender XDR incident of medium or high severity
+    kind: broken
+    category: MON
+    severity:
+      field: severity
+      map: { high: high, medium: medium, low: low, informational: info }
+      default: medium
+    entity: security-incident
+    lens: security
+    refresh: 1h
+    why: "Everything else in this pack reads configuration; this is Microsoft telling you an attack is in progress now. An active incident nobody is assigned to is the most urgent item of the day."
+    fix: "Open the incident, assign it, work through its alerts and evidence; resolve it only with a classification and determination."
+    refs: ["NIST-800-53:IR-4", "NIST-800-53:IR-6", "CIS-Controls-v8:17.4"]
+    query:
+      protocol: graph
+      path: /security/incidents
+      filter: "status eq 'active'"
+      key: id
+      name: displayName
+    each: { field: severity, op: in, value: [high, medium] }
+    evidence: "{displayName}: {severity}, created {createdDateTime}, updated {lastUpdateDateTime}, assigned to '{assignedTo}' - {incidentWebUrl}"
+
+  - id: M365-SECURITY-ALERT-OPEN
+    title: Defender alert left new or in progress
+    kind: broken
+    category: MON
+    severity:
+      field: severity
+      map: { high: high, medium: medium }
+      default: medium
+    entity: security-alert
+    lens: security
+    refresh: 1h
+    why: "A medium or high alert still new or in progress after a day was either never triaged or stalled. Alerts that belong to an active incident also show under the incident."
+    fix: "Triage the alert in the Defender portal (or with its incident); resolve it with a classification once handled."
+    refs: ["NIST-800-53:IR-4", "NIST-800-53:SI-4", "CIS-Controls-v8:17.4"]
+    query:
+      protocol: graph
+      path: /security/alerts_v2
+      filter: "(status eq 'new' or status eq 'inProgress') and (severity eq 'high' or severity eq 'medium')"
+      key: id
+      name: title
+    each:
+      all:
+        - { field: status, op: in, value: [new, inProgress] }
+        - { field: severity, op: in, value: [high, medium] }
+        - { field: createdDateTime, op: age-gt, value: 1, threshold: m365.alert-max-open-days }
+    evidence: "{title} ({serviceSource}, {category}): {severity}, {status} since {createdDateTime}, incident {incidentId}, assigned to '{assignedTo}' - {alertWebUrl}"

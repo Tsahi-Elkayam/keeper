@@ -4,7 +4,8 @@ name: Wiz cloud security
 integration: wiz
 # Endpoint: the tenant's API host (https://api.<region>.app.wiz.io); queries go to the default path
 # /graphql. The integration obtains the service-account token (read scopes for issues, vulnerabilities,
-# cloud accounts, connectors, controls and system health); rules only send read-only queries.
+# cloud accounts, connectors, controls, system health, projects and service accounts); rules only send
+# read-only queries.
 #
 # Schema: Wiz publishes its GraphQL schema only inside the tenant's API explorer. The queries below use
 # the field and filter names of the current schema as used by public integrations (issuesV2 with
@@ -119,15 +120,12 @@ rules:
     evidence: "{severity} {sourceRule.name} on {entitySnapshot.type} {entitySnapshot.name} ({entitySnapshot.subscriptionName})"
 
   - id: WIZ-ISSUE-OPEN-TOO-LONG
-    title: Critical or high issue open for too long
+    title: High-severity issue open for too long
     kind: broken
     category: CFG
-    severity:
-      field: severity
-      map: { CRITICAL: critical, HIGH: high }
-      default: high
+    severity: high
     entity: issue
-    why: Issues that stay open for weeks stop being looked at; age is the clearest sign that nobody owns them.
+    why: Issues that stay open for weeks stop being looked at; age is the clearest sign that nobody owns them. Critical issues have their own shorter clock (WIZ-ISSUE-CRITICAL-AGED).
     fix: Assign an owner and a due date, fix it, or record a risk acceptance in Wiz.
     refs: [NIST-800-53:RA-5, NIST-800-53:SI-2]
     query:
@@ -147,8 +145,109 @@ rules:
       paging: { cursor: data.issues.pageInfo.endCursor, hasNext: data.issues.pageInfo.hasNextPage, variable: after }
       key: id
       name: sourceRule.name
-    each: { field: createdAt, op: age-gt, value: 30, threshold: wiz.issue-max-open-days }
+    each:
+      all:
+        - { field: severity, op: eq, value: HIGH }
+        - { field: createdAt, op: age-gt, value: 30, threshold: wiz.issue-max-open-days }
     evidence: "{severity} {type} {sourceRule.name} on {entitySnapshot.name}, open since {createdAt}"
+
+  - id: WIZ-ISSUE-CRITICAL-AGED
+    title: Critical issue open for more than a week
+    kind: broken
+    category: CFG
+    severity: critical
+    entity: issue
+    why: A critical issue is an exposure Wiz rates as directly exploitable or high-impact; a week is long enough to fix or contain it, and anything older needs a named owner and a recorded risk decision.
+    fix: Fix or contain it this week; if that is impossible, assign an owner, set a due date and record the risk acceptance in Wiz.
+    refs: [NIST-800-53:RA-5, NIST-800-53:SI-2, CIS-Controls-v8:7.7]
+    query:
+      protocol: graphql
+      document: |
+        query($after: String) {
+          issues: issuesV2(first: 500, after: $after, filterBy: {status: [OPEN, IN_PROGRESS], severity: [CRITICAL, HIGH]}) {
+            nodes {
+              id type status severity createdAt dueAt
+              sourceRule { __typename ... on Control { id name } ... on CloudEventRule { id name } ... on CloudConfigurationRule { id name } }
+              entitySnapshot { id type name cloudPlatform region subscriptionName }
+            }
+            pageInfo { hasNextPage endCursor }
+          }
+        }
+      items: data.issues.nodes
+      paging: { cursor: data.issues.pageInfo.endCursor, hasNext: data.issues.pageInfo.hasNextPage, variable: after }
+      key: id
+      name: sourceRule.name
+    each:
+      all:
+        - { field: severity, op: eq, value: CRITICAL }
+        - { field: createdAt, op: age-gt, value: 7, threshold: wiz.critical-max-open-days }
+    evidence: "{type} {sourceRule.name} on {entitySnapshot.type} {entitySnapshot.name} ({entitySnapshot.subscriptionName}), open since {createdAt}, due {dueAt}"
+
+  - id: WIZ-ISSUE-UNTRIAGED
+    title: Critical or high issue untriaged for more than three days
+    kind: missing
+    category: CFG
+    severity: high
+    entity: issue
+    why: An issue still in Open with no due date days after it was raised has not been looked at - nobody has accepted it, assigned it or rejected it.
+    fix: Triage daily - move the issue to In Progress with an owner and a due date, or reject it with a reason.
+    refs: [NIST-800-53:IR-4, NIST-800-53:RA-5, CIS-Controls-v8:7.7]
+    query:
+      protocol: graphql
+      document: |
+        query($after: String) {
+          issues: issuesV2(first: 500, after: $after, filterBy: {status: [OPEN, IN_PROGRESS], severity: [CRITICAL, HIGH]}) {
+            nodes {
+              id type status severity createdAt dueAt
+              sourceRule { __typename ... on Control { id name } ... on CloudEventRule { id name } ... on CloudConfigurationRule { id name } }
+              entitySnapshot { id type name cloudPlatform region subscriptionName }
+            }
+            pageInfo { hasNextPage endCursor }
+          }
+        }
+      items: data.issues.nodes
+      paging: { cursor: data.issues.pageInfo.endCursor, hasNext: data.issues.pageInfo.hasNextPage, variable: after }
+      key: id
+      name: sourceRule.name
+    each:
+      all:
+        - { field: status, op: eq, value: OPEN }
+        - { field: dueAt, op: absent }
+        - { field: createdAt, op: age-gt, value: 3, threshold: wiz.triage-max-days }
+    evidence: "{severity} {sourceRule.name} on {entitySnapshot.name}, open since {createdAt}, not triaged"
+
+  - id: WIZ-ISSUE-CRITICAL-NO-DUE-DATE
+    title: Critical issue in progress has no due date
+    kind: missing
+    category: CFG
+    severity: low
+    entity: issue
+    why: Work on a critical issue without a due date has no commitment to measure against; it drifts until someone asks.
+    fix: Set a due date when taking the issue, in line with the remediation policy.
+    refs: [NIST-800-53:RA-7, CIS-Controls-v8:7.7]
+    query:
+      protocol: graphql
+      document: |
+        query($after: String) {
+          issues: issuesV2(first: 500, after: $after, filterBy: {status: [OPEN, IN_PROGRESS], severity: [CRITICAL, HIGH]}) {
+            nodes {
+              id type status severity createdAt dueAt
+              sourceRule { __typename ... on Control { id name } ... on CloudEventRule { id name } ... on CloudConfigurationRule { id name } }
+              entitySnapshot { id type name cloudPlatform region subscriptionName }
+            }
+            pageInfo { hasNextPage endCursor }
+          }
+        }
+      items: data.issues.nodes
+      paging: { cursor: data.issues.pageInfo.endCursor, hasNext: data.issues.pageInfo.hasNextPage, variable: after }
+      key: id
+      name: sourceRule.name
+    each:
+      all:
+        - { field: severity, op: eq, value: CRITICAL }
+        - { field: status, op: eq, value: IN_PROGRESS }
+        - { field: dueAt, op: absent }
+    evidence: "{sourceRule.name} on {entitySnapshot.name} in progress since {createdAt} without a due date"
 
   - id: WIZ-ISSUE-PAST-DUE
     title: Critical or high issue is past its due date
@@ -275,6 +374,35 @@ rules:
       name: name
     each: { field: vulnerableAsset.hasWideInternetExposure, op: eq, value: true }
     evidence: "{name} ({severity}) on {vulnerableAsset.type} {vulnerableAsset.name} ({vulnerableAsset.subscriptionName}) is exposed to the internet"
+
+  - id: WIZ-VULN-CRITICAL-INTERNET
+    title: Critical vulnerability without a known exploit on an internet-exposed asset
+    kind: broken
+    category: LCM
+    severity: critical
+    entity: vulnerability-finding
+    why: A critical CVE on a widely exposed asset is one exploit release away from being attacked by anyone; waiting for the exploit means patching during the attack. Findings with a known exploit are reported by WIZ-VULN-EXPLOIT-INTERNET.
+    fix: Patch to the fixed version; until then remove the exposure (security group, firewall, WAF or private endpoint).
+    refs: [NIST-800-53:SI-2, NIST-800-53:SC-7, CIS-Controls-v8:7.7, MITRE-ATTACK:T1190]
+    query:
+      protocol: graphql
+      document: |
+        query($after: String) {
+          vulnerabilityFindings(first: 500, after: $after, filterBy: {status: [OPEN], severity: [CRITICAL], hasExploit: false}) {
+            nodes {
+              id name severity status firstDetectedAt fixedVersion
+              vulnerableAsset { __typename ... on VulnerableAssetBase { id name type cloudPlatform subscriptionName hasLimitedInternetExposure hasWideInternetExposure } }
+            }
+            pageInfo { hasNextPage endCursor }
+          }
+        }
+      items: data.vulnerabilityFindings.nodes
+      paging: { cursor: data.vulnerabilityFindings.pageInfo.endCursor, hasNext: data.vulnerabilityFindings.pageInfo.hasNextPage, variable: after }
+      maxPages: 200
+      key: id
+      name: name
+    each: { field: vulnerableAsset.hasWideInternetExposure, op: eq, value: true }
+    evidence: "{name} on {vulnerableAsset.type} {vulnerableAsset.name} ({vulnerableAsset.subscriptionName}) is exposed to the internet, fixed in {fixedVersion}"
 
   # ---- Wiz's own coverage: system health, cloud accounts, connectors, controls ----------------
 
@@ -410,6 +538,30 @@ rules:
     each: { field: status, op: ne, value: CONNECTED }
     evidence: "{cloudProvider} account {name}: {status}"
 
+  - id: WIZ-CLOUD-ACCOUNT-NONE
+    title: Wiz returned no cloud accounts
+    kind: missing
+    lens: both
+    category: MON
+    severity: medium
+    entity: instance
+    why: An empty account list means nothing is connected or the service account lacks the read scope; every Wiz rule is quiet either way.
+    fix: Connect the cloud accounts, or add the cloud-account read scope to the review's service account.
+    refs: [NIST-800-53:CA-7]
+    query:
+      protocol: graphql
+      document: |
+        query {
+          cloudAccounts(first: 500) {
+            nodes { name externalId cloudProvider status }
+          }
+        }
+      items: data.cloudAccounts.nodes
+      key: externalId
+      name: name
+    count: none
+    evidence: "no cloud accounts returned"
+
   - id: WIZ-CONNECTOR-ERROR
     title: Enabled Wiz connector is not connected
     kind: broken
@@ -461,6 +613,33 @@ rules:
     each: { field: enabled, op: eq, value: false }
     evidence: "{name} ({type.name}) is disabled"
 
+  - id: WIZ-CONNECTOR-NONE-ENABLED
+    title: No Wiz connector is enabled
+    kind: missing
+    lens: both
+    category: MON
+    severity: medium
+    entity: instance
+    why: With no enabled connector Wiz scans nothing new, and the findings it still shows are ageing copies.
+    fix: Enable or recreate the cloud connectors, then confirm their first scan completes.
+    refs: [NIST-800-53:CA-7]
+    query:
+      protocol: graphql
+      document: |
+        query {
+          connectors(first: 500) {
+            nodes { name status enabled type { id name } }
+          }
+        }
+      items: data.connectors.nodes
+      key: name
+      name: name
+    count:
+      op: lt
+      value: 1
+      where: { field: enabled, op: eq, value: true }
+    evidence: "{count} enabled of {rows} connectors"
+
   - id: WIZ-CONTROL-DISABLED
     title: Wiz control is disabled in the tenant
     kind: misconfigured
@@ -489,3 +668,68 @@ rules:
       name: name
     each: any
     evidence: "{name} ({severity}) is disabled"
+
+  # ---- tenant hygiene ------------------------------------------------------------------------
+  # Field names for projects and service accounts follow public integrations of the Wiz API
+  # (archived; createdAt, lastRotatedAt); a different schema is a GraphQL error, reported as unknown.
+
+  - id: WIZ-PROJECT-NONE
+    title: No active Wiz project is defined
+    kind: missing
+    lens: both
+    category: HYG
+    severity: low
+    entity: instance
+    refresh: 7d
+    why: Without projects every finding lands in one undivided pool - nothing has an owning team or business unit, so nobody can be asked to fix it.
+    fix: Create projects per environment or business unit and assign the cloud accounts to them.
+    refs: [NIST-800-53:CM-8, CIS-Controls-v8:1.1]
+    query:
+      protocol: graphql
+      document: |
+        query($after: String) {
+          projects(first: 500, after: $after) {
+            nodes { id name slug archived }
+            pageInfo { hasNextPage endCursor }
+          }
+        }
+      items: data.projects.nodes
+      paging: { cursor: data.projects.pageInfo.endCursor, hasNext: data.projects.pageInfo.hasNextPage, variable: after }
+      key: id
+      name: name
+    count:
+      op: lt
+      value: 1
+      where: { field: archived, op: eq, value: false }
+    evidence: "{count} active of {rows} projects"
+
+  - id: WIZ-SERVICE-ACCOUNT-SECRET-OLD
+    title: Wiz service account secret not rotated for a year
+    kind: misconfigured
+    category: AUT
+    severity: low
+    entity: service-account
+    refresh: 7d
+    why: A service-account secret sits in an integration's configuration; one never rotated stays valid for everyone who ever saw that configuration.
+    fix: Rotate the secret and update the integration that uses it in the same change.
+    refs: [NIST-800-53:IA-5, CIS-Controls-v8:5.3]
+    query:
+      protocol: graphql
+      document: |
+        query($after: String) {
+          serviceAccounts(first: 500, after: $after) {
+            nodes { id name type createdAt lastRotatedAt }
+            pageInfo { hasNextPage endCursor }
+          }
+        }
+      items: data.serviceAccounts.nodes
+      paging: { cursor: data.serviceAccounts.pageInfo.endCursor, hasNext: data.serviceAccounts.pageInfo.hasNextPage, variable: after }
+      key: id
+      name: name
+    each:
+      any:
+        - { field: lastRotatedAt, op: age-gt, value: 365, threshold: wiz.service-account-rotation-days }
+        - all:
+            - { field: lastRotatedAt, op: absent }
+            - { field: createdAt, op: age-gt, value: 365, threshold: wiz.service-account-rotation-days }
+    evidence: "{name} ({type}): created {createdAt}, last rotated {lastRotatedAt}"

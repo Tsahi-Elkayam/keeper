@@ -840,6 +840,1012 @@ rules:
     deadline: due_on
     evidence: "{title} ({item}): {status_text}; was due {due_on}. Latest attestation: {latest_state}"
 
+  # ----------------------------------------------- access, response, exposure and continuity
+  - id: OBL-IAM-USER-ACCESS-REVIEW
+    title: User access not recertified within the interval
+    kind: missing
+    lens: security
+    category: IAM
+    severity: medium
+    entity: obligation
+    why: >-
+      Beyond the privileged groups, access only ever accumulates: shares, applications, mailbox
+      delegations and cloud roles below administrator are granted for a project or a role and never
+      taken back. Only the owner of each system can say who should still have it.
+    fix: >-
+      Have each system owner confirm every member or permission on their application, share or
+      group, apply the removals, then attest obligation iam.user-access-review with that system as
+      target.
+    refs: [NIST-800-53:AC-2, NIST-800-53:AC-6(7), CIS-Controls-v8:6.2, CIS-Controls-v8:6.8, ISO-27001:A.5.18]
+    refresh: 1d
+    query:
+      protocol: store
+      key: item
+      name: title
+      text: |
+        WITH t AS (
+          SELECT DISTINCT a.target FROM attestation a WHERE a.obligation = 'iam.user-access-review'
+          UNION
+          SELECT '-' WHERE NOT EXISTS (SELECT 1 FROM attestation a WHERE a.obligation = 'iam.user-access-review')
+        ),
+        s AS (
+          SELECT t.target,
+                 (SELECT MAX(a.done_on) FROM attestation a
+                   WHERE a.obligation = 'iam.user-access-review' AND a.target = t.target AND a.state = 'yes'
+                     AND NULLIF(TRIM(a.done_on), '') IS NOT NULL) AS last_done,
+                 (SELECT la.state FROM latest_attestation la
+                   WHERE la.obligation = 'iam.user-access-review' AND la.target = t.target) AS latest_state
+          FROM t
+        )
+        SELECT 'iam.user-access-review' AS obligation,
+               'User access to applications, shares and groups recertified' AS title,
+               s.target,
+               CASE WHEN s.target = '-' THEN 'iam.user-access-review' ELSE 'iam.user-access-review@' || s.target END AS item,
+               s.last_done,
+               COALESCE(s.latest_state, 'none') AS latest_state,
+               CASE WHEN s.last_done IS NULL THEN 'never attested as done'
+                    ELSE 'last done ' || s.last_done || ', ' || CAST(julianday(:today) - julianday(s.last_done) AS INTEGER) || ' days ago' END AS status_text,
+               CASE WHEN s.last_done IS NULL THEN :today
+                    ELSE date(s.last_done, '+' || COALESCE((SELECT st.value FROM setting st WHERE st.key = 'threshold.obligations.iam.user-access-review.interval-days'), '180') || ' days') END AS due_on
+        FROM s
+    each:
+      all:
+        - { field: latest_state, op: ne, value: na }
+        - any:
+            - { field: last_done, op: absent }
+            - { field: last_done, op: age-gt, value: 180, threshold: obligations.iam.user-access-review.interval-days }
+    deadline: due_on
+    evidence: "{title} ({item}): {status_text}; was due {due_on}. Latest attestation: {latest_state}"
+
+  - id: OBL-IAM-SERVICE-ACCOUNT-REVIEW
+    title: Service and automation accounts not reviewed within the interval
+    kind: missing
+    lens: security
+    category: IAM
+    severity: medium
+    entity: obligation
+    why: >-
+      Scans can see how old a service account's password is, but only a review decides whether the
+      account still needs to exist, who owns it, what it may do and whether a managed identity could
+      replace it. Unowned service accounts with old passwords and broad rights are a standard
+      foothold.
+    fix: >-
+      List the service and automation accounts of the directory or platform, confirm each with an
+      owner and a purpose, disable the rest, rotate or migrate the survivors to managed accounts,
+      then attest obligation iam.service-account-review with the directory or platform as target.
+    refs: [NIST-800-53:AC-2, NIST-800-53:IA-5, CIS-Controls-v8:5.5, ISO-27001:A.5.16]
+    refresh: 1d
+    query:
+      protocol: store
+      key: item
+      name: title
+      text: |
+        WITH t AS (
+          SELECT DISTINCT a.target FROM attestation a WHERE a.obligation = 'iam.service-account-review'
+          UNION
+          SELECT '-' WHERE NOT EXISTS (SELECT 1 FROM attestation a WHERE a.obligation = 'iam.service-account-review')
+        ),
+        s AS (
+          SELECT t.target,
+                 (SELECT MAX(a.done_on) FROM attestation a
+                   WHERE a.obligation = 'iam.service-account-review' AND a.target = t.target AND a.state = 'yes'
+                     AND NULLIF(TRIM(a.done_on), '') IS NOT NULL) AS last_done,
+                 (SELECT la.state FROM latest_attestation la
+                   WHERE la.obligation = 'iam.service-account-review' AND la.target = t.target) AS latest_state
+          FROM t
+        )
+        SELECT 'iam.service-account-review' AS obligation,
+               'Service and automation accounts reviewed' AS title,
+               s.target,
+               CASE WHEN s.target = '-' THEN 'iam.service-account-review' ELSE 'iam.service-account-review@' || s.target END AS item,
+               s.last_done,
+               COALESCE(s.latest_state, 'none') AS latest_state,
+               CASE WHEN s.last_done IS NULL THEN 'never attested as done'
+                    ELSE 'last done ' || s.last_done || ', ' || CAST(julianday(:today) - julianday(s.last_done) AS INTEGER) || ' days ago' END AS status_text,
+               CASE WHEN s.last_done IS NULL THEN :today
+                    ELSE date(s.last_done, '+' || COALESCE((SELECT st.value FROM setting st WHERE st.key = 'threshold.obligations.iam.service-account-review.interval-days'), '180') || ' days') END AS due_on
+        FROM s
+    each:
+      all:
+        - { field: latest_state, op: ne, value: na }
+        - any:
+            - { field: last_done, op: absent }
+            - { field: last_done, op: age-gt, value: 180, threshold: obligations.iam.service-account-review.interval-days }
+    deadline: due_on
+    evidence: "{title} ({item}): {status_text}; was due {due_on}. Latest attestation: {latest_state}"
+
+  - id: OBL-IAM-BREAK-GLASS-TEST
+    title: Emergency access accounts not tested within the interval
+    kind: missing
+    lens: security
+    category: IAM
+    severity: high
+    entity: obligation
+    why: >-
+      Emergency accounts (cloud tenant, directory, hypervisor, firewall) are kept outside conditional
+      access and everyday MFA by design and are almost never used. A wrong password, an expired
+      credential, a lost token or a policy that now blocks them is found only during the outage they
+      exist for.
+    fix: >-
+      Sign in with each emergency account the documented way, confirm that the sign-in alert fired,
+      rotate the credential if the procedure says so, then attest obligation iam.break-glass-test
+      with the tenant or directory as target.
+    refs: [NIST-800-53:AC-2, NIST-800-53:CP-2, ISO-27001:A.8.2]
+    refresh: 1d
+    query:
+      protocol: store
+      key: item
+      name: title
+      text: |
+        WITH t AS (
+          SELECT DISTINCT a.target FROM attestation a WHERE a.obligation = 'iam.break-glass-test'
+          UNION
+          SELECT '-' WHERE NOT EXISTS (SELECT 1 FROM attestation a WHERE a.obligation = 'iam.break-glass-test')
+        ),
+        s AS (
+          SELECT t.target,
+                 (SELECT MAX(a.done_on) FROM attestation a
+                   WHERE a.obligation = 'iam.break-glass-test' AND a.target = t.target AND a.state = 'yes'
+                     AND NULLIF(TRIM(a.done_on), '') IS NOT NULL) AS last_done,
+                 (SELECT la.state FROM latest_attestation la
+                   WHERE la.obligation = 'iam.break-glass-test' AND la.target = t.target) AS latest_state
+          FROM t
+        )
+        SELECT 'iam.break-glass-test' AS obligation,
+               'Emergency access accounts signed in with and verified' AS title,
+               s.target,
+               CASE WHEN s.target = '-' THEN 'iam.break-glass-test' ELSE 'iam.break-glass-test@' || s.target END AS item,
+               s.last_done,
+               COALESCE(s.latest_state, 'none') AS latest_state,
+               CASE WHEN s.last_done IS NULL THEN 'never attested as done'
+                    ELSE 'last done ' || s.last_done || ', ' || CAST(julianday(:today) - julianday(s.last_done) AS INTEGER) || ' days ago' END AS status_text,
+               CASE WHEN s.last_done IS NULL THEN :today
+                    ELSE date(s.last_done, '+' || COALESCE((SELECT st.value FROM setting st WHERE st.key = 'threshold.obligations.iam.break-glass-test.interval-days'), '90') || ' days') END AS due_on
+        FROM s
+    each:
+      all:
+        - { field: latest_state, op: ne, value: na }
+        - any:
+            - { field: last_done, op: absent }
+            - { field: last_done, op: age-gt, value: 90, threshold: obligations.iam.break-glass-test.interval-days }
+    deadline: due_on
+    evidence: "{title} ({item}): {status_text}; was due {due_on}. Latest attestation: {latest_state}"
+
+  - id: OBL-IR-EXERCISE
+    title: Incident response plan not exercised within the interval
+    kind: missing
+    lens: security
+    category: MON
+    severity: high
+    entity: obligation
+    why: >-
+      A response plan nobody has rehearsed is learned during the first real incident: who declares
+      it, who isolates what, who may shut down a service, who talks to management, users and
+      authorities. Those hours decide how far an attack spreads.
+    fix: >-
+      Run a tabletop (or a live exercise) on a realistic scenario with IT, management and
+      communications, record the gaps it shows as work items, update the plan, then attest
+      obligation ir.exercise.
+    refs: [NIST-800-53:IR-3, NIST-800-53:IR-8, CIS-Controls-v8:17.7, ISO-27001:A.5.24]
+    refresh: 1d
+    query:
+      protocol: store
+      key: item
+      name: title
+      text: |
+        WITH t AS (
+          SELECT DISTINCT a.target FROM attestation a WHERE a.obligation = 'ir.exercise'
+          UNION
+          SELECT '-' WHERE NOT EXISTS (SELECT 1 FROM attestation a WHERE a.obligation = 'ir.exercise')
+        ),
+        s AS (
+          SELECT t.target,
+                 (SELECT MAX(a.done_on) FROM attestation a
+                   WHERE a.obligation = 'ir.exercise' AND a.target = t.target AND a.state = 'yes'
+                     AND NULLIF(TRIM(a.done_on), '') IS NOT NULL) AS last_done,
+                 (SELECT la.state FROM latest_attestation la
+                   WHERE la.obligation = 'ir.exercise' AND la.target = t.target) AS latest_state
+          FROM t
+        )
+        SELECT 'ir.exercise' AS obligation,
+               'Incident response exercise (tabletop or live)' AS title,
+               s.target,
+               CASE WHEN s.target = '-' THEN 'ir.exercise' ELSE 'ir.exercise@' || s.target END AS item,
+               s.last_done,
+               COALESCE(s.latest_state, 'none') AS latest_state,
+               CASE WHEN s.last_done IS NULL THEN 'never attested as done'
+                    ELSE 'last done ' || s.last_done || ', ' || CAST(julianday(:today) - julianday(s.last_done) AS INTEGER) || ' days ago' END AS status_text,
+               CASE WHEN s.last_done IS NULL THEN :today
+                    ELSE date(s.last_done, '+' || COALESCE((SELECT st.value FROM setting st WHERE st.key = 'threshold.obligations.ir.exercise.interval-days'), '365') || ' days') END AS due_on
+        FROM s
+    each:
+      all:
+        - { field: latest_state, op: ne, value: na }
+        - any:
+            - { field: last_done, op: absent }
+            - { field: last_done, op: age-gt, value: 365, threshold: obligations.ir.exercise.interval-days }
+    deadline: due_on
+    evidence: "{title} ({item}): {status_text}; was due {due_on}. Latest attestation: {latest_state}"
+
+  - id: OBL-LOG-REVIEW
+    title: Security logs and alerts not reviewed within the interval
+    kind: missing
+    lens: security
+    category: MON
+    severity: medium
+    entity: obligation
+    why: >-
+      Logs that are collected and never read catch no attacker and satisfy no auditor. The weekly
+      look at alerts and anomalies is where slow attacks and broken log sources are noticed.
+    fix: >-
+      A named person reviews the period's alerts and top anomalies and records what was followed up,
+      then attests obligation log.review. Where a monitoring service does this, attest na per log
+      source with the service as evidence and an expiry date.
+    refs: [NIST-800-53:AU-6, CIS-Controls-v8:8.11, ISO-27001:A.8.15, ISO-27001:A.8.16]
+    refresh: 1d
+    query:
+      protocol: store
+      key: item
+      name: title
+      text: |
+        WITH t AS (
+          SELECT DISTINCT a.target FROM attestation a WHERE a.obligation = 'log.review'
+          UNION
+          SELECT '-' WHERE NOT EXISTS (SELECT 1 FROM attestation a WHERE a.obligation = 'log.review')
+        ),
+        s AS (
+          SELECT t.target,
+                 (SELECT MAX(a.done_on) FROM attestation a
+                   WHERE a.obligation = 'log.review' AND a.target = t.target AND a.state = 'yes'
+                     AND NULLIF(TRIM(a.done_on), '') IS NOT NULL) AS last_done,
+                 (SELECT la.state FROM latest_attestation la
+                   WHERE la.obligation = 'log.review' AND la.target = t.target) AS latest_state
+          FROM t
+        )
+        SELECT 'log.review' AS obligation,
+               'Security logs and alerts reviewed' AS title,
+               s.target,
+               CASE WHEN s.target = '-' THEN 'log.review' ELSE 'log.review@' || s.target END AS item,
+               s.last_done,
+               COALESCE(s.latest_state, 'none') AS latest_state,
+               CASE WHEN s.last_done IS NULL THEN 'never attested as done'
+                    ELSE 'last done ' || s.last_done || ', ' || CAST(julianday(:today) - julianday(s.last_done) AS INTEGER) || ' days ago' END AS status_text,
+               CASE WHEN s.last_done IS NULL THEN :today
+                    ELSE date(s.last_done, '+' || COALESCE((SELECT st.value FROM setting st WHERE st.key = 'threshold.obligations.log.review.interval-days'), '7') || ' days') END AS due_on
+        FROM s
+    each:
+      all:
+        - { field: latest_state, op: ne, value: na }
+        - any:
+            - { field: last_done, op: absent }
+            - { field: last_done, op: age-gt, value: 7, threshold: obligations.log.review.interval-days }
+    deadline: due_on
+    evidence: "{title} ({item}): {status_text}; was due {due_on}. Latest attestation: {latest_state}"
+
+  - id: OBL-VULN-SCAN-INTERNAL
+    title: Internal vulnerability scan not run within the interval
+    kind: missing
+    lens: security
+    category: MON
+    severity: medium
+    entity: obligation
+    why: >-
+      Patch reports show what the patch tool manages, not what is exposed: appliances, unmanaged
+      hosts, outdated third-party software and weak configurations appear only in an authenticated
+      scan of the internal network.
+    fix: >-
+      Run an authenticated vulnerability scan over every internal network, triage the critical and
+      high results into work items, then attest obligation vuln.scan-internal with the report as
+      evidence.
+    refs: [NIST-800-53:RA-5, CIS-Controls-v8:7.5, ISO-27001:A.8.8]
+    refresh: 1d
+    query:
+      protocol: store
+      key: item
+      name: title
+      text: |
+        WITH t AS (
+          SELECT DISTINCT a.target FROM attestation a WHERE a.obligation = 'vuln.scan-internal'
+          UNION
+          SELECT '-' WHERE NOT EXISTS (SELECT 1 FROM attestation a WHERE a.obligation = 'vuln.scan-internal')
+        ),
+        s AS (
+          SELECT t.target,
+                 (SELECT MAX(a.done_on) FROM attestation a
+                   WHERE a.obligation = 'vuln.scan-internal' AND a.target = t.target AND a.state = 'yes'
+                     AND NULLIF(TRIM(a.done_on), '') IS NOT NULL) AS last_done,
+                 (SELECT la.state FROM latest_attestation la
+                   WHERE la.obligation = 'vuln.scan-internal' AND la.target = t.target) AS latest_state
+          FROM t
+        )
+        SELECT 'vuln.scan-internal' AS obligation,
+               'Authenticated vulnerability scan of internal assets' AS title,
+               s.target,
+               CASE WHEN s.target = '-' THEN 'vuln.scan-internal' ELSE 'vuln.scan-internal@' || s.target END AS item,
+               s.last_done,
+               COALESCE(s.latest_state, 'none') AS latest_state,
+               CASE WHEN s.last_done IS NULL THEN 'never attested as done'
+                    ELSE 'last done ' || s.last_done || ', ' || CAST(julianday(:today) - julianday(s.last_done) AS INTEGER) || ' days ago' END AS status_text,
+               CASE WHEN s.last_done IS NULL THEN :today
+                    ELSE date(s.last_done, '+' || COALESCE((SELECT st.value FROM setting st WHERE st.key = 'threshold.obligations.vuln.scan-internal.interval-days'), '90') || ' days') END AS due_on
+        FROM s
+    each:
+      all:
+        - { field: latest_state, op: ne, value: na }
+        - any:
+            - { field: last_done, op: absent }
+            - { field: last_done, op: age-gt, value: 90, threshold: obligations.vuln.scan-internal.interval-days }
+    deadline: due_on
+    evidence: "{title} ({item}): {status_text}; was due {due_on}. Latest attestation: {latest_state}"
+
+  - id: OBL-VULN-SCAN-EXTERNAL
+    title: External vulnerability scan not run within the interval
+    kind: missing
+    lens: security
+    category: MON
+    severity: high
+    entity: obligation
+    why: >-
+      The internet-facing surface (published services, VPN and remote access, mail) is what
+      attackers scan every day. Without a regular scan from the outside, a newly exposed service or
+      an unpatched gateway is found by them first.
+    fix: >-
+      Scan every public address and DNS name from outside, compare what answers with the known list
+      of published services (anything unexpected is a finding in itself), then attest obligation
+      vuln.scan-external.
+    refs: [NIST-800-53:RA-5, CIS-Controls-v8:7.6, ISO-27001:A.8.8]
+    refresh: 1d
+    query:
+      protocol: store
+      key: item
+      name: title
+      text: |
+        WITH t AS (
+          SELECT DISTINCT a.target FROM attestation a WHERE a.obligation = 'vuln.scan-external'
+          UNION
+          SELECT '-' WHERE NOT EXISTS (SELECT 1 FROM attestation a WHERE a.obligation = 'vuln.scan-external')
+        ),
+        s AS (
+          SELECT t.target,
+                 (SELECT MAX(a.done_on) FROM attestation a
+                   WHERE a.obligation = 'vuln.scan-external' AND a.target = t.target AND a.state = 'yes'
+                     AND NULLIF(TRIM(a.done_on), '') IS NOT NULL) AS last_done,
+                 (SELECT la.state FROM latest_attestation la
+                   WHERE la.obligation = 'vuln.scan-external' AND la.target = t.target) AS latest_state
+          FROM t
+        )
+        SELECT 'vuln.scan-external' AS obligation,
+               'Vulnerability scan of the internet-facing surface' AS title,
+               s.target,
+               CASE WHEN s.target = '-' THEN 'vuln.scan-external' ELSE 'vuln.scan-external@' || s.target END AS item,
+               s.last_done,
+               COALESCE(s.latest_state, 'none') AS latest_state,
+               CASE WHEN s.last_done IS NULL THEN 'never attested as done'
+                    ELSE 'last done ' || s.last_done || ', ' || CAST(julianday(:today) - julianday(s.last_done) AS INTEGER) || ' days ago' END AS status_text,
+               CASE WHEN s.last_done IS NULL THEN :today
+                    ELSE date(s.last_done, '+' || COALESCE((SELECT st.value FROM setting st WHERE st.key = 'threshold.obligations.vuln.scan-external.interval-days'), '30') || ' days') END AS due_on
+        FROM s
+    each:
+      all:
+        - { field: latest_state, op: ne, value: na }
+        - any:
+            - { field: last_done, op: absent }
+            - { field: last_done, op: age-gt, value: 30, threshold: obligations.vuln.scan-external.interval-days }
+    deadline: due_on
+    evidence: "{title} ({item}): {status_text}; was due {due_on}. Latest attestation: {latest_state}"
+
+  - id: OBL-PATCH-COMPLIANCE-REVIEW
+    title: Patch compliance not reviewed within the interval
+    kind: missing
+    lens: both
+    category: LCM
+    severity: medium
+    entity: obligation
+    why: >-
+      The patch dashboard is green for the devices the patch tool manages. Appliances, hypervisors,
+      network gear and the servers that fail every month stay unpatched for years unless someone
+      looks at the whole estate, device class by device class.
+    fix: >-
+      List every device class with its patch source and compliance figure, chase the ones that fail
+      repeatedly and the ones no tool covers, then attest obligation patch.compliance-review with
+      the estate (servers, workstations, network, appliances) as target.
+    refs: [NIST-800-53:SI-2, NIST-800-53:SI-2(2), CIS-Controls-v8:7.3, CIS-Controls-v8:7.4, ISO-27001:A.8.8]
+    refresh: 1d
+    query:
+      protocol: store
+      key: item
+      name: title
+      text: |
+        WITH t AS (
+          SELECT DISTINCT a.target FROM attestation a WHERE a.obligation = 'patch.compliance-review'
+          UNION
+          SELECT '-' WHERE NOT EXISTS (SELECT 1 FROM attestation a WHERE a.obligation = 'patch.compliance-review')
+        ),
+        s AS (
+          SELECT t.target,
+                 (SELECT MAX(a.done_on) FROM attestation a
+                   WHERE a.obligation = 'patch.compliance-review' AND a.target = t.target AND a.state = 'yes'
+                     AND NULLIF(TRIM(a.done_on), '') IS NOT NULL) AS last_done,
+                 (SELECT la.state FROM latest_attestation la
+                   WHERE la.obligation = 'patch.compliance-review' AND la.target = t.target) AS latest_state
+          FROM t
+        )
+        SELECT 'patch.compliance-review' AS obligation,
+               'Patch compliance reviewed across the estate' AS title,
+               s.target,
+               CASE WHEN s.target = '-' THEN 'patch.compliance-review' ELSE 'patch.compliance-review@' || s.target END AS item,
+               s.last_done,
+               COALESCE(s.latest_state, 'none') AS latest_state,
+               CASE WHEN s.last_done IS NULL THEN 'never attested as done'
+                    ELSE 'last done ' || s.last_done || ', ' || CAST(julianday(:today) - julianday(s.last_done) AS INTEGER) || ' days ago' END AS status_text,
+               CASE WHEN s.last_done IS NULL THEN :today
+                    ELSE date(s.last_done, '+' || COALESCE((SELECT st.value FROM setting st WHERE st.key = 'threshold.obligations.patch.compliance-review.interval-days'), '30') || ' days') END AS due_on
+        FROM s
+    each:
+      all:
+        - { field: latest_state, op: ne, value: na }
+        - any:
+            - { field: last_done, op: absent }
+            - { field: last_done, op: age-gt, value: 30, threshold: obligations.patch.compliance-review.interval-days }
+    deadline: due_on
+    evidence: "{title} ({item}): {status_text}; was due {due_on}. Latest attestation: {latest_state}"
+
+  - id: OBL-NET-FIREWALL-RULE-REVIEW
+    title: Firewall rules not reviewed within the interval
+    kind: missing
+    lens: security
+    category: CFG
+    severity: medium
+    entity: obligation
+    why: >-
+      Firewall rule bases only grow: temporary any-to-any rules, vendor remote-access openings and
+      rules for systems that no longer exist stay because nobody owns them. Nobody reads them unless
+      a review makes them.
+    fix: >-
+      Export the rule base, give every rule an owner and a purpose, remove the unused and over-broad
+      ones (hit counters help), then attest obligation net.firewall-rule-review with the firewall or
+      zone as target.
+    refs: [NIST-800-53:SC-7, NIST-800-53:CM-7(1), CIS-Controls-v8:4.4, CIS-Controls-v8:13.4, ISO-27001:A.8.20]
+    refresh: 1d
+    query:
+      protocol: store
+      key: item
+      name: title
+      text: |
+        WITH t AS (
+          SELECT DISTINCT a.target FROM attestation a WHERE a.obligation = 'net.firewall-rule-review'
+          UNION
+          SELECT '-' WHERE NOT EXISTS (SELECT 1 FROM attestation a WHERE a.obligation = 'net.firewall-rule-review')
+        ),
+        s AS (
+          SELECT t.target,
+                 (SELECT MAX(a.done_on) FROM attestation a
+                   WHERE a.obligation = 'net.firewall-rule-review' AND a.target = t.target AND a.state = 'yes'
+                     AND NULLIF(TRIM(a.done_on), '') IS NOT NULL) AS last_done,
+                 (SELECT la.state FROM latest_attestation la
+                   WHERE la.obligation = 'net.firewall-rule-review' AND la.target = t.target) AS latest_state
+          FROM t
+        )
+        SELECT 'net.firewall-rule-review' AS obligation,
+               'Firewall rule base reviewed' AS title,
+               s.target,
+               CASE WHEN s.target = '-' THEN 'net.firewall-rule-review' ELSE 'net.firewall-rule-review@' || s.target END AS item,
+               s.last_done,
+               COALESCE(s.latest_state, 'none') AS latest_state,
+               CASE WHEN s.last_done IS NULL THEN 'never attested as done'
+                    ELSE 'last done ' || s.last_done || ', ' || CAST(julianday(:today) - julianday(s.last_done) AS INTEGER) || ' days ago' END AS status_text,
+               CASE WHEN s.last_done IS NULL THEN :today
+                    ELSE date(s.last_done, '+' || COALESCE((SELECT st.value FROM setting st WHERE st.key = 'threshold.obligations.net.firewall-rule-review.interval-days'), '180') || ' days') END AS due_on
+        FROM s
+    each:
+      all:
+        - { field: latest_state, op: ne, value: na }
+        - any:
+            - { field: last_done, op: absent }
+            - { field: last_done, op: age-gt, value: 180, threshold: obligations.net.firewall-rule-review.interval-days }
+    deadline: due_on
+    evidence: "{title} ({item}): {status_text}; was due {due_on}. Latest attestation: {latest_state}"
+
+  - id: OBL-ASSET-INVENTORY-REVIEW
+    title: Asset inventory not reconciled within the interval
+    kind: missing
+    lens: both
+    category: HYG
+    severity: medium
+    entity: obligation
+    why: >-
+      Devices and software that are not in the inventory are not patched, backed up or monitored.
+      Only comparing the inventory with what the network actually shows (discovery, DHCP, the
+      directory) finds them.
+    fix: >-
+      Compare the hardware and software inventory with discovery results, classify every unknown
+      device or product (add it, retire it or block it), then attest obligation
+      asset.inventory-review with the site as target.
+    refs: [NIST-800-53:CM-8, NIST-800-53:CM-8(3), CIS-Controls-v8:1.1, CIS-Controls-v8:2.1, ISO-27001:A.5.9]
+    refresh: 1d
+    query:
+      protocol: store
+      key: item
+      name: title
+      text: |
+        WITH t AS (
+          SELECT DISTINCT a.target FROM attestation a WHERE a.obligation = 'asset.inventory-review'
+          UNION
+          SELECT '-' WHERE NOT EXISTS (SELECT 1 FROM attestation a WHERE a.obligation = 'asset.inventory-review')
+        ),
+        s AS (
+          SELECT t.target,
+                 (SELECT MAX(a.done_on) FROM attestation a
+                   WHERE a.obligation = 'asset.inventory-review' AND a.target = t.target AND a.state = 'yes'
+                     AND NULLIF(TRIM(a.done_on), '') IS NOT NULL) AS last_done,
+                 (SELECT la.state FROM latest_attestation la
+                   WHERE la.obligation = 'asset.inventory-review' AND la.target = t.target) AS latest_state
+          FROM t
+        )
+        SELECT 'asset.inventory-review' AS obligation,
+               'Asset inventory reconciled with discovery' AS title,
+               s.target,
+               CASE WHEN s.target = '-' THEN 'asset.inventory-review' ELSE 'asset.inventory-review@' || s.target END AS item,
+               s.last_done,
+               COALESCE(s.latest_state, 'none') AS latest_state,
+               CASE WHEN s.last_done IS NULL THEN 'never attested as done'
+                    ELSE 'last done ' || s.last_done || ', ' || CAST(julianday(:today) - julianday(s.last_done) AS INTEGER) || ' days ago' END AS status_text,
+               CASE WHEN s.last_done IS NULL THEN :today
+                    ELSE date(s.last_done, '+' || COALESCE((SELECT st.value FROM setting st WHERE st.key = 'threshold.obligations.asset.inventory-review.interval-days'), '180') || ' days') END AS due_on
+        FROM s
+    each:
+      all:
+        - { field: latest_state, op: ne, value: na }
+        - any:
+            - { field: last_done, op: absent }
+            - { field: last_done, op: age-gt, value: 180, threshold: obligations.asset.inventory-review.interval-days }
+    deadline: due_on
+    evidence: "{title} ({item}): {status_text}; was due {due_on}. Latest attestation: {latest_state}"
+
+  - id: OBL-BACKUP-OFFLINE-COPY-VERIFIED
+    title: Offline or immutable backup copy not verified within the interval
+    kind: missing
+    lens: both
+    category: BCK
+    severity: high
+    entity: obligation
+    why: >-
+      Ransomware deletes or encrypts the backups it can reach before it encrypts anything else. A job
+      that succeeds to storage the attacker can reach is not a backup; only an offline or immutable
+      copy, checked to be current, survives that.
+    fix: >-
+      Check the immutability lock or the offline media rotation, the age of the newest offline copy,
+      and that the credentials able to delete it are not the ones the backup server uses, then
+      attest obligation backup.offline-copy-verified with the backup system as target.
+    refs: [NIST-800-53:CP-9, NIST-800-53:CP-9(3), NIST-800-53:CP-6, CIS-Controls-v8:11.3, CIS-Controls-v8:11.4, ISO-27001:A.8.13]
+    refresh: 1d
+    query:
+      protocol: store
+      key: item
+      name: title
+      text: |
+        WITH t AS (
+          SELECT DISTINCT a.target FROM attestation a WHERE a.obligation = 'backup.offline-copy-verified'
+          UNION
+          SELECT '-' WHERE NOT EXISTS (SELECT 1 FROM attestation a WHERE a.obligation = 'backup.offline-copy-verified')
+        ),
+        s AS (
+          SELECT t.target,
+                 (SELECT MAX(a.done_on) FROM attestation a
+                   WHERE a.obligation = 'backup.offline-copy-verified' AND a.target = t.target AND a.state = 'yes'
+                     AND NULLIF(TRIM(a.done_on), '') IS NOT NULL) AS last_done,
+                 (SELECT la.state FROM latest_attestation la
+                   WHERE la.obligation = 'backup.offline-copy-verified' AND la.target = t.target) AS latest_state
+          FROM t
+        )
+        SELECT 'backup.offline-copy-verified' AS obligation,
+               'Offline or immutable backup copy verified' AS title,
+               s.target,
+               CASE WHEN s.target = '-' THEN 'backup.offline-copy-verified' ELSE 'backup.offline-copy-verified@' || s.target END AS item,
+               s.last_done,
+               COALESCE(s.latest_state, 'none') AS latest_state,
+               CASE WHEN s.last_done IS NULL THEN 'never attested as done'
+                    ELSE 'last done ' || s.last_done || ', ' || CAST(julianday(:today) - julianday(s.last_done) AS INTEGER) || ' days ago' END AS status_text,
+               CASE WHEN s.last_done IS NULL THEN :today
+                    ELSE date(s.last_done, '+' || COALESCE((SELECT st.value FROM setting st WHERE st.key = 'threshold.obligations.backup.offline-copy-verified.interval-days'), '30') || ' days') END AS due_on
+        FROM s
+    each:
+      all:
+        - { field: latest_state, op: ne, value: na }
+        - any:
+            - { field: last_done, op: absent }
+            - { field: last_done, op: age-gt, value: 30, threshold: obligations.backup.offline-copy-verified.interval-days }
+    deadline: due_on
+    evidence: "{title} ({item}): {status_text}; was due {due_on}. Latest attestation: {latest_state}"
+
+  - id: OBL-BCP-REVIEW
+    title: Business continuity plan not reviewed within the interval
+    kind: missing
+    lens: both
+    category: BCK
+    severity: medium
+    entity: obligation
+    why: >-
+      A DR drill tests whether systems come back; the continuity plan says which come back first,
+      how the business works meanwhile and who decides. Organisations, contacts and priorities change
+      every year, and a plan nobody reviewed describes one that no longer exists.
+    fix: >-
+      Walk through the plan with the business owners of the critical systems, update contacts,
+      priorities, manual fallbacks and recovery targets, then attest obligation bcp.review.
+    refs: [NIST-800-53:CP-2, CIS-Controls-v8:11.1, ISO-27001:A.5.29, ISO-27001:A.5.30]
+    refresh: 1d
+    query:
+      protocol: store
+      key: item
+      name: title
+      text: |
+        WITH t AS (
+          SELECT DISTINCT a.target FROM attestation a WHERE a.obligation = 'bcp.review'
+          UNION
+          SELECT '-' WHERE NOT EXISTS (SELECT 1 FROM attestation a WHERE a.obligation = 'bcp.review')
+        ),
+        s AS (
+          SELECT t.target,
+                 (SELECT MAX(a.done_on) FROM attestation a
+                   WHERE a.obligation = 'bcp.review' AND a.target = t.target AND a.state = 'yes'
+                     AND NULLIF(TRIM(a.done_on), '') IS NOT NULL) AS last_done,
+                 (SELECT la.state FROM latest_attestation la
+                   WHERE la.obligation = 'bcp.review' AND la.target = t.target) AS latest_state
+          FROM t
+        )
+        SELECT 'bcp.review' AS obligation,
+               'Business continuity plan reviewed' AS title,
+               s.target,
+               CASE WHEN s.target = '-' THEN 'bcp.review' ELSE 'bcp.review@' || s.target END AS item,
+               s.last_done,
+               COALESCE(s.latest_state, 'none') AS latest_state,
+               CASE WHEN s.last_done IS NULL THEN 'never attested as done'
+                    ELSE 'last done ' || s.last_done || ', ' || CAST(julianday(:today) - julianday(s.last_done) AS INTEGER) || ' days ago' END AS status_text,
+               CASE WHEN s.last_done IS NULL THEN :today
+                    ELSE date(s.last_done, '+' || COALESCE((SELECT st.value FROM setting st WHERE st.key = 'threshold.obligations.bcp.review.interval-days'), '365') || ' days') END AS due_on
+        FROM s
+    each:
+      all:
+        - { field: latest_state, op: ne, value: na }
+        - any:
+            - { field: last_done, op: absent }
+            - { field: last_done, op: age-gt, value: 365, threshold: obligations.bcp.review.interval-days }
+    deadline: due_on
+    evidence: "{title} ({item}): {status_text}; was due {due_on}. Latest attestation: {latest_state}"
+
+  - id: OBL-SEC-AWARENESS-TRAINING
+    title: Security awareness training not run within the interval
+    kind: missing
+    lens: security
+    category: HYG
+    severity: low
+    entity: obligation
+    why: >-
+      Most intrusions still start with a person opening a message, approving a sign-in prompt or
+      giving a password away. People recognise those only if they are shown them regularly.
+    fix: >-
+      Run the yearly awareness programme or a phishing exercise with follow-up for those who fell for
+      it, keep the completion figures as evidence, then attest obligation sec.awareness-training.
+    refs: [NIST-800-53:AT-2, NIST-800-53:AT-2(3), CIS-Controls-v8:14.1, CIS-Controls-v8:14.2, ISO-27001:A.6.3]
+    refresh: 1d
+    query:
+      protocol: store
+      key: item
+      name: title
+      text: |
+        WITH t AS (
+          SELECT DISTINCT a.target FROM attestation a WHERE a.obligation = 'sec.awareness-training'
+          UNION
+          SELECT '-' WHERE NOT EXISTS (SELECT 1 FROM attestation a WHERE a.obligation = 'sec.awareness-training')
+        ),
+        s AS (
+          SELECT t.target,
+                 (SELECT MAX(a.done_on) FROM attestation a
+                   WHERE a.obligation = 'sec.awareness-training' AND a.target = t.target AND a.state = 'yes'
+                     AND NULLIF(TRIM(a.done_on), '') IS NOT NULL) AS last_done,
+                 (SELECT la.state FROM latest_attestation la
+                   WHERE la.obligation = 'sec.awareness-training' AND la.target = t.target) AS latest_state
+          FROM t
+        )
+        SELECT 'sec.awareness-training' AS obligation,
+               'Security awareness training or phishing exercise' AS title,
+               s.target,
+               CASE WHEN s.target = '-' THEN 'sec.awareness-training' ELSE 'sec.awareness-training@' || s.target END AS item,
+               s.last_done,
+               COALESCE(s.latest_state, 'none') AS latest_state,
+               CASE WHEN s.last_done IS NULL THEN 'never attested as done'
+                    ELSE 'last done ' || s.last_done || ', ' || CAST(julianday(:today) - julianday(s.last_done) AS INTEGER) || ' days ago' END AS status_text,
+               CASE WHEN s.last_done IS NULL THEN :today
+                    ELSE date(s.last_done, '+' || COALESCE((SELECT st.value FROM setting st WHERE st.key = 'threshold.obligations.sec.awareness-training.interval-days'), '365') || ' days') END AS due_on
+        FROM s
+    each:
+      all:
+        - { field: latest_state, op: ne, value: na }
+        - any:
+            - { field: last_done, op: absent }
+            - { field: last_done, op: age-gt, value: 365, threshold: obligations.sec.awareness-training.interval-days }
+    deadline: due_on
+    evidence: "{title} ({item}): {status_text}; was due {due_on}. Latest attestation: {latest_state}"
+
+  - id: OBL-GOV-POLICY-REVIEW
+    title: Security policies not reviewed within the interval
+    kind: missing
+    lens: security
+    category: HYG
+    severity: low
+    entity: obligation
+    why: >-
+      Policies (acceptable use, access control, backup, incident response) describe how the
+      organisation says it works. Unreviewed, they drift from practice until neither staff nor
+      auditors can rely on them, and every control framework asks for a documented review cycle.
+    fix: >-
+      Review and re-approve each policy, record its version and approver as evidence, then attest
+      obligation gov.policy-review with the policy document as target.
+    refs: [NIST-800-53:PL-1, NIST-800-53:AC-1, NIST-800-53:IR-1, ISO-27001:A.5.1]
+    refresh: 1d
+    query:
+      protocol: store
+      key: item
+      name: title
+      text: |
+        WITH t AS (
+          SELECT DISTINCT a.target FROM attestation a WHERE a.obligation = 'gov.policy-review'
+          UNION
+          SELECT '-' WHERE NOT EXISTS (SELECT 1 FROM attestation a WHERE a.obligation = 'gov.policy-review')
+        ),
+        s AS (
+          SELECT t.target,
+                 (SELECT MAX(a.done_on) FROM attestation a
+                   WHERE a.obligation = 'gov.policy-review' AND a.target = t.target AND a.state = 'yes'
+                     AND NULLIF(TRIM(a.done_on), '') IS NOT NULL) AS last_done,
+                 (SELECT la.state FROM latest_attestation la
+                   WHERE la.obligation = 'gov.policy-review' AND la.target = t.target) AS latest_state
+          FROM t
+        )
+        SELECT 'gov.policy-review' AS obligation,
+               'Security policy reviewed and re-approved' AS title,
+               s.target,
+               CASE WHEN s.target = '-' THEN 'gov.policy-review' ELSE 'gov.policy-review@' || s.target END AS item,
+               s.last_done,
+               COALESCE(s.latest_state, 'none') AS latest_state,
+               CASE WHEN s.last_done IS NULL THEN 'never attested as done'
+                    ELSE 'last done ' || s.last_done || ', ' || CAST(julianday(:today) - julianday(s.last_done) AS INTEGER) || ' days ago' END AS status_text,
+               CASE WHEN s.last_done IS NULL THEN :today
+                    ELSE date(s.last_done, '+' || COALESCE((SELECT st.value FROM setting st WHERE st.key = 'threshold.obligations.gov.policy-review.interval-days'), '365') || ' days') END AS due_on
+        FROM s
+    each:
+      all:
+        - { field: latest_state, op: ne, value: na }
+        - any:
+            - { field: last_done, op: absent }
+            - { field: last_done, op: age-gt, value: 365, threshold: obligations.gov.policy-review.interval-days }
+    deadline: due_on
+    evidence: "{title} ({item}): {status_text}; was due {due_on}. Latest attestation: {latest_state}"
+
+  # ----------------------------------------------- certificate authorities (target = the CA)
+  - id: OBL-PKI-CA-KEY-BACKUP
+    title: Certificate authority backup not verified within the interval
+    kind: missing
+    lens: both
+    category: PKI
+    severity: high
+    entity: obligation
+    why: >-
+      Without a usable backup of the CA's private key, database and configuration, losing the CA
+      host means no certificate it issued can be renewed or revoked: every sign-in, VPN and server
+      certificate that depends on it has to be replaced at once.
+    fix: >-
+      Back up the CA (private key, database, configuration) to offline storage with the key's
+      password in the privileged vault, check that the backup is readable, then attest obligation
+      pki.ca-key-backup with the CA as target.
+    refs: [NIST-800-53:CP-9, NIST-800-53:SC-12(1), NIST-800-53:SC-17, ISO-27001:A.8.13]
+    refresh: 1d
+    query:
+      protocol: store
+      key: item
+      name: title
+      text: |
+        WITH t AS (
+          SELECT DISTINCT a.target FROM attestation a WHERE a.obligation = 'pki.ca-key-backup'
+          UNION
+          SELECT '-' WHERE NOT EXISTS (SELECT 1 FROM attestation a WHERE a.obligation = 'pki.ca-key-backup')
+        ),
+        s AS (
+          SELECT t.target,
+                 (SELECT MAX(a.done_on) FROM attestation a
+                   WHERE a.obligation = 'pki.ca-key-backup' AND a.target = t.target AND a.state = 'yes'
+                     AND NULLIF(TRIM(a.done_on), '') IS NOT NULL) AS last_done,
+                 (SELECT la.state FROM latest_attestation la
+                   WHERE la.obligation = 'pki.ca-key-backup' AND la.target = t.target) AS latest_state
+          FROM t
+        )
+        SELECT 'pki.ca-key-backup' AS obligation,
+               'CA key, database and configuration backed up and verified' AS title,
+               s.target,
+               CASE WHEN s.target = '-' THEN 'pki.ca-key-backup' ELSE 'pki.ca-key-backup@' || s.target END AS item,
+               s.last_done,
+               COALESCE(s.latest_state, 'none') AS latest_state,
+               CASE WHEN s.last_done IS NULL THEN 'never attested as done'
+                    ELSE 'last done ' || s.last_done || ', ' || CAST(julianday(:today) - julianday(s.last_done) AS INTEGER) || ' days ago' END AS status_text,
+               CASE WHEN s.last_done IS NULL THEN :today
+                    ELSE date(s.last_done, '+' || COALESCE((SELECT st.value FROM setting st WHERE st.key = 'threshold.obligations.pki.ca-key-backup.interval-days'), '90') || ' days') END AS due_on
+        FROM s
+    each:
+      all:
+        - { field: latest_state, op: ne, value: na }
+        - any:
+            - { field: last_done, op: absent }
+            - { field: last_done, op: age-gt, value: 90, threshold: obligations.pki.ca-key-backup.interval-days }
+    deadline: due_on
+    evidence: "{title} ({item}): {status_text}; was due {due_on}. Latest attestation: {latest_state}"
+
+  - id: OBL-PKI-CA-RESTORE-TEST
+    title: Certificate authority restore not tested within the interval
+    kind: missing
+    lens: both
+    category: PKI
+    severity: medium
+    entity: obligation
+    why: >-
+      An untested CA backup is as uncertain as any other untested backup, with the whole PKI riding
+      on it: a missing key password or an incomplete database shows up only when the CA has to be
+      rebuilt.
+    fix: >-
+      Restore the CA onto an isolated test host, issue a test certificate and publish a test CRL,
+      record how long it took, then attest obligation pki.ca-restore-test with the CA as target.
+    refs: [NIST-800-53:CP-4, NIST-800-53:CP-10, NIST-800-53:SC-17, CIS-Controls-v8:11.5]
+    refresh: 1d
+    query:
+      protocol: store
+      key: item
+      name: title
+      text: |
+        WITH t AS (
+          SELECT DISTINCT a.target FROM attestation a WHERE a.obligation = 'pki.ca-restore-test'
+          UNION
+          SELECT '-' WHERE NOT EXISTS (SELECT 1 FROM attestation a WHERE a.obligation = 'pki.ca-restore-test')
+        ),
+        s AS (
+          SELECT t.target,
+                 (SELECT MAX(a.done_on) FROM attestation a
+                   WHERE a.obligation = 'pki.ca-restore-test' AND a.target = t.target AND a.state = 'yes'
+                     AND NULLIF(TRIM(a.done_on), '') IS NOT NULL) AS last_done,
+                 (SELECT la.state FROM latest_attestation la
+                   WHERE la.obligation = 'pki.ca-restore-test' AND la.target = t.target) AS latest_state
+          FROM t
+        )
+        SELECT 'pki.ca-restore-test' AS obligation,
+               'CA restored from backup on a test host' AS title,
+               s.target,
+               CASE WHEN s.target = '-' THEN 'pki.ca-restore-test' ELSE 'pki.ca-restore-test@' || s.target END AS item,
+               s.last_done,
+               COALESCE(s.latest_state, 'none') AS latest_state,
+               CASE WHEN s.last_done IS NULL THEN 'never attested as done'
+                    ELSE 'last done ' || s.last_done || ', ' || CAST(julianday(:today) - julianday(s.last_done) AS INTEGER) || ' days ago' END AS status_text,
+               CASE WHEN s.last_done IS NULL THEN :today
+                    ELSE date(s.last_done, '+' || COALESCE((SELECT st.value FROM setting st WHERE st.key = 'threshold.obligations.pki.ca-restore-test.interval-days'), '365') || ' days') END AS due_on
+        FROM s
+    each:
+      all:
+        - { field: latest_state, op: ne, value: na }
+        - any:
+            - { field: last_done, op: absent }
+            - { field: last_done, op: age-gt, value: 365, threshold: obligations.pki.ca-restore-test.interval-days }
+    deadline: due_on
+    evidence: "{title} ({item}): {status_text}; was due {due_on}. Latest attestation: {latest_state}"
+
+  - id: OBL-PKI-TEMPLATE-REVIEW
+    title: Certificate templates not reviewed within the interval
+    kind: missing
+    lens: security
+    category: PKI
+    severity: high
+    entity: obligation
+    why: >-
+      Template settings - who may enrol, subjects supplied in the request, purposes that allow
+      sign-in, weak key sizes - are behind the well-known escalation paths through certificate
+      services. The certificate services checks find the known patterns; only a review decides
+      whether each published template and its permissions are still needed.
+    fix: >-
+      Review every published template against the escalation checklist and its business need,
+      unpublish or fix what is not needed or too open, then attest obligation pki.template-review
+      with the CA as target.
+    refs: [NIST-800-53:SC-17, NIST-800-53:AC-6, MITRE-ATTACK:T1649, ADCS:ESC1]
+    refresh: 1d
+    query:
+      protocol: store
+      key: item
+      name: title
+      text: |
+        WITH t AS (
+          SELECT DISTINCT a.target FROM attestation a WHERE a.obligation = 'pki.template-review'
+          UNION
+          SELECT '-' WHERE NOT EXISTS (SELECT 1 FROM attestation a WHERE a.obligation = 'pki.template-review')
+        ),
+        s AS (
+          SELECT t.target,
+                 (SELECT MAX(a.done_on) FROM attestation a
+                   WHERE a.obligation = 'pki.template-review' AND a.target = t.target AND a.state = 'yes'
+                     AND NULLIF(TRIM(a.done_on), '') IS NOT NULL) AS last_done,
+                 (SELECT la.state FROM latest_attestation la
+                   WHERE la.obligation = 'pki.template-review' AND la.target = t.target) AS latest_state
+          FROM t
+        )
+        SELECT 'pki.template-review' AS obligation,
+               'Certificate templates and enrolment permissions reviewed' AS title,
+               s.target,
+               CASE WHEN s.target = '-' THEN 'pki.template-review' ELSE 'pki.template-review@' || s.target END AS item,
+               s.last_done,
+               COALESCE(s.latest_state, 'none') AS latest_state,
+               CASE WHEN s.last_done IS NULL THEN 'never attested as done'
+                    ELSE 'last done ' || s.last_done || ', ' || CAST(julianday(:today) - julianday(s.last_done) AS INTEGER) || ' days ago' END AS status_text,
+               CASE WHEN s.last_done IS NULL THEN :today
+                    ELSE date(s.last_done, '+' || COALESCE((SELECT st.value FROM setting st WHERE st.key = 'threshold.obligations.pki.template-review.interval-days'), '180') || ' days') END AS due_on
+        FROM s
+    each:
+      all:
+        - { field: latest_state, op: ne, value: na }
+        - any:
+            - { field: last_done, op: absent }
+            - { field: last_done, op: age-gt, value: 180, threshold: obligations.pki.template-review.interval-days }
+    deadline: due_on
+    evidence: "{title} ({item}): {status_text}; was due {due_on}. Latest attestation: {latest_state}"
+
+  - id: OBL-PKI-CA-ACCESS-REVIEW
+    title: Certificate authority access not recertified within the interval
+    kind: missing
+    lens: security
+    category: PKI
+    severity: medium
+    entity: obligation
+    why: >-
+      Whoever can manage the CA, approve requests or administer the CA host can issue a credential
+      for any account. These roles are granted for a migration or an incident and rarely taken back.
+    fix: >-
+      Confirm the members of every CA role (CA administrator, certificate manager, local
+      administrators and backup operators of the CA host), remove the rest, then attest obligation
+      pki.ca-access-review with the CA as target.
+    refs: [NIST-800-53:AC-2, NIST-800-53:AC-6(7), NIST-800-53:SC-17, CIS-Controls-v8:6.8]
+    refresh: 1d
+    query:
+      protocol: store
+      key: item
+      name: title
+      text: |
+        WITH t AS (
+          SELECT DISTINCT a.target FROM attestation a WHERE a.obligation = 'pki.ca-access-review'
+          UNION
+          SELECT '-' WHERE NOT EXISTS (SELECT 1 FROM attestation a WHERE a.obligation = 'pki.ca-access-review')
+        ),
+        s AS (
+          SELECT t.target,
+                 (SELECT MAX(a.done_on) FROM attestation a
+                   WHERE a.obligation = 'pki.ca-access-review' AND a.target = t.target AND a.state = 'yes'
+                     AND NULLIF(TRIM(a.done_on), '') IS NOT NULL) AS last_done,
+                 (SELECT la.state FROM latest_attestation la
+                   WHERE la.obligation = 'pki.ca-access-review' AND la.target = t.target) AS latest_state
+          FROM t
+        )
+        SELECT 'pki.ca-access-review' AS obligation,
+               'CA roles and CA host administrators recertified' AS title,
+               s.target,
+               CASE WHEN s.target = '-' THEN 'pki.ca-access-review' ELSE 'pki.ca-access-review@' || s.target END AS item,
+               s.last_done,
+               COALESCE(s.latest_state, 'none') AS latest_state,
+               CASE WHEN s.last_done IS NULL THEN 'never attested as done'
+                    ELSE 'last done ' || s.last_done || ', ' || CAST(julianday(:today) - julianday(s.last_done) AS INTEGER) || ' days ago' END AS status_text,
+               CASE WHEN s.last_done IS NULL THEN :today
+                    ELSE date(s.last_done, '+' || COALESCE((SELECT st.value FROM setting st WHERE st.key = 'threshold.obligations.pki.ca-access-review.interval-days'), '180') || ' days') END AS due_on
+        FROM s
+    each:
+      all:
+        - { field: latest_state, op: ne, value: na }
+        - any:
+            - { field: last_done, op: absent }
+            - { field: last_done, op: age-gt, value: 180, threshold: obligations.pki.ca-access-review.interval-days }
+    deadline: due_on
+    evidence: "{title} ({item}): {status_text}; was due {due_on}. Latest attestation: {latest_state}"
+
   # ----------------------------------------------- every attestation, any obligation
   - id: OBL-ATTESTATION-EXPIRED
     title: Attestation has expired
@@ -1054,3 +2060,118 @@ rules:
         - { field: state, op: eq, value: "yes" }
         - { field: done_on, op: age-lt, value: -1 }
     evidence: "{item}: attested 'yes' by {actor} with done_on {done_on}, which is in the future"
+
+  - id: OBL-ATTESTED-NA-NO-EXPIRY
+    title: Obligation excused as not applicable with no expiry
+    kind: missing
+    lens: both
+    category: HYG
+    severity: medium
+    entity: attestation
+    why: >-
+      'Does not apply' was true on the day it was recorded. Without an expiry nothing ever asks
+      again, so a system that is added later, or a service that stops covering it, leaves the
+      obligation excused for ever.
+    fix: >-
+      Record the 'na' again with an expires_on date (a year at most) and the reason as evidence, so
+      the exemption is re-confirmed on a schedule.
+    refs: [NIST-800-53:CA-7, NIST-800-53:RA-7]
+    refresh: 1d
+    query:
+      protocol: store
+      key: item
+      name: obligation
+      text: |
+        SELECT la.attestation_id,
+               la.obligation,
+               la.target,
+               CASE WHEN la.target = '-' THEN la.obligation ELSE la.obligation || '@' || la.target END AS item,
+               la.state,
+               NULLIF(TRIM(la.done_on), '') AS done_on,
+               NULLIF(TRIM(la.expires_on), '') AS expires_on,
+               la.actor,
+               la.recorded_at,
+               TRIM(la.evidence) AS evidence,
+               LENGTH(TRIM(la.evidence)) AS evidence_length
+        FROM latest_attestation la
+    each:
+      all:
+        - { field: state, op: eq, value: na }
+        - { field: expires_on, op: absent }
+    evidence: "{item}: attested 'na' by {actor} on {recorded_at} with no expiry ({evidence})"
+
+  - id: OBL-ATTESTATION-EVIDENCE-THIN
+    title: Attestation of a done obligation has almost no evidence
+    kind: missing
+    lens: both
+    category: HYG
+    severity: low
+    entity: attestation
+    why: >-
+      A 'yes' whose evidence is a word or two ("done", "ok") satisfies the obligation rule but not an
+      auditor, and a year later nobody can say what was actually done or where the proof is.
+    fix: >-
+      Record the attestation again with what was done, where the proof lives (ticket, report,
+      screenshot location) and who took part.
+    refs: [NIST-800-53:CA-7, NIST-800-53:CA-2]
+    refresh: 1d
+    query:
+      protocol: store
+      key: item
+      name: obligation
+      text: |
+        SELECT la.attestation_id,
+               la.obligation,
+               la.target,
+               CASE WHEN la.target = '-' THEN la.obligation ELSE la.obligation || '@' || la.target END AS item,
+               la.state,
+               NULLIF(TRIM(la.done_on), '') AS done_on,
+               NULLIF(TRIM(la.expires_on), '') AS expires_on,
+               la.actor,
+               la.recorded_at,
+               TRIM(la.evidence) AS evidence,
+               LENGTH(TRIM(la.evidence)) AS evidence_length
+        FROM latest_attestation la
+    each:
+      all:
+        - { field: state, op: eq, value: "yes" }
+        - { field: evidence_length, op: lt, value: 20, threshold: obligations.min-evidence-chars }
+    evidence: "{item}: attested 'yes' by {actor} on {recorded_at} with evidence '{evidence}' ({evidence_length} characters)"
+
+  # An obligation id maps to the rule OBL-<id in capitals, dots as dashes> (backup.restore-test ->
+  # OBL-BACKUP-RESTORE-TEST); a tenant's own obligation rules should follow the same naming. Judged
+  # only once the rule catalogue holds this rule, so an empty catalogue reports nothing.
+  - id: OBL-ATTESTATION-UNKNOWN-ID
+    title: Attestation names an obligation no rule checks
+    kind: misconfigured
+    lens: both
+    category: HYG
+    severity: low
+    entity: attestation
+    why: >-
+      An attestation under a misspelt or unknown obligation id proves nothing: no rule reads it, so
+      the real obligation stays "never done" while the person who recorded it believes it is
+      covered.
+    fix: >-
+      Record the attestation again under the right obligation id (the obligation rules list them), or
+      add the obligation rule the id was meant for.
+    refs: [NIST-800-53:CA-7]
+    refresh: 1d
+    query:
+      protocol: store
+      key: item
+      name: obligation
+      text: |
+        SELECT la.obligation,
+               la.target,
+               CASE WHEN la.target = '-' THEN la.obligation ELSE la.obligation || '@' || la.target END AS item,
+               la.state,
+               la.actor,
+               la.recorded_at,
+               'OBL-' || UPPER(REPLACE(la.obligation, '.', '-')) AS expected_rule
+        FROM latest_attestation la
+        WHERE NOT EXISTS (SELECT 1 FROM rule r
+                           WHERE UPPER(r.rule_id) = 'OBL-' || UPPER(REPLACE(la.obligation, '.', '-')))
+          AND EXISTS (SELECT 1 FROM rule r WHERE r.rule_id = 'OBL-ATTESTATION-UNKNOWN-ID')
+    each: any
+    evidence: "{item}: attested {state} by {actor} on {recorded_at}, but no rule {expected_rule} checks obligation {obligation}"

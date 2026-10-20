@@ -3,12 +3,15 @@ system: azure
 name: Azure Resource Manager (tenant scope)
 integration: azure
 # Endpoint: https://management.azure.com. The integration obtains the ARM token; rules only name GET
-# paths. Only routes that work without a subscription id in the path are used here (subscription list,
-# root-scope role assignments, reservations, tenant service-health events). Subscription-scoped
-# checks - NSG rules, storage accounts, Key Vault, VMs, budgets, policy - are in
-# docs/backlog/infrastructure.md: they need either a per-subscription integration or engine fan-out.
-# ARM pages with "nextLink" (not "@odata.nextLink"), which the runner does not follow; these lists
-# are normally a single page.
+# paths. Tenant-wide routes (subscription list, root-scope role assignments and role definitions,
+# billing, reservations, savings plans, management groups, tenant service-health events) are read
+# once. Subscription-scoped routes use for_each over /subscriptions: one GET per subscription the
+# review identity can see, each row carrying the subscription as "parent" (capped at 500). Checks that
+# still cannot be written (NSG rules, policy compliance, per-resource diagnostics) are in
+# docs/backlog/infrastructure.md.
+# ARM pages with "nextLink" (not "@odata.nextLink"), which the runner does not follow; a list longer
+# than one page is judged on its first page only. Tenant lists are normally one page; large
+# per-subscription resource lists may not be.
 defaults:
   lens: both
   refresh: 1d
@@ -77,6 +80,49 @@ rules:
     each: { field: managedByTenants, op: size-gt, value: 0 }
     evidence: "{displayName}: managed by tenant(s) {managedByTenants[].tenantId}"
 
+  - id: AZ-SUBSCRIPTION-NONE
+    title: The review identity sees no subscriptions
+    kind: missing
+    category: MON
+    severity: medium
+    entity: instance
+    why: With no subscription visible, every subscription rule in this file reads nothing and the result looks clean.
+    fix: Grant the review identity Reader at the root management group (or on each subscription), then rerun.
+    refs: [NIST-800-53:CA-7]
+    query:
+      protocol: http
+      path: /subscriptions
+      params: { api-version: "2022-12-01" }
+      paging: none
+      key: subscriptionId
+      name: displayName
+    count: none
+    evidence: "no subscriptions returned"
+
+  - id: AZ-SUBSCRIPTION-UNTAGGED
+    title: Subscription has no tags
+    kind: missing
+    lens: maintenance
+    category: HYG
+    severity: low
+    entity: subscription
+    refresh: 7d
+    why: Without owner, cost-centre and environment tags, cost reports and incident routing have nothing to group the subscription by, and nobody is obviously responsible for it.
+    fix: Apply the tagging standard (owner, cost centre, environment) to the subscription and enforce it with policy.
+    refs: [NIST-800-53:CM-8, CIS-Controls-v8:1.1]
+    query:
+      protocol: http
+      path: /subscriptions
+      params: { api-version: "2022-12-01" }
+      paging: none
+      key: subscriptionId
+      name: displayName
+    each:
+      any:
+        - { field: tags, op: absent }
+        - { field: tags, op: eq, value: "{}" }
+    evidence: "{displayName}: no tags"
+
   # ---- root scope ----------------------------------------------------------------------------
 
   - id: AZ-ROOT-SCOPE-ROLE-ASSIGNMENT
@@ -103,6 +149,149 @@ rules:
       name: properties.principalId
     each: { field: properties.scope, op: eq, value: / }
     evidence: "principal {properties.principalId} ({properties.principalType}) holds {properties.roleDefinitionId} at / since {properties.createdOn}"
+
+  # Role definitions read at the tenant level with type eq 'CustomRole' return every custom role in the
+  # tenant, whatever scopes it is assignable at (per the vendor's RBAC listing guide).
+
+  - id: AZ-CUSTOM-ROLE-WILDCARD-ACTIONS
+    title: Custom role grants every action, or every write, delete or action operation
+    kind: misconfigured
+    lens: security
+    category: IAM
+    severity: high
+    entity: role-definition
+    why: A custom role with "*" (or "*/write", "*/delete", "*/action") is Owner or Contributor under a harmless name; reviews of the built-in privileged roles never see who holds it.
+    fix: Replace the wildcard with the explicit actions the role needs; if it truly needs everything, use the built-in role so access reviews see it.
+    refs: [NIST-800-53:AC-6, NIST-800-53:AC-2, CIS-Controls-v8:6.8]
+    query:
+      protocol: http
+      path: /providers/Microsoft.Authorization/roleDefinitions
+      params: { api-version: "2022-04-01", $filter: "type eq 'CustomRole'" }
+      paging: none
+      key: name
+      name: properties.roleName
+    each:
+      all:
+        - { field: properties.type, op: eq, value: CustomRole }
+        - { field: "properties.permissions[].actions", op: match, value: '^\*(/(write|delete|action))?$' }
+    evidence: "{properties.roleName}: actions {properties.permissions[].actions}, not-actions {properties.permissions[].notActions}, assignable at {properties.assignableScopes}"
+
+  - id: AZ-CUSTOM-ROLE-ROOT-ASSIGNABLE
+    title: Custom role can be assigned at the tenant root
+    kind: misconfigured
+    lens: security
+    category: IAM
+    severity: medium
+    entity: role-definition
+    why: A custom role assignable at "/" can be granted over every management group and every subscription, including the ones created later.
+    fix: Narrow the role's assignable scopes to the management groups or subscriptions it is meant for.
+    refs: [NIST-800-53:AC-6, CIS-Controls-v8:6.8]
+    query:
+      protocol: http
+      path: /providers/Microsoft.Authorization/roleDefinitions
+      params: { api-version: "2022-04-01", $filter: "type eq 'CustomRole'" }
+      paging: none
+      key: name
+      name: properties.roleName
+    each:
+      all:
+        - { field: properties.type, op: eq, value: CustomRole }
+        - { field: properties.assignableScopes, op: contains, value: / }
+    evidence: "{properties.roleName}: assignable at {properties.assignableScopes}"
+
+  - id: AZ-MANAGEMENT-GROUP-FLAT
+    title: No management group below the tenant root
+    kind: missing
+    category: CFG
+    severity: low
+    entity: instance
+    refresh: 7d
+    why: Without a management-group hierarchy, policy, access and security settings can only be set subscription by subscription, and a new subscription inherits nothing. The same result appears when the review identity cannot read the groups.
+    fix: Create a small hierarchy (for example platform, workloads, sandbox) and move the subscriptions into it; grant the review identity read on the root group.
+    refs: [NIST-800-53:CM-6, CIS-Controls-v8:4.1]
+    query:
+      protocol: http
+      path: /providers/Microsoft.Management/managementGroups
+      params: { api-version: "2021-04-01" }
+      paging: none
+      key: name
+      name: properties.displayName
+    count: { op: lt, value: 2 }
+    evidence: "{count} management group(s) visible, the root included"
+
+  # ---- billing -------------------------------------------------------------------------------
+  # Needs Billing Reader on the billing account; without it the list is empty (AZ-BILLING-ACCOUNT-NONE).
+
+  - id: AZ-BILLING-ACCOUNT-STATUS
+    title: Billing account is not active
+    kind: broken
+    lens: maintenance
+    category: CST
+    severity:
+      field: properties.accountStatus
+      map: { Disabled: high, Expired: high, Terminated: high, Deleted: medium, UnderReview: medium, Pending: medium, Extended: medium, Transferred: low, New: low }
+      default: medium
+    entity: billing-account
+    why: A disabled, expired or terminated billing account stops the subscriptions under it; under review or extended is the step before.
+    fix: Contact the billing owner or reseller and resolve the account status before the subscriptions are affected.
+    refs: [NIST-800-53:SA-4]
+    query:
+      protocol: http
+      path: /providers/Microsoft.Billing/billingAccounts
+      params: { api-version: "2024-04-01" }
+      paging: none
+      key: name
+      name: properties.displayName
+    each: { field: properties.accountStatus, op: ne, value: Active }
+    evidence: "{properties.displayName} ({properties.agreementType}): {properties.accountStatus} {properties.accountStatusReasonCode}"
+
+  - id: AZ-BILLING-ENROLLMENT-ENDING
+    title: Enterprise Agreement enrollment ends soon
+    kind: broken
+    lens: maintenance
+    category: CST
+    severity:
+      daysLeft: properties.enrollmentDetails.endDate
+      ranges: [ { max: 30, value: high } ]
+      default: medium
+    entity: billing-account
+    why: When the enrollment ends without a renewal or a move to another agreement, its subscriptions lose their contract terms and, eventually, service.
+    fix: Start the renewal or the move to the next agreement with procurement now; it takes weeks.
+    refs: [NIST-800-53:SA-4]
+    deadline: properties.enrollmentDetails.endDate
+    query:
+      protocol: http
+      path: /providers/Microsoft.Billing/billingAccounts
+      params: { api-version: "2024-04-01" }
+      paging: none
+      key: name
+      name: properties.displayName
+    each:
+      all:
+        - { field: properties.agreementType, op: eq, value: EnterpriseAgreement }
+        - { field: properties.enrollmentDetails.endDate, op: until-lt, value: 90, threshold: azure.enrollment-notice-days }
+    evidence: "{properties.displayName}: enrollment ends {properties.enrollmentDetails.endDate}"
+
+  - id: AZ-BILLING-ACCOUNT-NONE
+    title: The review identity sees no billing account
+    kind: missing
+    lens: maintenance
+    category: MON
+    severity: low
+    entity: instance
+    refresh: 7d
+    why: Without a visible billing account the billing rules read nothing, so an account under review or an ending enrollment goes unnoticed.
+    fix: Grant the review identity Billing Reader on the billing account.
+    refs: [NIST-800-53:CA-7]
+    query:
+      protocol: http
+      path: /providers/Microsoft.Billing/billingAccounts
+      params: { api-version: "2024-04-01" }
+      paging: none
+      key: name
+      name: properties.displayName
+    count: none
+    evidence: "no billing account returned"
 
   # ---- reservations --------------------------------------------------------------------------
 
@@ -150,6 +339,54 @@ rules:
       key: name
       name: properties.displayName
     each: { field: properties.provisioningState, op: in, value: [BillingFailed, Failed] }
+    evidence: "{properties.displayName}: {properties.provisioningState}"
+
+  - id: AZ-SAVINGS-PLAN-EXPIRY
+    title: Savings plan expires soon and will not renew
+    kind: broken
+    lens: maintenance
+    category: CST
+    severity:
+      daysLeft: properties.expiryDateTime
+      ranges: [ { max: 7, value: high }, { max: 30, value: medium } ]
+      default: low
+    entity: savings-plan
+    why: When a savings plan lapses without renewal, the compute it covered falls back to pay-as-you-go prices overnight.
+    fix: Decide with finance whether to renew; turn on renew or buy the replacement before the expiry date.
+    refs: [NIST-800-53:SA-4]
+    deadline: properties.expiryDateTime
+    query:
+      protocol: http
+      path: /providers/Microsoft.BillingBenefits/savingsPlans
+      params: { api-version: "2022-11-01", $filter: "(properties/archived eq false)" }
+      paging: none
+      key: name
+      name: properties.displayName
+    each:
+      all:
+        - { field: properties.provisioningState, op: eq, value: Succeeded }
+        - { field: properties.renew, op: eq, value: false }
+        - { field: properties.expiryDateTime, op: until-lt, value: 60, threshold: azure.savings-plan-notice-days }
+    evidence: "{properties.displayName} ({properties.term}) expires {properties.expiryDateTime}, renew off"
+
+  - id: AZ-SAVINGS-PLAN-FAILED
+    title: Savings plan is failed or expired but still listed
+    kind: broken
+    lens: maintenance
+    category: CST
+    severity: medium
+    entity: savings-plan
+    why: A failed savings plan gives no discount while the organisation believes the compute is covered.
+    fix: Fix the billing problem behind it, or archive the plan once it is truly finished.
+    refs: [NIST-800-53:SA-4]
+    query:
+      protocol: http
+      path: /providers/Microsoft.BillingBenefits/savingsPlans
+      params: { api-version: "2022-11-01", $filter: "(properties/archived eq false)" }
+      paging: none
+      key: name
+      name: properties.displayName
+    each: { field: properties.provisioningState, op: in, value: [Failed, Expired] }
     evidence: "{properties.displayName}: {properties.provisioningState}"
 
   # ---- tenant service health -----------------------------------------------------------------
@@ -278,3 +515,198 @@ rules:
         - { field: properties.eventTags, op: contains, value: Action Recommended }
         - { field: properties.status, op: eq, value: Active }
     evidence: "{name}: {properties.title} ({properties.eventType})"
+
+  # ---- per subscription (for_each over /subscriptions) ---------------------------------------
+  # Rows are keyed by the resource id, which already names the subscription.
+
+  - id: AZ-DEFENDER-PLAN-OFF
+    title: Required Defender for Cloud plan is off for a subscription
+    kind: missing
+    lens: security
+    category: MON
+    severity: medium
+    entity: defender-plan
+    why: On the free tier Defender for Cloud only scores posture; threat detection for servers, storage, key vaults and the management plane stays off, so attacks there raise no alert. Which plans are required is a tenant decision (the threshold is a pattern of plan names).
+    fix: Turn the plan on for the subscription (or at the management group through policy), or narrow the required-plan pattern with a recorded reason.
+    refs: [NIST-800-53:SI-4, NIST-800-53:RA-5, CIS-Controls-v8:13.1]
+    query:
+      protocol: http
+      path: /subscriptions/{subscriptionId}/providers/Microsoft.Security/pricings
+      for_each: { path: /subscriptions, params: { api-version: "2022-12-01" }, paging: none, field: subscriptionId, max: 500 }
+      params: { api-version: "2024-01-01" }
+      paging: none
+      key: id
+      name: name
+    each:
+      all:
+        - { field: name, op: match, value: '^(VirtualMachines|StorageAccounts|KeyVaults|Arm|CloudPosture)$', threshold: azure.defender-required-plans }
+        - { field: properties.pricingTier, op: eq, value: Free }
+        - any:
+            - { field: properties.deprecated, op: absent }
+            - { field: properties.deprecated, op: eq, value: false }
+    evidence: "{parent.displayName}: plan {name} is on the {properties.pricingTier} tier"
+
+  - id: AZ-STORAGE-HTTP-ALLOWED
+    title: Storage account accepts unencrypted HTTP
+    kind: misconfigured
+    lens: security
+    category: CFG
+    severity: medium
+    entity: storage-account
+    why: With secure transfer off, data and shared-access signatures can travel over plain HTTP, readable and replayable by anyone on the path.
+    fix: Turn on "secure transfer required" (HTTPS only); check first that no client still calls the account over HTTP.
+    refs: [NIST-800-53:SC-8, CIS-Controls-v8:3.10]
+    query:
+      protocol: http
+      path: /subscriptions/{subscriptionId}/providers/Microsoft.Storage/storageAccounts
+      for_each: { path: /subscriptions, params: { api-version: "2022-12-01" }, paging: none, field: subscriptionId, max: 500 }
+      params: { api-version: "2023-05-01" }
+      paging: none
+      key: id
+      name: name
+    each: { field: properties.supportsHttpsTrafficOnly, op: eq, value: false }
+    evidence: "{name} in {parent.displayName}: HTTPS-only off"
+
+  - id: AZ-STORAGE-BLOB-PUBLIC-ACCESS-ALLOWED
+    title: Storage account allows anonymous public access to blobs
+    kind: misconfigured
+    lens: security
+    category: CFG
+    severity: medium
+    entity: storage-account
+    why: While the account allows anonymous access, any container set to public - by mistake or by a script - serves its blobs to the internet without a credential.
+    fix: Disallow anonymous blob access on the account; serve public content through a CDN or signed URLs instead.
+    refs: [NIST-800-53:AC-3, NIST-800-53:SC-7, CIS-Controls-v8:3.3]
+    query:
+      protocol: http
+      path: /subscriptions/{subscriptionId}/providers/Microsoft.Storage/storageAccounts
+      for_each: { path: /subscriptions, params: { api-version: "2022-12-01" }, paging: none, field: subscriptionId, max: 500 }
+      params: { api-version: "2023-05-01" }
+      paging: none
+      key: id
+      name: name
+    each: { field: properties.allowBlobPublicAccess, op: eq, value: true }
+    evidence: "{name} in {parent.displayName}: anonymous blob access allowed"
+
+  - id: AZ-STORAGE-SHARED-KEY-ALLOWED
+    title: Storage account accepts shared-key authorisation
+    kind: misconfigured
+    lens: security
+    category: AUT
+    severity: low
+    entity: storage-account
+    why: The account keys (and every SAS signed with them) grant full access with no identity attached, are rarely rotated and bypass conditional access; the setting is on unless explicitly turned off.
+    fix: Move the account's clients to Entra ID authorisation and disallow shared-key access; record an override where a dependent service still needs keys.
+    refs: [NIST-800-53:IA-5, NIST-800-53:AC-6]
+    query:
+      protocol: http
+      path: /subscriptions/{subscriptionId}/providers/Microsoft.Storage/storageAccounts
+      for_each: { path: /subscriptions, params: { api-version: "2022-12-01" }, paging: none, field: subscriptionId, max: 500 }
+      params: { api-version: "2023-05-01" }
+      paging: none
+      key: id
+      name: name
+    each:
+      any:
+        - { field: properties.allowSharedKeyAccess, op: absent }
+        - { field: properties.allowSharedKeyAccess, op: eq, value: true }
+    evidence: "{name} in {parent.displayName}: shared-key access allowed"
+
+  - id: AZ-KEYVAULT-PURGE-PROTECTION-OFF
+    title: Key vault has no purge protection
+    kind: misconfigured
+    lens: security
+    category: CFG
+    severity: medium
+    entity: key-vault
+    why: Without purge protection, anyone with enough rights can delete a vault and purge it immediately, destroying its keys and every piece of data encrypted with them - a ransomware and sabotage path.
+    fix: Enable purge protection on the vault (it cannot be turned off again; check the retention period first).
+    refs: [NIST-800-53:SC-12, NIST-800-53:CP-9, MITRE-ATTACK:T1485]
+    query:
+      protocol: http
+      path: /subscriptions/{subscriptionId}/providers/Microsoft.KeyVault/vaults
+      for_each: { path: /subscriptions, params: { api-version: "2022-12-01" }, paging: none, field: subscriptionId, max: 500 }
+      params: { api-version: "2023-07-01" }
+      paging: none
+      key: id
+      name: name
+    each:
+      any:
+        - { field: properties.enablePurgeProtection, op: absent }
+        - { field: properties.enablePurgeProtection, op: eq, value: false }
+    evidence: "{name} in {parent.displayName}: purge protection off"
+
+  - id: AZ-DISK-UNATTACHED
+    title: Managed disk has been unattached for a month
+    kind: misconfigured
+    lens: maintenance
+    category: CST
+    severity: low
+    entity: disk
+    refresh: 7d
+    why: An unattached disk is paid for every month and often holds a copy of a retired server's data that nobody looks after.
+    fix: Snapshot or archive it if the data matters, then delete it.
+    refs: [NIST-800-53:CM-8]
+    query:
+      protocol: http
+      path: /subscriptions/{subscriptionId}/providers/Microsoft.Compute/disks
+      for_each: { path: /subscriptions, params: { api-version: "2022-12-01" }, paging: none, field: subscriptionId, max: 500 }
+      params: { api-version: "2024-03-02" }
+      paging: none
+      key: id
+      name: name
+    each:
+      all:
+        - { field: properties.diskState, op: eq, value: Unattached }
+        - any:
+            - { field: properties.lastOwnershipUpdateTime, op: age-gt, value: 30, threshold: azure.unattached-disk-days }
+            - all:
+                - { field: properties.lastOwnershipUpdateTime, op: absent }
+                - { field: properties.timeCreated, op: age-gt, value: 30, threshold: azure.unattached-disk-days }
+    evidence: "{name} in {parent.displayName}: {properties.diskSizeGB} GB {sku.name}, unattached since {properties.lastOwnershipUpdateTime} (created {properties.timeCreated})"
+
+  - id: AZ-PUBLIC-IP-UNATTACHED
+    title: Public IP address is attached to nothing
+    kind: misconfigured
+    lens: maintenance
+    category: CST
+    severity: low
+    entity: public-ip
+    refresh: 7d
+    why: An unused public address costs money and is easy to re-attach to the wrong resource; a public address nobody owns is also an address someone may still have in an allow-list.
+    fix: Delete the address, or record what it is reserved for.
+    refs: [NIST-800-53:CM-8]
+    query:
+      protocol: http
+      path: /subscriptions/{subscriptionId}/providers/Microsoft.Network/publicIPAddresses
+      for_each: { path: /subscriptions, params: { api-version: "2022-12-01" }, paging: none, field: subscriptionId, max: 500 }
+      params: { api-version: "2024-05-01" }
+      paging: none
+      key: id
+      name: name
+    each:
+      all:
+        - { field: properties.ipConfiguration, op: absent }
+        - { field: properties.natGateway, op: absent }
+    evidence: "{name} in {parent.displayName}: {properties.ipAddress} ({sku.name}) is not attached"
+
+  - id: AZ-VM-STOPPED-NOT-DEALLOCATED
+    title: VM is stopped but still allocated
+    kind: misconfigured
+    lens: maintenance
+    category: CST
+    severity: low
+    entity: vm
+    why: A VM shut down from inside the guest stays allocated and keeps billing for compute while doing nothing.
+    fix: Stop (deallocate) the VM from the portal or API, or delete it if it is no longer needed.
+    refs: [NIST-800-53:CM-8]
+    query:
+      protocol: http
+      path: /subscriptions/{subscriptionId}/providers/Microsoft.Compute/virtualMachines
+      for_each: { path: /subscriptions, params: { api-version: "2022-12-01" }, paging: none, field: subscriptionId, max: 500 }
+      params: { api-version: "2024-07-01", statusOnly: "true" }
+      paging: none
+      key: id
+      name: name
+    each: { field: "properties.instanceView.statuses[].code", op: eq, value: PowerState/stopped }
+    evidence: "{name} in {parent.displayName}: stopped, not deallocated"

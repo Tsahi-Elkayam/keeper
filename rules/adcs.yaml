@@ -196,6 +196,47 @@ rules:
     each: { field: msPKI-RA-Application-Policies, op: match, value: 'msPKI-Hash-Algorithm`PZPWSTR`(SHA1|MD5|MD4|MD2)`' }
     evidence: "{displayName} ({cn}) - {msPKI-RA-Application-Policies}"
 
+  - id: ADCS-TPL-KEY-ARCHIVAL-AUTH
+    title: Authentication template archives the private key at the CA
+    severity: low
+    why: With key archival the CA keeps a recoverable copy of every logon private key it issues, so a compromise of the CA database or a key recovery agent yields working logon credentials for every holder. Archival is meant for encryption keys, not authentication keys.
+    fix: Clear "archive subject's encryption private key" on logon templates and keep archival for encryption templates (EFS, S/MIME) only.
+    refs: [MITRE-ATTACK:T1649, NIST-800-53:SC-12]
+    query:
+      protocol: ldap
+      base: 'CN=Certificate Templates,CN=Public Key Services,CN=Services,{CONFIGDN}'
+      scope: onelevel
+      filter: '(objectClass=pKICertificateTemplate)'
+      attributes: [cn, displayName, msPKI-Certificate-Name-Flag, msPKI-Enrollment-Flag, msPKI-RA-Signature, pKIExtendedKeyUsage, msPKI-Certificate-Application-Policy, msPKI-Template-Schema-Version, msPKI-Minimal-Key-Size, msPKI-Private-Key-Flag, msPKI-RA-Application-Policies]
+      key: cn
+      name: displayName
+    each:
+      all:
+        - { field: msPKI-Private-Key-Flag, op: flag, value: 1 }
+        - any:
+            - { field: pKIExtendedKeyUsage, op: match, value: '^(1\.3\.6\.1\.5\.5\.7\.3\.2|1\.3\.6\.1\.5\.2\.3\.4|1\.3\.6\.1\.4\.1\.311\.20\.2\.2|2\.5\.29\.37\.0)$' }
+            - { field: msPKI-Certificate-Application-Policy, op: match, value: '^(1\.3\.6\.1\.5\.5\.7\.3\.2|1\.3\.6\.1\.5\.2\.3\.4|1\.3\.6\.1\.4\.1\.311\.20\.2\.2|2\.5\.29\.37\.0)$' }
+    evidence: "{displayName} ({cn}) - private key flag {msPKI-Private-Key-Flag}, EKU {pKIExtendedKeyUsage}"
+
+  # ---------------------------------------------------------------- change signals
+
+  - id: ADCS-PKI-OBJECT-RECENTLY-CHANGED
+    title: Certificate template, CA or issuance policy object changed in the last week
+    category: MON
+    severity: medium
+    why: Editing a template is how ESC4 is used - make a harmless template exploitable, enroll, change it back - and a change to a CA's published templates is how a dangerous template goes live. The query looks back 30 days at most, so adcs.pki-change-days above 30 has no effect.
+    fix: Match the change against the PKI change log; if nobody made it, treat it as an incident and compare the template with its last backup. The CA's template-change audit events name the writer.
+    refs: [MITRE-ATTACK:T1649, NIST-800-53:CM-3, NIST-800-53:AU-12, ADCS:ESC4]
+    query:
+      protocol: ldap
+      base: 'CN=Public Key Services,CN=Services,{CONFIGDN}'
+      filter: '(&(|(objectClass=pKICertificateTemplate)(objectClass=pKIEnrollmentService)(objectClass=msPKI-Enterprise-Oid))(whenChanged>={GT:30}))'
+      attributes: [cn, displayName, objectClass, whenChanged]
+      key: distinguishedName
+      name: displayName
+    each: { field: whenChanged, op: age-lt, value: 7, threshold: adcs.pki-change-days }
+    evidence: "{displayName} ({cn}) - changed {whenChanged}"
+
   # ---------------------------------------------------------------- issuance policies
 
   - id: ADCS-OID-GROUP-LINK
@@ -293,6 +334,46 @@ rules:
     each: { field: msPKI-Enrollment-Servers, op: match, value: 'http://' }
     evidence: "{cn} on {dNSHostName} - enrollment servers {msPKI-Enrollment-Servers}"
 
+  - id: ADCS-CA-NO-TEMPLATES
+    title: Enterprise CA publishes no templates
+    lens: maintenance
+    severity: low
+    entity: domain
+    why: A CA that issues nothing is usually dead or forgotten, yet it may still sit in the NTAuth store where every domain controller trusts it for logon.
+    fix: Decommission it properly (revoke what it issued, remove it from NTAuth and the Enrollment Services container), or publish the templates it is for.
+    refs: [NIST-800-53:CM-8, NIST-800-53:SC-17]
+    query:
+      protocol: ldap
+      base: 'CN=Enrollment Services,CN=Public Key Services,CN=Services,{CONFIGDN}'
+      scope: onelevel
+      filter: '(objectClass=pKIEnrollmentService)'
+      attributes: [cn, dNSHostName, certificateTemplates, msPKI-Enrollment-Servers]
+      key: cn
+      name: dNSHostName
+    each: { field: certificateTemplates, op: empty }
+    evidence: "{cn} on {dNSHostName} - no published templates"
+
+  - id: ADCS-POP-CA-NONE
+    title: No enterprise CA is visible in the configuration partition
+    kind: missing
+    lens: maintenance
+    category: MON
+    severity: info
+    entity: domain
+    why: Every CA rule then passes without data. Either the estate has no AD CS - accept the finding as that - or the reader cannot see the Enrollment Services container.
+    fix: If AD CS exists, check the integration account's read access to CN=Public Key Services,CN=Services in the configuration partition; otherwise accept the finding with the reason "no AD CS".
+    refs: [NIST-800-53:CA-7]
+    query:
+      protocol: ldap
+      base: 'CN=Enrollment Services,CN=Public Key Services,CN=Services,{CONFIGDN}'
+      scope: onelevel
+      filter: '(objectClass=pKIEnrollmentService)'
+      attributes: [cn, dNSHostName, certificateTemplates, msPKI-Enrollment-Servers]
+      key: cn
+      name: dNSHostName
+    count: none
+    evidence: "{count} enterprise CAs visible"
+
   # ---------------------------------------------------------------- certificate mapping on accounts
 
   - id: ADCS-ACCOUNT-WEAK-CERT-MAPPING
@@ -310,3 +391,19 @@ rules:
       name: displayName
     each: { field: altSecurityIdentities, op: match, value: '^X509:(<I>.*<S>|<S>|<RFC822>)' }
     evidence: "{sAMAccountName} - mapping {altSecurityIdentities}"
+
+  - id: ADCS-ACCOUNT-CERT-MAPPING-PRIVILEGED
+    title: Privileged account accepts a certificate mapped to it explicitly
+    severity: medium
+    entity: user
+    why: An explicit certificate mapping is a second credential for an administrator that no password reset, MFA or Protected Users membership touches; whoever can write altSecurityIdentities, or obtain a certificate that satisfies the mapping, signs in as that administrator. Weak mapping forms are also reported by ADCS-ACCOUNT-WEAK-CERT-MAPPING, which needs its own fix.
+    fix: Remove mappings administrators do not use; keep only strong forms (issuer and serial number, subject key identifier or public-key hash) and restrict who may write altSecurityIdentities on protected accounts.
+    refs: [MITRE-ATTACK:T1649, NIST-800-53:IA-5(2), NIST-800-53:AC-6, ADCS:ESC14]
+    query:
+      protocol: ldap
+      filter: '(&{USER}{ENABLED}(adminCount=1)(altSecurityIdentities=*))'
+      attributes: [sAMAccountName, displayName, altSecurityIdentities, userAccountControl]
+      key: sAMAccountName
+      name: displayName
+    each: any
+    evidence: "{sAMAccountName} - privileged, mapping {altSecurityIdentities}"

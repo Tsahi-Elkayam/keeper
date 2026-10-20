@@ -10,7 +10,8 @@ integration: files
 # Copy the .ocsf.json file into imports\prowler\. The newest matching file is read.
 # Fields used: status_code (PASS, FAIL, MANUAL), status (New, or Suppressed for muted findings),
 # severity (Critical, High, Medium, Low, Informational), metadata.event_code (the check id),
-# finding_info.uid and .title, status_detail, resources[].uid, cloud.account.uid, cloud.region.
+# finding_info.uid and .title, status_detail, resources[].uid, cloud.account.uid, cloud.region,
+# and the event time time_dt (finding_info.created_time_dt as a fallback) for the report's age.
 rules:
   - id: PROWLER-FAILED
     title: Prowler check failed
@@ -47,3 +48,101 @@ rules:
         map: { Critical: critical, High: high, Medium: medium, Low: low, Informational: info }
         default: medium
     evidence: "{metadata.event_code}: {status_detail} (resource {resources[].uid}, account {cloud.account.uid}, region {cloud.region}) [{_file}]"
+
+  - id: PROWLER-MANUAL
+    title: Prowler check needs a manual decision
+    kind: missing
+    lens: security
+    category: MON
+    severity: low
+    entity: cloud-resource
+    why: >-
+      Prowler could not decide this check on its own (MANUAL): the report shows neither a pass nor a
+      failure, so unless a person does the check the setting is simply unknown.
+    fix: >-
+      Do the check the status detail describes. Then mute it in Prowler's mutelist with the reason
+      and a review date - it arrives as Suppressed and is no longer reported - or fix what you found.
+    refs: [NIST-800-53:CA-7, NIST-800-53:CA-2]
+    refresh: 1d
+    query:
+      protocol: file
+      key: finding_info.uid
+      name: resources[].uid
+      path: "prowler/*.ocsf.json"
+      format: json
+    each:
+      all:
+        - { field: status_code, op: eq, value: MANUAL }
+        - any:
+            - { field: status, op: absent }
+            - { field: status, op: ne, value: Suppressed }
+    emit:
+      check: "PROWLER-{metadata.event_code}"
+      title: "{finding_info.title}"
+    evidence: "{metadata.event_code} needs a manual check: {status_detail} (account {cloud.account.uid}, region {cloud.region}) [{_file}]"
+
+  # Muted failures get their own check id, so a finding that is muted does not quietly turn into the
+  # same finding at a lower severity.
+  - id: PROWLER-MUTED-HIGH
+    title: Critical or high Prowler failure is muted
+    kind: misconfigured
+    lens: security
+    category: CFG
+    severity: info
+    entity: cloud-resource
+    why: >-
+      Muting a failure hides it from PROWLER-FAILED for good. For a critical or high check that may
+      be a legitimate accepted risk, but it should stay on a visible list with a reason and an owner
+      instead of disappearing.
+    fix: >-
+      Confirm the mutelist entry still has a reason, an owner and a review date. If it does not,
+      remove it and fix the resource.
+    refs: [NIST-800-53:CA-5, NIST-800-53:RA-7]
+    refresh: 1d
+    query:
+      protocol: file
+      key: finding_info.uid
+      name: resources[].uid
+      path: "prowler/*.ocsf.json"
+      format: json
+    each:
+      all:
+        - { field: status, op: eq, value: Suppressed }
+        - { field: status_code, op: eq, value: FAIL }
+        - { field: severity, op: in, value: [Critical, High] }
+    emit:
+      check: "PROWLER-MUTED-{metadata.event_code}"
+      title: "Muted: {finding_info.title}"
+    evidence: "{metadata.event_code} ({severity}) is muted: {status_detail} (resource {resources[].uid}, account {cloud.account.uid}) [{_file}]"
+
+  # The OCSF file is a bare array with no file-level object, so the report's age is judged over its
+  # findings: stale when not one finding carries an event time inside the limit. Findings without a
+  # readable time are not counted, and the evidence says how many there were.
+  - id: PROWLER-REPORT-STALE
+    title: Prowler results are out of date
+    kind: missing
+    lens: security
+    category: MON
+    severity: medium
+    entity: prowler-report
+    why: >-
+      The Prowler findings are only as current as the scan they came from. With no recent scan the
+      cloud accounts look exactly like accounts with nothing wrong.
+    fix: >-
+      Schedule Prowler for every account and copy each run's .ocsf.json into imports\prowler\.
+    refs: [NIST-800-53:CA-7, CIS-Controls-v8:7.5]
+    refresh: 1d
+    query:
+      protocol: file
+      key: finding_info.uid
+      name: resources[].uid
+      path: "prowler/*.ocsf.json"
+      format: json
+    count:
+      op: lt
+      value: 1
+      where:
+        any:
+          - { field: time_dt, op: age-lt, value: 35, threshold: prowler.max-report-age-days }
+          - { field: finding_info.created_time_dt, op: age-lt, value: 35, threshold: prowler.max-report-age-days }
+    evidence: "None of the {rows} findings in the newest Prowler output is newer than the limit"

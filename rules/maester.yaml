@@ -9,7 +9,8 @@ integration: files
 # Copy TestResults-*.json into imports\maester\. The newest matching file is read.
 # Each test is an object in the top-level Tests array with Id, Title, Name, Severity
 # (Critical, High, Medium, Low, Info or empty), Result (Passed, Failed, Skipped, NotRun, Error,
-# Investigate), Block and Tag.
+# Investigate), Block and Tag. The root object also carries the run's ExecutedAt time and the
+# module's CurrentVersion and LatestVersion.
 rules:
   - id: MAESTER-FAILED
     title: Maester test failed
@@ -106,13 +107,20 @@ rules:
     fix: >-
       Schedule Invoke-Maester (for example in a pipeline) and copy each new TestResults-*.json into
       imports\maester\.
+    refs: [NIST-800-53:CA-7]
     refresh: 1d
-    # A small object every results file carries, so this rule reads one row per file.
+    # No items: the file's root object is the one row, so every results file gives a verdict. The
+    # run's own ExecutedAt is judged (a downloaded or extracted file gets a new modified time); the
+    # file's modified time stands in only when the results carry no ExecutedAt.
     query:
       protocol: file
       key: _file
       path: "maester/TestResults-*.json"
       format: json
-      items: PowerShellInfo
-    each: { field: _modified, op: age-gt, value: 35, threshold: maester.max-report-age-days }
-    evidence: "{_file} was written {_modified}"
+    each:
+      any:
+        - { field: ExecutedAt, op: age-gt, value: 35, threshold: maester.max-report-age-days }
+        - all:
+            - { field: ExecutedAt, op: absent }
+            - { field: _modified, op: age-gt, value: 35, threshold: maester.max-report-age-days }
+    evidence: "{_file}: run executed {ExecutedAt}, file written {_modified}"

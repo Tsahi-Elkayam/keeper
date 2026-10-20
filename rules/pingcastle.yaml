@@ -241,3 +241,59 @@ rules:
       items: "/HealthcheckData/GenerationDate"
     each: { field: _text, op: age-gt, value: 35, threshold: pingcastle.max-report-age-days }
     evidence: "{_file} was generated {_text}"
+
+  # Machine proof for obligation ad.krbtgt-rotation: the same threshold governs both, so one number
+  # (threshold obligations.ad.krbtgt-rotation.interval-days) sets the rotation interval.
+  - id: PC-KRBTGT-AGE
+    title: krbtgt password older than the rotation interval (PingCastle)
+    kind: misconfigured
+    lens: security
+    category: AUT
+    severity: high
+    entity: domain
+    why: >-
+      The krbtgt key signs every Kerberos ticket in the domain; until it changes, a copy an attacker
+      took keeps forging valid tickets for any account. PingCastle reads the date of the last change
+      from the directory itself, so this proves the rotation independently of what was attested.
+    fix: >-
+      Reset the krbtgt password twice, letting replication finish between the two resets, attest
+      obligation ad.krbtgt-rotation, then run PingCastle again and replace the XML in
+      imports\pingcastle\.
+    refs: [NIST-800-53:IA-5, NIST-800-53:SC-12, MITRE-ATTACK:T1558.001]
+    refresh: 1d
+    query:
+      protocol: file
+      key: _file
+      path: "pingcastle/ad_hc_*.xml"
+      format: xml
+      items: "/HealthcheckData/KrbtgtLastChangeDate"
+    each: { field: _text, op: age-gt, value: 180, threshold: obligations.ad.krbtgt-rotation.interval-days }
+    evidence: "{_file}: krbtgt password last changed {_text}"
+
+  # msDS-Behavior-Version of the domain: 0 = 2000, 2 = 2003, 3 = 2008, 4 = 2008 R2, 5 = 2012,
+  # 6 = 2012 R2, 7 = 2016 (also the level of 2019 and 2022), 10 = 2025.
+  - id: PC-FUNCTIONAL-LEVEL-OLD
+    title: Domain functional level is below Windows Server 2016 (PingCastle)
+    kind: misconfigured
+    lens: security
+    category: LCM
+    severity: medium
+    entity: domain
+    why: >-
+      Below the 2016 functional level the domain cannot use the newer Kerberos protections
+      (authentication policies and silos, stronger ticket handling) and keeps behaviours that later
+      levels removed. A low level usually also means an old domain controller is, or recently was,
+      still in service.
+    fix: >-
+      Retire the last domain controllers running the older version, then raise the domain functional
+      level (and afterwards the forest's). Run PingCastle again and replace the XML.
+    refs: [NIST-800-53:CM-6, NIST-800-53:SA-22]
+    refresh: 1d
+    query:
+      protocol: file
+      key: _file
+      path: "pingcastle/ad_hc_*.xml"
+      format: xml
+      items: "/HealthcheckData/DomainFunctionalLevel"
+    each: { field: _text, op: lt, value: 7, threshold: pingcastle.min-functional-level }
+    evidence: "{_file}: domain functional level {_text}"

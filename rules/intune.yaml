@@ -33,7 +33,7 @@ rules:
     query:
       protocol: graph
       path: /deviceManagement/managedDevices
-      select: [id, deviceName, operatingSystem, osVersion, complianceState, lastSyncDateTime, enrolledDateTime, jailBroken, isEncrypted, managedDeviceOwnerType, managementAgent, userPrincipalName, managementCertificateExpirationDate, partnerReportedThreatState, androidSecurityPatchLevel, complianceGracePeriodExpirationDateTime, serialNumber, model]
+      select: [id, deviceName, operatingSystem, osVersion, complianceState, lastSyncDateTime, enrolledDateTime, jailBroken, isEncrypted, managedDeviceOwnerType, managementAgent, userPrincipalName, managementCertificateExpirationDate, partnerReportedThreatState, androidSecurityPatchLevel, complianceGracePeriodExpirationDateTime, serialNumber, model, isSupervised]
       key: id
       name: deviceName
     each:
@@ -54,7 +54,7 @@ rules:
     query:
       protocol: graph
       path: /deviceManagement/managedDevices
-      select: [id, deviceName, operatingSystem, osVersion, complianceState, lastSyncDateTime, enrolledDateTime, jailBroken, isEncrypted, managedDeviceOwnerType, managementAgent, userPrincipalName, managementCertificateExpirationDate, partnerReportedThreatState, androidSecurityPatchLevel, complianceGracePeriodExpirationDateTime, serialNumber, model]
+      select: [id, deviceName, operatingSystem, osVersion, complianceState, lastSyncDateTime, enrolledDateTime, jailBroken, isEncrypted, managedDeviceOwnerType, managementAgent, userPrincipalName, managementCertificateExpirationDate, partnerReportedThreatState, androidSecurityPatchLevel, complianceGracePeriodExpirationDateTime, serialNumber, model, isSupervised]
       key: id
       name: deviceName
     each: { field: lastSyncDateTime, op: age-gt, value: 30, threshold: intune.device-stale-days }
@@ -73,7 +73,7 @@ rules:
     query:
       protocol: graph
       path: /deviceManagement/managedDevices
-      select: [id, deviceName, operatingSystem, osVersion, complianceState, lastSyncDateTime, enrolledDateTime, jailBroken, isEncrypted, managedDeviceOwnerType, managementAgent, userPrincipalName, managementCertificateExpirationDate, partnerReportedThreatState, androidSecurityPatchLevel, complianceGracePeriodExpirationDateTime, serialNumber, model]
+      select: [id, deviceName, operatingSystem, osVersion, complianceState, lastSyncDateTime, enrolledDateTime, jailBroken, isEncrypted, managedDeviceOwnerType, managementAgent, userPrincipalName, managementCertificateExpirationDate, partnerReportedThreatState, androidSecurityPatchLevel, complianceGracePeriodExpirationDateTime, serialNumber, model, isSupervised]
       key: id
       name: deviceName
     each: { field: jailBroken, op: eq, value: 'True' }
@@ -92,7 +92,7 @@ rules:
     query:
       protocol: graph
       path: /deviceManagement/managedDevices
-      select: [id, deviceName, operatingSystem, osVersion, complianceState, lastSyncDateTime, enrolledDateTime, jailBroken, isEncrypted, managedDeviceOwnerType, managementAgent, userPrincipalName, managementCertificateExpirationDate, partnerReportedThreatState, androidSecurityPatchLevel, complianceGracePeriodExpirationDateTime, serialNumber, model]
+      select: [id, deviceName, operatingSystem, osVersion, complianceState, lastSyncDateTime, enrolledDateTime, jailBroken, isEncrypted, managedDeviceOwnerType, managementAgent, userPrincipalName, managementCertificateExpirationDate, partnerReportedThreatState, androidSecurityPatchLevel, complianceGracePeriodExpirationDateTime, serialNumber, model, isSupervised]
       key: id
       name: deviceName
     each:
@@ -113,7 +113,7 @@ rules:
     query:
       protocol: graph
       path: /deviceManagement/managedDevices
-      select: [id, deviceName, operatingSystem, osVersion, complianceState, lastSyncDateTime, enrolledDateTime, jailBroken, isEncrypted, managedDeviceOwnerType, managementAgent, userPrincipalName, managementCertificateExpirationDate, partnerReportedThreatState, androidSecurityPatchLevel, complianceGracePeriodExpirationDateTime, serialNumber, model]
+      select: [id, deviceName, operatingSystem, osVersion, complianceState, lastSyncDateTime, enrolledDateTime, jailBroken, isEncrypted, managedDeviceOwnerType, managementAgent, userPrincipalName, managementCertificateExpirationDate, partnerReportedThreatState, androidSecurityPatchLevel, complianceGracePeriodExpirationDateTime, serialNumber, model, isSupervised]
       key: id
       name: deviceName
     each:
@@ -135,7 +135,7 @@ rules:
     query:
       protocol: graph
       path: /deviceManagement/managedDevices
-      select: [id, deviceName, operatingSystem, osVersion, complianceState, lastSyncDateTime, enrolledDateTime, jailBroken, isEncrypted, managedDeviceOwnerType, managementAgent, userPrincipalName, managementCertificateExpirationDate, partnerReportedThreatState, androidSecurityPatchLevel, complianceGracePeriodExpirationDateTime, serialNumber, model]
+      select: [id, deviceName, operatingSystem, osVersion, complianceState, lastSyncDateTime, enrolledDateTime, jailBroken, isEncrypted, managedDeviceOwnerType, managementAgent, userPrincipalName, managementCertificateExpirationDate, partnerReportedThreatState, androidSecurityPatchLevel, complianceGracePeriodExpirationDateTime, serialNumber, model, isSupervised]
       key: id
       name: deviceName
     each:
@@ -156,7 +156,7 @@ rules:
     query:
       protocol: graph
       path: /deviceManagement/managedDevices
-      select: [id, deviceName, operatingSystem, osVersion, complianceState, lastSyncDateTime, enrolledDateTime, jailBroken, isEncrypted, managedDeviceOwnerType, managementAgent, userPrincipalName, managementCertificateExpirationDate, partnerReportedThreatState, androidSecurityPatchLevel, complianceGracePeriodExpirationDateTime, serialNumber, model]
+      select: [id, deviceName, operatingSystem, osVersion, complianceState, lastSyncDateTime, enrolledDateTime, jailBroken, isEncrypted, managedDeviceOwnerType, managementAgent, userPrincipalName, managementCertificateExpirationDate, partnerReportedThreatState, androidSecurityPatchLevel, complianceGracePeriodExpirationDateTime, serialNumber, model, isSupervised]
       key: id
       name: deviceName
     each:
@@ -179,7 +179,7 @@ rules:
     query:
       protocol: graph
       path: /deviceManagement/managedDevices
-      select: [id, deviceName, operatingSystem, osVersion, complianceState, lastSyncDateTime, enrolledDateTime, jailBroken, isEncrypted, managedDeviceOwnerType, managementAgent, userPrincipalName, managementCertificateExpirationDate, partnerReportedThreatState, androidSecurityPatchLevel, complianceGracePeriodExpirationDateTime, serialNumber, model]
+      select: [id, deviceName, operatingSystem, osVersion, complianceState, lastSyncDateTime, enrolledDateTime, jailBroken, isEncrypted, managedDeviceOwnerType, managementAgent, userPrincipalName, managementCertificateExpirationDate, partnerReportedThreatState, androidSecurityPatchLevel, complianceGracePeriodExpirationDateTime, serialNumber, model, isSupervised]
       key: id
       name: deviceName
     each:
@@ -201,7 +201,7 @@ rules:
     query:
       protocol: graph
       path: /deviceManagement/managedDevices
-      select: [id, deviceName, operatingSystem, osVersion, complianceState, lastSyncDateTime, enrolledDateTime, jailBroken, isEncrypted, managedDeviceOwnerType, managementAgent, userPrincipalName, managementCertificateExpirationDate, partnerReportedThreatState, androidSecurityPatchLevel, complianceGracePeriodExpirationDateTime, serialNumber, model]
+      select: [id, deviceName, operatingSystem, osVersion, complianceState, lastSyncDateTime, enrolledDateTime, jailBroken, isEncrypted, managedDeviceOwnerType, managementAgent, userPrincipalName, managementCertificateExpirationDate, partnerReportedThreatState, androidSecurityPatchLevel, complianceGracePeriodExpirationDateTime, serialNumber, model, isSupervised]
       key: id
       name: deviceName
     each:
@@ -223,7 +223,7 @@ rules:
     query:
       protocol: graph
       path: /deviceManagement/managedDevices
-      select: [id, deviceName, operatingSystem, osVersion, complianceState, lastSyncDateTime, enrolledDateTime, jailBroken, isEncrypted, managedDeviceOwnerType, managementAgent, userPrincipalName, managementCertificateExpirationDate, partnerReportedThreatState, androidSecurityPatchLevel, complianceGracePeriodExpirationDateTime, serialNumber, model]
+      select: [id, deviceName, operatingSystem, osVersion, complianceState, lastSyncDateTime, enrolledDateTime, jailBroken, isEncrypted, managedDeviceOwnerType, managementAgent, userPrincipalName, managementCertificateExpirationDate, partnerReportedThreatState, androidSecurityPatchLevel, complianceGracePeriodExpirationDateTime, serialNumber, model, isSupervised]
       key: id
       name: deviceName
     each:
@@ -245,7 +245,7 @@ rules:
     query:
       protocol: graph
       path: /deviceManagement/managedDevices
-      select: [id, deviceName, operatingSystem, osVersion, complianceState, lastSyncDateTime, enrolledDateTime, jailBroken, isEncrypted, managedDeviceOwnerType, managementAgent, userPrincipalName, managementCertificateExpirationDate, partnerReportedThreatState, androidSecurityPatchLevel, complianceGracePeriodExpirationDateTime, serialNumber, model]
+      select: [id, deviceName, operatingSystem, osVersion, complianceState, lastSyncDateTime, enrolledDateTime, jailBroken, isEncrypted, managedDeviceOwnerType, managementAgent, userPrincipalName, managementCertificateExpirationDate, partnerReportedThreatState, androidSecurityPatchLevel, complianceGracePeriodExpirationDateTime, serialNumber, model, isSupervised]
       key: id
       name: deviceName
     each:
@@ -270,7 +270,7 @@ rules:
     query:
       protocol: graph
       path: /deviceManagement/managedDevices
-      select: [id, deviceName, operatingSystem, osVersion, complianceState, lastSyncDateTime, enrolledDateTime, jailBroken, isEncrypted, managedDeviceOwnerType, managementAgent, userPrincipalName, managementCertificateExpirationDate, partnerReportedThreatState, androidSecurityPatchLevel, complianceGracePeriodExpirationDateTime, serialNumber, model]
+      select: [id, deviceName, operatingSystem, osVersion, complianceState, lastSyncDateTime, enrolledDateTime, jailBroken, isEncrypted, managedDeviceOwnerType, managementAgent, userPrincipalName, managementCertificateExpirationDate, partnerReportedThreatState, androidSecurityPatchLevel, complianceGracePeriodExpirationDateTime, serialNumber, model, isSupervised]
       key: id
       name: deviceName
     each:
@@ -295,7 +295,7 @@ rules:
     query:
       protocol: graph
       path: /deviceManagement/managedDevices
-      select: [id, deviceName, operatingSystem, osVersion, complianceState, lastSyncDateTime, enrolledDateTime, jailBroken, isEncrypted, managedDeviceOwnerType, managementAgent, userPrincipalName, managementCertificateExpirationDate, partnerReportedThreatState, androidSecurityPatchLevel, complianceGracePeriodExpirationDateTime, serialNumber, model]
+      select: [id, deviceName, operatingSystem, osVersion, complianceState, lastSyncDateTime, enrolledDateTime, jailBroken, isEncrypted, managedDeviceOwnerType, managementAgent, userPrincipalName, managementCertificateExpirationDate, partnerReportedThreatState, androidSecurityPatchLevel, complianceGracePeriodExpirationDateTime, serialNumber, model, isSupervised]
       key: id
       name: deviceName
     each: { field: partnerReportedThreatState, op: in, value: [compromised, highSeverity, mediumSeverity] }
@@ -314,7 +314,7 @@ rules:
     query:
       protocol: graph
       path: /deviceManagement/managedDevices
-      select: [id, deviceName, operatingSystem, osVersion, complianceState, lastSyncDateTime, enrolledDateTime, jailBroken, isEncrypted, managedDeviceOwnerType, managementAgent, userPrincipalName, managementCertificateExpirationDate, partnerReportedThreatState, androidSecurityPatchLevel, complianceGracePeriodExpirationDateTime, serialNumber, model]
+      select: [id, deviceName, operatingSystem, osVersion, complianceState, lastSyncDateTime, enrolledDateTime, jailBroken, isEncrypted, managedDeviceOwnerType, managementAgent, userPrincipalName, managementCertificateExpirationDate, partnerReportedThreatState, androidSecurityPatchLevel, complianceGracePeriodExpirationDateTime, serialNumber, model, isSupervised]
       key: id
       name: deviceName
     each:
@@ -322,6 +322,30 @@ rules:
         - { field: complianceState, op: eq, value: inGracePeriod }
         - { field: complianceGracePeriodExpirationDateTime, op: until-lt, value: 3, threshold: intune.grace-notice-days }
     evidence: "{deviceName} ({userPrincipalName}): grace period ends {complianceGracePeriodExpirationDateTime}"
+
+  - id: INTUNE-DEVICE-IOS-CORPORATE-UNSUPERVISED
+    title: Corporate iPhone or iPad is not supervised
+    kind: misconfigured
+    category: CFG
+    severity: low
+    entity: managed-device
+    lens: security
+    why: "Most restrictive controls on Apple devices (blocking apps, silent app installs, activation lock bypass, preventing removal of management) only apply to supervised devices; an unsupervised corporate device gets the weak set."
+    fix: "Register the device in Apple Business Manager and re-enrol it through automated device enrolment so it is supervised."
+    refs: ["NIST-800-53:AC-19", "NIST-800-53:CM-6"]
+    query:
+      protocol: graph
+      path: /deviceManagement/managedDevices
+      select: [id, deviceName, operatingSystem, osVersion, complianceState, lastSyncDateTime, enrolledDateTime, jailBroken, isEncrypted, managedDeviceOwnerType, managementAgent, userPrincipalName, managementCertificateExpirationDate, partnerReportedThreatState, androidSecurityPatchLevel, complianceGracePeriodExpirationDateTime, serialNumber, model, isSupervised]
+      key: id
+      name: deviceName
+    each:
+      all:
+        - { field: operatingSystem, op: match, value: '^(iOS|iPadOS)$' }
+        - { field: managedDeviceOwnerType, op: eq, value: company }
+        - { field: isSupervised, op: eq, value: false }
+        - { field: lastSyncDateTime, op: age-lt, value: 30, threshold: intune.device-stale-days }
+    evidence: "{deviceName} ({operatingSystem} {osVersion}, {userPrincipalName}, serial {serialNumber}): not supervised"
 
   # =================================================================== compliance policies ===
   - id: INTUNE-COMPLIANCE-NONE
@@ -461,6 +485,261 @@ rules:
         - { field: storageRequireEncryption, op: eq, value: false }
     evidence: "{displayName}: bitLockerEnabled {bitLockerEnabled}, storageRequireEncryption {storageRequireEncryption}"
 
+  # Platform of a compliance policy, told by a field only that platform's type carries (the
+  # @odata.type is not addressable): iOS passcodeBlockSimple, macOS systemIntegrityProtectionEnabled,
+  # Android (all types) securityRequireSafetyNetAttestationBasicIntegrity, Windows bitLockerEnabled.
+  - id: INTUNE-COMPLIANCE-IOS-NONE
+    title: No assigned compliance policy for iOS and iPadOS
+    kind: missing
+    category: CFG
+    severity: medium
+    entity: tenant
+    lens: security
+    why: "Without an assigned iOS compliance policy no iPhone or iPad is ever judged, so passcode, jailbreak and OS level go unchecked and 'require compliant device' means nothing for them. A tenant with no Apple devices accepts this finding."
+    fix: "Create and assign an iOS/iPadOS compliance policy: passcode required, jailbreak blocked, minimum OS version, threat level if a threat-defence connector exists."
+    refs: [CIS-M365:4.1, "NIST-800-53:CM-6", "NIST-800-53:AC-19"]
+    query:
+      protocol: graph
+      path: /deviceManagement/deviceCompliancePolicies
+      expand: assignments
+      key: id
+      name: displayName
+    count:
+      op: lt
+      value: 1
+      where:
+        all:
+          - { field: passcodeBlockSimple, op: exists }
+          - { field: assignments, op: notempty }
+    evidence: "{count} assigned iOS compliance policies among {rows} compliance policies"
+
+  - id: INTUNE-COMPLIANCE-MACOS-NONE
+    title: No assigned compliance policy for macOS
+    kind: missing
+    category: CFG
+    severity: medium
+    entity: tenant
+    lens: security
+    why: "Without an assigned macOS compliance policy no Mac is judged for FileVault, firewall, System Integrity Protection or OS level. A tenant with no Macs accepts this finding."
+    fix: "Create and assign a macOS compliance policy requiring FileVault, the firewall, System Integrity Protection and a minimum OS version."
+    refs: [CIS-M365:4.1, "NIST-800-53:CM-6", "NIST-800-53:AC-19"]
+    query:
+      protocol: graph
+      path: /deviceManagement/deviceCompliancePolicies
+      expand: assignments
+      key: id
+      name: displayName
+    count:
+      op: lt
+      value: 1
+      where:
+        all:
+          - { field: systemIntegrityProtectionEnabled, op: exists }
+          - { field: assignments, op: notempty }
+    evidence: "{count} assigned macOS compliance policies among {rows} compliance policies"
+
+  - id: INTUNE-COMPLIANCE-ANDROID-NONE
+    title: No assigned compliance policy for Android
+    kind: missing
+    category: CFG
+    severity: medium
+    entity: tenant
+    lens: security
+    why: "Without an assigned Android compliance policy no Android device is judged for root, Play Integrity, encryption or patch level. Read from the beta API so that work-profile and fully managed policy types count. A tenant with no Android devices accepts this finding."
+    fix: "Create and assign Android Enterprise compliance policies (work profile and fully managed) with Play Integrity, encryption, a passcode and a minimum security patch level."
+    refs: [CIS-M365:4.1, "NIST-800-53:CM-6", "NIST-800-53:AC-19"]
+    query:
+      protocol: graph
+      version: beta
+      path: /deviceManagement/deviceCompliancePolicies
+      expand: assignments
+      key: id
+      name: displayName
+    count:
+      op: lt
+      value: 1
+      where:
+        all:
+          - { field: securityRequireSafetyNetAttestationBasicIntegrity, op: exists }
+          - { field: assignments, op: notempty }
+    evidence: "{count} assigned Android compliance policies among {rows} compliance policies"
+
+  - id: INTUNE-COMPLIANCE-NO-THREAT-LEVEL
+    title: Compliance policy ignores the device threat level
+    kind: misconfigured
+    category: CFG
+    severity: medium
+    entity: compliance-policy
+    lens: security
+    why: "When a threat-defence connector (Defender for Endpoint or a partner) feeds Intune, a compliance policy that does not use the device threat level keeps a device with active malware compliant, and Conditional Access keeps letting it in. Without a connector this is moot (INTUNE-MTD-NONE)."
+    fix: "Turn on 'require the device to be at or under the machine risk score' (Windows) or the threat level setting (mobile) in each compliance policy, once the connector is enabled for the platform."
+    refs: ["NIST-800-53:SI-3", "NIST-800-53:SI-4", "CIS-Controls-v8:10.1"]
+    query:
+      protocol: graph
+      version: beta
+      path: /deviceManagement/deviceCompliancePolicies
+      key: id
+      name: displayName
+    each: { field: deviceThreatProtectionEnabled, op: eq, value: false }
+    evidence: "{displayName}: deviceThreatProtectionEnabled {deviceThreatProtectionEnabled}"
+
+  - id: INTUNE-COMPLIANCE-MOBILE-NO-PASSWORD
+    title: Mobile or Mac compliance policy does not require a device passcode
+    kind: misconfigured
+    category: AUT
+    severity: medium
+    entity: compliance-policy
+    lens: security
+    why: "A lost phone, tablet or Mac without a passcode hands its mail, files and tokens to whoever picks it up."
+    fix: "Require a passcode of at least 6 digits with a short inactivity lock in the policy."
+    refs: ["NIST-800-53:IA-5(1)", "NIST-800-53:AC-19", "CIS-Controls-v8:4.3"]
+    query:
+      protocol: graph
+      version: beta
+      path: /deviceManagement/deviceCompliancePolicies
+      key: id
+      name: displayName
+    each:
+      any:
+        - { field: passcodeRequired, op: eq, value: false }
+        - all:
+            - any:
+                - { field: securityRequireSafetyNetAttestationBasicIntegrity, op: exists }
+                - { field: systemIntegrityProtectionEnabled, op: exists }
+            - { field: passwordRequired, op: eq, value: false }
+    evidence: "{displayName}: passcodeRequired {passcodeRequired}, passwordRequired {passwordRequired}"
+
+  - id: INTUNE-COMPLIANCE-WINDOWS-NO-AV
+    title: Windows compliance policy requires no antivirus
+    kind: misconfigured
+    category: CFG
+    severity: medium
+    entity: compliance-policy
+    lens: security
+    why: "A Windows compliance policy that requires neither Defender, real-time protection nor any registered antivirus marks a PC with protection switched off as compliant. The settings are only exposed in the beta API."
+    fix: "Require Microsoft Defender Antimalware, real-time protection and 'antivirus required' in the Windows compliance policy."
+    refs: ["NIST-800-53:SI-3", "CIS-Controls-v8:10.1", "MITRE-ATTACK:T1562.001"]
+    query:
+      protocol: graph
+      version: beta
+      path: /deviceManagement/deviceCompliancePolicies
+      key: id
+      name: displayName
+    each:
+      all:
+        - { field: bitLockerEnabled, op: exists }
+        - { field: defenderEnabled, op: eq, value: false }
+        - { field: rtpEnabled, op: eq, value: false }
+        - { field: antivirusRequired, op: eq, value: false }
+    evidence: "{displayName}: defenderEnabled {defenderEnabled}, rtpEnabled {rtpEnabled}, antivirusRequired {antivirusRequired}"
+
+  - id: INTUNE-COMPLIANCE-WINDOWS-NO-HEALTH-ATTESTATION
+    title: Assigned Windows compliance policy requires no device health check
+    kind: misconfigured
+    category: CFG
+    severity: low
+    entity: compliance-policy
+    lens: security
+    why: "Secure Boot, code integrity, BitLocker and early-launch antimalware reported by device health attestation are what tell a tampered boot chain from a healthy one; a policy that requires none of them cannot."
+    fix: "Require at least Secure Boot, code integrity and BitLocker through device health attestation in the Windows compliance policy."
+    refs: ["NIST-800-53:SI-7", "NIST-800-53:SC-28", "CIS-Controls-v8:3.6"]
+    query:
+      protocol: graph
+      path: /deviceManagement/deviceCompliancePolicies
+      expand: assignments
+      key: id
+      name: displayName
+    each:
+      all:
+        - { field: assignments, op: notempty }
+        - { field: bitLockerEnabled, op: eq, value: false }
+        - { field: secureBootEnabled, op: eq, value: false }
+        - { field: codeIntegrityEnabled, op: eq, value: false }
+        - { field: earlyLaunchAntiMalwareDriverEnabled, op: eq, value: false }
+    evidence: "{displayName}: BitLocker {bitLockerEnabled}, Secure Boot {secureBootEnabled}, code integrity {codeIntegrityEnabled}, ELAM {earlyLaunchAntiMalwareDriverEnabled}"
+
+  - id: INTUNE-COMPLIANCE-MACOS-WEAK
+    title: Assigned macOS compliance policy misses FileVault, firewall or SIP
+    kind: misconfigured
+    category: CFG
+    severity: medium
+    entity: compliance-policy
+    lens: security
+    why: "FileVault protects the data on a lost Mac, the firewall its network exposure and System Integrity Protection its system files; a policy without any one of them calls a Mac without that protection compliant."
+    fix: "Require FileVault (storage encryption), the firewall and System Integrity Protection in the macOS compliance policy."
+    refs: ["NIST-800-53:SC-28", "NIST-800-53:SC-7", "NIST-800-53:SI-7"]
+    query:
+      protocol: graph
+      path: /deviceManagement/deviceCompliancePolicies
+      expand: assignments
+      key: id
+      name: displayName
+    each:
+      all:
+        - { field: systemIntegrityProtectionEnabled, op: exists }
+        - { field: assignments, op: notempty }
+        - any:
+            - { field: storageRequireEncryption, op: eq, value: false }
+            - { field: firewallEnabled, op: eq, value: false }
+            - { field: systemIntegrityProtectionEnabled, op: eq, value: false }
+    evidence: "{displayName}: FileVault {storageRequireEncryption}, firewall {firewallEnabled}, SIP {systemIntegrityProtectionEnabled}"
+
+  - id: INTUNE-COMPLIANCE-ANDROID-NO-ENCRYPTION
+    title: Android compliance policy does not require encryption
+    kind: misconfigured
+    category: CFG
+    severity: medium
+    entity: compliance-policy
+    lens: security
+    why: "Android Enterprise devices are encrypted by default, but the policy is what reports an unencrypted legacy or modified device as noncompliant."
+    fix: "Require storage encryption in every Android compliance policy."
+    refs: ["NIST-800-53:SC-28", "NIST-800-53:AC-19"]
+    query:
+      protocol: graph
+      version: beta
+      path: /deviceManagement/deviceCompliancePolicies
+      key: id
+      name: displayName
+    each:
+      all:
+        - { field: securityRequireSafetyNetAttestationBasicIntegrity, op: exists }
+        - { field: storageRequireEncryption, op: eq, value: false }
+    evidence: "{displayName}: storageRequireEncryption {storageRequireEncryption}"
+
+  - id: INTUNE-COMPLIANCE-NO-OS-MINIMUM
+    title: Compliance policy sets no minimum OS version
+    kind: misconfigured
+    category: LCM
+    severity: low
+    entity: compliance-policy
+    why: "Without a minimum OS version the 'unsupported OS' device findings have nothing that enforces them: an out-of-support device stays compliant."
+    fix: "Set the minimum to the oldest release that still receives security updates, and raise it as releases age."
+    refs: ["NIST-800-53:SI-2", "NIST-800-53:SA-22"]
+    query:
+      protocol: graph
+      version: beta
+      path: /deviceManagement/deviceCompliancePolicies
+      key: id
+      name: displayName
+    each: { field: osMinimumVersion, op: empty }
+    evidence: "{displayName}: no minimum OS version"
+
+  - id: INTUNE-COMPLIANCE-UNKNOWN-DEVICES
+    title: Devices have never been evaluated for compliance
+    kind: broken
+    category: HLT
+    severity: low
+    entity: intune-tenant
+    why: "Devices in the unknown compliance state were never judged by any policy; they usually have a broken management channel or an expiring MDM certificate (INTUNE-DEVICE-MGMT-CERT-EXPIRY)."
+    fix: "Force a sync on the affected devices; re-enrol the ones that stay unknown and check why they stopped checking in."
+    refs: ["NIST-800-53:CM-6", "NIST-800-53:CM-8"]
+    query:
+      protocol: graph
+      path: /deviceManagement/deviceCompliancePolicyDeviceStateSummary
+      key: id
+    each: { field: unknownDeviceCount, op: gt, value: 0, threshold: intune.unknown-compliance-devices-max }
+    evidence: "{unknownDeviceCount} unknown, {compliantDeviceCount} compliant, {nonCompliantDeviceCount} noncompliant, {errorDeviceCount} in error, {inGracePeriodCount} in grace period"
+
   # =========================================================== configuration profiles ===
   - id: INTUNE-CONFIG-UNASSIGNED
     title: Device configuration profile is not assigned
@@ -512,6 +791,178 @@ rules:
       key: id
     each: { field: conflictDeviceCount, op: gt, value: 0, threshold: intune.config-conflict-devices-max }
     evidence: "{conflictDeviceCount} device(s) in conflict"
+
+  - id: INTUNE-CONFIG-PROFILE-ERRORS
+    title: Configuration profile fails on devices
+    kind: broken
+    category: CFG
+    severity: medium
+    entity: configuration-profile
+    why: "Devices in error or failed for a profile did not get its settings (a security baseline, Wi-Fi, certificates); the tenant summary says how many devices, this names the profile."
+    fix: "Open the profile's device status, read the failing setting and fix the profile or the devices."
+    refs: ["NIST-800-53:CM-6"]
+    query:
+      protocol: graph
+      path: /deviceManagement/deviceConfigurations
+      expand: deviceStatusOverview
+      key: id
+      name: displayName
+    each:
+      any:
+        - { field: deviceStatusOverview.errorCount, op: gt, value: 0, threshold: intune.profile-error-devices-max }
+        - { field: deviceStatusOverview.failedCount, op: gt, value: 0, threshold: intune.profile-error-devices-max }
+    evidence: "{displayName}: {deviceStatusOverview.errorCount} in error, {deviceStatusOverview.failedCount} failed, {deviceStatusOverview.successCount} succeeded"
+
+  # ===================================================================== Windows updates ===
+  # Update rings are deviceConfigurations of type windowsUpdateForBusinessConfiguration, told by
+  # qualityUpdatesDeferralPeriodInDays (only that type carries it).
+  - id: INTUNE-UPDATE-RING-NONE
+    title: No assigned Windows Update ring
+    kind: missing
+    category: LCM
+    severity: medium
+    entity: tenant
+    lens: security
+    why: "Without an assigned update ring Windows update behaviour is whatever each device's local settings say, which in practice lets users defer updates indefinitely."
+    fix: "Create a pilot ring and a broad ring with short quality-update deferrals and deadlines; assign the broad ring to all Windows devices."
+    refs: ["NIST-800-53:SI-2", "CIS-Controls-v8:7.3"]
+    query:
+      protocol: graph
+      path: /deviceManagement/deviceConfigurations
+      expand: assignments
+      key: id
+      name: displayName
+    count:
+      op: lt
+      value: 1
+      where:
+        all:
+          - { field: qualityUpdatesDeferralPeriodInDays, op: exists }
+          - { field: assignments, op: notempty }
+    evidence: "{count} assigned update rings among {rows} configuration profiles"
+
+  - id: INTUNE-UPDATE-RING-QUALITY-PAUSED
+    title: Update ring has security (quality) updates paused
+    kind: misconfigured
+    category: LCM
+    severity:
+      daysLeft: qualityUpdatesPauseExpiryDateTime
+      ranges: [ { max: 14, value: medium } ]
+      default: high
+    deadline: qualityUpdatesPauseExpiryDateTime
+    entity: configuration-profile
+    lens: security
+    why: "A quality-update pause is set during an incident and then forgotten; it lifts itself only after 35 days, all of them without security patches for the ring's devices."
+    fix: "Resume quality updates; when one update breaks something, roll it back or exclude the affected devices instead of pausing the ring."
+    refs: ["NIST-800-53:SI-2", "CIS-Controls-v8:7.3"]
+    query:
+      protocol: graph
+      path: /deviceManagement/deviceConfigurations
+      expand: assignments
+      key: id
+      name: displayName
+    each:
+      all:
+        - { field: qualityUpdatesPaused, op: eq, value: true }
+        - { field: assignments, op: notempty }
+    evidence: "{displayName}: quality updates paused until {qualityUpdatesPauseExpiryDateTime}"
+
+  - id: INTUNE-UPDATE-RING-NO-DEADLINE
+    title: Update ring sets no short deadline for quality updates
+    kind: misconfigured
+    category: LCM
+    severity: low
+    entity: configuration-profile
+    lens: security
+    why: "Without a quality-update deadline (or with a long one) users postpone the restart that installs the patch for as long as they like. A deadline of 0 means 'install at once' and passes."
+    fix: "Set a quality-update deadline of 3 to 7 days and a grace period of 1 to 2 days."
+    refs: ["NIST-800-53:SI-2(2)", "CIS-Controls-v8:7.3"]
+    query:
+      protocol: graph
+      path: /deviceManagement/deviceConfigurations
+      expand: assignments
+      key: id
+      name: displayName
+    each:
+      all:
+        - { field: qualityUpdatesDeferralPeriodInDays, op: exists }
+        - { field: assignments, op: notempty }
+        - any:
+            - { field: deadlineForQualityUpdatesInDays, op: absent }
+            - { field: deadlineForQualityUpdatesInDays, op: gt, value: 7, threshold: intune.quality-update-deadline-max-days }
+    evidence: "{displayName}: quality-update deadline {deadlineForQualityUpdatesInDays} days, grace {deadlineGracePeriodInDays} days"
+
+  - id: INTUNE-UPDATE-RING-QUALITY-DEFERRAL-LONG
+    title: Update ring defers security (quality) updates for long
+    kind: misconfigured
+    category: LCM
+    severity: low
+    entity: configuration-profile
+    lens: security
+    why: "Every day of quality-update deferral is a day the ring's devices run with known, often exploited, vulnerabilities. Pilot rings are expected near 0; the broad ring should stay within a week."
+    fix: "Use 0-3 days for the pilot ring and at most 7 days for the broad ring; rely on deadlines rather than long deferrals."
+    refs: ["NIST-800-53:SI-2(2)", "CIS-Controls-v8:7.3"]
+    query:
+      protocol: graph
+      path: /deviceManagement/deviceConfigurations
+      expand: assignments
+      key: id
+      name: displayName
+    each:
+      all:
+        - { field: assignments, op: notempty }
+        - { field: qualityUpdatesDeferralPeriodInDays, op: gt, value: 7, threshold: intune.quality-deferral-max-days }
+    evidence: "{displayName}: quality updates deferred {qualityUpdatesDeferralPeriodInDays} days"
+
+  - id: INTUNE-UPDATE-RING-MICROSOFT-PRODUCTS-OFF
+    title: Update ring does not deliver updates for other Microsoft products
+    kind: misconfigured
+    category: LCM
+    severity: low
+    entity: configuration-profile
+    why: "With Microsoft Update off, servicing for other Microsoft products installed by MSI (.NET, SQL tools, older Office) never arrives through Windows Update."
+    fix: "Turn on 'Microsoft product updates' in the ring."
+    refs: ["NIST-800-53:SI-2"]
+    query:
+      protocol: graph
+      path: /deviceManagement/deviceConfigurations
+      expand: assignments
+      key: id
+      name: displayName
+    each:
+      all:
+        - { field: qualityUpdatesDeferralPeriodInDays, op: exists }
+        - { field: assignments, op: notempty }
+        - { field: microsoftUpdateServiceAllowed, op: eq, value: false }
+    evidence: "{displayName}: microsoftUpdateServiceAllowed {microsoftUpdateServiceAllowed}"
+
+  - id: INTUNE-FEATURE-UPDATE-PROFILE-EOS
+    title: Feature update profile pins devices to a Windows release near or past end of support
+    kind: broken
+    category: LCM
+    severity:
+      daysLeft: endOfSupportDate
+      ranges: [ { max: 0, value: high } ]
+      default: medium
+    deadline: endOfSupportDate
+    entity: feature-update-profile
+    lens: both
+    why: "A feature update profile holds its devices on the targeted release; once that release reaches end of support they stop getting security updates while the profile looks in order. Only exposed in the beta API."
+    fix: "Retarget the profile to a serviced Windows release before the end-of-support date."
+    refs: ["NIST-800-53:SI-2", "NIST-800-53:SA-22"]
+    query:
+      protocol: graph
+      version: beta
+      path: /deviceManagement/windowsFeatureUpdateProfiles
+      select: [id, displayName, featureUpdateVersion, endOfSupportDate, installFeatureUpdatesOptional, lastModifiedDateTime]
+      expand: assignments
+      key: id
+      name: displayName
+    each:
+      all:
+        - { field: assignments, op: notempty }
+        - { field: endOfSupportDate, op: until-lt, value: 90, threshold: intune.feature-update-eos-notice-days }
+    evidence: "{displayName}: targets {featureUpdateVersion}, end of support {endOfSupportDate}"
 
   # ======================================================================= tenant settings ===
   - id: INTUNE-NO-POLICY-MEANS-COMPLIANT
@@ -567,6 +1018,28 @@ rules:
       key: id
     each: { field: subscriptionState, op: ne, value: active }
     evidence: "Intune subscriptionState = {subscriptionState}"
+
+  - id: INTUNE-CLEANUP-RULE-OFF
+    title: No device clean-up rule retires stale device records
+    kind: missing
+    category: HYG
+    severity: low
+    entity: intune-tenant
+    lens: maintenance
+    why: "Without a clean-up rule, devices that stopped checking in (INTUNE-DEVICE-STALE) stay in Intune forever, keep their last compliance state and skew every report. Only exposed in the beta API."
+    fix: "Set the device clean-up rule to retire devices inactive for 90 days (or the stale threshold in use)."
+    refs: ["NIST-800-53:CM-8(3)"]
+    query:
+      protocol: graph
+      version: beta
+      path: /deviceManagement
+      select: [id, managedDeviceCleanupSettings]
+      key: id
+    each:
+      any:
+        - { field: managedDeviceCleanupSettings.deviceInactivityBeforeRetirementInDays, op: empty }
+        - { field: managedDeviceCleanupSettings.deviceInactivityBeforeRetirementInDays, op: eq, value: 0 }
+    evidence: "deviceInactivityBeforeRetirementInDays = '{managedDeviceCleanupSettings.deviceInactivityBeforeRetirementInDays}'"
 
   # ================================================================== enrolment restrictions ===
   - id: INTUNE-ENROLL-ANDROID-DEVICE-ADMIN-ALLOWED
@@ -624,6 +1097,88 @@ rules:
             - { field: androidRestriction.platformBlocked, op: eq, value: false }
             - { field: androidRestriction.personalDeviceEnrollmentBlocked, op: eq, value: false }
     evidence: "{displayName} (priority {priority}): personal blocked - Windows {windowsRestriction.personalDeviceEnrollmentBlocked}, iOS {iosRestriction.personalDeviceEnrollmentBlocked}, macOS {macOSRestriction.personalDeviceEnrollmentBlocked}, Android {androidRestriction.personalDeviceEnrollmentBlocked}"
+
+  - id: INTUNE-ENROLL-NO-OS-MINIMUM
+    title: Enrolment restriction lets any OS version enrol
+    kind: misconfigured
+    category: LCM
+    severity: low
+    entity: enrollment-configuration
+    why: "Without a minimum OS version in the platform restriction, out-of-support devices still enrol and then either fail compliance at once or, with no compliance policy, pass."
+    fix: "Set a minimum OS version for every allowed platform in the enrolment restrictions."
+    refs: ["NIST-800-53:SI-2", CIS-M365:4.2]
+    query:
+      protocol: graph
+      path: /deviceManagement/deviceEnrollmentConfigurations
+      key: id
+      name: displayName
+    each:
+      any:
+        - all:
+            - { field: windowsRestriction, op: exists }
+            - { field: windowsRestriction.platformBlocked, op: eq, value: false }
+            - { field: windowsRestriction.osMinimumVersion, op: empty }
+        - all:
+            - { field: iosRestriction, op: exists }
+            - { field: iosRestriction.platformBlocked, op: eq, value: false }
+            - { field: iosRestriction.osMinimumVersion, op: empty }
+        - all:
+            - { field: macOSRestriction, op: exists }
+            - { field: macOSRestriction.platformBlocked, op: eq, value: false }
+            - { field: macOSRestriction.osMinimumVersion, op: empty }
+        - all:
+            - { field: androidRestriction, op: exists }
+            - { field: androidRestriction.platformBlocked, op: eq, value: false }
+            - { field: androidRestriction.osMinimumVersion, op: empty }
+    evidence: "{displayName} (priority {priority}): minimum OS - Windows '{windowsRestriction.osMinimumVersion}', iOS '{iosRestriction.osMinimumVersion}', macOS '{macOSRestriction.osMinimumVersion}', Android '{androidRestriction.osMinimumVersion}'"
+
+  - id: INTUNE-ENROLL-WHFB-WEAK
+    title: Windows Hello for Business enrolment is off or weak
+    kind: misconfigured
+    category: AUT
+    severity: low
+    entity: enrollment-configuration
+    lens: security
+    why: "Windows Hello for Business replaces the password with a TPM-bound key; disabled, or allowed with a short PIN or without a TPM, it gives a weaker sign-in than it appears to."
+    fix: "Enable Windows Hello for Business with 'use a TPM' required and a minimum PIN length of 6 or more."
+    refs: ["NIST-800-53:IA-2(6)", "NIST-800-53:IA-5(1)", "CIS-Controls-v8:6.5"]
+    query:
+      protocol: graph
+      path: /deviceManagement/deviceEnrollmentConfigurations
+      key: id
+      name: displayName
+    each:
+      all:
+        - { field: pinMinimumLength, op: exists }
+        - any:
+            - { field: state, op: eq, value: disabled }
+            - all:
+                - { field: state, op: eq, value: enabled }
+                - any:
+                    - { field: pinMinimumLength, op: lt, value: 6 }
+                    - { field: securityDeviceRequired, op: eq, value: false }
+    evidence: "{displayName}: state {state}, minimum PIN {pinMinimumLength}, TPM required {securityDeviceRequired}"
+
+  - id: INTUNE-ENROLL-ESP-USE-ON-FAILURE
+    title: Enrolment status page lets users in when app installation fails
+    kind: misconfigured
+    category: CFG
+    severity: low
+    entity: enrollment-configuration
+    lens: security
+    why: "With 'allow use on install failure', a PC whose security apps failed to install during setup is handed to the user anyway and stays without them until someone notices."
+    fix: "Block device use until the required apps install, collect logs on failure and make the security apps the blocking apps."
+    refs: ["NIST-800-53:CM-2", "NIST-800-53:CM-6"]
+    query:
+      protocol: graph
+      path: /deviceManagement/deviceEnrollmentConfigurations
+      key: id
+      name: displayName
+    each:
+      all:
+        - { field: showInstallationProgress, op: eq, value: true }
+        - { field: allowDeviceUseOnInstallFailure, op: eq, value: true }
+    evidence: "{displayName} (priority {priority}): device usable after install failure"
 
   # ========================================================= Apple and Android connections ===
   - id: INTUNE-APNS-MISSING
@@ -850,6 +1405,32 @@ rules:
     each: { field: enrollmentState, op: eq, value: failed }
     evidence: "serial {serialNumber} ({model}): enrolment {enrollmentState}, last contact {lastContactedDateTime}"
 
+  - id: INTUNE-AUTOPILOT-PROFILE-USER-ADMIN
+    title: Autopilot profile makes the enrolling user a local administrator
+    kind: misconfigured
+    category: IAM
+    severity: medium
+    entity: autopilot-profile
+    lens: security
+    why: "With the user account type set to Administrator every new PC ships with its user as local admin: they can install anything, switch protections off and dump credentials. Only exposed in the beta API."
+    fix: "Set the user account type to Standard; grant local admin where needed through Windows LAPS or a managed group."
+    refs: [CIS-M365:5.1.4.4, "NIST-800-53:AC-6(1)", "MITRE-ATTACK:T1078.003"]
+    query:
+      protocol: graph
+      version: beta
+      path: /deviceManagement/windowsAutopilotDeploymentProfiles
+      select: [id, displayName, outOfBoxExperienceSetting, outOfBoxExperienceSettings, preprovisioningAllowed, deviceNameTemplate, lastModifiedDateTime]
+      expand: assignments
+      key: id
+      name: displayName
+    each:
+      all:
+        - { field: assignments, op: notempty }
+        - any:
+            - { field: outOfBoxExperienceSetting.userType, op: eq, value: administrator }
+            - { field: outOfBoxExperienceSettings.userType, op: eq, value: administrator }
+    evidence: "{displayName}: user account type {outOfBoxExperienceSetting.userType}{outOfBoxExperienceSettings.userType}"
+
   # ==================================================== threat defence and app protection ===
   - id: INTUNE-MTD-NONE
     title: No Defender for Endpoint or other threat-defence connector is set up
@@ -947,3 +1528,421 @@ rules:
       name: displayName
     count: none
     evidence: "no Android app protection policy"
+
+  - id: INTUNE-MAM-IOS-DATA-TRANSFER-OPEN
+    title: iOS app protection policy lets corporate data leave managed apps
+    kind: misconfigured
+    category: CFG
+    severity: medium
+    entity: app-protection-policy
+    lens: security
+    why: "An app protection policy that allows transfer or clipboard sharing to any app, Save As anywhere or backup of app data lets corporate mail and files walk out to personal apps and clouds - the protection exists in name only."
+    fix: "Limit data transfer and clipboard to managed apps, block Save As except to OneDrive and SharePoint, and block backup."
+    refs: ["NIST-800-53:AC-19", "NIST-800-53:SC-28", "NIST-800-53:AC-20(3)", "CIS-Controls-v8:3.1"]
+    query:
+      protocol: graph
+      path: /deviceAppManagement/iosManagedAppProtections
+      key: id
+      name: displayName
+    each:
+      all:
+        - { field: isAssigned, op: eq, value: true }
+        - any:
+            - { field: allowedOutboundDataTransferDestinations, op: eq, value: allApps }
+            - { field: allowedOutboundClipboardSharingLevel, op: eq, value: allApps }
+            - { field: saveAsBlocked, op: eq, value: false }
+            - { field: dataBackupBlocked, op: eq, value: false }
+    evidence: "{displayName}: transfer {allowedOutboundDataTransferDestinations}, clipboard {allowedOutboundClipboardSharingLevel}, Save As blocked {saveAsBlocked}, backup blocked {dataBackupBlocked}"
+
+  - id: INTUNE-MAM-ANDROID-DATA-TRANSFER-OPEN
+    title: Android app protection policy lets corporate data leave managed apps
+    kind: misconfigured
+    category: CFG
+    severity: medium
+    entity: app-protection-policy
+    lens: security
+    why: "An app protection policy that allows transfer or clipboard sharing to any app, Save As anywhere or backup of app data lets corporate mail and files walk out to personal apps and clouds - the protection exists in name only."
+    fix: "Limit data transfer and clipboard to managed apps, block Save As except to OneDrive and SharePoint, and block backup."
+    refs: ["NIST-800-53:AC-19", "NIST-800-53:SC-28", "NIST-800-53:AC-20(3)", "CIS-Controls-v8:3.1"]
+    query:
+      protocol: graph
+      path: /deviceAppManagement/androidManagedAppProtections
+      key: id
+      name: displayName
+    each:
+      all:
+        - { field: isAssigned, op: eq, value: true }
+        - any:
+            - { field: allowedOutboundDataTransferDestinations, op: eq, value: allApps }
+            - { field: allowedOutboundClipboardSharingLevel, op: eq, value: allApps }
+            - { field: saveAsBlocked, op: eq, value: false }
+            - { field: dataBackupBlocked, op: eq, value: false }
+    evidence: "{displayName}: transfer {allowedOutboundDataTransferDestinations}, clipboard {allowedOutboundClipboardSharingLevel}, Save As blocked {saveAsBlocked}, backup blocked {dataBackupBlocked}"
+
+  - id: INTUNE-MAM-IOS-NO-PIN
+    title: iOS app protection policy requires no app PIN or allows jailbroken devices
+    kind: misconfigured
+    category: AUT
+    severity: medium
+    entity: app-protection-policy
+    lens: security
+    why: "Without an app PIN anyone holding the unlocked phone opens corporate mail; without the device-condition check a jailbroken device runs the managed apps with their protections bypassed."
+    fix: "Require a 6-digit app PIN (biometrics allowed) and block jailbroken devices in the policy's conditional launch."
+    refs: ["NIST-800-53:IA-5(1)", "NIST-800-53:AC-19", "NIST-800-53:SI-7"]
+    query:
+      protocol: graph
+      path: /deviceAppManagement/iosManagedAppProtections
+      key: id
+      name: displayName
+    each:
+      all:
+        - { field: isAssigned, op: eq, value: true }
+        - any:
+            - { field: pinRequired, op: eq, value: false }
+            - { field: deviceComplianceRequired, op: eq, value: false }
+    evidence: "{displayName}: PIN required {pinRequired} (minimum {minimumPinLength}), block jailbroken {deviceComplianceRequired}"
+
+  - id: INTUNE-MAM-ANDROID-NO-PIN
+    title: Android app protection policy requires no app PIN or allows rooted devices
+    kind: misconfigured
+    category: AUT
+    severity: medium
+    entity: app-protection-policy
+    lens: security
+    why: "Without an app PIN anyone holding the unlocked phone opens corporate mail; without the device-condition check a rooted device runs the managed apps with their protections bypassed."
+    fix: "Require a 6-digit app PIN (biometrics allowed) and block rooted devices in the policy's conditional launch."
+    refs: ["NIST-800-53:IA-5(1)", "NIST-800-53:AC-19", "NIST-800-53:SI-7"]
+    query:
+      protocol: graph
+      path: /deviceAppManagement/androidManagedAppProtections
+      key: id
+      name: displayName
+    each:
+      all:
+        - { field: isAssigned, op: eq, value: true }
+        - any:
+            - { field: pinRequired, op: eq, value: false }
+            - { field: deviceComplianceRequired, op: eq, value: false }
+    evidence: "{displayName}: PIN required {pinRequired} (minimum {minimumPinLength}), block rooted {deviceComplianceRequired}"
+
+  - id: INTUNE-MAM-IOS-UNASSIGNED
+    title: iOS app protection policy is assigned to nobody
+    kind: misconfigured
+    category: HYG
+    severity: low
+    entity: app-protection-policy
+    lens: maintenance
+    why: "A protection policy written and never assigned protects nothing, while it makes the tenant look covered."
+    fix: "Assign it to the user groups it was written for, or delete it."
+    refs: ["NIST-800-53:CM-6"]
+    query:
+      protocol: graph
+      path: /deviceAppManagement/iosManagedAppProtections
+      key: id
+      name: displayName
+    each: { field: isAssigned, op: eq, value: false }
+    evidence: "{displayName}: not assigned"
+
+  - id: INTUNE-MAM-ANDROID-UNASSIGNED
+    title: Android app protection policy is assigned to nobody
+    kind: misconfigured
+    category: HYG
+    severity: low
+    entity: app-protection-policy
+    lens: maintenance
+    why: "A protection policy written and never assigned protects nothing, while it makes the tenant look covered."
+    fix: "Assign it to the user groups it was written for, or delete it."
+    refs: ["NIST-800-53:CM-6"]
+    query:
+      protocol: graph
+      path: /deviceAppManagement/androidManagedAppProtections
+      key: id
+      name: displayName
+    each: { field: isAssigned, op: eq, value: false }
+    evidence: "{displayName}: not assigned"
+
+  # ====================================================== endpoint security (settings catalog) ===
+  # Endpoint security and settings-catalog policies (beta configurationPolicies) carry their template
+  # family, so the existence of an assigned policy per family is visible without reading each setting.
+  # Policies made with the older template API (deviceManagement/intents) are not read here.
+  - id: INTUNE-ESEC-ANTIVIRUS-NONE
+    title: No assigned endpoint security antivirus policy for Windows
+    kind: missing
+    category: CFG
+    severity: medium
+    entity: tenant
+    lens: security
+    why: "Without an assigned antivirus policy Defender's settings (real-time protection, cloud protection, exclusions) on Windows are whatever each device happens to have. A policy counts if it is assigned, targets Windows and comes from the antivirus template family."
+    fix: "Create a Microsoft Defender Antivirus endpoint security policy and assign it to all Windows devices; check its per-device report for errors. Policies on the older template API should be migrated."
+    refs: ["NIST-800-53:SI-3", "CIS-Controls-v8:10.1", "MITRE-ATTACK:T1562.001"]
+    query:
+      protocol: graph
+      version: beta
+      path: /deviceManagement/configurationPolicies
+      select: [id, name, platforms, technologies, isAssigned, settingCount, templateReference, createdDateTime, lastModifiedDateTime]
+      key: id
+      name: name
+    count:
+      op: lt
+      value: 1
+      where:
+        all:
+          - { field: isAssigned, op: eq, value: true }
+          - { field: platforms, op: contains, value: windows10 }
+          - { field: templateReference.templateFamily, op: eq, value: endpointSecurityAntivirus }
+    evidence: "{count} assigned Windows antivirus policies among {rows} configuration policies"
+
+  - id: INTUNE-ESEC-FIREWALL-NONE
+    title: No assigned endpoint security firewall policy for Windows
+    kind: missing
+    category: CFG
+    severity: medium
+    entity: tenant
+    lens: security
+    why: "Without an assigned firewall policy Windows Firewall profiles and rules are left to local settings, which group policies or users may have switched off. A policy counts if it is assigned, targets Windows and comes from the firewall template family."
+    fix: "Create a Windows Firewall endpoint security policy (all profiles on, inbound blocked by default) and assign it to all Windows devices."
+    refs: ["NIST-800-53:SC-7", "CIS-Controls-v8:4.5"]
+    query:
+      protocol: graph
+      version: beta
+      path: /deviceManagement/configurationPolicies
+      select: [id, name, platforms, technologies, isAssigned, settingCount, templateReference, createdDateTime, lastModifiedDateTime]
+      key: id
+      name: name
+    count:
+      op: lt
+      value: 1
+      where:
+        all:
+          - { field: isAssigned, op: eq, value: true }
+          - { field: platforms, op: contains, value: windows10 }
+          - { field: templateReference.templateFamily, op: eq, value: endpointSecurityFirewall }
+    evidence: "{count} assigned Windows firewall policies among {rows} configuration policies"
+
+  - id: INTUNE-ESEC-DISK-ENCRYPTION-NONE
+    title: No assigned endpoint security disk encryption policy for Windows
+    kind: missing
+    category: CFG
+    severity: medium
+    entity: tenant
+    lens: security
+    why: "Without an assigned BitLocker policy encryption, its strength and recovery-key escrow depend on each device's history. A policy counts if it is assigned, targets Windows and comes from the disk encryption template family."
+    fix: "Create a BitLocker endpoint security policy (silent encryption, keys backed up to Entra) and assign it to all Windows devices."
+    refs: ["NIST-800-53:SC-28", "CIS-Controls-v8:3.6"]
+    query:
+      protocol: graph
+      version: beta
+      path: /deviceManagement/configurationPolicies
+      select: [id, name, platforms, technologies, isAssigned, settingCount, templateReference, createdDateTime, lastModifiedDateTime]
+      key: id
+      name: name
+    count:
+      op: lt
+      value: 1
+      where:
+        all:
+          - { field: isAssigned, op: eq, value: true }
+          - { field: platforms, op: contains, value: windows10 }
+          - { field: templateReference.templateFamily, op: eq, value: endpointSecurityDiskEncryption }
+    evidence: "{count} assigned Windows disk encryption policies among {rows} configuration policies"
+
+  - id: INTUNE-ESEC-EDR-NONE
+    title: No assigned endpoint detection and response policy for Windows
+    kind: missing
+    category: CFG
+    severity: medium
+    entity: tenant
+    lens: security
+    why: "The EDR policy is what onboards Windows devices to Defender for Endpoint from Intune; without one, onboarding depends on some other path that may have missed devices. A policy counts if it is assigned, targets Windows and comes from the EDR template family."
+    fix: "Create an endpoint detection and response policy using the connector's onboarding package and assign it to all Windows devices."
+    refs: ["NIST-800-53:SI-4", "CIS-Controls-v8:13.7", "MITRE-ATTACK:T1562.001"]
+    query:
+      protocol: graph
+      version: beta
+      path: /deviceManagement/configurationPolicies
+      select: [id, name, platforms, technologies, isAssigned, settingCount, templateReference, createdDateTime, lastModifiedDateTime]
+      key: id
+      name: name
+    count:
+      op: lt
+      value: 1
+      where:
+        all:
+          - { field: isAssigned, op: eq, value: true }
+          - { field: platforms, op: contains, value: windows10 }
+          - { field: templateReference.templateFamily, op: eq, value: endpointSecurityEndpointDetectionAndResponse }
+    evidence: "{count} assigned Windows EDR policies among {rows} configuration policies"
+
+  - id: INTUNE-ESEC-ASR-NONE
+    title: No assigned attack surface reduction policy for Windows
+    kind: missing
+    category: CFG
+    severity: medium
+    entity: tenant
+    lens: security
+    why: "Attack surface reduction rules stop the commonest malware entry points (Office spawning processes, credential theft from LSASS, scripts from mail); without an assigned policy they are off. A policy counts if it is assigned, targets Windows and comes from the ASR template family."
+    fix: "Create an attack surface reduction rules policy, run it in audit mode on a pilot, then block mode for all Windows devices."
+    refs: ["NIST-800-53:CM-7", "CIS-Controls-v8:10.5", "MITRE-ATTACK:T1562.001"]
+    query:
+      protocol: graph
+      version: beta
+      path: /deviceManagement/configurationPolicies
+      select: [id, name, platforms, technologies, isAssigned, settingCount, templateReference, createdDateTime, lastModifiedDateTime]
+      key: id
+      name: name
+    count:
+      op: lt
+      value: 1
+      where:
+        all:
+          - { field: isAssigned, op: eq, value: true }
+          - { field: platforms, op: contains, value: windows10 }
+          - { field: templateReference.templateFamily, op: eq, value: endpointSecurityAttackSurfaceReduction }
+    evidence: "{count} assigned Windows attack surface reduction policies among {rows} configuration policies"
+
+  - id: INTUNE-ESEC-LAPS-NONE
+    title: No assigned Windows LAPS policy
+    kind: missing
+    category: IAM
+    severity: medium
+    entity: tenant
+    lens: security
+    why: "Turning on Entra LAPS in device settings (ENTRA-DEVREG-LAPS-OFF) is not enough: without an assigned LAPS policy no device rotates or backs up its local administrator password. A policy counts if it is assigned and comes from the account protection family with a LAPS template."
+    fix: "Create a Windows LAPS policy (back up to Entra ID, rotate every 30 days or less) and assign it to all Windows devices."
+    refs: [CIS-M365:5.1.4.5, "NIST-800-53:IA-5(1)", "MITRE-ATTACK:T1078.003"]
+    query:
+      protocol: graph
+      version: beta
+      path: /deviceManagement/configurationPolicies
+      select: [id, name, platforms, technologies, isAssigned, settingCount, templateReference, createdDateTime, lastModifiedDateTime]
+      key: id
+      name: name
+    count:
+      op: lt
+      value: 1
+      where:
+        all:
+          - { field: isAssigned, op: eq, value: true }
+          - { field: templateReference.templateFamily, op: eq, value: endpointSecurityAccountProtection }
+          - { field: templateReference.templateDisplayName, op: match, value: '(LAPS|local admin(istrator)? password)', threshold: intune.laps-template-name-pattern }
+    evidence: "{count} assigned LAPS policies among {rows} configuration policies"
+
+  - id: INTUNE-ESEC-BASELINE-NONE
+    title: No assigned security baseline
+    kind: missing
+    category: CFG
+    severity: low
+    entity: tenant
+    lens: security
+    why: "A security baseline is the cheapest way to set the hundreds of Windows, Defender and Edge hardening settings that otherwise stay at their defaults."
+    fix: "Deploy the Windows security baseline (and the Defender and Edge baselines) to a pilot group, then to all devices."
+    refs: ["NIST-800-53:CM-6", "CIS-Controls-v8:4.1"]
+    query:
+      protocol: graph
+      version: beta
+      path: /deviceManagement/configurationPolicies
+      select: [id, name, platforms, technologies, isAssigned, settingCount, templateReference, createdDateTime, lastModifiedDateTime]
+      key: id
+      name: name
+    count:
+      op: lt
+      value: 1
+      where:
+        all:
+          - { field: isAssigned, op: eq, value: true }
+          - { field: templateReference.templateFamily, op: eq, value: baseline }
+    evidence: "{count} assigned security baselines among {rows} configuration policies"
+
+  - id: INTUNE-CONFIGPOLICY-UNASSIGNED
+    title: Settings catalog or endpoint security policy is assigned to nobody
+    kind: misconfigured
+    category: HYG
+    severity: low
+    entity: configuration-policy
+    lens: maintenance
+    why: "An unassigned policy does nothing and makes it hard to see which settings really apply."
+    fix: "Assign the policy to the groups it was written for, or delete it."
+    refs: ["NIST-800-53:CM-2"]
+    query:
+      protocol: graph
+      version: beta
+      path: /deviceManagement/configurationPolicies
+      select: [id, name, platforms, technologies, isAssigned, settingCount, templateReference, createdDateTime, lastModifiedDateTime]
+      key: id
+      name: name
+    each: { field: isAssigned, op: eq, value: false }
+    evidence: "{name} ({templateReference.templateDisplayName}, {platforms}): not assigned, last changed {lastModifiedDateTime}"
+
+  # ============================================================ scripts and connectors ===
+  # Script queries select metadata only: the script bodies (detection, remediation and platform script
+  # content) are never fetched.
+  - id: INTUNE-REMEDIATION-SCRIPT-ERRORS
+    title: Remediation script errors on devices
+    kind: broken
+    category: HLT
+    severity: medium
+    entity: script
+    why: "A remediation whose detection or remediation script errors, or that runs without fixing the issue, leaves the problem it was written for in place on those devices while the console shows the remediation as deployed. Only exposed in the beta API; Microsoft's own global scripts are left out."
+    fix: "Open the script's device status, read the error output, and fix the script or the devices."
+    refs: ["NIST-800-53:CM-6", "NIST-800-53:SI-2"]
+    query:
+      protocol: graph
+      version: beta
+      path: /deviceManagement/deviceHealthScripts
+      select: [id, displayName, publisher, isGlobalScript, runAsAccount, lastModifiedDateTime]
+      expand: runSummary
+      key: id
+      name: displayName
+    each:
+      all:
+        - any:
+            - { field: isGlobalScript, op: absent }
+            - { field: isGlobalScript, op: eq, value: false }
+        - any:
+            - { field: runSummary.detectionScriptErrorDeviceCount, op: gt, value: 0, threshold: intune.script-error-devices-max }
+            - { field: runSummary.remediationScriptErrorDeviceCount, op: gt, value: 0, threshold: intune.script-error-devices-max }
+            - { field: runSummary.issueReoccurredDeviceCount, op: gt, value: 0, threshold: intune.script-error-devices-max }
+    evidence: "{displayName}: detection errors {runSummary.detectionScriptErrorDeviceCount}, remediation errors {runSummary.remediationScriptErrorDeviceCount}, not fixed {runSummary.issueReoccurredDeviceCount} (last run {runSummary.lastScriptRunDateTime})"
+
+  - id: INTUNE-PLATFORM-SCRIPT-ERRORS
+    title: PowerShell platform script fails on devices
+    kind: broken
+    category: HLT
+    severity: low
+    entity: script
+    why: "A platform script that errors did not make the change it was deployed for on those devices. Only exposed in the beta API."
+    fix: "Read the device run states, fix or retire the script."
+    refs: ["NIST-800-53:CM-6"]
+    query:
+      protocol: graph
+      version: beta
+      path: /deviceManagement/deviceManagementScripts
+      select: [id, displayName, runAsAccount, enforceSignatureCheck, lastModifiedDateTime]
+      expand: runSummary
+      key: id
+      name: displayName
+    each: { field: runSummary.errorDeviceCount, op: gt, value: 0, threshold: intune.script-error-devices-max }
+    evidence: "{displayName}: {runSummary.errorDeviceCount} device(s) in error, {runSummary.successDeviceCount} succeeded"
+
+  - id: INTUNE-NDES-CONNECTOR-INACTIVE
+    title: Certificate connector (NDES/PKCS) is inactive or silent
+    kind: broken
+    category: PKI
+    severity: medium
+    entity: certificate-connector
+    lens: both
+    why: "When the certificate connector stops, SCEP and PKCS certificates stop being issued and renewed, and Wi-Fi, VPN and other certificate-based access fails device by device as certificates expire. Only exposed in the beta API."
+    fix: "Check the connector service and its service account on the server; renew or re-enrol the connector and confirm it reports in again."
+    refs: ["NIST-800-53:SC-17", "NIST-800-53:SI-4"]
+    query:
+      protocol: graph
+      version: beta
+      path: /deviceManagement/ndesConnectors
+      select: [id, displayName, machineName, state, lastConnectionDateTime, connectorVersion]
+      key: id
+      name: displayName
+    each:
+      any:
+        - { field: state, op: eq, value: inactive }
+        - { field: lastConnectionDateTime, op: age-gt, value: 1, threshold: intune.connector-max-age-days }
+    evidence: "{displayName} on {machineName} (version {connectorVersion}): state {state}, last connection {lastConnectionDateTime}"

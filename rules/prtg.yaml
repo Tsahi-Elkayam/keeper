@@ -12,6 +12,10 @@ integration: prtg
 #   8 Paused by dependency, 9 Paused by schedule, 10 Unusual, 11 Paused by licence, 12 Paused until,
 #   13 Down (acknowledged), 14 Down (partial).
 # downtimesince_raw is in seconds; priority_raw is 1 (lowest) to 5 (highest).
+# Devices use the same table with content=devices ({"devices": [...]}) and the per-device sensor counts
+# (totalsens, upsens, downsens, ... each with a _raw twin). Probes: the vendor's support answer reads
+# them as content=probes with filter_parentid=0 ({"probes": [...]}); condition_raw 2 = connected,
+# 0 = disconnected. If that answer shape is wrong the list is empty and PRTG-PROBE-NONE says so.
 defaults:
   lens: maintenance
   refresh: 1h
@@ -188,6 +192,177 @@ rules:
       name: sensor
     each: { field: status_raw, op: eq, value: 4 }
     evidence: "{device} / {sensor}: {status} - {message}"
+
+  - id: PRTG-SENSOR-DOWN-HIGH-PRIORITY-DAY
+    title: High-priority sensor down and unacknowledged for more than a day
+    kind: broken
+    severity: high
+    why: A priority 4 or 5 sensor is one its owner marked as important; down and unacknowledged after a day means the outage and the alert path are both broken.
+    fix: Fix the monitored service, or acknowledge the alarm with a note; then find out why the alert reached nobody.
+    refs: [NIST-800-53:SI-4, NIST-800-53:IR-4]
+    query:
+      protocol: http
+      path: /api/table.json
+      params: { content: sensors, columns: "objid,device,group,probe,sensor,status,message,downtimesince,priority,lastcheck" }
+      paging: offset
+      offsetParam: start
+      limitParam: count
+      pageSize: 5000
+      items: sensors
+      key: objid
+      name: sensor
+    each:
+      all:
+        - { field: status_raw, op: in, value: [5, 14] }
+        - { field: priority_raw, op: ge, value: 4 }
+        - { field: downtimesince_raw, op: gt, value: 86400, threshold: prtg.high-priority-down-max-seconds }
+    evidence: "{probe} / {device} / {sensor} (priority {priority_raw}): {status} for {downtimesince} - {message}"
+
+  - id: PRTG-SENSOR-UNUSUAL
+    title: Sensor reports unusual values
+    kind: broken
+    severity: low
+    why: Unusual means the values are far from the sensor's own history - the early warning before a limit is crossed, or a sign the baseline needs tuning.
+    fix: Look at the channel graph; open a ticket if the change is real, tune unusual detection if it is not.
+    refs: [NIST-800-53:SI-4]
+    query:
+      protocol: http
+      path: /api/table.json
+      params: { content: sensors, columns: "objid,device,group,probe,sensor,status,message,downtimesince,priority,lastcheck" }
+      paging: offset
+      offsetParam: start
+      limitParam: count
+      pageSize: 5000
+      items: sensors
+      key: objid
+      name: sensor
+    each: { field: status_raw, op: eq, value: 10 }
+    evidence: "{device} / {sensor}: {status} - {message}"
+
+  # ---- probes --------------------------------------------------------------------------------
+
+  - id: PRTG-PROBE-DISCONNECTED
+    title: Probe is not connected to the core server
+    kind: broken
+    severity: high
+    entity: probe
+    refresh: 30m
+    why: Every sensor under a disconnected probe stops reporting, while the dashboards keep showing their last known state.
+    fix: Check the probe service and its path to the core server; approve the probe again if it re-registered with a new identity.
+    refs: [NIST-800-53:SI-4, CIS-Controls-v8:8.2]
+    query:
+      protocol: http
+      path: /api/table.json
+      params: { content: probes, columns: "objid,name,condition,status,message", filter_parentid: "0" }
+      paging: offset
+      offsetParam: start
+      limitParam: count
+      pageSize: 5000
+      items: probes
+      key: objid
+      name: name
+    each: { field: condition_raw, op: ne, value: 2 }
+    evidence: "probe {name}: {condition} - {message}"
+
+  - id: PRTG-PROBE-NONE
+    title: PRTG returned no probes
+    kind: missing
+    severity: medium
+    entity: instance
+    why: An empty probe table means the API account cannot see the probes (so the sensor table is partial too), or the probe query is not answered in the shape the rules expect.
+    fix: Give the API user read rights on the root group; if probes are visible in the web interface, the query shape needs checking.
+    refs: [NIST-800-53:CA-7]
+    query:
+      protocol: http
+      path: /api/table.json
+      params: { content: probes, columns: "objid,name,condition,status,message", filter_parentid: "0" }
+      paging: offset
+      offsetParam: start
+      limitParam: count
+      pageSize: 5000
+      items: probes
+      key: objid
+      name: name
+    count: none
+    evidence: "the probe table is empty"
+
+  # ---- devices -------------------------------------------------------------------------------
+
+  - id: PRTG-DEVICE-ALL-SENSORS-DOWN
+    title: Device has sensors down and none up
+    kind: broken
+    category: AVL
+    severity: high
+    entity: device
+    why: When no sensor of a device is up and some are down, the device itself is down - a bigger event than the separate sensor alarms suggest, and easy to lose among them.
+    fix: Treat it as a host outage - check power, network and the device - before working the individual sensors.
+    refs: [NIST-800-53:SI-4, NIST-800-53:IR-4]
+    query:
+      protocol: http
+      path: /api/table.json
+      params: { content: devices, columns: "objid,device,host,group,probe,status,message,totalsens,upsens,downsens,downacksens,partialdownsens,warnsens,pausedsens,unusualsens,undefinedsens" }
+      paging: offset
+      offsetParam: start
+      limitParam: count
+      pageSize: 5000
+      items: devices
+      key: objid
+      name: device
+    each:
+      all:
+        - { field: totalsens_raw, op: gt, value: 0 }
+        - { field: upsens_raw, op: eq, value: 0 }
+        - { field: warnsens_raw, op: eq, value: 0 }
+        - { field: unusualsens_raw, op: eq, value: 0 }
+        - { field: downsens_raw, op: gt, value: 0 }
+    evidence: "{probe} / {group} / {device}: {downsens_raw} of {totalsens_raw} sensors down, none up"
+
+  - id: PRTG-DEVICE-WITHOUT-SENSORS
+    title: Device has no sensors
+    kind: missing
+    category: MON
+    severity: low
+    entity: device
+    refresh: 1d
+    why: A device without sensors is inventoried but not monitored; it looks covered in the device tree while nothing watches it.
+    fix: Add at least an availability (ping) sensor, or delete the device if it is gone.
+    refs: [NIST-800-53:SI-4, CIS-Controls-v8:1.1]
+    query:
+      protocol: http
+      path: /api/table.json
+      params: { content: devices, columns: "objid,device,host,group,probe,status,message,totalsens,upsens,downsens,downacksens,partialdownsens,warnsens,pausedsens,unusualsens,undefinedsens" }
+      paging: offset
+      offsetParam: start
+      limitParam: count
+      pageSize: 5000
+      items: devices
+      key: objid
+      name: device
+    each: { field: totalsens_raw, op: eq, value: 0 }
+    evidence: "{probe} / {group} / {device}: no sensors"
+
+  - id: PRTG-DEVICE-PAUSED
+    title: Whole device paused by a user
+    kind: misconfigured
+    category: MON
+    severity: medium
+    entity: device
+    why: Pausing a device silences every sensor on it - a larger blind spot than one paused sensor, and the pause people forget after maintenance.
+    fix: Resume the device, or use a timed pause (pause until) so it comes back by itself.
+    refs: [NIST-800-53:SI-4]
+    query:
+      protocol: http
+      path: /api/table.json
+      params: { content: devices, columns: "objid,device,host,group,probe,status,message,totalsens,upsens,downsens,downacksens,partialdownsens,warnsens,pausedsens,unusualsens,undefinedsens" }
+      paging: offset
+      offsetParam: start
+      limitParam: count
+      pageSize: 5000
+      items: devices
+      key: objid
+      name: device
+    each: { field: status_raw, op: eq, value: 7 }
+    evidence: "{probe} / {group} / {device}: {status} - {message}"
 
   - id: PRTG-NO-SENSORS
     title: PRTG returned no sensors
