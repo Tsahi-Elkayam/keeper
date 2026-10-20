@@ -61,7 +61,7 @@ rules:
                  ('intune-sccm', 'intune', 'sccm', 'XS-COMPUTER-INTUNE-ACTIVE-SCCM-DEAD'),
                  ('ad-prtg', 'active-directory', 'prtg', 'XS-SERVER-NOT-MONITORED, XS-MONITOR-TARGET-AD-GONE, XS-VEEAM-REPOSITORY-HOST-UNMANAGED'),
                  ('ad-dynatrace', 'active-directory', 'dynatrace', 'XS-SERVER-NOT-MONITORED, XS-MONITOR-TARGET-AD-GONE'),
-                 ('ad-veeam', 'active-directory', 'veeam', 'XS-SERVER-AD-NO-BACKUP, XS-VEEAM-REPOSITORY-HOST-UNMANAGED'),
+                 ('ad-veeam', 'active-directory', 'veeam', 'XS-SERVER-AD-NO-BACKUP, XS-DC-IMAGE-ONLY-BACKUP, XS-VEEAM-REPOSITORY-HOST-UNMANAGED'),
                  ('vmware-veeam', 'vmware', 'veeam', 'XS-VM-NO-BACKUP, XS-BACKUP-OBJECT-VM-GONE'),
                  ('vmware-prtg', 'vmware', 'prtg', 'XS-ESXI-HOST-NOT-MONITORED'),
                  ('ad-wiz', 'active-directory', 'wiz', 'XS-HOST-KEV-COMPOUND, XS-HOST-EOL-EXPOSED'),
@@ -3331,3 +3331,71 @@ rules:
       name: product
     each: { field: drifted, op: eq, value: 1 }
     evidence: "Register {licence_id} ({product}): {seats} seats, {seats_used} used; tenant SKU {part}: {enabled_units} enabled, {consumed} assigned"
+
+  - id: XS-DC-IMAGE-ONLY-BACKUP
+    title: Domain controller backed up only by jobs without application-aware processing
+    kind: misconfigured
+    lens: both
+    category: BCK
+    severity: high
+    entity: computer
+    why: >-
+      A domain controller VM named in an enabled Veeam backup job whose application-aware processing
+      is off, and in no job where it is on, gets crash-consistent images only: the directory was not
+      told it is being backed up, so the image is not a supported directory restore (USN rollback risk)
+      even though the job is green. VEEAM-JOB-APP-AWARE-OFF flags the job; this names the domain
+      controllers it leaves without a directory-aware backup (see OBL-AD-SYSTEM-STATE-BACKUP). DCs
+      included through a folder, tag or cluster rather than by name are not seen here.
+    fix: >-
+      Turn on application-aware processing (with guest credentials from the vault) in the job that
+      protects the domain controller, or add a directory-aware system state backup, then attest
+      ad.system-state-backup.
+    refs: [NIST-800-53:CP-9, NIST-800-53:CP-10, CIS-Controls-v8:11.2]
+    query:
+      protocol: store
+      text: |
+        WITH max_age AS (
+          SELECT COALESCE((SELECT CAST(value AS REAL) FROM setting WHERE key = 'threshold.cross.max-scan-age-days'), 14) AS days
+        ),
+        live AS (
+          SELECT lr.run_id, lr.instance, lr.system, lr.status
+          FROM latest_run lr CROSS JOIN max_age m
+          WHERE lr.status <> 'failed' AND julianday(:now) - julianday(lr.started_at) <= m.days
+        ),
+        dcs AS (
+          SELECT r.instance, s.entity_key AS account, UPPER(RTRIM(s.entity_key, '$')) AS short_name,
+                 MAX(json_extract(s.attrs, '$.dNSHostName')) AS dns_name
+          FROM live r JOIN row_seen s ON s.run_id = r.run_id
+          WHERE r.system = 'active-directory' AND s.entity_type = 'computer'
+          GROUP BY r.instance, s.entity_key
+          HAVING (COALESCE(MAX(CAST(json_extract(s.attrs, '$.userAccountControl') AS INTEGER)), 0) & 8192) = 8192
+        ),
+        jobs AS (
+          SELECT r.instance, s.entity_key AS job_id,
+                 MAX(json_extract(s.attrs, '$.name')) AS job_name,
+                 MAX(CAST(json_extract(s.attrs, '$.isDisabled') AS INTEGER)) AS disabled,
+                 MAX(CAST(json_extract(s.attrs, '$.guestProcessing.appAwareProcessing.isEnabled') AS INTEGER)) AS app_aware,
+                 MAX(json_extract(s.attrs, '$.virtualMachines.includes')) AS includes
+          FROM live r JOIN row_seen s ON s.run_id = r.run_id
+          WHERE r.system = 'veeam' AND s.entity_type = 'job'
+          GROUP BY r.instance, s.entity_key
+        ),
+        included AS (
+          SELECT x.job_id, x.job_name, x.app_aware,
+                 UPPER(CASE WHEN x.n GLOB '[0-9]*.[0-9]*.[0-9]*.[0-9]*' THEN x.n
+                            WHEN instr(x.n, '.') > 0 THEN substr(x.n, 1, instr(x.n, '.') - 1) ELSE x.n END) AS short_name
+          FROM (SELECT jb.job_id, jb.job_name, jb.app_aware, TRIM(json_extract(je.value, '$.name')) AS n
+                FROM jobs jb, json_each(CASE WHEN json_valid(jb.includes) THEN jb.includes ELSE '[]' END) je
+                WHERE COALESCE(jb.disabled, 0) = 0) x
+          WHERE x.n IS NOT NULL AND x.n <> ''
+        )
+        SELECT d.instance || '/' || d.account AS id, d.account, d.dns_name,
+               GROUP_CONCAT(DISTINCT i.job_name) AS job_names
+        FROM dcs d
+        JOIN included i ON i.short_name = d.short_name AND i.app_aware = 0
+        WHERE NOT EXISTS (SELECT 1 FROM included y WHERE y.short_name = d.short_name AND y.app_aware = 1)
+        GROUP BY d.instance, d.account
+      key: id
+      name: dns_name
+    each: any
+    evidence: "Domain controller {dns_name} is backed up by {job_names} without application-aware processing, and by no job with it"
