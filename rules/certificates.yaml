@@ -6,6 +6,14 @@ integration: tls
 # Every rule below uses the same query, so each endpoint gets one handshake per scan.
 # Bind lab and test endpoints as their own tls integration: rules that judge production
 # (self-signed, private CA) can then be disabled there with an override instead of everywhere.
+# Not only web sites: bind every listener that speaks TLS directly - application and appliance
+# consoles on their own ports (often 8443 or 9443), voice and video nodes (8443, SIP over TLS on
+# 5061), recorder and camera-management consoles, integration gateways, custom domain names of SaaS
+# services. These rules then judge them like any web site, and a target whose handshake fails is
+# reported in coverage as failed (unknown for every rule, never a pass), which doubles as a liveness
+# signal. The subject and issuer of an unknown console usually name its product. Listeners that
+# start TLS inside another protocol (SMTP, LDAP or FTP with STARTTLS) cannot be scanned this way;
+# record their certificates as key dates of kind certificate (REG-KEY-CERTIFICATE-DUE).
 rules:
   - id: TLS-CERT-EXPIRED
     title: Certificate on a TLS endpoint has expired

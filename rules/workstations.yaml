@@ -32,7 +32,7 @@ rules:
     refs: [NIST-800-53:SI-2]
     query:
       protocol: cim
-      wql: SELECT Caption, Version, BuildNumber, LastBootUpTime, FreePhysicalMemory, TotalVisibleMemorySize FROM Win32_OperatingSystem
+      wql: SELECT Caption, Version, BuildNumber, OperatingSystemSKU, LastBootUpTime, FreePhysicalMemory, TotalVisibleMemorySize FROM Win32_OperatingSystem
       key: host
     each: { field: LastBootUpTime, op: age-gt, value: 30, threshold: workstations.uptime-max-days }
     evidence: "{host}: last boot {LastBootUpTime}"
@@ -48,7 +48,7 @@ rules:
     refs: [NIST-800-53:SA-22, CIS-CSC-v8:2.2]
     query:
       protocol: cim
-      wql: SELECT Caption, Version, BuildNumber, LastBootUpTime, FreePhysicalMemory, TotalVisibleMemorySize FROM Win32_OperatingSystem
+      wql: SELECT Caption, Version, BuildNumber, OperatingSystemSKU, LastBootUpTime, FreePhysicalMemory, TotalVisibleMemorySize FROM Win32_OperatingSystem
       key: host
     each:
       all:
@@ -67,7 +67,7 @@ rules:
     refs: [NIST-800-53:SA-22, NIST-800-53:SI-2]
     query:
       protocol: cim
-      wql: SELECT Caption, Version, BuildNumber, LastBootUpTime, FreePhysicalMemory, TotalVisibleMemorySize FROM Win32_OperatingSystem
+      wql: SELECT Caption, Version, BuildNumber, OperatingSystemSKU, LastBootUpTime, FreePhysicalMemory, TotalVisibleMemorySize FROM Win32_OperatingSystem
       key: host
     each: { field: BuildNumber, op: in, value: [10240, 10586, 14393, 15063, 16299, 17134, 18362, 18363, 19041, 19042, 19043, 22000, 22621], threshold: workstations.unsupported-builds }
     evidence: "{host}: {Caption} build {BuildNumber}"
@@ -102,7 +102,7 @@ rules:
     fix: Find the largest consumers; restart if a leak, add memory if the baseline load does not fit. The threshold is in KB.
     query:
       protocol: cim
-      wql: SELECT Caption, Version, BuildNumber, LastBootUpTime, FreePhysicalMemory, TotalVisibleMemorySize FROM Win32_OperatingSystem
+      wql: SELECT Caption, Version, BuildNumber, OperatingSystemSKU, LastBootUpTime, FreePhysicalMemory, TotalVisibleMemorySize FROM Win32_OperatingSystem
       key: host
     each: { field: FreePhysicalMemory, op: lt, value: 1048576, threshold: workstations.available-memory-kb-min }
     evidence: "{host}: {FreePhysicalMemory} KB free of {TotalVisibleMemorySize} KB"
@@ -193,7 +193,7 @@ rules:
     query:
       protocol: cim
       namespace: root/Microsoft/Windows/Storage
-      wql: SELECT DeviceId, FriendlyName, MediaType, HealthStatus FROM MSFT_PhysicalDisk
+      wql: SELECT DeviceId, FriendlyName, MediaType, BusType, HealthStatus FROM MSFT_PhysicalDisk
       key: "{host}|{DeviceId}"
     each: { field: HealthStatus, op: ne, value: 0 }
     evidence: "{host}: disk {FriendlyName} health {HealthStatus} (0 healthy, 1 warning, 2 unhealthy)"
@@ -406,7 +406,7 @@ rules:
     category: HLT
     severity: medium
     entity: process
-    why: Command-line tools that normally exit in seconds (scheduled-task, policy, registry, licensing helpers) and stay for hours are hung calls; they point at a stuck service.
+    why: Command-line tools that normally exit in seconds (scheduled-task, policy, registry and network helpers) and stay for hours are hung calls; they point at a stuck service. The licensing service has its own one-hour rule (WS-PROC-SPPSVC-LONG).
     fix: Find the stuck service they wait on (often the Task Scheduler, Group Policy or WMI); restart it or the PC.
     query:
       protocol: cim
@@ -414,7 +414,7 @@ rules:
       key: "{host}|{Name}|{ProcessId}"
     each:
       all:
-        - { field: Name, op: match, value: '^(schtasks|wmic|reg|sc|net|net1|netsh|gpupdate|sppsvc|cscript|wscript)\.exe$', threshold: workstations.hung-tool-pattern }
+        - { field: Name, op: match, value: '^(schtasks|wmic|reg|sc|net|net1|netsh|gpupdate|cscript|wscript)\.exe$', threshold: workstations.hung-tool-pattern }
         - { field: CreationDate, op: age-gt, value: 0.5, threshold: workstations.hung-tool-age-days }
     evidence: "{host}: {Name} (pid {ProcessId}) running since {CreationDate}"
 
@@ -978,3 +978,2611 @@ rules:
       key: "{host}|{ArticleID}|{Name}"
     each: { field: EvaluationState, op: eq, value: 13 }
     evidence: "{host}: KB{ArticleID} failed with error {ErrorCode}"
+
+  - id: WS-CCM-UPDATE-RESTART-WAIT
+    title: Installed update waits for a restart
+    kind: broken
+    lens: both
+    category: LCM
+    severity: medium
+    entity: software-update
+    why: The update is installed but does nothing until the PC restarts; the device stays exposed while reports may already count it as patched.
+    fix: Let the deployment's restart settings or a maintenance window restart the PC; users who postpone for weeks need a deadline.
+    refs: [NIST-800-53:SI-2]
+    query:
+      protocol: cim
+      namespace: root/ccm/ClientSDK
+      wql: SELECT ArticleID, Name, ComplianceState, EvaluationState, Deadline, ErrorCode FROM CCM_SoftwareUpdate
+      key: "{host}|{ArticleID}|{Name}"
+    each: { field: EvaluationState, op: in, value: [8, 9, 10] }
+    evidence: "{host}: KB{ArticleID} waiting for restart (state {EvaluationState})"
+
+  # ---- services: accounts and image paths (one full read of Win32_Service) ---------------------
+
+  - id: WS-SVC-DOMAIN-ACCOUNT
+    title: Service on a workstation runs as a domain user account
+    kind: misconfigured
+    lens: security
+    category: IAM
+    severity: high
+    entity: service
+    why: The account's password is stored in LSA secrets on every PC that runs the service, so one local administrator anywhere can recover it; on user PCs this is usually a vendor agent installed with one shared account, and a privileged one exposes the domain.
+    fix: Move the service to a group managed service account, a virtual account or LocalService, and keep the account out of privileged groups. Accounts that are expected go in the allow pattern.
+    refs: [NIST-800-53:IA-5, CIS-Controls-v8:5.4, MITRE-ATTACK:T1078.002]
+    query:
+      protocol: cim
+      wql: >-
+        SELECT Name, StartName, State, StartMode FROM Win32_Service WHERE StartName <> 'LocalSystem'
+        AND NOT StartName LIKE 'NT AUTHORITY%' AND NOT StartName LIKE 'NT SERVICE%'
+      key: "{host}|{Name}"
+    each:
+      all:
+        - { field: StartName, op: notmatch, value: '^\.\\' }
+        - { field: StartName, op: notmatch, value: '\$$' }
+        - { field: StartName, op: match, value: '\\|@' }
+        - { field: StartName, op: notmatch, value: '^$', threshold: workstations.service-account-allow-pattern }
+    evidence: "{host}: {Name} runs as {StartName} ({State})"
+
+  - id: WS-SVC-USER-WRITABLE-PATH
+    title: Service binary lives in a folder ordinary users can write to
+    kind: misconfigured
+    lens: security
+    category: IAM
+    severity: high
+    entity: service
+    why: A service started from a profile, temp or public folder can have its program replaced by anyone who can write there, and the replacement runs with the service's rights at the next start - privilege escalation without an exploit.
+    fix: Reinstall the product under Program Files. If a vendor insists on a profile path, restrict the folder to administrators and record the exception in the ignore pattern.
+    refs: [NIST-800-53:CM-6, NIST-800-53:AC-6, CIS-Controls-v8:4.1, MITRE-ATTACK:T1574.010, MITRE-ATTACK:T1543.003]
+    query:
+      protocol: cim
+      wql: SELECT Name, DisplayName, PathName, StartName, StartMode, State FROM Win32_Service
+      key: "{host}|{Name}"
+    each:
+      all:
+        - { field: PathName, op: match, value: '\\Users\\|\\AppData\\|\\(Windows\\)?Te?mp\\' }
+        - { field: PathName, op: notmatch, value: '\\AppData\\Local\\Microsoft\\OneDrive\\', threshold: workstations.userpath-service-ignore-pattern }
+    evidence: "{host}: {Name} runs {PathName} as {StartName}"
+
+  - id: WS-AGENT-UNEXPECTED
+    title: Security or remote-management agent running that the organisation did not approve
+    kind: misconfigured
+    lens: security
+    category: MON
+    severity: medium
+    entity: service
+    why: An agent from a known security, proxy or remote-management family that is not on the approved list is either a leftover, a trial nobody finished, or a product mislabelled in the inventory; it hooks the system like the approved ones and is patched by nobody.
+    fix: Identify the product from the service path, then remove it or add it to the approved pattern. Set the known-agent pattern to the families the organisation tracks.
+    refs: [NIST-800-53:CM-7, NIST-800-53:CM-8, CIS-Controls-v8:2.3]
+    query:
+      protocol: cim
+      wql: SELECT Name, DisplayName, PathName, StartName, StartMode, State FROM Win32_Service
+      key: "{host}|{Name}"
+    each:
+      all:
+        - { field: State, op: eq, value: Running }
+        - { field: Name, op: match, value: '^(Sense|WinDefend|MDCoreSvc|CSFalconService|SentinelAgent|CbDefense|cyserver|xagt|CylanceSvc|EFRService|TracSrvWrapper|ekrn|EraAgentSvc|SAVService|McShield|masvc|SepMasterService|AVP.*|klnagent|ntrtscan|TmCCSF|AvastSvc|AVGSvc|bdservicehost|EPSecurityService|elastic-agent|TaniumClient|QualysAgent|ir_agent|WazuhSvc|AnyDesk.*|TeamViewer.*|ScreenConnect.*|LogMeIn.*|Splashtop.*)$', threshold: workstations.known-agent-pattern }
+        - { field: Name, op: notmatch, value: '^(Sense|WinDefend|MDCoreSvc)$', threshold: workstations.approved-agent-pattern }
+    evidence: "{host}: {Name} ({DisplayName}) running from {PathName}"
+
+  - id: WS-SMB1-CLIENT-DRIVER
+    title: SMB1 client driver installed and not disabled
+    kind: misconfigured
+    lens: security
+    category: AUT
+    severity: high
+    why: The SMB1 redirector is the part of SMB1 that a PC uses to reach servers; while its driver can start, the PC can be talked down to SMB1 and its sessions relayed. The driver state can differ from what the optional-feature rule sees.
+    fix: Remove the SMB1 feature; where it must stay for a while, set the mrxsmb10 driver to Disabled by policy. No row means the driver is not installed, which is the good answer.
+    refs: [NIST-800-53:CM-7, CIS-Controls-v8:4.8, MITRE-ATTACK:T1557.001]
+    query:
+      protocol: cim
+      wql: SELECT Name, State, StartMode, Started FROM Win32_SystemDriver WHERE Name = 'mrxsmb10'
+      key: host
+    each: { field: StartMode, op: ne, value: Disabled }
+    evidence: "{host}: mrxsmb10 start mode {StartMode}, state {State}"
+
+  # ---- Remote Desktop ----------------------------------------------------------------------------
+
+  - id: WS-RDP-ENABLED
+    title: Remote Desktop connections allowed on a workstation
+    kind: misconfigured
+    lens: security
+    category: AUT
+    severity: medium
+    why: A user PC that accepts Remote Desktop is a lateral-movement hop and a target for logons with stolen credentials; most estates need it on a few administrator PCs only.
+    fix: Turn Remote Desktop off by policy on user PCs and allow it on an administrator-PC group only, with NLA and a restricted Remote Desktop Users group.
+    refs: [NIST-800-53:AC-17, CIS-Controls-v8:4.8, MITRE-ATTACK:T1021.001]
+    query:
+      protocol: cim
+      namespace: root/cimv2/TerminalServices
+      wql: SELECT ServerName, AllowTSConnections, PolicySourceAllowTSConnections FROM Win32_TerminalServiceSetting
+      key: host
+    each: { field: AllowTSConnections, op: eq, value: 1 }
+    evidence: "{host}: Remote Desktop allowed (policy source {PolicySourceAllowTSConnections})"
+
+  - id: WS-RDP-WEAK-SECURITY
+    title: Remote Desktop security layer or encryption below the baseline on a workstation
+    kind: misconfigured
+    lens: security
+    category: AUT
+    severity: medium
+    why: Below TLS as the security layer and High encryption, an RDP session can be downgraded or read on the wire.
+    fix: Require the SSL (TLS) security layer and High encryption by policy.
+    refs: [NIST-800-53:SC-8, NIST-800-53:AC-17]
+    query:
+      protocol: cim
+      namespace: root/cimv2/TerminalServices
+      wql: SELECT TerminalName, UserAuthenticationRequired, SecurityLayer, MinEncryptionLevel FROM Win32_TSGeneralSetting WHERE TerminalName = 'RDP-Tcp'
+      key: host
+    each:
+      any:
+        - { field: SecurityLayer, op: lt, value: 2 }
+        - { field: MinEncryptionLevel, op: lt, value: 3 }
+    evidence: "{host}: RDP security layer {SecurityLayer}, encryption level {MinEncryptionLevel}"
+
+  - id: WS-RDPUSERS-BROAD
+    title: Broad group can log on to the workstation through Remote Desktop
+    kind: misconfigured
+    lens: security
+    category: IAM
+    severity: high
+    entity: local-group-member
+    why: With Domain Users, Authenticated Users, Everyone or a similar group in Remote Desktop Users, every account in the organisation can open a session on this PC once RDP is on.
+    fix: Remove the group and grant Remote Desktop to a named group per role. An empty result means nobody is in the group; a renamed or localised group also reads empty.
+    refs: [NIST-800-53:AC-6, NIST-800-53:AC-17, CIS-Controls-v8:5.4, MITRE-ATTACK:T1021.001]
+    query:
+      protocol: cim
+      wql: SELECT GroupComponent, PartComponent FROM Win32_GroupUser WHERE GroupComponent = "Win32_Group.Domain='{HOST}',Name='Remote Desktop Users'"
+      key: "{host}|{PartComponent}"
+    each: { field: PartComponent, op: match, value: 'Name = "(Everyone|Authenticated Users|Users|INTERACTIVE|Domain Users|Domain Computers|Domain Guests|Guests)"' }
+    evidence: "{host}: Remote Desktop Users contains {PartComponent}"
+
+  - id: WS-LOCAL-ACCOUNT-EXTRA
+    title: Enabled local user account besides the built-in ones
+    kind: misconfigured
+    lens: security
+    category: IAM
+    severity: medium
+    entity: local-account
+    why: On a domain-joined PC an extra local account is usually an imaging leftover or a technician account with one password across the fleet - an administrator on every PC that no directory review sees.
+    fix: Disable or delete the account; where a local administrator is needed, use the built-in one managed by LAPS and list its name in the allow pattern.
+    refs: [NIST-800-53:AC-2, CIS-Controls-v8:5.2, CIS-Controls-v8:5.4, MITRE-ATTACK:T1078.003]
+    query:
+      protocol: cim
+      wql: SELECT Name, SID, Disabled, PasswordRequired, Lockout FROM Win32_UserAccount WHERE LocalAccount = TRUE
+      key: "{host}|{Name}"
+    each:
+      all:
+        - { field: Disabled, op: eq, value: false }
+        - { field: SID, op: notmatch, value: '-(500|501|503|504)$' }
+        - { field: Name, op: notmatch, value: '^$', threshold: workstations.local-account-allow-pattern }
+    evidence: "{host}: local account {Name} ({SID}) is enabled"
+
+  # ---- Defender: tamper protection, components, cloud, exclusions, platform ---------------------
+
+  - id: WS-DEFENDER-TAMPER-OFF
+    title: Defender active without tamper protection
+    kind: misconfigured
+    lens: security
+    category: MON
+    severity: medium
+    why: Without tamper protection, any process with administrator rights can switch real-time protection off with one setting change, which is the first thing ransomware does.
+    fix: Turn tamper protection on from the Defender portal (tenant-wide) or Intune; Group Policy cannot set it.
+    refs: [NIST-800-53:SI-3, CIS-Controls-v8:10.1, MITRE-ATTACK:T1562.001]
+    query:
+      protocol: cim
+      namespace: root/Microsoft/Windows/Defender
+      wql: SELECT * FROM MSFT_MpComputerStatus
+      key: host
+    each:
+      all:
+        - { field: AMRunningMode, op: match, value: '^Normal' }
+        - { field: IsTamperProtected, op: eq, value: false }
+    evidence: "{host}: mode {AMRunningMode}, tamper protected {IsTamperProtected}"
+
+  - id: WS-DEFENDER-COMPONENT-OFF
+    title: A real-time component of Defender is off
+    kind: misconfigured
+    lens: security
+    category: MON
+    severity: medium
+    why: Real-time protection is on, but behaviour monitoring, downloaded-file scanning or on-access protection is off; these catch fileless and living-off-the-land activity that signature scans miss.
+    fix: Remove the policy that disables the component (the Disable*Monitoring and DisableIOAVProtection preferences show which).
+    refs: [NIST-800-53:SI-3, CIS-Controls-v8:10.1, MITRE-ATTACK:T1562.001]
+    query:
+      protocol: cim
+      namespace: root/Microsoft/Windows/Defender
+      wql: SELECT * FROM MSFT_MpComputerStatus
+      key: host
+    each:
+      all:
+        - { field: AMRunningMode, op: match, value: '^Normal' }
+        - { field: RealTimeProtectionEnabled, op: eq, value: true }
+        - any:
+            - { field: BehaviorMonitorEnabled, op: eq, value: false }
+            - { field: IoavProtectionEnabled, op: eq, value: false }
+            - { field: OnAccessProtectionEnabled, op: eq, value: false }
+    evidence: "{host}: behaviour {BehaviorMonitorEnabled}, downloads {IoavProtectionEnabled}, on-access {OnAccessProtectionEnabled}"
+
+  - id: WS-DEFENDER-PLATFORM-OLD
+    title: Defender platform older than the supported window
+    kind: broken
+    lens: both
+    category: MON
+    severity: medium
+    why: Microsoft supports only the last few monthly Defender platform releases; a platform months behind means the PC's update path for it is broken even if signatures still arrive.
+    fix: Approve the Defender platform update (KB4052623) in the update tool and check the PC's update source. Raise the pattern as releases move on (version format 4.18.YYMM.N).
+    refs: [NIST-800-53:SI-2, NIST-800-53:SI-3, CIS-Controls-v8:10.2]
+    query:
+      protocol: cim
+      namespace: root/Microsoft/Windows/Defender
+      wql: SELECT * FROM MSFT_MpComputerStatus
+      key: host
+    each:
+      all:
+        - { field: AMServiceEnabled, op: eq, value: true }
+        - { field: AMProductVersion, op: match, value: '^(?:[0-3]\.|4\.(?:[0-9]|1[0-7])\.|4\.18\.(?:1\d{3,4}|2[0-5]\d{2,3}|260[0-4]\d)\.)', threshold: workstations.defender-platform-old-pattern }
+    evidence: "{host}: Defender platform {AMProductVersion}, engine {AMEngineVersion}"
+
+  - id: WS-DEFENDER-MAPS-OFF
+    title: Defender cloud-delivered protection is off
+    kind: misconfigured
+    lens: security
+    category: MON
+    severity: medium
+    why: With MAPS off, Defender works from local signatures only; block at first sight, cloud block levels and most detections of new malware depend on the cloud lookup. Where another antivirus is the primary engine this can be waived.
+    fix: Set cloud-delivered protection (MAPS) to Advanced and sample submission to safe samples by policy.
+    refs: [NIST-800-53:SI-3, CIS-Controls-v8:10.1]
+    query:
+      protocol: cim
+      namespace: root/Microsoft/Windows/Defender
+      wql: SELECT * FROM MSFT_MpPreference
+      key: host
+    each: { field: MAPSReporting, op: eq, value: 0 }
+    evidence: "{host}: MAPS {MAPSReporting}, block at first sight disabled {DisableBlockAtFirstSeen}, cloud block level {CloudBlockLevel}"
+
+  - id: WS-DEFENDER-BAFS-OFF
+    title: Defender block at first sight is turned off
+    kind: misconfigured
+    lens: security
+    category: MON
+    severity: low
+    why: Block at first sight holds a new, never-seen file until the cloud has judged it; turned off, the first copy of a new piece of malware runs.
+    fix: Remove the policy that sets DisableBlockAtFirstSeen; keep MAPS on, which the feature needs.
+    refs: [NIST-800-53:SI-3, CIS-Controls-v8:10.1]
+    query:
+      protocol: cim
+      namespace: root/Microsoft/Windows/Defender
+      wql: SELECT * FROM MSFT_MpPreference
+      key: host
+    each: { field: DisableBlockAtFirstSeen, op: eq, value: true }
+    evidence: "{host}: block at first sight disabled"
+
+  - id: WS-DEFENDER-PUA-OFF
+    title: Defender does not block potentially unwanted applications
+    kind: misconfigured
+    lens: security
+    category: MON
+    severity: low
+    why: Bundled adware, cracked-software installers and browser hijackers are not malware by signature; without PUA blocking they install freely and are a common first foothold.
+    fix: Set PUA protection to Block (1) by policy; Audit (2) only reports.
+    refs: [NIST-800-53:SI-3, CIS-Controls-v8:10.1]
+    query:
+      protocol: cim
+      namespace: root/Microsoft/Windows/Defender
+      wql: SELECT * FROM MSFT_MpPreference
+      key: host
+    each: { field: PUAProtection, op: ne, value: 1 }
+    evidence: "{host}: PUA protection {PUAProtection} (1 block, 2 audit, 0 off)"
+
+  - id: WS-DEFENDER-NETWORK-PROTECTION-OFF
+    title: Defender network protection is not blocking
+    kind: misconfigured
+    lens: security
+    category: MON
+    severity: low
+    why: Network protection blocks connections to known phishing, malware and command-and-control hosts from every process, not only the browser; off or audit-only after a half-finished rollout, it blocks nothing.
+    fix: Set network protection to Enabled (block) by policy after an audit period.
+    refs: [NIST-800-53:SI-3, NIST-800-53:SC-7, CIS-Controls-v8:10.1]
+    query:
+      protocol: cim
+      namespace: root/Microsoft/Windows/Defender
+      wql: SELECT * FROM MSFT_MpPreference
+      key: host
+    each: { field: EnableNetworkProtection, op: ne, value: 1 }
+    evidence: "{host}: network protection {EnableNetworkProtection} (1 block, 2 audit, 0 off)"
+
+  - id: WS-DEFENDER-SCRIPT-SCAN-OFF
+    title: Defender script scanning is turned off
+    kind: misconfigured
+    lens: security
+    category: MON
+    severity: low
+    why: Script scanning inspects PowerShell, VBScript and JavaScript content as it runs; without it obfuscated scripts and in-memory loaders pass unseen.
+    fix: Remove the policy that sets DisableScriptScanning.
+    refs: [NIST-800-53:SI-3, CIS-Controls-v8:10.5, MITRE-ATTACK:T1059]
+    query:
+      protocol: cim
+      namespace: root/Microsoft/Windows/Defender
+      wql: SELECT * FROM MSFT_MpPreference
+      key: host
+    each: { field: DisableScriptScanning, op: eq, value: true }
+    evidence: "{host}: script scanning disabled"
+
+  - id: WS-DEFENDER-EXCLUSIONS-BROAD
+    title: Defender excludes a whole drive, profile, temp folder or a risky file type
+    kind: misconfigured
+    lens: security
+    category: MON
+    severity: high
+    why: An exclusion such as a drive root, the Users or ProgramData folder, a temp folder, a wildcard or an extension like .exe or .ps1 means anything dropped there is never scanned; attackers look for these first.
+    fix: Narrow the exclusion to the vendor's exact folder or process, and remove extension exclusions for executable and script types.
+    refs: [NIST-800-53:SI-3, CIS-Controls-v8:10.1, MITRE-ATTACK:T1562.001]
+    query:
+      protocol: cim
+      namespace: root/Microsoft/Windows/Defender
+      wql: SELECT * FROM MSFT_MpPreference
+      key: host
+    each:
+      any:
+        - { field: ExclusionPath, op: match, value: '^[A-Za-z]:\\?\*?$|^\*(\.\*)?\\?$|\\(Users|ProgramData|Windows|Program Files( \(x86\))?|AppData(\\(Local|Roaming|LocalLow))?|Downloads|Desktop|Temp|Tmp)\\?\*?$|^%(TEMP|TMP|USERPROFILE|APPDATA|LOCALAPPDATA|PROGRAMDATA|WINDIR|SYSTEMROOT)%\\?\*?$', threshold: workstations.defender-broad-exclusion-pattern }
+        - { field: ExclusionExtension, op: match, value: '^\.?(exe|dll|sys|scr|com|ps1|psm1|vbs|vbe|js|jse|wsf|hta|bat|cmd|msi|lnk)$', threshold: workstations.defender-risky-extension-pattern }
+    evidence: "{host}: excluded paths {ExclusionPath}; extensions {ExclusionExtension}"
+
+  - id: WS-DEFENDER-EXCLUSION-LOLBIN
+    title: Defender excludes a script host or system tool as a process
+    kind: misconfigured
+    lens: security
+    category: MON
+    severity: high
+    why: Files opened by an excluded process are not scanned, so excluding PowerShell, cmd, a script host or a signed system tool blinds Defender to everything run through it.
+    fix: Remove the process exclusion; exclude the vendor's own binary by full path instead.
+    refs: [NIST-800-53:SI-3, MITRE-ATTACK:T1562.001, MITRE-ATTACK:T1059.001]
+    query:
+      protocol: cim
+      namespace: root/Microsoft/Windows/Defender
+      wql: SELECT * FROM MSFT_MpPreference
+      key: host
+    each: { field: ExclusionProcess, op: match, value: '(^|\\)(powershell|powershell_ise|pwsh|cmd|wscript|cscript|mshta|rundll32|regsvr32|msbuild|installutil|regasm|regsvcs|certutil|bitsadmin|wmic|explorer|svchost)(\.exe)?$', threshold: workstations.defender-lolbin-pattern }
+    evidence: "{host}: excluded processes {ExclusionProcess}"
+
+  - id: WS-DEFENDER-EXCLUSIONS-UNREADABLE
+    title: Defender exclusions could not be read
+    kind: missing
+    lens: security
+    category: MON
+    severity: low
+    why: Defender hides its exclusion lists from accounts that are not local administrators and answers with a placeholder instead; the two exclusion rules then have nothing to judge on this PC.
+    fix: Give the scan account local administrator rights on the PC (or read exclusions through the Defender portal) and re-scan.
+    refs: [NIST-800-53:SI-3]
+    query:
+      protocol: cim
+      namespace: root/Microsoft/Windows/Defender
+      wql: SELECT * FROM MSFT_MpPreference
+      key: host
+    each: { field: ExclusionPath, op: match, value: '^N/A' }
+    evidence: "{host}: exclusions answered as {ExclusionPath}"
+
+  - id: WS-DEFENDER-ACTIVE-THREAT
+    title: Defender reports an active threat on a workstation
+    kind: broken
+    lens: security
+    category: MON
+    severity: high
+    entity: threat
+    why: An active threat is one Defender detected and has not removed; the PC may be compromised now.
+    fix: Isolate the PC, remediate from the security portal and find how the threat got in.
+    refs: [NIST-800-53:SI-3, NIST-800-53:IR-4]
+    query:
+      protocol: cim
+      namespace: root/Microsoft/Windows/Defender
+      wql: SELECT * FROM MSFT_MpThreat
+      key: "{host}|{ThreatID}"
+    each: { field: IsActive, op: eq, value: true }
+    evidence: "{host}: active threat {ThreatName} (severity {SeverityID})"
+
+  # ---- data protection, application control, shares, autostart -------------------------------
+
+  - id: WS-BITLOCKER-DATA-OFF
+    title: Fixed data drive not protected by BitLocker
+    kind: misconfigured
+    lens: security
+    category: CFG
+    severity: medium
+    entity: volume
+    why: A second internal drive left unencrypted carries the same stolen-laptop risk as the system drive and is often where users keep files. Volumes without a drive letter are not judged.
+    fix: Enable BitLocker on fixed data drives by policy, with automatic unlock.
+    refs: [NIST-800-53:SC-28, CIS-Controls-v8:3.6]
+    query:
+      protocol: cim
+      namespace: root/cimv2/Security/MicrosoftVolumeEncryption
+      wql: SELECT DeviceID, DriveLetter, ProtectionStatus, ConversionStatus, VolumeType FROM Win32_EncryptableVolume WHERE VolumeType = 1
+      key: "{host}|{DeviceID}"
+    each:
+      all:
+        - { field: DriveLetter, op: notempty }
+        - { field: ProtectionStatus, op: ne, value: 1 }
+    evidence: "{host}: {DriveLetter} protection status {ProtectionStatus}, conversion {ConversionStatus}"
+
+  - id: WS-WDAC-AUDIT-ONLY
+    title: Application control policy runs in audit mode only
+    kind: misconfigured
+    lens: security
+    category: CFG
+    severity: low
+    why: An App Control (WDAC) user-mode policy left in audit mode logs what it would block and blocks nothing; it is usually a pilot that never finished.
+    fix: Review the audit events, then move the policy to enforced.
+    refs: [NIST-800-53:CM-7, CIS-Controls-v8:2.5, MITRE-ATTACK:T1204]
+    query:
+      protocol: cim
+      namespace: root/Microsoft/Windows/DeviceGuard
+      wql: SELECT * FROM Win32_DeviceGuard
+      key: host
+    each: { field: UsermodeCodeIntegrityPolicyEnforcementStatus, op: eq, value: 1 }
+    evidence: "{host}: user-mode code integrity {UsermodeCodeIntegrityPolicyEnforcementStatus} (1 audit, 2 enforced), kernel {CodeIntegrityPolicyEnforcementStatus}"
+
+  - id: WS-SHARE-NONADMIN
+    title: User-created file share on a workstation
+    kind: misconfigured
+    lens: security
+    category: CFG
+    severity: medium
+    entity: share
+    why: A share on a user PC is an unmanaged data store outside the file server's backup, permissions review and DLP, and a path ransomware uses to spread.
+    fix: Move the data to a file server and remove the share; list shares a documented application needs in the allow pattern.
+    refs: [NIST-800-53:AC-3, CIS-Controls-v8:3.3, MITRE-ATTACK:T1135]
+    query:
+      protocol: cim
+      wql: SELECT Name, Path, Type, Description FROM Win32_Share WHERE Type = 0
+      key: "{host}|{Name}"
+    each:
+      all:
+        - { field: Name, op: notmatch, value: '\$$' }
+        - { field: Name, op: notmatch, value: '^$', threshold: workstations.share-allow-pattern }
+    evidence: "{host}: share {Name} -> {Path}"
+
+  - id: WS-STARTUP-USERPATH
+    title: Autostart entry runs a script, a script host, or a program from a temp or public folder
+    kind: misconfigured
+    lens: security
+    category: CFG
+    severity: medium
+    entity: startup-entry
+    why: Run keys and Startup folders are the commonest user-level persistence; a script host, a script file, or a program straight from a temp, public or AppData root folder at logon is the pattern malware and abandoned logon scripts leave. Ordinary per-user application installs under AppData are not flagged.
+    fix: Remove the entry; if it is a legitimate tool, install it machine-wide and list it in the ignore pattern.
+    refs: [NIST-800-53:CM-7, MITRE-ATTACK:T1547.001, MITRE-ATTACK:T1059]
+    query:
+      protocol: cim
+      wql: SELECT Name, Command, Location, User FROM Win32_StartupCommand
+      key: "{host}|{User}|{Location}|{Name}"
+    each:
+      all:
+        - { field: Command, op: match, value: '\b(wscript|cscript|mshta|powershell|pwsh|rundll32|regsvr32)(\.exe)?\b|\.(vbs|vbe|js|jse|wsf|wsh|hta|bat|cmd|ps1)\b|\\(Windows\\)?Te?mp\\|\\Users\\Public\\|\\AppData\\(Local|Roaming|LocalLow)\\[^\\]+\.(exe|scr|com)\b|\\Downloads\\' }
+        - { field: Command, op: notmatch, value: '^$', threshold: workstations.startup-ignore-pattern }
+    evidence: "{host}: {Location} {Name} ({User}) -> {Command}"
+
+  # ---- network configuration (one read of the IP-enabled adapters) ----------------------------
+
+  - id: WS-DNS-PUBLIC
+    title: Adapter uses a public DNS resolver
+    kind: misconfigured
+    lens: both
+    category: CFG
+    severity: medium
+    entity: network-adapter
+    why: A PC pointed at a public resolver cannot resolve the domain reliably (logon and Group Policy fail intermittently), bypasses DNS filtering, and usually had its address set by hand. Laptops scanned over VPN can show a home router's resolver on the Wi-Fi adapter.
+    fix: Set the adapter back to DHCP-provided DNS and block outbound DNS except from the internal resolvers.
+    refs: [NIST-800-53:SC-20, NIST-800-53:CM-6, MITRE-ATTACK:T1071.004]
+    query:
+      protocol: cim
+      wql: SELECT Index, Description, IPEnabled, DHCPEnabled, DNSServerSearchOrder, TcpipNetbiosOptions, IPAddress, DefaultIPGateway FROM Win32_NetworkAdapterConfiguration WHERE IPEnabled = TRUE
+      key: "{host}|{Index}"
+    each: { field: DNSServerSearchOrder, op: match, value: '^(8\.8\.8\.8|8\.8\.4\.4|1\.1\.1\.1|1\.0\.0\.1|9\.9\.9\.9|149\.112\.112\.112|208\.67\.222\.222|208\.67\.220\.220|2001:4860:4860::88(88|44)|2606:4700:4700::1(111|001))$', threshold: workstations.public-dns-pattern }
+    evidence: "{host}: {Description} uses DNS {DNSServerSearchOrder}"
+
+  - id: WS-NETBIOS-ON
+    title: NetBIOS over TCP/IP enabled on a workstation adapter
+    kind: misconfigured
+    lens: security
+    category: AUT
+    severity: low
+    entity: network-adapter
+    why: NetBIOS name queries are answered by whoever is on the segment, which is the first step of credential-relay attacks. Value 0 (follow DHCP) counts as on, because DHCP rarely sends the option.
+    fix: Disable NetBIOS over TCP/IP through the DHCP option (Microsoft vendor option 1 = 2) or by policy; VPN and virtual adapters go in the adapter pattern.
+    refs: [NIST-800-53:CM-7, CIS-Controls-v8:4.8, MITRE-ATTACK:T1557.001]
+    query:
+      protocol: cim
+      wql: SELECT Index, Description, IPEnabled, DHCPEnabled, DNSServerSearchOrder, TcpipNetbiosOptions, IPAddress, DefaultIPGateway FROM Win32_NetworkAdapterConfiguration WHERE IPEnabled = TRUE
+      key: "{host}|{Index}"
+    each:
+      all:
+        - { field: TcpipNetbiosOptions, op: ne, value: 2 }
+        - { field: Description, op: notmatch, value: 'VPN|Virtual|TAP-|Hyper-V|VMware|VirtualBox|WAN Miniport|Bluetooth|Fortinet|AnyConnect|Check Point|Zscaler|WireGuard', threshold: workstations.virtual-adapter-pattern }
+    evidence: "{host}: {Description} NetBIOS option {TcpipNetbiosOptions} (2 = disabled)"
+
+  - id: WS-IP-STATIC
+    title: Physical adapter has a static IP address
+    kind: misconfigured
+    category: CFG
+    severity: low
+    entity: network-adapter
+    why: A hand-set address on a user PC conflicts with DHCP scopes, survives moves to another floor or site, and usually carries hand-set DNS servers too.
+    fix: Set the adapter back to DHCP; use a reservation where the PC needs a fixed address.
+    refs: [NIST-800-53:CM-6]
+    query:
+      protocol: cim
+      wql: SELECT Index, Description, IPEnabled, DHCPEnabled, DNSServerSearchOrder, TcpipNetbiosOptions, IPAddress, DefaultIPGateway FROM Win32_NetworkAdapterConfiguration WHERE IPEnabled = TRUE
+      key: "{host}|{Index}"
+    each:
+      all:
+        - { field: DHCPEnabled, op: eq, value: false }
+        - { field: Description, op: notmatch, value: 'VPN|Virtual|TAP-|Hyper-V|VMware|VirtualBox|WAN Miniport|Bluetooth|Fortinet|AnyConnect|Check Point|Zscaler|WireGuard', threshold: workstations.virtual-adapter-pattern }
+    evidence: "{host}: {Description} static {IPAddress}, gateway {DefaultIPGateway}, DNS {DNSServerSearchOrder}"
+
+  - id: WS-SMB-SERVER-SIGNING-OFF
+    title: Workstation's SMB server does not require signing
+    kind: misconfigured
+    lens: security
+    category: AUT
+    severity: medium
+    why: Every PC runs the Server service for its administrative shares; without required signing, sessions to it can be relayed by a machine in the middle.
+    fix: Require SMB server signing by policy ('Microsoft network server - Digitally sign communications (always)').
+    refs: [NIST-800-53:SC-8, CIS-Controls-v8:4.1, MITRE-ATTACK:T1557.001]
+    query:
+      protocol: cim
+      namespace: root/Microsoft/Windows/SMB
+      wql: SELECT * FROM MSFT_SmbServerConfiguration
+      key: host
+    each: { field: RequireSecuritySignature, op: eq, value: false }
+    evidence: "{host}: SMB server RequireSecuritySignature = {RequireSecuritySignature}"
+
+  - id: WS-HOST-NAME-MISMATCH
+    title: The scanned address answered with another computer's name
+    kind: misconfigured
+    lens: both
+    category: CFG
+    severity: high
+    why: The DNS name of this computer leads to a PC that calls itself something else (a stale record, a reused address); every per-host finding for this name is then about the wrong machine, and users and tools that use the name reach the wrong PC.
+    fix: Fix the DNS record (scavenging, dynamic registration) or the computer's name, then re-scan.
+    refs: [NIST-800-53:CM-8, NIST-800-53:SC-22]
+    query:
+      protocol: cim
+      wql: SELECT Name, DNSHostName, Domain FROM Win32_ComputerSystem WHERE DNSHostName <> '{HOST}'
+      key: host
+    each: any
+    evidence: "{host}: the PC answering is {DNSHostName} ({Name}, {Domain})"
+
+  # ---- network adapters ----------------------------------------------------------------------
+
+  - id: WS-NIC-SLOW-LINK
+    title: Wired link at 100 Mbps or less, or half duplex
+    kind: broken
+    category: HLT
+    severity: medium
+    entity: network-adapter
+    why: A gigabit PC that negotiated 100 Mbps or half duplex has a bad cable, dock or switch port; file copies, updates and Teams calls crawl while the PC itself looks fine.
+    fix: Check the cable, dock and switch port; leave speed and duplex on auto-negotiation. The threshold is in bits per second.
+    refs: [NIST-800-53:CP-2(2), NIST-800-53:SI-13]
+    query:
+      protocol: cim
+      namespace: root/StandardCimv2
+      wql: SELECT Name, InterfaceDescription, Speed, FullDuplex, NdisPhysicalMedium, MediaConnectState, DriverVersionString, DriverDate FROM MSFT_NetAdapter WHERE HardwareInterface = TRUE AND MediaConnectState = 1
+      key: "{host}|{Name}"
+    each:
+      all:
+        - { field: NdisPhysicalMedium, op: eq, value: 14 }
+        - any:
+            - { field: Speed, op: le, value: 100000000, threshold: workstations.wired-min-bps }
+            - { field: FullDuplex, op: eq, value: false }
+    evidence: "{host}: {Name} ({InterfaceDescription}) at {Speed} bit/s, full duplex {FullDuplex}"
+
+  - id: WS-NIC-DRIVER-OLD
+    title: Connected network adapter runs a driver more than three years old
+    kind: broken
+    category: LCM
+    severity: low
+    entity: network-adapter
+    why: Old NIC drivers carry known link-drop, power-management and offload bugs; they are a frequent cause of drops that look like network faults. Some in-box drivers carry an old date by design.
+    fix: Update the driver from the PC vendor's driver pack or the update tool.
+    refs: [NIST-800-53:SI-2]
+    query:
+      protocol: cim
+      namespace: root/StandardCimv2
+      wql: SELECT Name, InterfaceDescription, Speed, FullDuplex, NdisPhysicalMedium, MediaConnectState, DriverVersionString, DriverDate FROM MSFT_NetAdapter WHERE HardwareInterface = TRUE AND MediaConnectState = 1
+      key: "{host}|{Name}"
+    each: { field: DriverDate, op: age-gt, value: 1095, threshold: workstations.nic-driver-max-age-days }
+    evidence: "{host}: {InterfaceDescription} driver {DriverVersionString} dated {DriverDate}"
+
+  - id: WS-NIC-SPEED-FORCED
+    title: Network adapter speed and duplex forced instead of negotiated
+    kind: misconfigured
+    category: CFG
+    severity: low
+    entity: network-adapter
+    why: A forced speed or duplex on one end and auto-negotiation on the switch gives a duplex mismatch - a link that works but loses packets under load.
+    fix: Set Speed & Duplex back to Auto Negotiation unless the switch port is forced to the same value on purpose.
+    refs: [NIST-800-53:CM-6]
+    query:
+      protocol: cim
+      namespace: root/StandardCimv2
+      wql: SELECT Name, DisplayName, RegistryKeyword, DisplayValue, RegistryValue FROM MSFT_NetAdapterAdvancedPropertySettingData WHERE RegistryKeyword = '*SpeedDuplex'
+      key: "{host}|{Name}"
+    each: { field: RegistryValue, op: ne, value: 0 }
+    evidence: "{host}: {Name} speed and duplex set to {DisplayValue} ({RegistryValue})"
+
+  - id: WS-STATIC-ROUTES
+    title: Static IPv4 routes configured on the PC
+    kind: misconfigured
+    category: CFG
+    severity: low
+    entity: route
+    why: A route added by hand or by an old script sends some traffic past the gateway the network expects; it survives moves and breaks reachability in ways nobody can see from the network side.
+    fix: Remove the persistent route and let routing happen in the network; routes a VPN client manages belong in the ignore pattern.
+    refs: [NIST-800-53:CM-6]
+    query:
+      protocol: cim
+      namespace: root/StandardCimv2
+      wql: SELECT DestinationPrefix, NextHop, InterfaceAlias, Protocol FROM MSFT_NetRoute WHERE AddressFamily = 2 AND Protocol = 3
+      key: "{host}|{DestinationPrefix}|{InterfaceAlias}"
+    each:
+      all:
+        - { field: DestinationPrefix, op: ne, value: 0.0.0.0/0 }
+        - { field: InterfaceAlias, op: notmatch, value: '^$', threshold: workstations.static-route-ignore-interface-pattern }
+    evidence: "{host}: route {DestinationPrefix} via {NextHop} ({InterfaceAlias})"
+
+  # ---- hardware and capacity -------------------------------------------------------------------
+
+  - id: WS-DISK-HDD-SYSTEM
+    title: PC has an internal spinning hard disk
+    kind: misconfigured
+    category: HLT
+    severity: low
+    entity: disk
+    why: A spinning disk is the single biggest hardware cause of a slow PC with today's security agents; boot, logon and updates take many times longer than on an SSD. USB disks are not counted.
+    fix: Replace the disk with an SSD, or the PC at its next refresh.
+    refs: [NIST-800-53:CP-2(2)]
+    query:
+      protocol: cim
+      namespace: root/Microsoft/Windows/Storage
+      wql: SELECT DeviceId, FriendlyName, MediaType, BusType, HealthStatus FROM MSFT_PhysicalDisk
+      key: "{host}|{DeviceId}"
+    each:
+      all:
+        - { field: MediaType, op: eq, value: 3 }
+        - { field: BusType, op: ne, value: 7 }
+    evidence: "{host}: {FriendlyName} is a hard disk (bus {BusType})"
+
+  - id: WS-MEMORY-LOW-TOTAL
+    title: Workstation has less than 8 GB of memory
+    kind: misconfigured
+    category: HLT
+    severity: low
+    why: With today's browser and security stack, a PC under 8 GB pages constantly; it is slow whatever else is fixed. The threshold is in KB of visible memory.
+    fix: Add memory where the board allows, otherwise plan the replacement.
+    refs: [NIST-800-53:CP-2(2)]
+    query:
+      protocol: cim
+      wql: SELECT Caption, Version, BuildNumber, OperatingSystemSKU, LastBootUpTime, FreePhysicalMemory, TotalVisibleMemorySize FROM Win32_OperatingSystem
+      key: host
+    each: { field: TotalVisibleMemorySize, op: lt, value: 7864320, threshold: workstations.min-memory-kb }
+    evidence: "{host}: {TotalVisibleMemorySize} KB visible memory"
+
+  - id: WS-PAGEFILE-NONE
+    title: No page file
+    kind: misconfigured
+    category: HLT
+    severity: low
+    why: Without a page file the commit limit is the RAM alone, so allocations fail early, programs hang and no crash dump is written. Usually an image or a performance tweak.
+    fix: Let Windows manage the page file, or set a fixed one large enough for a kernel dump.
+    refs: [NIST-800-53:SC-5]
+    query:
+      protocol: cim
+      wql: SELECT Name, AllocatedBaseSize, CurrentUsage, PeakUsage FROM Win32_PageFileUsage
+      key: "{host}|{Name}"
+    count: { op: lt, value: 1 }
+    evidence: "{host}: no page file"
+
+  - id: WS-SERVICES-EXE-BUSY
+    title: Service Control Manager (services.exe) busy since boot
+    kind: broken
+    category: HLT
+    severity: medium
+    entity: process
+    why: services.exe normally uses 1-3% of one core; an agent that queries or reconfigures services in a loop drives it far higher, and every service start, logon and scheduled task waits on it. The rule fires when its kernel or its user time alone exceeds 5% of the time since it started, so the combined share is at least about 5% and every case above 10% is caught. WS-WATCHED-AGENT-RUNNING on the same PC lists the agents found running.
+    fix: Compare the PCs where it fires with the agents they run; stop or reconfigure the agent on one PC to confirm, then take it to the vendor.
+    refs: [NIST-800-53:SI-4, NIST-800-53:SC-5]
+    query:
+      protocol: cim
+      wql: SELECT Name, ProcessId, CreationDate, KernelModeTime, UserModeTime FROM Win32_Process WHERE Name = 'services.exe'
+      key: "{host}|{Name}"
+    each:
+      any:
+        - { field: CreationDate, op: age-lt, value: { field: KernelModeTime, times: 2.3148148e-11 } }
+        - { field: CreationDate, op: age-lt, value: { field: UserModeTime, times: 2.3148148e-11 } }
+    evidence: "{host}: services.exe since {CreationDate}, kernel {KernelModeTime} and user {UserModeTime} (100 ns units)"
+
+  - id: WS-WATCHED-AGENT-RUNNING
+    title: Agent from the watch list is running
+    kind: misconfigured
+    category: MON
+    severity: info
+    why: Lists, per PC, the running services that match the organisation's watch list of agent services, so a load problem (services.exe busy, slow logons) can be compared between PCs with and without each agent. The default list is empty and the rule stays silent until it is set.
+    fix: Set the watch pattern to the agent service names under study; compare the hosts listed here with WS-SERVICES-EXE-BUSY and the boot-degradation findings.
+    refs: [NIST-800-53:CM-8, NIST-800-53:SI-4]
+    query:
+      protocol: cim
+      wql: SELECT Name, DisplayName, PathName, StartName, StartMode, State FROM Win32_Service
+      key: "{host}|{Name}"
+    count:
+      op: ge
+      value: 1
+      where:
+        all:
+          - { field: State, op: eq, value: Running }
+          - { field: Name, op: match, value: '^$', threshold: workstations.watch-agent-pattern }
+    evidence: "{host}: {count} watched agents running ({sample})"
+
+  - id: WS-PROC-SPPSVC-LONG
+    title: Software Protection service process running for over an hour
+    kind: broken
+    category: HLT
+    severity: medium
+    entity: process
+    why: The licensing service normally starts, checks and exits within minutes; running for hours it is stuck or looping on activation, holding CPU and the service manager.
+    fix: Check activation (KMS or AD-based activation reachable) and restart the PC; a recurring loop needs the licensing store repaired.
+    refs: [NIST-800-53:SI-4]
+    query:
+      protocol: cim
+      wql: SELECT Name, ProcessId, CreationDate FROM Win32_Process
+      key: "{host}|{Name}|{ProcessId}"
+    each:
+      all:
+        - { field: Name, op: eq, value: sppsvc.exe }
+        - { field: CreationDate, op: age-gt, value: 0.042, threshold: workstations.sppsvc-max-age-days }
+    evidence: "{host}: sppsvc.exe (pid {ProcessId}) running since {CreationDate}"
+
+  - id: WS-NOT-ACTIVATED
+    title: Windows is not activated on the workstation
+    kind: broken
+    category: CST
+    severity: low
+    why: An unactivated PC nags the user, loses personalisation and eventually restarts; it also shows that the activation path (KMS or AD-based) does not work for its network.
+    fix: Activate against the organisation's KMS or AD-based activation; check DNS for the KMS record from the PC's subnet.
+    refs: [NIST-800-53:CM-8]
+    query:
+      protocol: cim
+      wql: SELECT Name, LicenseStatus FROM SoftwareLicensingProduct WHERE ApplicationID = '55c92734-d682-4d71-983e-d6ec3f16059f' AND PartialProductKey IS NOT NULL
+      key: host
+    each: { field: LicenseStatus, op: ne, value: 1 }
+    evidence: "{host}: {Name} license status {LicenseStatus} (1 = licensed)"
+
+  - id: WS-OS-PRO-BUILD-UNSUPPORTED
+    title: Home or Pro edition on a build whose shorter servicing has ended
+    kind: broken
+    lens: both
+    category: LCM
+    severity: high
+    why: Home, Pro, Pro Education and Pro for Workstations get 24 months per feature update, not the 36 of Enterprise and Education; 23H2 ended for them on 2025-11-11 and 24H2 on 2026-10-13, so such a PC gets no more security updates while the Enterprise-date rule still calls it fine.
+    fix: Feature-update the PC (25H2 is serviced for Pro until 2027-10-12) or move it to an Enterprise licence. Add builds to the list as dates pass.
+    refs: [NIST-800-53:SA-22, NIST-800-53:SI-2, CIS-Controls-v8:2.2]
+    query:
+      protocol: cim
+      wql: SELECT Caption, Version, BuildNumber, OperatingSystemSKU, LastBootUpTime, FreePhysicalMemory, TotalVisibleMemorySize FROM Win32_OperatingSystem
+      key: host
+    each:
+      all:
+        - { field: OperatingSystemSKU, op: in, value: [48, 49, 98, 99, 100, 101, 161, 162, 164, 165], threshold: workstations.short-servicing-skus }
+        - { field: BuildNumber, op: in, value: [22631, 26100], threshold: workstations.pro-unsupported-builds }
+    evidence: "{host}: {Caption} (SKU {OperatingSystemSKU}) build {BuildNumber}"
+
+  - id: WS-PROFILES-MANY
+    title: Many unused user profiles on a workstation
+    kind: misconfigured
+    category: HYG
+    severity: low
+    why: Every profile left by a former user takes disk space, slows antivirus and backup scans, and keeps that user's cached data on the PC. Profile last-use dates are not reliable on current Windows, so the count is the signal.
+    fix: Delete old profiles by policy ('Delete user profiles older than a specified number of days') or a cleanup task.
+    refs: [NIST-800-53:SC-4]
+    query:
+      protocol: cim
+      wql: SELECT SID, LocalPath, LastUseTime FROM Win32_UserProfile WHERE Special = FALSE AND Loaded = FALSE
+      key: "{host}|{SID}"
+    count: { op: gt, value: 15, threshold: workstations.profiles-max }
+    evidence: "{host}: {count} profiles not in use"
+
+  # ---- registry: effective settings, read-only through StdRegProv -------------------------------
+  # One row per host. A value that is missing is the Windows default; where that default is the
+  # insecure one the condition fails on "absent" too. A key that is missing reads as exists = false.
+
+  - id: WS-REG-LSA-PPL
+    title: LSA is not running as a protected process
+    kind: misconfigured
+    lens: security
+    category: AUT
+    severity: high
+    why: Without LSA protection, any administrator-level process can open LSASS and read the credentials of everyone who logged on - the core step of credential-dumping tools.
+    fix: Set RunAsPPL to 1 (with UEFI lock) or 2 by policy after checking that no unsigned LSA plug-in is needed.
+    refs: [NIST-800-53:SC-39, NIST-800-53:IA-5, MITRE-ATTACK:T1003.001]
+    query:
+      protocol: registry
+      path: SYSTEM\CurrentControlSet\Control\Lsa
+      values: [RunAsPPL, RunAsPPLBoot]
+      key: host
+    each:
+      all:
+        - any:
+            - { field: RunAsPPL, op: absent }
+            - { field: RunAsPPL, op: notin, value: [1, 2] }
+        - any:
+            - { field: RunAsPPLBoot, op: absent }
+            - { field: RunAsPPLBoot, op: notin, value: [1, 2] }
+    evidence: "{host}: RunAsPPL {RunAsPPL}, RunAsPPLBoot {RunAsPPLBoot}"
+
+  - id: WS-REG-WDIGEST
+    title: WDigest keeps clear-text passwords in memory
+    kind: misconfigured
+    lens: security
+    category: AUT
+    severity: high
+    why: With UseLogonCredential set to 1, WDigest stores every logged-on user's password in clear text in LSASS, readable by any credential-dumping tool.
+    fix: Remove the value or set it to 0 by policy and find the tool that turned it on.
+    refs: [NIST-800-53:IA-5, MITRE-ATTACK:T1003.001]
+    query:
+      protocol: registry
+      path: SYSTEM\CurrentControlSet\Control\SecurityProviders\WDigest
+      values: [UseLogonCredential]
+      key: host
+    each: { field: UseLogonCredential, op: eq, value: 1 }
+    evidence: "{host}: WDigest UseLogonCredential = {UseLogonCredential}"
+
+  - id: WS-REG-LLMNR
+    title: Multicast name resolution (LLMNR) is not turned off by policy
+    kind: misconfigured
+    lens: security
+    category: AUT
+    severity: medium
+    why: When DNS fails, LLMNR asks the whole segment and believes whoever answers first, which hands NTLM hashes to a responder tool on the same network.
+    fix: Set 'Turn off multicast name resolution' to Enabled by policy (EnableMulticast = 0).
+    refs: [NIST-800-53:CM-7, CIS-Controls-v8:4.8, MITRE-ATTACK:T1557.001]
+    query:
+      protocol: registry
+      path: SOFTWARE\Policies\Microsoft\Windows NT\DNSClient
+      values: [EnableMulticast]
+      key: host
+    each:
+      any:
+        - { field: EnableMulticast, op: absent }
+        - { field: EnableMulticast, op: ne, value: 0 }
+    evidence: "{host}: EnableMulticast = {EnableMulticast} (missing = on)"
+
+  - id: WS-REG-NBT-NODETYPE
+    title: NetBIOS name resolution may use broadcasts
+    kind: misconfigured
+    lens: security
+    category: AUT
+    severity: low
+    why: Any node type other than P-node lets NetBIOS names be resolved by broadcast, which a responder on the segment can answer.
+    fix: Set NodeType to 2 (P-node) by policy, or disable NetBIOS over TCP/IP on the adapters.
+    refs: [NIST-800-53:CM-7, MITRE-ATTACK:T1557.001]
+    query:
+      protocol: registry
+      path: SYSTEM\CurrentControlSet\Services\NetBT\Parameters
+      values: [NodeType, DhcpNodeType]
+      key: host
+    each:
+      any:
+        - { field: NodeType, op: absent }
+        - { field: NodeType, op: ne, value: 2 }
+    evidence: "{host}: NodeType {NodeType}, from DHCP {DhcpNodeType}"
+
+  - id: WS-REG-CACHED-LOGONS
+    title: More cached domain logons than needed
+    kind: misconfigured
+    lens: security
+    category: AUT
+    severity: low
+    why: Each cached logon keeps a crackable verifier of a user's password on the PC; the default of 10 keeps those of every recent user, while laptops need only a few for offline work.
+    fix: Set 'Number of previous logons to cache' to 4 or fewer by policy (servers need fewer still).
+    refs: [NIST-800-53:IA-5, MITRE-ATTACK:T1003.005]
+    query:
+      protocol: registry
+      path: SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon
+      values: [AutoAdminLogon, DefaultUserName, DefaultPassword, CachedLogonsCount]
+      key: host
+    each:
+      any:
+        - { field: CachedLogonsCount, op: absent }
+        - { field: CachedLogonsCount, op: gt, value: 4, threshold: workstations.cached-logons-max }
+    evidence: "{host}: CachedLogonsCount = {CachedLogonsCount} (missing = 10)"
+
+  - id: WS-REG-AUTOLOGON-PASSWORD
+    title: Automatic logon password stored in clear text
+    kind: misconfigured
+    lens: security
+    category: IAM
+    severity: critical
+    why: A DefaultPassword value under Winlogon is a password in clear text that any user with registry read access on the PC, or anyone who copies the hive, can read. The scan reports only that it is set.
+    fix: Remove DefaultPassword; if the device must log on by itself, use a kiosk configuration or store the secret with the autologon tool's LSA option, under an account with no other rights.
+    refs: [NIST-800-53:IA-5, CIS-Controls-v8:5.2, MITRE-ATTACK:T1552.002]
+    query:
+      protocol: registry
+      path: SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon
+      values: [AutoAdminLogon, DefaultUserName, DefaultPassword, CachedLogonsCount]
+      key: host
+    each: { field: DefaultPassword, op: exists }
+    evidence: "{host}: DefaultPassword is set for {DefaultUserName} (AutoAdminLogon {AutoAdminLogon})"
+
+  - id: WS-REG-AUTOLOGON
+    title: Automatic logon is turned on
+    kind: misconfigured
+    lens: security
+    category: IAM
+    severity: medium
+    why: A PC that logs an account on by itself gives that account's session to whoever sits down or switches it on; on an office PC it is usually a leftover from imaging or a support visit.
+    fix: Set AutoAdminLogon to 0 unless the device is a documented kiosk, and record kiosks as exceptions.
+    refs: [NIST-800-53:AC-2, NIST-800-53:IA-2]
+    query:
+      protocol: registry
+      path: SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon
+      values: [AutoAdminLogon, DefaultUserName, DefaultPassword, CachedLogonsCount]
+      key: host
+    each: { field: AutoAdminLogon, op: eq, value: 1 }
+    evidence: "{host}: automatic logon as {DefaultUserName}"
+
+  - id: WS-REG-HARDENED-UNC-WEAK
+    title: Hardened UNC paths for SYSVOL or NETLOGON weakened
+    kind: misconfigured
+    lens: security
+    category: AUT
+    severity: high
+    why: Windows requires mutual authentication and integrity on SYSVOL and NETLOGON by default; a policy entry that sets either to 0 lets a machine in the middle serve the PC forged Group Policy and logon scripts. A missing entry keeps the secure default.
+    fix: Set the \\*\SYSVOL and \\*\NETLOGON entries to RequireMutualAuthentication=1, RequireIntegrity=1 (or remove them).
+    refs: [NIST-800-53:SC-8, NIST-800-53:SC-23, MITRE-ATTACK:T1557]
+    query:
+      protocol: registry
+      path: SOFTWARE\Policies\Microsoft\Windows\NetworkProvider\HardenedPaths
+      key: host
+    each:
+      any:
+        - { field: '\\*\SYSVOL', op: match, value: '(RequireMutualAuthentication|RequireIntegrity)\s*=\s*0' }
+        - { field: '\\*\NETLOGON', op: match, value: '(RequireMutualAuthentication|RequireIntegrity)\s*=\s*0' }
+    evidence: "{host}: hardened paths weakened"
+
+  - id: WS-REG-UAC-OFF
+    title: User Account Control is off or administrators elevate without a prompt
+    kind: misconfigured
+    lens: security
+    category: AUT
+    severity: high
+    why: With EnableLUA at 0 every administrator process runs with full rights, and with ConsentPromptBehaviorAdmin at 0 elevation is silent; this reads the effective value, whether a policy, an image or a tool set it.
+    fix: Set EnableLUA to 1 and ConsentPromptBehaviorAdmin to a prompting value by policy; find what changed it.
+    refs: [NIST-800-53:AC-6, CIS-Controls-v8:4.1, MITRE-ATTACK:T1548.002]
+    query:
+      protocol: registry
+      path: SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System
+      values: [EnableLUA, ConsentPromptBehaviorAdmin, FilterAdministratorToken, LocalAccountTokenFilterPolicy]
+      key: host
+    each:
+      any:
+        - { field: EnableLUA, op: eq, value: 0 }
+        - { field: ConsentPromptBehaviorAdmin, op: eq, value: 0 }
+    evidence: "{host}: EnableLUA {EnableLUA}, ConsentPromptBehaviorAdmin {ConsentPromptBehaviorAdmin}"
+
+  - id: WS-REG-REMOTE-UAC-OFF
+    title: Remote UAC restrictions for local accounts are turned off
+    kind: misconfigured
+    lens: security
+    category: AUT
+    severity: high
+    why: LocalAccountTokenFilterPolicy = 1 gives local administrator accounts a full token over the network, so one shared local password or hash opens every PC remotely (pass-the-hash).
+    fix: Remove the value (or set 0); manage PCs remotely with domain accounts and keep local administrator passwords unique with LAPS.
+    refs: [NIST-800-53:AC-6, NIST-800-53:AC-17, MITRE-ATTACK:T1550.002]
+    query:
+      protocol: registry
+      path: SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System
+      values: [EnableLUA, ConsentPromptBehaviorAdmin, FilterAdministratorToken, LocalAccountTokenFilterPolicy]
+      key: host
+    each: { field: LocalAccountTokenFilterPolicy, op: eq, value: 1 }
+    evidence: "{host}: LocalAccountTokenFilterPolicy = 1"
+
+  - id: WS-REG-WINRM-SERVICE-INSECURE
+    title: WinRM service accepts Basic authentication or unencrypted traffic
+    kind: misconfigured
+    lens: security
+    category: AUT
+    severity: medium
+    why: Basic authentication sends reusable credentials, and unencrypted traffic exposes every remote command and its output on the wire.
+    fix: Set 'Allow Basic authentication' and 'Allow unencrypted traffic' for the WinRM service to Disabled by policy.
+    refs: [NIST-800-53:SC-8, NIST-800-53:IA-2, CIS-Controls-v8:3.10]
+    query:
+      protocol: registry
+      path: SOFTWARE\Policies\Microsoft\Windows\WinRM\Service
+      values: [AllowBasic, AllowUnencryptedTraffic]
+      key: host
+    each:
+      any:
+        - { field: AllowBasic, op: eq, value: 1 }
+        - { field: AllowUnencryptedTraffic, op: eq, value: 1 }
+    evidence: "{host}: WinRM service AllowBasic {AllowBasic}, AllowUnencryptedTraffic {AllowUnencryptedTraffic}"
+
+  - id: WS-REG-WINRM-CLIENT-INSECURE
+    title: WinRM client allows Basic, Digest or unencrypted traffic
+    kind: misconfigured
+    lens: security
+    category: AUT
+    severity: medium
+    why: A client that offers Basic or Digest authentication or sends unencrypted traffic leaks the administrator's credentials to any endpoint it is pointed at.
+    fix: Set Basic, Digest and unencrypted traffic for the WinRM client to Disabled by policy.
+    refs: [NIST-800-53:SC-8, NIST-800-53:IA-2]
+    query:
+      protocol: registry
+      path: SOFTWARE\Policies\Microsoft\Windows\WinRM\Client
+      values: [AllowBasic, AllowDigest, AllowUnencryptedTraffic]
+      key: host
+    each:
+      any:
+        - { field: AllowBasic, op: eq, value: 1 }
+        - { field: AllowDigest, op: eq, value: 1 }
+        - { field: AllowUnencryptedTraffic, op: eq, value: 1 }
+    evidence: "{host}: WinRM client AllowBasic {AllowBasic}, AllowDigest {AllowDigest}, AllowUnencryptedTraffic {AllowUnencryptedTraffic}"
+
+  - id: WS-REG-CREDSSP-DELEGATION
+    title: Policy delegates credentials to remote servers through CredSSP
+    kind: misconfigured
+    lens: security
+    category: AUT
+    severity: low
+    why: Credential delegation hands the user's reusable credentials to the listed servers; the NTLM-only variants do it to servers whose identity was never proven. A compromised target then holds the user's password.
+    fix: Remove the delegation policies, or limit the server list to the exact hosts that need it (never a wildcard) and never use the NTLM-only variants.
+    refs: [NIST-800-53:IA-5, NIST-800-53:AC-17, MITRE-ATTACK:T1003]
+    query:
+      protocol: registry
+      path: SOFTWARE\Policies\Microsoft\Windows\CredentialsDelegation
+      values: [AllowFreshCredentials, AllowDefaultCredentials, AllowSavedCredentials, AllowFreshCredentialsWhenNTLMOnly, AllowDefCredentialsWhenNTLMOnly]
+      key: host
+    each:
+      any:
+        - { field: AllowFreshCredentials, op: eq, value: 1 }
+        - { field: AllowDefaultCredentials, op: eq, value: 1 }
+        - { field: AllowSavedCredentials, op: eq, value: 1 }
+        - { field: AllowFreshCredentialsWhenNTLMOnly, op: eq, value: 1 }
+        - { field: AllowDefCredentialsWhenNTLMOnly, op: eq, value: 1 }
+    evidence: "{host}: fresh {AllowFreshCredentials}, default {AllowDefaultCredentials}, saved {AllowSavedCredentials}, NTLM-only {AllowFreshCredentialsWhenNTLMOnly}/{AllowDefCredentialsWhenNTLMOnly}"
+
+  - id: WS-REG-KERBEROS-RC4
+    title: Kerberos on the PC still allows RC4
+    kind: misconfigured
+    lens: security
+    category: AUT
+    severity: medium
+    why: RC4 tickets are the ones roasting attacks crack offline; while a PC offers RC4 (the default when the policy is not set), the domain cannot drop it.
+    fix: Set 'Network security - Configure encryption types allowed for Kerberos' to AES only after the RC4 dependencies are found.
+    refs: [NIST-800-53:SC-13, NIST-800-53:IA-5, MITRE-ATTACK:T1558.003]
+    query:
+      protocol: registry
+      path: SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System\Kerberos\Parameters
+      values: [SupportedEncryptionTypes]
+      key: host
+    each:
+      any:
+        - { field: SupportedEncryptionTypes, op: absent }
+        - { field: SupportedEncryptionTypes, op: flag, value: 4 }
+    evidence: "{host}: SupportedEncryptionTypes = {SupportedEncryptionTypes} (missing = OS default with RC4)"
+
+  - id: WS-REG-WSUS-HTTP
+    title: Windows Update source is a plain-HTTP update server
+    kind: misconfigured
+    lens: security
+    category: LCM
+    severity: high
+    why: Update metadata fetched over plain HTTP can be altered by a machine in the middle, which can then push a signed Microsoft tool with attacker-chosen arguments as an "update".
+    fix: Move the update server (or the software update point) to HTTPS and update the policy URLs.
+    refs: [NIST-800-53:SI-2, NIST-800-53:SC-8, MITRE-ATTACK:T1557]
+    query:
+      protocol: registry
+      path: SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate
+      values: [WUServer, WUStatusServer, UpdateServiceUrlAlternate]
+      key: host
+    each:
+      any:
+        - { field: WUServer, op: match, value: '^http://' }
+        - { field: WUStatusServer, op: match, value: '^http://' }
+    evidence: "{host}: update server {WUServer}, status server {WUStatusServer}"
+
+  - id: WS-REG-SECUREBOOT-CA2023
+    title: Secure Boot 2023 certificate update not applied
+    kind: missing
+    lens: both
+    category: PKI
+    severity: medium
+    why: The 2011 Microsoft Secure Boot certificates expire during 2026; a PC that has not moved to the 2023 certificates cannot receive new boot manager and Secure Boot fixes. PCs without the servicing key (legacy BIOS) are not judged here.
+    fix: Let the monthly update apply the certificate update (or trigger it per Microsoft's Secure Boot guidance); update the firmware first where the vendor requires it.
+    refs: [NIST-800-53:SI-7, NIST-800-53:SI-2]
+    query:
+      protocol: registry
+      path: SYSTEM\CurrentControlSet\Control\SecureBoot\Servicing
+      values: [UEFICA2023Status, UEFICA2023Error, WindowsUEFICA2023Capable]
+      key: host
+    each:
+      all:
+        - { field: exists, op: eq, value: true }
+        - any:
+            - { field: UEFICA2023Status, op: absent }
+            - { field: UEFICA2023Status, op: ne, value: Updated }
+    evidence: "{host}: UEFICA2023Status {UEFICA2023Status}, error {UEFICA2023Error}, capable {WindowsUEFICA2023Capable}"
+
+  - id: WS-REG-MDE-NOT-ONBOARDED
+    title: PC not onboarded to Defender for Endpoint
+    kind: missing
+    lens: security
+    category: MON
+    severity: high
+    why: Without onboarding the EDR sensor reports nothing, so attacks on this PC are invisible to the security team. Applies where Defender for Endpoint is the organisation's EDR.
+    fix: Run the onboarding package from the management tool and check the Sense service and its connectivity to the cloud.
+    refs: [NIST-800-53:SI-4, CIS-Controls-v8:13.7]
+    query:
+      protocol: registry
+      path: SOFTWARE\Microsoft\Windows Advanced Threat Protection\Status
+      values: [OnboardingState, LastConnected]
+      key: host
+    each:
+      any:
+        - { field: OnboardingState, op: absent }
+        - { field: OnboardingState, op: ne, value: 1 }
+    evidence: "{host}: OnboardingState {OnboardingState}"
+
+  - id: WS-REG-APPLOCKER-AUDIT-ONLY
+    title: AppLocker executable rules in audit mode only
+    kind: misconfigured
+    lens: security
+    category: CFG
+    severity: low
+    why: AppLocker set to audit logs what it would block and blocks nothing; like an audit-only App Control policy, it is usually a pilot that never finished.
+    fix: Review the AppLocker audit events, then set executable rules to Enforce rules.
+    refs: [NIST-800-53:CM-7, CIS-Controls-v8:2.5]
+    query:
+      protocol: registry
+      path: SOFTWARE\Policies\Microsoft\Windows\SrpV2\Exe
+      values: [EnforcementMode]
+      key: host
+    each: { field: EnforcementMode, op: eq, value: 0 }
+    evidence: "{host}: AppLocker EXE EnforcementMode = 0 (audit only)"
+
+  - id: WS-REG-SECURITY-LOG-SIZE
+    title: Security log size not set by policy to the baseline
+    kind: misconfigured
+    lens: security
+    category: LOG
+    severity: low
+    why: The default 20 MB Security log holds hours on a busy PC; logon and process evidence is overwritten before an incident is looked at. The policy value is in KB.
+    fix: Set 'Security - Specify the maximum log file size (KB)' to 196608 or more by policy, or forward the log to a collector.
+    refs: [NIST-800-53:AU-4, NIST-800-53:AU-11, CIS-Controls-v8:8.3]
+    query:
+      protocol: registry
+      path: SOFTWARE\Policies\Microsoft\Windows\EventLog\Security
+      values: [MaxSize]
+      key: host
+    each:
+      any:
+        - { field: MaxSize, op: absent }
+        - { field: MaxSize, op: lt, value: 196608, threshold: workstations.security-log-min-kb }
+    evidence: "{host}: Security log policy size {MaxSize} KB (missing = not set by policy)"
+
+  - id: WS-REG-REBOOT-PENDING
+    title: Component servicing waits for a restart
+    kind: broken
+    lens: both
+    category: LCM
+    severity: medium
+    why: The component store marked a restart as required; installed updates, features and repairs are not active, and the next servicing operation may refuse to run until the PC restarts.
+    fix: Restart the PC in a maintenance window or through the deployment's restart settings.
+    refs: [NIST-800-53:SI-2]
+    query:
+      protocol: registry
+      path: SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending
+      key: host
+    each: { field: exists, op: eq, value: true }
+    evidence: "{host}: component servicing restart pending"
+
+  - id: WS-REG-REBOOT-REQUIRED-WU
+    title: Windows Update waits for a restart
+    kind: broken
+    lens: both
+    category: LCM
+    severity: medium
+    why: Windows Update installed updates that only take effect after a restart; until then the PC runs the old, vulnerable files.
+    fix: Restart the PC in a maintenance window or through the deployment's restart settings.
+    refs: [NIST-800-53:SI-2]
+    query:
+      protocol: registry
+      path: SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired
+      key: host
+    each: { field: exists, op: eq, value: true }
+    evidence: "{host}: Windows Update restart required"
+
+  - id: WS-REG-REBOOT-PENDING-CCM
+    title: Configuration Manager client waits for a restart
+    kind: broken
+    lens: both
+    category: LCM
+    severity: medium
+    why: The client recorded that a deployment needs a restart; until it happens the installed updates or applications are not active, and later deployments can wait behind it.
+    fix: Restart the PC in a maintenance window or let the client's restart notification run to its deadline.
+    refs: [NIST-800-53:SI-2]
+    query:
+      protocol: registry
+      path: SOFTWARE\Microsoft\SMS\Mobile Client\Reboot Management\RebootData
+      key: host
+    each: { field: exists, op: eq, value: true }
+    evidence: "{host}: Configuration Manager restart pending"
+
+  - id: WS-REG-PENDING-RENAMES
+    title: Many file replacements queued for the next boot
+    kind: broken
+    category: LCM
+    severity: medium
+    why: Hundreds of queued file replacements mean updates or installs are half applied (seen on PCs that every other restart check called clean); the next boot is slow and files in use stay old until it happens. The list holds two entries per rename.
+    fix: Restart the PC; if the queue refills at once, find the installer that keeps adding to it.
+    refs: [NIST-800-53:SI-2]
+    query:
+      protocol: registry
+      path: SYSTEM\CurrentControlSet\Control\Session Manager
+      values: [PendingFileRenameOperations]
+      key: host
+    each: { field: PendingFileRenameOperations, op: size-gt, value: 200, threshold: workstations.pending-rename-entries-max }
+    evidence: "{host}: pending file rename list holds more entries than the limit"
+
+  # ---- Configuration Manager client, as the PC sees it --------------------------------------
+  # Authoritative for: client installed and service state, client version, assigned site and
+  # management point, when inventory last reported, cache and when the health evaluation ran.
+  # The site's view of the same client is in workstations-sccm.yaml.
+
+  - id: WS-CCM-SERVICE-MISSING
+    title: Configuration Manager client service not installed
+    kind: missing
+    lens: both
+    category: LCM
+    severity: high
+    why: Without the CcmExec service nothing deploys updates or software to this PC and nothing inventories it, whatever the site's records still say.
+    fix: Install the client (fix the push error or deploy it by policy); the site view WSF-NO-CLIENT names the same gap from the other side.
+    refs: [NIST-800-53:CM-8, NIST-800-53:SI-2]
+    query:
+      protocol: cim
+      wql: SELECT Name, DisplayName, PathName, StartName, StartMode, State FROM Win32_Service
+      key: "{host}|{Name}"
+    count:
+      op: lt
+      value: 1
+      where: { field: Name, op: eq, value: CcmExec }
+    evidence: "{host}: no CcmExec service among {rows} services"
+
+  - id: WS-CCM-SERVICE-NOT-AUTO
+    title: Configuration Manager client service is not set to start automatically
+    kind: misconfigured
+    lens: both
+    category: LCM
+    severity: high
+    entity: service
+    why: A client service set to Manual or Disabled stops for good at the next restart; the PC then drops out of every deployment while the site keeps the record for weeks.
+    fix: Set CcmExec back to Automatic and find the policy or tool that changed it; a stopped automatic service is reported by WS-SVC-AGENT-STOPPED.
+    refs: [NIST-800-53:CM-8, NIST-800-53:SI-2]
+    query:
+      protocol: cim
+      wql: SELECT Name, DisplayName, PathName, StartName, StartMode, State FROM Win32_Service
+      key: "{host}|{Name}"
+    each:
+      all:
+        - { field: Name, op: eq, value: CcmExec }
+        - { field: StartMode, op: ne, value: Auto }
+    evidence: "{host}: CcmExec start mode {StartMode}, state {State}"
+
+  - id: WS-CCM-VERSION-UNSUPPORTED
+    title: Configuration Manager client on the PC is older than the oldest supported release
+    kind: broken
+    lens: both
+    category: LCM
+    severity: medium
+    why: The version the client itself reports; a client left on an unsupported release misses fixes and features the site relies on, typically because automatic client upgrade does not reach it. The threshold is shared with the site-side rule.
+    fix: Repair or reinstall the client; check automatic client upgrade and the PC's access to the management point.
+    refs: [NIST-800-53:SI-2]
+    query:
+      protocol: cim
+      namespace: root/ccm
+      wql: SELECT ClientVersion FROM SMS_Client
+      key: host
+    each: { field: ClientVersion, op: match, value: '^5\.0+\.(\d{1,3}|[0-8]\d{3}|90\d\d|91[0-3]\d|9140)\.', threshold: sccm.client-version-unsupported-pattern }
+    evidence: "{host}: client {ClientVersion}"
+
+  - id: WS-CCM-NO-ASSIGNMENT
+    title: Configuration Manager client is not assigned to a site
+    kind: broken
+    lens: both
+    category: LCM
+    severity: high
+    why: An installed client without a site assignment requests no policy and receives no deployments; it looks installed to every tool that only checks the service.
+    fix: Assign the client (site code by policy or a client reinstall with the site code) and check boundary groups for its network.
+    refs: [NIST-800-53:CM-8, NIST-800-53:SI-2]
+    query:
+      protocol: cim
+      namespace: root/ccm
+      wql: SELECT Name, CurrentManagementPoint FROM SMS_Authority
+      key: "{host}|{Name}"
+    count: { op: lt, value: 1 }
+    evidence: "{host}: no site authority on the client"
+
+  - id: WS-CCM-NO-MP
+    title: Configuration Manager client has no current management point
+    kind: broken
+    lens: both
+    category: AVL
+    severity: medium
+    why: Without a current management point the client cannot fetch policy or send inventory and state; usually location services found no management point for the PC's network.
+    fix: Check LocationServices.log, the boundary group of the PC's network and the management point's health.
+    refs: [NIST-800-53:SI-4]
+    query:
+      protocol: cim
+      namespace: root/ccm
+      wql: SELECT Name, CurrentManagementPoint FROM SMS_Authority
+      key: "{host}|{Name}"
+    each: { field: CurrentManagementPoint, op: empty }
+    evidence: "{host}: assigned to {Name}, no current management point"
+
+  - id: WS-CCM-WRONG-SITE
+    title: Configuration Manager client assigned to an unexpected site
+    kind: misconfigured
+    lens: both
+    category: CFG
+    severity: medium
+    why: A client that reports to another site (a lab, an old hierarchy) gets that site's policies and none of production's. The default pattern only checks the form; set it to the organisation's site codes.
+    fix: Reassign the client to the production site and remove whatever pointed it elsewhere.
+    refs: [NIST-800-53:CM-8]
+    query:
+      protocol: cim
+      namespace: root/ccm
+      wql: SELECT Name, CurrentManagementPoint FROM SMS_Authority
+      key: "{host}|{Name}"
+    each: { field: Name, op: notmatch, value: '^SMS:[A-Z0-9]{3}$', threshold: sccm.site-authority-pattern }
+    evidence: "{host}: assigned to {Name} via {CurrentManagementPoint}"
+
+  - id: WS-CCM-HWINV-STALE
+    title: Client has not reported hardware inventory recently (PC side)
+    kind: broken
+    category: MON
+    severity: medium
+    entity: inventory-action
+    why: The client's own record of when hardware inventory last reported. When the site also says stale the PC is the problem (WMI, inventory too large); when the PC reported recently but the site says stale, the management point or site inbox is.
+    fix: Read InventoryAgent.log on the PC; repair WMI or trim custom inventory classes. The threshold is shared with WSF-HWINV-STALE.
+    refs: [NIST-800-53:CM-8]
+    query:
+      protocol: cim
+      namespace: root/ccm/invagt
+      wql: SELECT InventoryActionID, LastCycleStartedDate, LastReportDate FROM InventoryActionStatus
+      key: "{host}|{InventoryActionID}"
+    each:
+      all:
+        - { field: InventoryActionID, op: eq, value: '{00000000-0000-0000-0000-000000000001}' }
+        - any:
+            - { field: LastReportDate, op: absent }
+            - { field: LastReportDate, op: age-gt, value: 14, threshold: workstations.hw-inventory-max-age-days }
+    evidence: "{host}: hardware inventory last reported {LastReportDate}, last cycle started {LastCycleStartedDate}"
+
+  - id: WS-CCM-HEARTBEAT-STALE
+    title: Client has not sent its heartbeat recently (PC side)
+    kind: broken
+    category: MON
+    severity: medium
+    entity: inventory-action
+    why: The heartbeat discovery record keeps the device active in the site; a client that stopped sending it is marked inactive and falls out of collections even though it still runs.
+    fix: Read InventoryAgent.log for the discovery action; check the client's policy and management point. The threshold is shared with WSF-HEARTBEAT-STALE.
+    refs: [NIST-800-53:CM-8]
+    query:
+      protocol: cim
+      namespace: root/ccm/invagt
+      wql: SELECT InventoryActionID, LastCycleStartedDate, LastReportDate FROM InventoryActionStatus
+      key: "{host}|{InventoryActionID}"
+    each:
+      all:
+        - { field: InventoryActionID, op: eq, value: '{00000000-0000-0000-0000-000000000003}' }
+        - any:
+            - { field: LastReportDate, op: absent }
+            - { field: LastReportDate, op: age-gt, value: 9, threshold: workstations.ddr-max-age-days }
+    evidence: "{host}: heartbeat last reported {LastReportDate}"
+
+  - id: WS-CCM-INVENTORY-NEVER
+    title: Client has never run hardware inventory
+    kind: missing
+    category: MON
+    severity: medium
+    why: No hardware-inventory action is recorded at all, so the client never received or never ran the inventory policy; every inventory-based report misses this PC.
+    fix: Check that client settings deploy hardware inventory to the PC's collections and that machine policy downloads (PolicyAgent.log).
+    refs: [NIST-800-53:CM-8]
+    query:
+      protocol: cim
+      namespace: root/ccm/invagt
+      wql: SELECT InventoryActionID, LastCycleStartedDate, LastReportDate FROM InventoryActionStatus
+      key: "{host}|{InventoryActionID}"
+    count:
+      op: lt
+      value: 1
+      where: { field: InventoryActionID, op: eq, value: '{00000000-0000-0000-0000-000000000001}' }
+    evidence: "{host}: no hardware inventory action among {rows} inventory actions"
+
+  - id: WS-CCM-CACHE-SMALL
+    title: Configuration Manager client cache smaller than the default
+    kind: misconfigured
+    category: LCM
+    severity: low
+    why: Feature updates, Office and large applications need more room than a shrunken cache allows; their downloads fail or loop while smaller deployments still work. The threshold is in MB.
+    fix: Set the cache size in client settings (5 GB or more, or a percentage of the disk).
+    refs: [NIST-800-53:SI-2]
+    query:
+      protocol: cim
+      namespace: root/ccm/SoftMgmtAgent
+      wql: SELECT Size, Location FROM CacheConfig
+      key: host
+    each: { field: Size, op: lt, value: 5120, threshold: workstations.ccm-cache-min-mb }
+    evidence: "{host}: client cache {Size} MB at {Location}"
+
+  - id: WS-CCM-EVAL-NEVER
+    title: Client health evaluation has never run
+    kind: missing
+    category: MON
+    severity: medium
+    why: ccmeval runs daily from a scheduled task and records its last run; no record means the task is missing or the Task Scheduler is broken, so a failing client is never repaired or reported.
+    fix: Check the 'Configuration Manager Health Evaluation' scheduled task and the Task Scheduler service; run ccmeval once by hand and read CcmEval.log.
+    refs: [NIST-800-53:SI-4]
+    query:
+      protocol: registry
+      path: SOFTWARE\Microsoft\CCM\CcmEval
+      values: [LastEvalTime, LastSiteCode]
+      key: host
+    each: { field: exists, op: eq, value: false }
+    evidence: "{host}: no client health evaluation record"
+
+  - id: WS-CCM-EVAL-STALE
+    title: Client health evaluation has not run recently
+    kind: broken
+    category: MON
+    severity: medium
+    why: The daily health evaluation stopped running; the site still shows the client as active, and the cause is usually a hung Task Scheduler or a broken WMI on the PC. The threshold is shared with WSF-CLIENT-CHECK-STALE.
+    fix: Check the scheduled task, the Task Scheduler service and CcmEval.log on the PC.
+    refs: [NIST-800-53:SI-4]
+    query:
+      protocol: registry
+      path: SOFTWARE\Microsoft\CCM\CcmEval
+      values: [LastEvalTime, LastSiteCode]
+      key: host
+    each: { field: LastEvalTime, op: age-gt, value: 7, threshold: workstations.client-check-max-age-days }
+    evidence: "{host}: health evaluation last ran {LastEvalTime} (site {LastSiteCode})"
+
+  # ---- event logs: fleet health signals ------------------------------------------------------
+  # Each signal is counted per PC over the last 7 days (the query's window) and judged against a
+  # threshold setting. Queries filter by id on the PC; where an id is shared by several providers
+  # the provider is checked in `where`. The key carries the thing an event is about (DNS name,
+  # server, service) so the sample in the evidence names it. A PC whose log cannot be read is
+  # unknown; a channel the PC does not have reads as no events.
+
+  - id: WS-EVT-DNS-TIMEOUT
+    title: Many DNS lookups timed out
+    kind: broken
+    category: AVL
+    severity: medium
+    why: Name lookups that time out stall logons, file shares, Outlook and web apps for seconds each; on many PCs at once it is the DNS servers or the path to them, and the sample names the zones affected.
+    fix: Check the DNS servers the PC uses and the network path to them; for one name, its zone or forwarder.
+    refs: [NIST-800-53:SC-22, NIST-800-53:SI-4]
+    query:
+      protocol: eventlog
+      log: System
+      ids: [1014]
+      max: 2000
+      key: "{host}|{QueryName}|{recordId}"
+    count:
+      op: ge
+      value: 20
+      threshold: workstations.dns-timeouts-max-7d
+      where: { field: provider, op: match, value: 'DNS-Client' }
+    evidence: "{host}: {count} DNS timeouts in 7 days ({sample})"
+
+  - id: WS-EVT-DNS-REGISTER-FAIL
+    title: PC cannot register its own name in DNS
+    kind: broken
+    category: AVL
+    severity: low
+    why: When dynamic registration fails, other machines (and the scanner) reach the PC through a stale record that may point at another device.
+    fix: Check the zone's dynamic-update and secure-update settings, record ownership and scavenging.
+    refs: [NIST-800-53:SC-22]
+    query:
+      protocol: eventlog
+      log: System
+      ids: [8015, 8018, 8019, 8020]
+      max: 300
+      key: "{host}|{id}|{recordId}"
+    count:
+      op: ge
+      value: 3
+      threshold: workstations.dns-register-fail-max-7d
+      where: { field: provider, op: match, value: 'DNS-Client' }
+    evidence: "{host}: {count} DNS registration failures in 7 days"
+
+  - id: WS-EVT-NO-DC
+    title: PC could not reach a domain controller for its secure channel
+    kind: broken
+    category: AVL
+    severity: high
+    why: Without a secure channel to a DC, logons, Group Policy and file-share authentication wait for timeouts or fail; across many PCs of one subnet it points at a site or routing gap.
+    fix: Check DC reachability and the AD site of the PC's subnet; one PC alone usually has a broken computer-account password (reset the secure channel).
+    refs: [NIST-800-53:IA-3, NIST-800-53:SI-4]
+    query:
+      protocol: eventlog
+      log: System
+      ids: [5719, 5783]
+      max: 500
+      key: "{host}|{id}|{recordId}"
+    count:
+      op: ge
+      value: 1
+      threshold: workstations.nodc-max-7d
+      where: { field: provider, op: match, value: 'NETLOGON' }
+    evidence: "{host}: {count} secure-channel failures in 7 days"
+
+  - id: WS-EVT-LSA-NEGOTIATE
+    title: Negotiate could not reach an authority
+    kind: broken
+    category: AUT
+    severity: medium
+    why: Kerberos authentication through Negotiate failed and fell back or gave up; sign-in to shares and intranet applications stalls.
+    fix: Check DC reachability from the PC's subnet, clock skew, and the service names in the events.
+    refs: [NIST-800-53:IA-2, NIST-800-53:SI-4]
+    query:
+      protocol: eventlog
+      log: System
+      ids: [40960, 40961]
+      max: 500
+      key: "{host}|{id}|{recordId}"
+    count:
+      op: ge
+      value: 5
+      threshold: workstations.lsa-negotiate-max-7d
+      where: { field: provider, op: match, value: 'LsaSrv' }
+    evidence: "{host}: {count} Negotiate failures in 7 days"
+
+  - id: WS-EVT-KERBEROS-AP-MODIFIED
+    title: Kerberos ticket could not be decrypted by the target server
+    kind: broken
+    category: AUT
+    severity: medium
+    why: KRB_AP_ERR_MODIFIED means the ticket was encrypted for a different key than the server holds - a duplicate service name, a service account whose password changed, or DNS pointing the name at another host. It is never noise.
+    fix: Look for the service name on two accounts (setspn -X) and check the DNS record of the server in the events.
+    refs: [NIST-800-53:IA-2, NIST-800-53:IA-5]
+    query:
+      protocol: eventlog
+      log: System
+      ids: [3, 4, 14]
+      providers: [Microsoft-Windows-Security-Kerberos]
+      max: 500
+      key: "{host}|{id}|{recordId}"
+    count:
+      op: ge
+      value: 1
+      threshold: workstations.kerberos-modified-max-7d
+      where: { field: id, op: eq, value: 4 }
+    evidence: "{host}: {count} KRB_AP_ERR_MODIFIED errors in 7 days"
+
+  - id: WS-EVT-KERBEROS-ERROR
+    title: Repeated Kerberos errors on the PC
+    kind: broken
+    category: AUT
+    severity: medium
+    why: Repeated Kerberos errors (unknown service names, wrong encryption types, clock skew) make authentication fall back to NTLM or fail, and logons and share access slow down.
+    fix: Read the error codes in the events; unknown principals point at stale names, encryption errors at RC4 or AES settings, skew at time sync.
+    refs: [NIST-800-53:IA-2, NIST-800-53:SI-4]
+    query:
+      protocol: eventlog
+      log: System
+      ids: [3, 4, 14]
+      providers: [Microsoft-Windows-Security-Kerberos]
+      max: 500
+      key: "{host}|{id}|{recordId}"
+    count:
+      op: ge
+      value: 5
+      threshold: workstations.kerberos-errors-max-7d
+      where: { field: id, op: in, value: [3, 14] }
+    evidence: "{host}: {count} Kerberos errors in 7 days"
+
+  - id: WS-EVT-GP-FAILURE
+    title: Group Policy processing failed
+    kind: broken
+    category: CFG
+    severity: high
+    why: Group Policy could not find a DC, read SYSVOL or apply its settings; the PC keeps old or partial settings and the logon waits for timeouts.
+    fix: Check DC and SYSVOL reachability from the PC's subnet and the error code in the events; a GPO that points at a retired server shows here too.
+    refs: [NIST-800-53:CM-6]
+    query:
+      protocol: eventlog
+      log: System
+      ids: [1006, 1030, 1053, 1054, 1055, 1058, 1129]
+      max: 500
+      key: "{host}|{id}|{ErrorCode}|{recordId}"
+    count:
+      op: ge
+      value: 2
+      threshold: workstations.gp-failures-max-7d
+      where: { field: provider, op: match, value: 'GroupPolicy' }
+    evidence: "{host}: {count} Group Policy failures in 7 days ({sample})"
+
+  - id: WS-EVT-TIME-SYNC-FAIL
+    title: Time synchronisation failing
+    kind: broken
+    category: CFG
+    severity: medium
+    why: A PC that cannot sync its clock drifts; past five minutes of skew Kerberos fails and logons, shares and Group Policy break with confusing errors.
+    fix: Check the time source chain (PDC emulator, domain hierarchy) and UDP 123 from the PC's subnet.
+    refs: [NIST-800-53:AU-8, NIST-800-53:SC-45]
+    query:
+      protocol: eventlog
+      log: System
+      ids: [36, 47, 50, 129, 134]
+      providers: [Microsoft-Windows-Time-Service]
+      max: 300
+      key: "{host}|{id}|{recordId}"
+    count: { op: ge, value: 2, threshold: workstations.time-sync-fail-max-7d }
+    evidence: "{host}: {count} time synchronisation errors in 7 days"
+
+  - id: WS-EVT-DHCP-FAIL
+    title: DHCP lease failures
+    kind: broken
+    category: AVL
+    severity: medium
+    why: The PC could not get or renew its address; it drops off the network or falls back to an address nothing can reach.
+    fix: Check the scope for exhaustion and the DHCP relay for the PC's subnet.
+    refs: [NIST-800-53:SI-4]
+    query:
+      protocol: eventlog
+      log: System
+      ids: [1001, 1002, 1003]
+      max: 300
+      key: "{host}|{id}|{recordId}"
+    count:
+      op: ge
+      value: 2
+      threshold: workstations.dhcp-fail-max-7d
+      where: { field: provider, op: match, value: 'Dhcp' }
+    evidence: "{host}: {count} DHCP failures in 7 days"
+
+  - id: WS-EVT-IP-CONFLICT
+    title: IP address conflict detected
+    kind: broken
+    category: CFG
+    severity: high
+    why: Another device uses the PC's address; both lose connections at random until one of them changes.
+    fix: Find the other device by the MAC address in the event; remove static addresses inside DHCP scopes.
+    refs: [NIST-800-53:CM-6]
+    query:
+      protocol: eventlog
+      log: System
+      ids: [4199, 4227, 4231]
+      max: 300
+      key: "{host}|{id}|{recordId}"
+    count:
+      op: ge
+      value: 1
+      where:
+        all:
+          - { field: id, op: eq, value: 4199 }
+          - { field: provider, op: match, value: 'Tcpip' }
+    evidence: "{host}: {count} address conflicts in 7 days"
+
+  - id: WS-EVT-PORT-EXHAUSTION
+    title: TCP ephemeral ports ran out
+    kind: broken
+    category: HLT
+    severity: high
+    why: With all ephemeral ports in use, new connections fail until ports free up - everything network-bound breaks at once. Usually one process leaks connections.
+    fix: On the PC, count connections per owning process and fix or remove the leaking program.
+    refs: [NIST-800-53:SC-5]
+    query:
+      protocol: eventlog
+      log: System
+      ids: [4199, 4227, 4231]
+      max: 300
+      key: "{host}|{id}|{recordId}"
+    count:
+      op: ge
+      value: 1
+      where:
+        all:
+          - { field: id, op: eq, value: 4231 }
+          - { field: provider, op: match, value: 'Tcpip' }
+    evidence: "{host}: {count} port exhaustion events in 7 days"
+
+  - id: WS-EVT-NIC-RESET
+    title: Network adapter was reset by Windows
+    kind: broken
+    category: HLT
+    severity: medium
+    why: Windows reset a network adapter whose driver stopped responding; each reset drops connections for seconds and points at a driver or hardware fault.
+    fix: Update the NIC driver; replace the adapter or dock if the resets continue.
+    refs: [NIST-800-53:SI-13]
+    query:
+      protocol: eventlog
+      log: System
+      ids: [10400, 10401, 10402]
+      max: 300
+      key: "{host}|{id}|{recordId}"
+    count:
+      op: ge
+      value: 2
+      threshold: workstations.nic-resets-max-7d
+      where: { field: provider, op: match, value: 'NDIS' }
+    evidence: "{host}: {count} adapter reset events in 7 days"
+
+  - id: WS-EVT-NIC-LINK-DOWN
+    title: Wired network link drops often
+    kind: broken
+    category: AVL
+    severity: low
+    why: The wired link went down repeatedly - cable, switch port, dock or NIC power saving; docking laptops flap now and then, so only high counts matter.
+    fix: Check the cable, dock and switch port; turn off energy saving on the NIC. Add NIC drivers the pattern misses to the provider setting.
+    refs: [NIST-800-53:SI-13]
+    query:
+      protocol: eventlog
+      log: System
+      ids: [27]
+      max: 300
+      key: "{host}|{provider}|{recordId}"
+    count:
+      op: ge
+      value: 10
+      threshold: workstations.nic-linkdown-max-7d
+      where: { field: provider, op: match, value: '^(e1\w*express|e1[a-z]\d+\w*|e2f\w*|igc\w*|ixgb\w*|rt\d+\w*|rtcx\w*|b57\w*|bxnd\w*|Netwtw\w*|Netwaw\w*|mlx\w*)$', threshold: workstations.nic-driver-provider-pattern }
+    evidence: "{host}: {count} link-down events in 7 days ({sample})"
+
+  - id: WS-EVT-WIFI-DROP
+    title: Wi-Fi disconnects or fails to connect very often
+    kind: broken
+    category: AVL
+    severity: low
+    why: Roaming and sleep disconnect Wi-Fi now and then; dozens a week mean a weak signal, an overloaded access point or a driver problem, and users lose calls and sessions.
+    fix: Look at the SSIDs in the sample, the access point and the Wi-Fi driver version.
+    refs: [NIST-800-53:SI-13]
+    query:
+      protocol: eventlog
+      log: Microsoft-Windows-WLAN-AutoConfig/Operational
+      ids: [8001, 8002, 8003]
+      max: 1000
+      key: "{host}|{SSID}|{recordId}"
+    count:
+      op: ge
+      value: 30
+      threshold: workstations.wifi-drops-max-7d
+      where: { field: id, op: in, value: [8002, 8003] }
+    evidence: "{host}: {count} Wi-Fi failures or disconnects in 7 days ({sample})"
+
+  - id: WS-EVT-WIFI-HOTSPOT
+    title: PC joined what looks like a phone hotspot
+    kind: misconfigured
+    lens: security
+    category: AUT
+    severity: medium
+    why: A PC on a phone hotspot sends its traffic around the organisation's network controls (proxy, DNS filtering, DLP) and is reachable from whatever else is on that hotspot; on a wired desktop it is how users bypass a blocked site.
+    fix: Block hotspot SSIDs or ad-hoc connections by Wi-Fi policy; keep the hotspot pattern generic and list the organisation's own SSIDs in the managed pattern.
+    refs: [NIST-800-53:SC-7, NIST-800-53:AC-18, MITRE-ATTACK:T1011]
+    query:
+      protocol: eventlog
+      log: Microsoft-Windows-WLAN-AutoConfig/Operational
+      ids: [8001, 8002, 8003]
+      max: 1000
+      key: "{host}|{SSID}|{recordId}"
+    count:
+      op: ge
+      value: 1
+      where:
+        all:
+          - { field: id, op: eq, value: 8001 }
+          - { field: SSID, op: match, value: 'iPhone|Android|Galaxy|Redmi|Xiaomi|POCO|HUAWEI|Honor|Pixel|OnePlus|OPPO|vivo|realme|Moto|Nokia|Hotspot|DIRECT-', threshold: workstations.hotspot-ssid-pattern }
+          - { field: SSID, op: notmatch, value: '^$', threshold: workstations.managed-ssid-pattern }
+    evidence: "{host}: joined {count} times ({sample})"
+
+  - id: WS-EVT-NCSI-FLAP
+    title: Windows keeps changing its Internet-access state
+    kind: broken
+    category: AVL
+    severity: low
+    why: Each change makes users see "No Internet" and makes Teams and Outlook reconnect; boot, sleep and VPN also log it, so only high counts matter. The same hour on many PCs is a network event.
+    fix: Check that the PC can reach the connectivity probe through the proxy and firewall, and the network path at the hours in the events.
+    refs: [NIST-800-53:SI-4]
+    query:
+      protocol: eventlog
+      log: Microsoft-Windows-NCSI/Operational
+      ids: [4042]
+      max: 1000
+      key: "{host}|{recordId}"
+    count: { op: ge, value: 20, threshold: workstations.ncsi-changes-max-7d }
+    evidence: "{host}: {count} connectivity changes in 7 days"
+
+  - id: WS-EVT-ROOT-LIST-FETCH-FAIL
+    title: Trusted root and revocation lists cannot be downloaded
+    kind: broken
+    category: PKI
+    severity: medium
+    why: When Windows cannot fetch the trusted root list, signed programs and TLS connections can wait for the download timeout at every start, and new root certificates never arrive.
+    fix: Allow the PC (through proxy, firewall or TLS inspection) to reach the Windows Update certificate list and CRL addresses, or distribute the root list internally.
+    refs: [NIST-800-53:SC-17]
+    query:
+      protocol: eventlog
+      log: Application
+      ids: [11, 4107]
+      providers: [Microsoft-Windows-CAPI2]
+      max: 500
+      key: "{host}|{id}|{recordId}"
+    count: { op: ge, value: 5, threshold: workstations.root-list-fail-max-7d }
+    evidence: "{host}: {count} certificate list download failures in 7 days"
+
+  - id: WS-EVT-SCHANNEL-FAIL
+    title: Very many TLS handshake failures
+    kind: broken
+    category: PKI
+    severity: low
+    why: Some TLS failures are background noise on every PC; hundreds a week mean a protocol or cipher mismatch with a server, or TLS inspection breaking connections.
+    fix: Find the destinations at the time of the events; compare their TLS settings with the PC's.
+    refs: [NIST-800-53:SC-8]
+    query:
+      protocol: eventlog
+      log: System
+      ids: [36871, 36874, 36887, 36888]
+      max: 500
+      key: "{host}|{id}|{recordId}"
+    count:
+      op: ge
+      value: 50
+      threshold: workstations.schannel-fail-max-7d
+      where: { field: provider, op: match, value: 'Schannel' }
+    evidence: "{host}: {count} TLS failures in 7 days"
+
+  - id: WS-EVT-SMB-CONNECT-FAIL
+    title: PC failed to connect to file servers
+    kind: broken
+    category: AVL
+    severity: medium
+    why: Explorer, mapped drives and Office files hang while the PC tries a file server it cannot reach; the sample names the servers.
+    fix: Check the named servers and the network path to them; remove references to servers that no longer exist.
+    refs: [NIST-800-53:SI-4]
+    query:
+      protocol: eventlog
+      log: Microsoft-Windows-SMBClient/Connectivity
+      ids: [30800, 30803, 30804, 30805, 30807]
+      max: 1000
+      key: "{host}|{ServerName}|{recordId}"
+    count:
+      op: ge
+      value: 3
+      threshold: workstations.smb-connect-fail-max-7d
+      where: { field: id, op: eq, value: 30803 }
+    evidence: "{host}: {count} failed connections in 7 days ({sample})"
+
+  - id: WS-EVT-SMB-SESSION-DROP
+    title: File-server sessions dropped repeatedly
+    kind: broken
+    category: AVL
+    severity: medium
+    why: Connections to file servers dropped mid-session; open documents freeze and saves fail. The same hour on many PCs is a server or network event.
+    fix: Check the named servers' health and the network at the times of the events.
+    refs: [NIST-800-53:SI-4]
+    query:
+      protocol: eventlog
+      log: Microsoft-Windows-SMBClient/Connectivity
+      ids: [30800, 30803, 30804, 30805, 30807]
+      max: 1000
+      key: "{host}|{ServerName}|{recordId}"
+    count:
+      op: ge
+      value: 5
+      threshold: workstations.smb-session-drop-max-7d
+      where: { field: id, op: in, value: [30804, 30805, 30807] }
+    evidence: "{host}: {count} dropped sessions in 7 days ({sample})"
+
+  - id: WS-EVT-SMB-NAME-UNRESOLVED
+    title: PC still refers to a file server name that no longer resolves
+    kind: misconfigured
+    category: CFG
+    severity: medium
+    why: A drive map, shortcut, recent-files list, installer source or task still points at a retired server; every attempt can freeze Explorer or a Save dialog while the name fails to resolve.
+    fix: Remove the reference (drive-map policy, shortcuts, installer source lists) or keep a DNS alias for the old name.
+    refs: [NIST-800-53:CM-6]
+    query:
+      protocol: eventlog
+      log: Microsoft-Windows-SMBClient/Connectivity
+      ids: [30800, 30803, 30804, 30805, 30807]
+      max: 1000
+      key: "{host}|{ServerName}|{recordId}"
+    count:
+      op: ge
+      value: 1
+      where: { field: id, op: eq, value: 30800 }
+    evidence: "{host}: {count} unresolved server names in 7 days ({sample})"
+
+  - id: WS-EVT-SMB-AUTH-FAIL
+    title: Repeated sign-in failures to file servers
+    kind: broken
+    lens: both
+    category: IAM
+    severity: medium
+    why: The PC keeps failing to authenticate to a file server and retries, often hundreds of times a day; Explorer and Office wait each time, and the retries look like password guessing to the server.
+    fix: Check the named server's service name and computer account, or the reference to a retired server; stale saved credentials on the PC cause it too.
+    refs: [NIST-800-53:AC-7, NIST-800-53:IA-2]
+    query:
+      protocol: eventlog
+      log: Microsoft-Windows-SMBClient/Security
+      ids: [31001, 31002]
+      max: 1000
+      key: "{host}|{ServerName}|{recordId}"
+    count: { op: ge, value: 10, threshold: workstations.smb-auth-fail-max-7d }
+    evidence: "{host}: {count} sign-in failures in 7 days ({sample})"
+
+  - id: WS-EVT-DISK-ERROR
+    title: Disk, controller or file system errors
+    kind: broken
+    category: HLT
+    severity: high
+    why: Bad blocks, paging errors, file-system corruption and failed log flushes mean data is being damaged; the disk usually fails soon after.
+    fix: Back up the user's data now, run a disk check and replace the disk if errors repeat.
+    refs: [NIST-800-53:SI-13, NIST-800-53:CP-9]
+    query:
+      protocol: eventlog
+      log: System
+      ids: [7, 51, 55, 129, 140, 153]
+      max: 500
+      key: "{host}|{provider}|{id}|{recordId}"
+    count:
+      op: ge
+      value: 1
+      where:
+        all:
+          - { field: id, op: in, value: [7, 51, 55, 140] }
+          - { field: provider, op: match, value: '^(disk|stor\w*|iaStor\w*|nvme\w*|Ntfs|Microsoft-Windows-Ntfs|volmgr|partmgr)$', threshold: workstations.disk-event-provider-pattern }
+    evidence: "{host}: {count} disk or file system errors in 7 days ({sample})"
+
+  - id: WS-EVT-DISK-RETRY
+    title: Disk I/O retries or controller resets
+    kind: broken
+    category: HLT
+    severity: medium
+    why: Retried I/O and controller resets freeze everything that waits for the disk for seconds at a time; they come before outright failures.
+    fix: Update the storage driver and firmware; replace the disk if retries continue.
+    refs: [NIST-800-53:SI-13]
+    query:
+      protocol: eventlog
+      log: System
+      ids: [7, 51, 55, 129, 140, 153]
+      max: 500
+      key: "{host}|{provider}|{id}|{recordId}"
+    count:
+      op: ge
+      value: 5
+      threshold: workstations.disk-retries-max-7d
+      where:
+        all:
+          - { field: id, op: in, value: [129, 153] }
+          - { field: provider, op: match, value: '^(disk|stor\w*|iaStor\w*|nvme\w*|Ntfs|Microsoft-Windows-Ntfs|volmgr|partmgr)$', threshold: workstations.disk-event-provider-pattern }
+    evidence: "{host}: {count} disk retries or resets in 7 days ({sample})"
+
+  - id: WS-EVT-OUT-OF-MEMORY
+    title: Windows ran low on virtual memory
+    kind: broken
+    category: HLT
+    severity: medium
+    why: The resource-exhaustion detector fired because commit charge reached the limit; programs failed to allocate and Windows may have closed some.
+    fix: Find the growing process named in the event, restart it or the PC, and add memory if the normal load does not fit.
+    refs: [NIST-800-53:SC-5]
+    query:
+      protocol: eventlog
+      log: System
+      ids: [2004]
+      max: 100
+      key: "{host}|{recordId}"
+    count:
+      op: ge
+      value: 1
+      where: { field: provider, op: match, value: 'Resource-Exhaustion' }
+    evidence: "{host}: {count} low-memory events in 7 days"
+
+  - id: WS-EVT-CPU-THROTTLED
+    title: Processor speed held down by firmware
+    kind: broken
+    category: HLT
+    severity: medium
+    why: The firmware limited the CPU (power or heat), so the PC is slow all the time, not only at peaks; often a power plan, BIOS setting, dock or charger.
+    fix: Check the BIOS power settings, the power plan, the charger and dock, and the cooling of the model.
+    refs: [NIST-800-53:SI-13]
+    query:
+      protocol: eventlog
+      log: System
+      ids: [37]
+      max: 500
+      key: "{host}|{recordId}"
+    count:
+      op: ge
+      value: 1
+      threshold: workstations.cpu-throttle-max-7d
+      where: { field: provider, op: match, value: 'Kernel-Processor-Power' }
+    evidence: "{host}: {count} firmware throttling reports in 7 days"
+
+  - id: WS-EVT-UNEXPECTED-SHUTDOWN
+    title: PC restarted without a clean shutdown
+    kind: broken
+    category: HLT
+    severity: medium
+    why: A restart without a clean shutdown (power loss, a hang the user ended with the power button, a crash without a dump) loses unsaved work and can corrupt files. One incident usually logs both the kernel-power and the event-log record.
+    fix: Look at the bugcheck code in the event; check power (per model and per site) and hangs before it.
+    refs: [NIST-800-53:SI-13, NIST-800-53:SI-4]
+    query:
+      protocol: eventlog
+      log: System
+      ids: [41, 1001, 6008]
+      max: 100
+      key: "{host}|{id}|{BugcheckCode}|{recordId}"
+    count:
+      op: ge
+      value: 1
+      threshold: workstations.unexpected-shutdowns-max-7d
+      where:
+        any:
+          - all:
+              - { field: id, op: eq, value: 41 }
+              - { field: provider, op: match, value: 'Kernel-Power' }
+          - all:
+              - { field: id, op: eq, value: 6008 }
+              - { field: provider, op: match, value: '^EventLog$' }
+    evidence: "{host}: {count} unclean restarts in 7 days"
+
+  - id: WS-EVT-BUGCHECK
+    title: PC crashed with a blue screen
+    kind: broken
+    category: HLT
+    severity: high
+    why: A bugcheck is a kernel crash, almost always a driver, firmware or hardware fault; it repeats until the cause is fixed and can corrupt data each time.
+    fix: Read the stop code and the dump; update or remove the driver named there, then check memory and disk.
+    refs: [NIST-800-53:SI-13, NIST-800-53:SI-4]
+    query:
+      protocol: eventlog
+      log: System
+      ids: [41, 1001, 6008]
+      max: 100
+      key: "{host}|{id}|{BugcheckCode}|{recordId}"
+    count:
+      op: ge
+      value: 1
+      where:
+        all:
+          - { field: id, op: eq, value: 1001 }
+          - { field: provider, op: match, value: 'WER-SystemErrorReporting|BugCheck' }
+    evidence: "{host}: {count} bugchecks in 7 days"
+
+  - id: WS-EVT-SERVICE-FAIL
+    title: Services failed to start or crashed
+    kind: broken
+    category: HLT
+    severity: medium
+    why: Services that fail at start (7000, 7022 hung at start), cannot log on as their account (7038, 7041 - often after a logon right was removed) or end unexpectedly (7023, 7024, 7031, 7034) leave their function off - often an agent - and slow every start while they retry. The sample names them.
+    fix: Read the service's own log for why; fix or remove it. Services that fail on every PC by design go in the ignore pattern (display names).
+    refs: [NIST-800-53:SI-4]
+    query:
+      protocol: eventlog
+      log: System
+      ids: [7000, 7009, 7011, 7022, 7023, 7024, 7031, 7034, 7038, 7041, 7043]
+      providers: [Service Control Manager]
+      max: 2000
+      key: "{host}|{id}|{param1}|{param2}|{recordId}"
+    count:
+      op: ge
+      value: 1
+      threshold: workstations.service-failures-max-7d
+      where:
+        all:
+          - { field: id, op: in, value: [7000, 7022, 7023, 7024, 7031, 7034, 7038, 7041] }
+          - { field: param1, op: notmatch, value: '^(Diagnostic Service Host|Diagnostic System Host)$', threshold: workstations.service-fail-ignore-pattern }
+    evidence: "{host}: {count} service failures in 7 days ({sample})"
+
+  - id: WS-EVT-SERVICE-TIMEOUT
+    title: Services did not answer the service manager in time
+    kind: broken
+    category: HLT
+    severity: medium
+    why: A service that does not respond within 30 seconds at start (7009) or while running (7011) holds up starts, logons and scheduled work; it often comes with a busy services.exe or a stuck service.
+    fix: Look at the named services (second value in the sample); check stuck services, CPU and disk load on the same PC and remove what is not needed.
+    refs: [NIST-800-53:SI-4]
+    query:
+      protocol: eventlog
+      log: System
+      ids: [7000, 7009, 7011, 7022, 7023, 7024, 7031, 7034, 7038, 7041, 7043]
+      providers: [Service Control Manager]
+      max: 2000
+      key: "{host}|{id}|{param1}|{param2}|{recordId}"
+    count:
+      op: ge
+      value: 1
+      threshold: workstations.service-timeouts-max-7d
+      where: { field: id, op: in, value: [7009, 7011] }
+    evidence: "{host}: {count} service timeouts in 7 days ({sample})"
+
+  - id: WS-EVT-SERVICE-SHUTDOWN-HANG
+    title: Service did not stop when Windows shut down
+    kind: broken
+    category: HLT
+    severity: medium
+    why: A service that ignores the preshutdown request makes the shutdown wait for it or hang altogether; updates that need the restart are delayed with it.
+    fix: Find the named service's vendor fix; if it is not needed, remove it.
+    refs: [NIST-800-53:SI-4]
+    query:
+      protocol: eventlog
+      log: System
+      ids: [7000, 7009, 7011, 7022, 7023, 7024, 7031, 7034, 7038, 7041, 7043]
+      providers: [Service Control Manager]
+      max: 2000
+      key: "{host}|{id}|{param1}|{param2}|{recordId}"
+    count:
+      op: ge
+      value: 1
+      where: { field: id, op: eq, value: 7043 }
+    evidence: "{host}: {count} services hung at shutdown in 7 days ({sample})"
+
+  - id: WS-EVT-COM-WAIT-STOP-PENDING
+    title: COM activation timed out on a service stuck stopping
+    kind: broken
+    category: HLT
+    severity: medium
+    why: A program asked for a COM server whose service is stuck in Stop Pending, and waited until the timeout; it usually sits next to a stuck Windows Update or Group Policy service.
+    fix: Restart the PC; if it returns, find the process behind the service that will not exit.
+    refs: [NIST-800-53:SI-4]
+    query:
+      protocol: eventlog
+      log: System
+      ids: [10029]
+      providers: [Microsoft-Windows-DistributedCOM]
+      max: 500
+      key: "{host}|{param2}|{recordId}"
+    count: { op: ge, value: 1 }
+    evidence: "{host}: {count} COM waits on a stopping service in 7 days ({sample})"
+
+  - id: WS-EVT-DRIVER-BLOCKED
+    title: Windows refused to load a driver
+    kind: broken
+    category: HLT
+    severity: low
+    why: A driver blocked at load (incompatible or on the vulnerable-driver list) is usually left by old or unwanted software, and whatever depends on it does not work.
+    fix: Find the program that installed the driver and update or remove it.
+    refs: [NIST-800-53:CM-7, NIST-800-53:SI-7]
+    query:
+      protocol: eventlog
+      log: System
+      ids: [1060]
+      providers: [Application Popup]
+      max: 100
+      key: "{host}|{recordId}"
+    count: { op: ge, value: 1 }
+    evidence: "{host}: {count} blocked driver loads in 7 days"
+
+  - id: WS-EVT-UPDATE-INSTALL-FAIL
+    title: Windows Update installations failing
+    kind: broken
+    lens: both
+    category: LCM
+    severity: medium
+    why: Updates that fail to install are retried, keep disk and CPU busy each time, and leave the PC unpatched; the sample names the updates.
+    fix: Look up the error codes, check free space and servicing health (component store) on the PC.
+    refs: [NIST-800-53:SI-2]
+    query:
+      protocol: eventlog
+      log: System
+      ids: [20]
+      max: 200
+      key: "{host}|{updateTitle}|{recordId}"
+    count:
+      op: ge
+      value: 2
+      threshold: workstations.update-fail-max-7d
+      where: { field: provider, op: match, value: 'WindowsUpdateClient' }
+    evidence: "{host}: {count} failed update installs in 7 days ({sample})"
+
+  - id: WS-EVT-APP-HANG
+    title: Programs stopped responding often
+    kind: broken
+    category: HLT
+    severity: low
+    why: Hangs are the freezes users describe; Outlook, Explorer or Office hanging on many PCs points at shares, mail or the network rather than the PC.
+    fix: Read the program names in the events on the PC; compare with SMB, DNS and disk signals of the same PC.
+    refs: [NIST-800-53:SI-4]
+    query:
+      protocol: eventlog
+      log: Application
+      ids: [1002]
+      providers: [Application Hang]
+      max: 500
+      key: "{host}|{AppName}|{recordId}"
+    count: { op: ge, value: 5, threshold: workstations.app-hangs-max-7d }
+    evidence: "{host}: {count} program hangs in 7 days ({sample})"
+
+  - id: WS-EVT-APP-CRASH
+    title: Programs crashed often
+    kind: broken
+    category: HLT
+    severity: low
+    why: Frequent crashes lose work and, when the crashing program is a security agent, leave the PC unprotected between restarts.
+    fix: Read the program and faulting-module names in the events on the PC; update the program or the module's owner.
+    refs: [NIST-800-53:SI-4]
+    query:
+      protocol: eventlog
+      log: Application
+      ids: [1000]
+      providers: [Application Error]
+      max: 500
+      key: "{host}|{AppName}|{recordId}"
+    count: { op: ge, value: 5, threshold: workstations.app-crashes-max-7d }
+    evidence: "{host}: {count} program crashes in 7 days ({sample})"
+
+  - id: WS-EVT-AGENT-CRASH
+    title: A security or management agent crashed
+    kind: broken
+    lens: both
+    category: MON
+    severity: high
+    why: A crashing security or management agent leaves the PC unprotected or unmanaged until it restarts, and repeated crashes usually mean a broken build of the agent on this PC.
+    fix: Collect the crash details from the event and the agent's logs and open a vendor case; update or reinstall the agent. Set the pattern to the organisation's agent process names.
+    refs: [NIST-800-53:SI-3, NIST-800-53:SI-4]
+    query:
+      protocol: eventlog
+      log: Application
+      ids: [1000]
+      providers: [Application Error]
+      max: 500
+      key: "{host}|{AppName}|{recordId}"
+    count:
+      op: ge
+      value: 1
+      where: { field: AppName, op: match, value: '^(MsMpEng|MsSense|SenseIR|SenseCncProxy|CcmExec|CcmEval|IntuneManagementExtension|AgentExecutor)\.exe$', threshold: workstations.agent-process-pattern }
+    evidence: "{host}: {count} agent crashes in 7 days ({sample})"
+
+  - id: WS-EVT-WMI-ERRORS
+    title: Many WMI client errors
+    kind: broken
+    category: MON
+    severity: low
+    why: Management and security agents that query WMI and fail retry over and over, loading the WMI service and stalling themselves; the result codes show whether it is a missing class, access or a broken provider.
+    fix: Find the calling process (ClientProcessId in the events) and update or reconfigure that agent; repair WMI if the errors come from everyone.
+    refs: [NIST-800-53:SI-4]
+    query:
+      protocol: eventlog
+      log: Microsoft-Windows-WMI-Activity/Operational
+      ids: [5858]
+      max: 1000
+      key: "{host}|{ResultCode}|{recordId}"
+    count: { op: ge, value: 50, threshold: workstations.wmi-errors-max-7d }
+    evidence: "{host}: {count} WMI errors in 7 days ({sample})"
+
+  - id: WS-EVT-PROFILE-TEMPORARY
+    title: User logged on with a temporary or backup profile
+    kind: broken
+    category: HLT
+    severity: high
+    why: Windows could not load the user's profile and logged them on with a temporary one; everything they save is lost at logoff.
+    fix: Repair the profile (registry ProfileList entry, permissions, disk errors) before the user logs off.
+    refs: [NIST-800-53:SI-4]
+    query:
+      protocol: eventlog
+      log: Application
+      ids: [1500, 1502, 1504, 1508, 1511, 1515, 1521]
+      max: 200
+      key: "{host}|{id}|{recordId}"
+    count:
+      op: ge
+      value: 1
+      where:
+        all:
+          - { field: id, op: in, value: [1511, 1515] }
+          - { field: provider, op: match, value: 'User Profile' }
+    evidence: "{host}: {count} temporary or backup profile logons in 7 days"
+
+  - id: WS-EVT-PROFILE-FAIL
+    title: User profile load or save problems
+    kind: broken
+    category: HLT
+    severity: medium
+    why: Errors loading, unloading or saving profiles make logons and logoffs slow and lose settings; roaming or redirected profiles fail the same way when their server is unreachable.
+    fix: Read the event ids per PC; check the profile path, disk and the processes that keep the profile open at logoff.
+    refs: [NIST-800-53:SI-4]
+    query:
+      protocol: eventlog
+      log: Application
+      ids: [1500, 1502, 1504, 1508, 1511, 1515, 1521]
+      max: 200
+      key: "{host}|{id}|{recordId}"
+    count:
+      op: ge
+      value: 1
+      threshold: workstations.profile-fail-max-7d
+      where:
+        all:
+          - { field: id, op: in, value: [1500, 1502, 1504, 1508, 1521] }
+          - { field: provider, op: match, value: 'User Profile' }
+    evidence: "{host}: {count} profile errors in 7 days ({sample})"
+
+  - id: WS-EVT-WINLOGON-SLOW
+    title: A logon step held the user at the Welcome screen
+    kind: broken
+    category: HLT
+    severity: low
+    why: Winlogon reports a notification subscriber (Group Policy, profiles, an agent) that took long to handle logon or logoff; users wait at Welcome.
+    fix: Read the subscriber names in the events on the PC; tune or remove the slow one.
+    refs: [NIST-800-53:SI-4]
+    query:
+      protocol: eventlog
+      log: Application
+      ids: [6005, 6006]
+      max: 300
+      key: "{host}|{id}|{recordId}"
+    count:
+      op: ge
+      value: 3
+      threshold: workstations.winlogon-slow-max-7d
+      where: { field: provider, op: match, value: 'Winlogon' }
+    evidence: "{host}: {count} slow logon notifications in 7 days"
+
+  - id: WS-EVT-MSI-RECONFIGURE-LOOP
+    title: Windows Installer keeps reconfiguring a product
+    kind: broken
+    category: HLT
+    severity: low
+    why: A product that Windows Installer reconfigures at every logon or boot (a self-repair loop) delays the session each time and hides a broken package or a missing source.
+    fix: Read the product names in the events on the PC and repair or reinstall that product from a reachable source.
+    refs: [NIST-800-53:SI-4]
+    query:
+      protocol: eventlog
+      log: Application
+      ids: [1035]
+      providers: [MsiInstaller]
+      max: 500
+      key: "{host}|{recordId}"
+    count: { op: ge, value: 20, threshold: workstations.msi-reconfigure-max-7d }
+    evidence: "{host}: {count} product reconfigurations in 7 days"
+
+  - id: WS-EVT-APP-LOG-FLOOD
+    title: Application log floods within a day
+    kind: broken
+    category: LOG
+    severity: medium
+    why: Thousands of Application events in one day mean one source is flooding the log, which then holds only hours; the crash and hang history needed to explain a complaint is gone. The sample shows the newest events' providers. The query reads at most 5000 events, so a threshold above that cannot fire.
+    fix: Fix or remove the flooding source (often a driver, a sensor component or an agent in a retry loop) and size the log by policy.
+    refs: [NIST-800-53:AU-4, NIST-800-53:AU-5]
+    query:
+      protocol: eventlog
+      log: Application
+      days: 1
+      max: 5000
+      key: "{host}|{provider}|{id}|{recordId}"
+    count: { op: ge, value: 3000, threshold: workstations.app-log-events-per-day-max }
+    evidence: "{host}: {count} Application events in 24 hours ({sample})"
+
+  - id: WS-EVT-SECURITY-LOG-CLEARED
+    title: Security event log was cleared
+    kind: broken
+    lens: security
+    category: LOG
+    severity: high
+    why: Clearing the Security log erases the evidence of logons and process starts; outside a documented procedure it is an attacker covering tracks. The window is 30 days.
+    fix: Find who cleared it (account in the event) and why; treat an unexplained clear as an incident and forward the log to a collector.
+    refs: [NIST-800-53:AU-9, NIST-800-53:AU-6, MITRE-ATTACK:T1070.001]
+    query:
+      protocol: eventlog
+      log: Security
+      ids: [1102]
+      days: 30
+      max: 50
+      key: "{host}|{SubjectUserName}|{recordId}"
+    count: { op: ge, value: 1 }
+    evidence: "{host}: Security log cleared {count} times in 30 days ({sample})"
+
+  # ---- event logs: boot, shutdown and Group Policy timing --------------------------------------
+
+  - id: WS-EVT-BOOT-SLOW
+    title: Startups take more than two minutes
+    kind: broken
+    category: HLT
+    severity: low
+    why: Windows measured repeated slow boots to the logon screen; users start the day waiting and restart less often. BootTime is in milliseconds.
+    fix: Look at the boot degradation events (WS-EVT-BOOT-DEGRADED-BY) for what Windows blamed; disk type and start-up programs come next.
+    refs: [NIST-800-53:SI-4]
+    query:
+      protocol: eventlog
+      log: Microsoft-Windows-Diagnostics-Performance/Operational
+      ids: [100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 200, 201, 202, 203, 204, 205, 206, 207, 208, 209, 210]
+      max: 500
+      key: "{host}|{id}|{FriendlyName}|{recordId}"
+    count:
+      op: ge
+      value: 2
+      where:
+        all:
+          - { field: id, op: eq, value: 100 }
+          - { field: BootTime, op: gt, value: 120000, threshold: workstations.boot-max-ms }
+    evidence: "{host}: {count} slow startups in 7 days"
+
+  - id: WS-EVT-POST-BOOT-SLOW
+    title: Desktop takes more than a minute to settle after startup
+    kind: broken
+    category: HLT
+    severity: low
+    why: After the desktop appears, start-up programs and agents keep the PC busy for over a minute; users see a desktop they cannot use. BootPostBootTime is in milliseconds.
+    fix: Reduce start-up programs and delay agents that do not need to run at logon.
+    refs: [NIST-800-53:SI-4]
+    query:
+      protocol: eventlog
+      log: Microsoft-Windows-Diagnostics-Performance/Operational
+      ids: [100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 200, 201, 202, 203, 204, 205, 206, 207, 208, 209, 210]
+      max: 500
+      key: "{host}|{id}|{FriendlyName}|{recordId}"
+    count:
+      op: ge
+      value: 2
+      where:
+        all:
+          - { field: id, op: eq, value: 100 }
+          - { field: BootPostBootTime, op: gt, value: 60000, threshold: workstations.post-boot-max-ms }
+    evidence: "{host}: {count} slow post-boot phases in 7 days"
+
+  - id: WS-EVT-SHUTDOWN-SLOW
+    title: Shutdowns take more than a minute
+    kind: broken
+    category: HLT
+    severity: low
+    why: Slow shutdowns mean services or programs that do not stop in time; updates that need the restart wait with them. ShutdownTime is in milliseconds.
+    fix: Look at the shutdown degradation events and the services that hang at shutdown on the same PC.
+    refs: [NIST-800-53:SI-4]
+    query:
+      protocol: eventlog
+      log: Microsoft-Windows-Diagnostics-Performance/Operational
+      ids: [100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 200, 201, 202, 203, 204, 205, 206, 207, 208, 209, 210]
+      max: 500
+      key: "{host}|{id}|{FriendlyName}|{recordId}"
+    count:
+      op: ge
+      value: 2
+      where:
+        all:
+          - { field: id, op: eq, value: 200 }
+          - { field: ShutdownTime, op: gt, value: 60000, threshold: workstations.shutdown-max-ms }
+    evidence: "{host}: {count} slow shutdowns in 7 days"
+
+  - id: WS-EVT-BOOT-DEGRADED-BY
+    title: Windows blamed a program or driver for slowing startup or shutdown
+    kind: broken
+    category: HLT
+    severity: low
+    why: The boot and shutdown diagnostics name the application, driver or service that added more than ten seconds; the sample carries those names.
+    fix: Update, delay or remove what is named; a security agent named on many PCs is a vendor case.
+    refs: [NIST-800-53:SI-4]
+    query:
+      protocol: eventlog
+      log: Microsoft-Windows-Diagnostics-Performance/Operational
+      ids: [100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 200, 201, 202, 203, 204, 205, 206, 207, 208, 209, 210]
+      max: 500
+      key: "{host}|{id}|{FriendlyName}|{recordId}"
+    count:
+      op: ge
+      value: 2
+      where:
+        all:
+          - { field: id, op: in, value: [101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 201, 202, 203, 204, 205, 206, 207, 208, 209, 210] }
+          - { field: DegradationTime, op: gt, value: 10000, threshold: workstations.boot-degradation-max-ms }
+    evidence: "{host}: {count} slowdowns blamed in 7 days ({sample})"
+
+  - id: WS-EVT-GP-STARTUP-SLOW
+    title: Computer Group Policy at startup takes more than 30 seconds
+    kind: broken
+    category: CFG
+    severity: low
+    why: Computer policy processing at boot holds the logon screen; slow processing usually means a slow DC, a slow link, or one extension (scripts, software installation, drive maps) that waits for a timeout.
+    fix: Look at the slow extensions (WS-EVT-GP-EXTENSION-SLOW) and the DC the PC used (WS-EVT-GP-DC-REMOTE).
+    refs: [NIST-800-53:CM-6]
+    query:
+      protocol: eventlog
+      log: Microsoft-Windows-GroupPolicy/Operational
+      ids: [5308, 8000, 8001, 8004, 8005]
+      max: 2000
+      key: "{host}|{id}|{DCName}|{recordId}"
+    count:
+      op: ge
+      value: 2
+      where:
+        all:
+          - { field: id, op: eq, value: 8000 }
+          - { field: PolicyElaspedTimeInSeconds, op: gt, value: 30, threshold: workstations.gp-startup-max-seconds }
+    evidence: "{host}: {count} slow computer policy runs at startup in 7 days"
+
+  - id: WS-EVT-GP-LOGON-SLOW
+    title: User Group Policy at logon takes more than 30 seconds
+    kind: broken
+    category: CFG
+    severity: low
+    why: User policy processing at logon keeps the user at Welcome; drive maps to retired servers, logon scripts and folder redirection are the usual cause.
+    fix: Look at the slow extensions on the same PC and remove references to servers that no longer exist.
+    refs: [NIST-800-53:CM-6]
+    query:
+      protocol: eventlog
+      log: Microsoft-Windows-GroupPolicy/Operational
+      ids: [5308, 8000, 8001, 8004, 8005]
+      max: 2000
+      key: "{host}|{id}|{DCName}|{recordId}"
+    count:
+      op: ge
+      value: 2
+      where:
+        all:
+          - { field: id, op: eq, value: 8001 }
+          - { field: PolicyElaspedTimeInSeconds, op: gt, value: 30, threshold: workstations.gp-logon-max-seconds }
+    evidence: "{host}: {count} slow user policy runs at logon in 7 days"
+
+  - id: WS-EVT-GP-DC-REMOTE
+    title: Group Policy served by a domain controller the PC should not use
+    kind: misconfigured
+    category: CFG
+    severity: medium
+    why: A PC that processes policy against a DC in another site or region waits on a slow link at every refresh, which means its subnet is in the wrong AD site or in none. The default pattern accepts every DC; set it to the DCs each site should use.
+    fix: Put the PC's subnet in the right AD site and check that the site has a DC.
+    refs: [NIST-800-53:CM-6]
+    query:
+      protocol: eventlog
+      log: Microsoft-Windows-GroupPolicy/Operational
+      ids: [5308, 8000, 8001, 8004, 8005]
+      max: 2000
+      key: "{host}|{id}|{DCName}|{recordId}"
+    count:
+      op: ge
+      value: 1
+      where:
+        all:
+          - { field: id, op: eq, value: 5308 }
+          - { field: DCName, op: notmatch, value: '.', threshold: workstations.local-dc-pattern }
+    evidence: "{host}: {count} policy runs against an unexpected DC ({sample})"
+
+  - id: WS-EVT-GP-SILENT
+    title: Group Policy has not completed a run for a day
+    kind: broken
+    category: CFG
+    severity: medium
+    why: Policy refreshes every 90 minutes and at every boot; a day without a completed run means the Group Policy client is stuck (often next to a service stuck pending) or the PC cannot reach a DC. The window is a setting in days.
+    fix: Restart the PC; if it stays silent, look at the Group Policy client service and the GP-FAILURE events.
+    refs: [NIST-800-53:CM-6]
+    query:
+      protocol: eventlog
+      log: Microsoft-Windows-GroupPolicy/Operational
+      ids: [5308, 8000, 8001, 8004, 8005]
+      max: 2000
+      key: "{host}|{id}|{DCName}|{recordId}"
+    count:
+      op: lt
+      value: 1
+      where:
+        all:
+          - { field: id, op: in, value: [8000, 8001, 8004, 8005] }
+          - { field: time, op: age-lt, value: 1, threshold: workstations.gp-silent-max-days }
+    evidence: "{host}: no completed Group Policy run in the window ({rows} policy events in 7 days)"
+
+  - id: WS-EVT-GP-EXTENSION-SLOW
+    title: A Group Policy extension takes more than five seconds
+    kind: broken
+    category: CFG
+    severity: low
+    why: One client-side extension (scripts, drive maps, software installation, printers) that takes seconds at every refresh is usually waiting for a server or path that no longer answers; the sample names it.
+    fix: Find the GPO behind the extension and remove the stale server, share or package reference. The threshold is in milliseconds.
+    refs: [NIST-800-53:CM-6]
+    query:
+      protocol: eventlog
+      log: Microsoft-Windows-GroupPolicy/Operational
+      ids: [5016]
+      max: 3000
+      key: "{host}|{CSEExtensionName}|{recordId}"
+    count:
+      op: ge
+      value: 2
+      where: { field: CSEElaspedTimeInMilliSeconds, op: gt, value: 5000, threshold: workstations.gp-extension-max-ms }
+    evidence: "{host}: {count} slow extension runs in 7 days ({sample})"

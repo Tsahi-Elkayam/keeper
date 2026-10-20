@@ -784,3 +784,613 @@ rules:
       key: ResourceID
     each: { field: Version, op: match, value: '^10\.1\.(1\d{4}|2[01]\d{3}|22000)\.', threshold: sccm.adk-old-version-pattern }
     evidence: "resource {ResourceID}: {DisplayName} {Version}"
+
+  - id: SCCM-DRIVER-PACKAGE-STALE
+    title: Driver package not updated for two years
+    kind: misconfigured
+    category: LCM
+    severity: low
+    entity: package
+    refresh: 7d
+    why: Task sequences that apply old driver packages image new hardware with outdated storage and network drivers, which then cause the disk and link problems the fleet rules see.
+    fix: Refresh the package from the vendor's current driver pack or retire it with the models it served.
+    refs: [NIST-800-53:SI-2, NIST-800-53:CM-2]
+    query:
+      protocol: http
+      path: /wmi/SMS_DriverPackage
+      params:
+        $select: PackageID,Name,SourceDate,LastRefreshTime,PackageSize
+      key: PackageID
+      name: Name
+    each: { field: SourceDate, op: age-gt, value: 730, threshold: sccm.driver-package-max-age-days }
+    evidence: "{Name} ({PackageID}): source date {SourceDate}"
+
+  - id: SCCM-OSIMAGE-STALE
+    title: Operating system image not serviced for a year
+    kind: misconfigured
+    category: LCM
+    severity: low
+    entity: os-image
+    refresh: 7d
+    why: An image a year behind installs a year of known vulnerabilities and then spends an hour on cumulative updates at every deployment.
+    fix: Apply the current cumulative update to the image (offline servicing or a build-and-capture) or replace it with a current release.
+    refs: [NIST-800-53:SI-2, NIST-800-53:CM-2]
+    query:
+      protocol: http
+      path: /wmi/SMS_ImagePackage
+      params:
+        $select: PackageID,Name,SourceDate,LastRefreshTime
+      key: PackageID
+      name: Name
+    each: { field: SourceDate, op: age-gt, value: 365, threshold: sccm.os-image-max-age-days }
+    evidence: "{Name} ({PackageID}): source date {SourceDate}"
+
+  # ---- run scripts, deployment targeting --------------------------------------------------------
+
+  - id: SCCM-SCRIPT-SELF-APPROVED
+    title: Run Script approved by its own author
+    kind: misconfigured
+    lens: security
+    category: IAM
+    severity: high
+    entity: script
+    why: Scripts run as SYSTEM on every device they target; when the author approved their own script, the hierarchy lets authors self-approve or one person holds both roles, and the two-person check is gone.
+    fix: Turn on 'Script authors require additional script approver' in the hierarchy settings and give author and approver roles to different people.
+    refs: [NIST-800-53:AC-5, NIST-800-53:CM-5, MITRE-ATTACK:T1072]
+    query:
+      protocol: http
+      path: /wmi/SMS_Scripts
+      params:
+        $select: ScriptGuid,ScriptName,Author,Approver,ApprovalState,LastUpdateTime
+      key: ScriptGuid
+      name: ScriptName
+    each:
+      all:
+        - { field: ApprovalState, op: eq, value: 3 }
+        - { field: Approver, op: eq, value: { field: Author } }
+    evidence: "{ScriptName}: written and approved by {Author}, last changed {LastUpdateTime}"
+
+  - id: SCCM-SCRIPT-PENDING
+    title: Run Script waiting for approval for over a month
+    kind: misconfigured
+    category: HYG
+    severity: low
+    entity: script
+    why: Scripts left unapproved for weeks are abandoned work or a request nobody reviews; either way the approval queue stops meaning anything.
+    fix: Approve, deny or delete the script.
+    refs: [NIST-800-53:CM-3]
+    query:
+      protocol: http
+      path: /wmi/SMS_Scripts
+      params:
+        $select: ScriptGuid,ScriptName,Author,Approver,ApprovalState,LastUpdateTime
+      key: ScriptGuid
+      name: ScriptName
+    each:
+      all:
+        - { field: ApprovalState, op: eq, value: 0 }
+        - { field: LastUpdateTime, op: age-gt, value: 30, threshold: sccm.script-pending-max-days }
+    evidence: "{ScriptName} by {Author}: waiting since {LastUpdateTime}"
+
+  - id: SCCM-DEPLOYMENT-TO-ALL-SYSTEMS
+    title: Required deployment targeted at a built-in all-devices or all-users collection
+    kind: misconfigured
+    lens: both
+    category: CFG
+    severity:
+      field: FeatureType
+      map: { "7": critical }
+      default: high
+    entity: deployment
+    why: A Required application, package or task sequence on All Systems, All Desktop and Server Clients or All Users reaches every server, every new client and every user; a task sequence there has reimaged whole estates. Built-in collection ids are product constants.
+    fix: Retarget the deployment to a limited collection; keep the built-in collections for client settings. Feature types deployed there on purpose (for example update groups) can be added to the threshold list.
+    refs: [NIST-800-53:CM-3, NIST-800-53:CM-5, MITRE-ATTACK:T1072]
+    query:
+      protocol: http
+      path: /wmi/SMS_DeploymentSummary
+      params:
+        $select: DeploymentID,SoftwareName,CollectionID,CollectionName,FeatureType,DeploymentIntent,DeploymentTime,EnforcementDeadline,NumberTargeted,NumberErrors,SummarizationTime,CreationTime
+      key: DeploymentID
+      name: SoftwareName
+    each:
+      all:
+        - { field: CollectionID, op: in, value: [SMS00001, SMS00002, SMS00004, SMSDM003], threshold: sccm.all-collection-ids }
+        - { field: FeatureType, op: in, value: [1, 2, 7], threshold: sccm.all-collection-feature-types }
+        - { field: DeploymentIntent, op: eq, value: 1 }
+    evidence: "{SoftwareName} -> {CollectionName} ({CollectionID}): required, feature type {FeatureType}, {NumberTargeted} targeted"
+
+  - id: SCCM-TS-REQUIRED-BROAD
+    title: Required task sequence deployment targets many devices
+    kind: misconfigured
+    lens: both
+    category: CFG
+    severity: high
+    entity: deployment
+    why: A required operating-system task sequence runs without consent at its deadline; on a large collection one mistake wipes many PCs.
+    fix: Make it Available, or target a staging collection that devices enter on purpose.
+    refs: [NIST-800-53:CM-3]
+    query:
+      protocol: http
+      path: /wmi/SMS_DeploymentSummary
+      params:
+        $select: DeploymentID,SoftwareName,CollectionID,CollectionName,FeatureType,DeploymentIntent,DeploymentTime,EnforcementDeadline,NumberTargeted,NumberErrors,SummarizationTime,CreationTime
+      key: DeploymentID
+      name: SoftwareName
+    each:
+      all:
+        - { field: FeatureType, op: eq, value: 7 }
+        - { field: DeploymentIntent, op: eq, value: 1 }
+        - { field: NumberTargeted, op: gt, value: 25, threshold: sccm.required-ts-max-targets }
+    evidence: "{SoftwareName} -> {CollectionName}: required task sequence on {NumberTargeted} devices"
+
+  - id: SCCM-DEPLOYMENT-SUMMARY-STALE
+    title: Deployment summary not refreshed for days
+    kind: broken
+    category: MON
+    severity: low
+    entity: deployment
+    why: The console and every count-based deployment rule show numbers days old; the summarizer is backed up or failing.
+    fix: Check the deployment summarization in the site's component status and the site database's load.
+    refs: [NIST-800-53:SI-4]
+    query:
+      protocol: http
+      path: /wmi/SMS_DeploymentSummary
+      params:
+        $select: DeploymentID,SoftwareName,CollectionID,CollectionName,FeatureType,DeploymentIntent,DeploymentTime,EnforcementDeadline,NumberTargeted,NumberErrors,SummarizationTime,CreationTime
+      key: DeploymentID
+      name: SoftwareName
+    each:
+      all:
+        - { field: DeploymentTime, op: age-lt, value: 90 }
+        - { field: SummarizationTime, op: age-gt, value: 3, threshold: sccm.summary-max-age-days }
+    evidence: "{SoftwareName} -> {CollectionName}: last summarized {SummarizationTime}"
+
+  # ---- distribution points ----------------------------------------------------------------------
+
+  - id: SCCM-DP-DRIVE-LOW-SPACE
+    title: Distribution point drive is low on free space
+    kind: broken
+    category: HLT
+    severity:
+      field: PercentFree
+      ranges: [ { max: 5, value: critical } ]
+      default: high
+    entity: dp-drive
+    refresh: 6h
+    why: A full drive on a distribution point fails every new content copy silently; remote and pull distribution points do not show in the site-system storage rule.
+    fix: Clean the content library (orphaned content, old images and packages), set the drive priorities, or extend the volume.
+    refs: [NIST-800-53:SC-5]
+    query:
+      protocol: http
+      path: /wmi/SMS_DistributionPointDriveInfo
+      params:
+        $select: NALPath,Drive,BytesTotal,BytesFree,PercentFree,Status,SiteCode
+      key: "{NALPath}|{Drive}"
+      name: NALPath
+    each:
+      all:
+        - { field: BytesTotal, op: gt, value: 0 }
+        - { field: PercentFree, op: lt, value: 10, threshold: sccm.dp-drive-free-pct-min }
+    evidence: "{NALPath} {Drive}: {PercentFree}% free ({BytesFree} of {BytesTotal} KB)"
+
+  - id: SCCM-DP-DRIVE-COPY-ERROR
+    title: Last content copy to a distribution point drive failed
+    kind: broken
+    category: AVL
+    severity: medium
+    entity: dp-drive
+    refresh: 6h
+    why: The drive returned an error on the last attempt to copy content to it (space, permissions, disk); packages queued for that drive do not arrive.
+    fix: Look up the error code, fix the drive and redistribute the failed content.
+    refs: [NIST-800-53:SI-4]
+    query:
+      protocol: http
+      path: /wmi/SMS_DistributionPointDriveInfo
+      params:
+        $select: NALPath,Drive,BytesTotal,BytesFree,PercentFree,Status,SiteCode
+      key: "{NALPath}|{Drive}"
+      name: NALPath
+    each: { field: Status, op: ne, value: 0 }
+    evidence: "{NALPath} {Drive}: last copy error {Status}"
+
+  - id: SCCM-DP-CONTENT-ERRORS
+    title: Distribution point with failed content installations
+    kind: broken
+    category: AVL
+    severity: high
+    entity: distribution-point
+    refresh: 6h
+    why: Content-level rules list packages; this names the distribution point that fails them, with the count, so one sick server is fixed once instead of per package.
+    fix: Monitoring > Distribution Point Configuration Status for that server; redistribute the failed content or repair the role.
+    refs: [NIST-800-53:SI-4, NIST-800-53:SI-2]
+    query:
+      protocol: http
+      path: /wmi/SMS_DPStatusInfo
+      params:
+        $select: NALPath,Name,MessageState,MessageCount,NumberErrors,NumberInProgress,NumberInstalled,NumberUnknown,LastStatusTime,IsPullDP,IsPXE,Version
+      key: NALPath
+      name: Name
+    each:
+      any:
+        - { field: NumberErrors, op: gt, value: 0 }
+        - { field: MessageState, op: eq, value: 3 }
+    evidence: "{Name}: {NumberErrors} failed, {NumberInProgress} in progress, {NumberInstalled} installed; state {MessageState}, last status {LastStatusTime}"
+
+  # ---- collections --------------------------------------------------------------------------------
+
+  - id: SCCM-COLLECTION-REFRESH-STALE
+    title: Scheduled collection has not been evaluated for days
+    kind: broken
+    category: HLT
+    severity: medium
+    entity: collection
+    why: A collection with a refresh schedule whose last evaluation is days old has a stuck evaluator or a broken schedule; deployments to it never gain new members. Collections on monthly schedules need a higher threshold.
+    fix: Read colleval.log, check the schedule and the evaluator queue in the console.
+    refs: [NIST-800-53:CM-3, NIST-800-53:SI-4]
+    query:
+      protocol: http
+      path: /wmi/SMS_Collection
+      params:
+        $filter: "RefreshType eq 2 or RefreshType eq 6"
+        $select: CollectionID,Name,RefreshType,MemberCount,LastRefreshTime,LastMemberChangeTime,LastChangeTime,CurrentStatus,IsBuiltIn,FullEvaluationRunTime,IncrementalEvaluationRunTime,FullEvaluationNextRefreshTime
+      key: CollectionID
+      name: Name
+    each:
+      all:
+        - { field: IsBuiltIn, op: eq, value: false }
+        - { field: LastRefreshTime, op: age-gt, value: 8, threshold: sccm.collection-refresh-max-days }
+    evidence: "{Name} ({CollectionID}): last refresh {LastRefreshTime}, next full evaluation {FullEvaluationNextRefreshTime}, status {CurrentStatus}"
+
+  - id: SCCM-COLLECTION-EVAL-SLOW
+    title: Collection takes minutes to evaluate
+    kind: broken
+    category: HLT
+    severity: low
+    entity: collection
+    why: Slow membership rules (nested includes, joins on inventory classes, wildcards) hold the collection evaluator for every other collection, so new devices wait for their deployments. Run times are in seconds.
+    fix: Rewrite the query rule (limit by a smaller collection, avoid inventory joins), or lengthen its schedule.
+    refs: [NIST-800-53:SI-4]
+    query:
+      protocol: http
+      path: /wmi/SMS_Collection
+      params:
+        $select: CollectionID,Name,CollectionType,MemberCount,IsBuiltIn,LastChangeTime,LastMemberChangeTime,LastRefreshTime,FullEvaluationRunTime,IncrementalEvaluationRunTime
+      key: CollectionID
+      name: Name
+    each:
+      any:
+        - { field: FullEvaluationRunTime, op: gt, value: 300, threshold: sccm.collection-full-eval-max-seconds }
+        - { field: IncrementalEvaluationRunTime, op: gt, value: 60, threshold: sccm.collection-incremental-eval-max-seconds }
+    evidence: "{Name} ({CollectionID}): full evaluation {FullEvaluationRunTime} s, incremental {IncrementalEvaluationRunTime} s"
+
+  - id: SCCM-COLLECTION-EMPTY-STALE
+    title: Empty collection untouched for six months
+    kind: misconfigured
+    category: HYG
+    severity: low
+    entity: collection
+    why: Dead collections still cost evaluation time, clutter targeting and invite deployments to the wrong place.
+    fix: Delete the collection after checking that no deployment, maintenance window or client setting refers to it.
+    refs: [NIST-800-53:CM-2]
+    query:
+      protocol: http
+      path: /wmi/SMS_Collection
+      params:
+        $select: CollectionID,Name,CollectionType,MemberCount,IsBuiltIn,LastChangeTime,LastMemberChangeTime,LastRefreshTime,FullEvaluationRunTime,IncrementalEvaluationRunTime
+      key: CollectionID
+      name: Name
+    each:
+      all:
+        - { field: MemberCount, op: eq, value: 0 }
+        - { field: IsBuiltIn, op: eq, value: false }
+        - { field: LastChangeTime, op: age-gt, value: 180, threshold: sccm.empty-collection-max-age-days }
+        - any:
+            - { field: LastMemberChangeTime, op: absent }
+            - { field: LastMemberChangeTime, op: age-gt, value: 180, threshold: sccm.empty-collection-max-age-days }
+    evidence: "{Name} ({CollectionID}): empty, last changed {LastChangeTime}"
+
+  # ---- update groups and rules ------------------------------------------------------------------
+
+  - id: SCCM-SUG-SUPERSEDED-UPDATES
+    title: Deployed update group still contains superseded updates
+    kind: misconfigured
+    category: HYG
+    severity: low
+    entity: update-group
+    why: Superseded updates in a deployed group are still evaluated on every client and can still install, only to be replaced by the newer update - double work and double downloads.
+    fix: Remove superseded updates from the group (or let the automatic deployment rule rebuild it).
+    refs: [NIST-800-53:SI-2]
+    query:
+      protocol: http
+      path: /wmi/SMS_AuthorizationList
+      params:
+        $select: CI_ID,LocalizedDisplayName,IsDeployed,ContainsExpiredUpdates,ContainsSupersededUpdates,NumberOfUpdates,NumberOfExpiredUpdates,DateLastModified
+      key: CI_ID
+      name: LocalizedDisplayName
+    each:
+      all:
+        - { field: IsDeployed, op: eq, value: true }
+        - { field: ContainsSupersededUpdates, op: eq, value: true }
+        - { field: DateLastModified, op: age-gt, value: 60, threshold: sccm.sug-superseded-grace-days }
+    evidence: "{LocalizedDisplayName}: contains superseded updates, last modified {DateLastModified}"
+
+  - id: SCCM-ADR-DISABLED
+    title: Automatic deployment rule disabled for weeks
+    kind: misconfigured
+    lens: both
+    category: LCM
+    severity: medium
+    entity: adr
+    why: A rule switched off "for a month" stops delivering updates to its collections, and nobody sees it because the rule and its old deployments still exist.
+    fix: Enable the rule, or delete it and its deployments if another rule took over.
+    refs: [NIST-800-53:SI-2]
+    query:
+      protocol: http
+      path: /wmi/SMS_AutoDeployment
+      params:
+        $select: Name,AutoDeploymentEnabled,LastRunTime,LastErrorCode,LastErrorTime
+      key: Name
+    each:
+      all:
+        - { field: AutoDeploymentEnabled, op: eq, value: false }
+        - any:
+            - { field: LastRunTime, op: absent }
+            - { field: LastRunTime, op: age-gt, value: 60, threshold: sccm.adr-disabled-max-days }
+    evidence: "{Name}: disabled, last run {LastRunTime}"
+
+  # ---- client health of servers, as the site sees them -------------------------------------------
+  # Twins of the workstation rules in workstations-sccm.yaml. The site is authoritative for the client
+  # check result, policy requests, status messages, heartbeats and blocked or unapproved records; the
+  # PC-side twins in windows-server.yaml are authoritative for service, version, assignment and the
+  # time inventory last reported.
+
+  - id: SCCM-SERVER-CLIENT-INACTIVE
+    title: Server client is inactive
+    kind: broken
+    category: HLT
+    severity: high
+    entity: computer
+    why: An inactive server client sends no heartbeat, policy request or inventory; it receives no update deployments and its compliance is unknown. When the server's own client answers, the record is what is wrong.
+    fix: Check the server is in use and its client runs (WINSRV-CCM-*); repair the client or retire the record.
+    refs: [NIST-800-53:CM-8, NIST-800-53:SI-2]
+    query:
+      protocol: http
+      path: /wmi/SMS_CombinedDeviceResources
+      params:
+        $filter: "startswith(DeviceOS,'Microsoft Windows NT Server') eq true or startswith(DeviceOS,'Microsoft Windows NT Advanced Server') eq true"
+        $select: ResourceID,Name,IsClient,IsActive,IsObsolete,IsBlocked,IsApproved,SiteCode,ClientVersion,ClientCheckPass,ClientRemediationSuccess,LastClientCheckTime,LastPolicyRequest,LastDDR,LastHardwareScan,LastSoftwareScan,LastStatusMessage,LastMPServerName,LastActiveTime,DeviceOS,EPInfectionStatus,EPLastThreatName,EPLastInfectionTime
+      key: ResourceID
+      name: Name
+    each:
+      all:
+        - { field: IsClient, op: eq, value: true }
+        - { field: IsActive, op: eq, value: false }
+        - { field: IsObsolete, op: ne, value: true }
+    evidence: "{Name}: inactive, last active {LastActiveTime}, last policy request {LastPolicyRequest}"
+
+  - id: SCCM-SERVER-CLIENT-CHECK-FAILED
+    title: Server client fails the client health evaluation
+    kind: broken
+    category: HLT
+    severity: medium
+    entity: computer
+    why: ccmeval found a broken prerequisite (WMI, services, cache) on the server; remediation status tells whether it fixed it.
+    fix: Read CcmEval.log on the server and reinstall the client when the failure repeats.
+    refs: [NIST-800-53:SI-4]
+    query:
+      protocol: http
+      path: /wmi/SMS_CombinedDeviceResources
+      params:
+        $filter: "startswith(DeviceOS,'Microsoft Windows NT Server') eq true or startswith(DeviceOS,'Microsoft Windows NT Advanced Server') eq true"
+        $select: ResourceID,Name,IsClient,IsActive,IsObsolete,IsBlocked,IsApproved,SiteCode,ClientVersion,ClientCheckPass,ClientRemediationSuccess,LastClientCheckTime,LastPolicyRequest,LastDDR,LastHardwareScan,LastSoftwareScan,LastStatusMessage,LastMPServerName,LastActiveTime,DeviceOS,EPInfectionStatus,EPLastThreatName,EPLastInfectionTime
+      key: ResourceID
+      name: Name
+    each:
+      all:
+        - { field: IsClient, op: eq, value: true }
+        - { field: ClientCheckPass, op: eq, value: 2 }
+    evidence: "{Name}: client check failed at {LastClientCheckTime}, remediation {ClientRemediationSuccess} (1 succeeded, 2 failed)"
+
+  - id: SCCM-SERVER-CLIENT-CHECK-STALE
+    title: Active server client has not run the client health evaluation
+    kind: broken
+    category: HLT
+    severity: medium
+    entity: computer
+    why: ccmeval runs daily; when the site has no recent result for an active server, the scheduled task or ccmeval itself is broken and the active status cannot be trusted.
+    fix: Check the 'Configuration Manager Health Evaluation' task and the Task Scheduler on the server.
+    refs: [NIST-800-53:SI-4]
+    query:
+      protocol: http
+      path: /wmi/SMS_CombinedDeviceResources
+      params:
+        $filter: "startswith(DeviceOS,'Microsoft Windows NT Server') eq true or startswith(DeviceOS,'Microsoft Windows NT Advanced Server') eq true"
+        $select: ResourceID,Name,IsClient,IsActive,IsObsolete,IsBlocked,IsApproved,SiteCode,ClientVersion,ClientCheckPass,ClientRemediationSuccess,LastClientCheckTime,LastPolicyRequest,LastDDR,LastHardwareScan,LastSoftwareScan,LastStatusMessage,LastMPServerName,LastActiveTime,DeviceOS,EPInfectionStatus,EPLastThreatName,EPLastInfectionTime
+      key: ResourceID
+      name: Name
+    each:
+      all:
+        - { field: IsClient, op: eq, value: true }
+        - { field: IsActive, op: eq, value: true }
+        - any:
+            - { field: LastClientCheckTime, op: absent }
+            - { field: LastClientCheckTime, op: age-gt, value: 7, threshold: windows-server.client-check-max-age-days }
+    evidence: "{Name}: last client check {LastClientCheckTime}"
+
+  - id: SCCM-SERVER-POLICY-STALE
+    title: Active server client has not requested policy for days
+    kind: broken
+    category: HLT
+    severity: medium
+    entity: computer
+    why: A server client that stopped requesting policy never learns of new update deployments or maintenance windows, while it still looks active.
+    fix: Check PolicyAgent.log and LocationServices.log on the server; a missing management point or boundary is common.
+    refs: [NIST-800-53:SI-2]
+    query:
+      protocol: http
+      path: /wmi/SMS_CombinedDeviceResources
+      params:
+        $filter: "startswith(DeviceOS,'Microsoft Windows NT Server') eq true or startswith(DeviceOS,'Microsoft Windows NT Advanced Server') eq true"
+        $select: ResourceID,Name,IsClient,IsActive,IsObsolete,IsBlocked,IsApproved,SiteCode,ClientVersion,ClientCheckPass,ClientRemediationSuccess,LastClientCheckTime,LastPolicyRequest,LastDDR,LastHardwareScan,LastSoftwareScan,LastStatusMessage,LastMPServerName,LastActiveTime,DeviceOS,EPInfectionStatus,EPLastThreatName,EPLastInfectionTime
+      key: ResourceID
+      name: Name
+    each:
+      all:
+        - { field: IsClient, op: eq, value: true }
+        - { field: IsActive, op: eq, value: true }
+        - { field: LastPolicyRequest, op: age-gt, value: 7, threshold: windows-server.policy-request-max-age-days }
+    evidence: "{Name}: last policy request {LastPolicyRequest} to {LastMPServerName}"
+
+  - id: SCCM-SERVER-HEARTBEAT-STALE
+    title: Active server client has not sent a heartbeat record for days
+    kind: broken
+    category: HLT
+    severity: medium
+    entity: computer
+    why: The heartbeat discovery record keeps the server active; stale while policy requests continue, the record inbox is backed up or the heartbeat schedule is broken, and the server will drop to inactive.
+    fix: Compare with the server's own last heartbeat (WINSRV-CCM-HEARTBEAT-STALE); if the server sent it, look at the management point and the site's discovery inbox.
+    refs: [NIST-800-53:CM-8]
+    query:
+      protocol: http
+      path: /wmi/SMS_CombinedDeviceResources
+      params:
+        $filter: "startswith(DeviceOS,'Microsoft Windows NT Server') eq true or startswith(DeviceOS,'Microsoft Windows NT Advanced Server') eq true"
+        $select: ResourceID,Name,IsClient,IsActive,IsObsolete,IsBlocked,IsApproved,SiteCode,ClientVersion,ClientCheckPass,ClientRemediationSuccess,LastClientCheckTime,LastPolicyRequest,LastDDR,LastHardwareScan,LastSoftwareScan,LastStatusMessage,LastMPServerName,LastActiveTime,DeviceOS,EPInfectionStatus,EPLastThreatName,EPLastInfectionTime
+      key: ResourceID
+      name: Name
+    each:
+      all:
+        - { field: IsClient, op: eq, value: true }
+        - { field: IsActive, op: eq, value: true }
+        - any:
+            - { field: LastDDR, op: absent }
+            - { field: LastDDR, op: age-gt, value: 9, threshold: windows-server.ddr-max-age-days }
+    evidence: "{Name}: last heartbeat record {LastDDR}, last policy request {LastPolicyRequest}"
+
+  - id: SCCM-SERVER-HWINV-STALE
+    title: Active server has no recent hardware inventory
+    kind: broken
+    category: HLT
+    severity: low
+    entity: computer
+    why: Inventory-based reports and rules are blind or stale for this server. The server's own record (WINSRV-CCM-HWINV-STALE) says whether it reported and the site lost it.
+    fix: Check InventoryAgent.log on the server; inventory over the size limit and a broken WMI are the usual causes.
+    refs: [NIST-800-53:CM-8]
+    query:
+      protocol: http
+      path: /wmi/SMS_CombinedDeviceResources
+      params:
+        $filter: "startswith(DeviceOS,'Microsoft Windows NT Server') eq true or startswith(DeviceOS,'Microsoft Windows NT Advanced Server') eq true"
+        $select: ResourceID,Name,IsClient,IsActive,IsObsolete,IsBlocked,IsApproved,SiteCode,ClientVersion,ClientCheckPass,ClientRemediationSuccess,LastClientCheckTime,LastPolicyRequest,LastDDR,LastHardwareScan,LastSoftwareScan,LastStatusMessage,LastMPServerName,LastActiveTime,DeviceOS,EPInfectionStatus,EPLastThreatName,EPLastInfectionTime
+      key: ResourceID
+      name: Name
+    each:
+      all:
+        - { field: IsClient, op: eq, value: true }
+        - { field: IsActive, op: eq, value: true }
+        - any:
+            - { field: LastHardwareScan, op: absent }
+            - { field: LastHardwareScan, op: age-gt, value: 14, threshold: windows-server.hw-inventory-max-age-days }
+    evidence: "{Name}: last hardware scan {LastHardwareScan}"
+
+  - id: SCCM-SERVER-STATUS-MESSAGE-STALE
+    title: Active server client sends no status messages
+    kind: broken
+    category: HLT
+    severity: medium
+    entity: computer
+    why: State and status messages carry deployment and update compliance; when none arrive from an active server, its compliance in every report is stale (certificate, management point or inbox problem).
+    fix: Check StateMessage.log on the server and the management point's status message processing.
+    refs: [NIST-800-53:SI-4]
+    query:
+      protocol: http
+      path: /wmi/SMS_CombinedDeviceResources
+      params:
+        $filter: "startswith(DeviceOS,'Microsoft Windows NT Server') eq true or startswith(DeviceOS,'Microsoft Windows NT Advanced Server') eq true"
+        $select: ResourceID,Name,IsClient,IsActive,IsObsolete,IsBlocked,IsApproved,SiteCode,ClientVersion,ClientCheckPass,ClientRemediationSuccess,LastClientCheckTime,LastPolicyRequest,LastDDR,LastHardwareScan,LastSoftwareScan,LastStatusMessage,LastMPServerName,LastActiveTime,DeviceOS,EPInfectionStatus,EPLastThreatName,EPLastInfectionTime
+      key: ResourceID
+      name: Name
+    each:
+      all:
+        - { field: IsClient, op: eq, value: true }
+        - { field: IsActive, op: eq, value: true }
+        - any:
+            - { field: LastStatusMessage, op: absent }
+            - { field: LastStatusMessage, op: age-gt, value: 14, threshold: windows-server.status-message-max-age-days }
+    evidence: "{Name}: last status message {LastStatusMessage}"
+
+  - id: SCCM-SERVER-NO-ASSIGNED-SITE
+    title: Server client record carries no site code
+    kind: broken
+    category: CFG
+    severity: high
+    entity: computer
+    why: A client that lost its site assignment gets no policy and no updates. The server's own record (WINSRV-CCM-NO-ASSIGNMENT) is authoritative when the two disagree.
+    fix: Reassign the client to the site and check the boundary group of its network.
+    refs: [NIST-800-53:CM-8, NIST-800-53:SI-2]
+    query:
+      protocol: http
+      path: /wmi/SMS_CombinedDeviceResources
+      params:
+        $filter: "startswith(DeviceOS,'Microsoft Windows NT Server') eq true or startswith(DeviceOS,'Microsoft Windows NT Advanced Server') eq true"
+        $select: ResourceID,Name,IsClient,IsActive,IsObsolete,IsBlocked,IsApproved,SiteCode,ClientVersion,ClientCheckPass,ClientRemediationSuccess,LastClientCheckTime,LastPolicyRequest,LastDDR,LastHardwareScan,LastSoftwareScan,LastStatusMessage,LastMPServerName,LastActiveTime,DeviceOS,EPInfectionStatus,EPLastThreatName,EPLastInfectionTime
+      key: ResourceID
+      name: Name
+    each:
+      all:
+        - { field: IsClient, op: eq, value: true }
+        - { field: IsObsolete, op: ne, value: true }
+        - { field: SiteCode, op: empty }
+    evidence: "{Name}: no site code, client {ClientVersion}"
+
+  - id: SCCM-SERVER-CLIENT-BLOCKED
+    title: Server client is blocked or not approved
+    kind: misconfigured
+    category: CFG
+    severity: medium
+    entity: computer
+    why: A blocked or unapproved client is refused policy by the site while it looks installed and healthy on the server itself; it gets no deployments.
+    fix: Unblock or approve the record if the server is genuine; if it was blocked on purpose, remove the client.
+    refs: [NIST-800-53:CM-8]
+    query:
+      protocol: http
+      path: /wmi/SMS_CombinedDeviceResources
+      params:
+        $filter: "startswith(DeviceOS,'Microsoft Windows NT Server') eq true or startswith(DeviceOS,'Microsoft Windows NT Advanced Server') eq true"
+        $select: ResourceID,Name,IsClient,IsActive,IsObsolete,IsBlocked,IsApproved,SiteCode,ClientVersion,ClientCheckPass,ClientRemediationSuccess,LastClientCheckTime,LastPolicyRequest,LastDDR,LastHardwareScan,LastSoftwareScan,LastStatusMessage,LastMPServerName,LastActiveTime,DeviceOS,EPInfectionStatus,EPLastThreatName,EPLastInfectionTime
+      key: ResourceID
+      name: Name
+    each:
+      all:
+        - { field: IsObsolete, op: ne, value: true }
+        - any:
+            - { field: IsBlocked, op: eq, value: true }
+            - all:
+                - { field: IsClient, op: eq, value: true }
+                - { field: IsActive, op: eq, value: true }
+                - { field: IsApproved, op: eq, value: 0 }
+    evidence: "{Name}: blocked {IsBlocked}, approved {IsApproved}"
+
+  - id: SCCM-SERVER-EP-INFECTED
+    title: Endpoint Protection reports an infection on a server it could not clean
+    kind: broken
+    lens: security
+    category: MON
+    severity: high
+    entity: computer
+    why: Infection status Pending (3) or Failed (4) means the antimalware engine found a threat it has not removed. Only meaningful where the site manages Endpoint Protection; elsewhere the value is 0 and nothing fires.
+    fix: Open the server in the Endpoint Protection view, run a full scan and isolate it if the threat remains.
+    refs: [NIST-800-53:SI-3, NIST-800-53:IR-4]
+    query:
+      protocol: http
+      path: /wmi/SMS_CombinedDeviceResources
+      params:
+        $filter: "startswith(DeviceOS,'Microsoft Windows NT Server') eq true or startswith(DeviceOS,'Microsoft Windows NT Advanced Server') eq true"
+        $select: ResourceID,Name,IsClient,IsActive,IsObsolete,IsBlocked,IsApproved,SiteCode,ClientVersion,ClientCheckPass,ClientRemediationSuccess,LastClientCheckTime,LastPolicyRequest,LastDDR,LastHardwareScan,LastSoftwareScan,LastStatusMessage,LastMPServerName,LastActiveTime,DeviceOS,EPInfectionStatus,EPLastThreatName,EPLastInfectionTime
+      key: ResourceID
+      name: Name
+    each:
+      all:
+        - { field: IsClient, op: eq, value: true }
+        - { field: EPInfectionStatus, op: in, value: [3, 4] }
+    evidence: "{Name}: infection status {EPInfectionStatus}, last threat {EPLastThreatName} at {EPLastInfectionTime}"

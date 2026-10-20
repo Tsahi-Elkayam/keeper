@@ -915,3 +915,1411 @@ rules:
         - { field: HandleCount, op: gt, value: 50000, threshold: windows-server.process-handles-max }
         - { field: Name, op: notmatch, value: '^(System|Registry|Memory Compression|lsass\.exe|sqlservr\.exe|svchost\.exe|MsMpEng\.exe)$', threshold: windows-server.process-handles-ignore-pattern }
     evidence: "{host}: {Name} (pid {ProcessId}) holds {HandleCount} handles"
+
+  - id: WINSRV-OS-MAINSTREAM-ENDED
+    title: Server release is in extended support only
+    kind: broken
+    lens: both
+    category: LCM
+    severity: low
+    refresh: 7d
+    why: Windows Server 2019 (build 17763) left mainstream support on 2024-01-09 and 2022 (build 20348) on 2026-10-13; from then on only security fixes ship - no other fixes or features. It is the planning signal before WINSRV-OS-ENDING.
+    fix: Plan the move to Windows Server 2025 (mainstream to 2029-11-13); add builds to the list as dates pass.
+    refs: [NIST-800-53:SA-22]
+    query:
+      protocol: cim
+      wql: SELECT Caption, Version, BuildNumber, LastBootUpTime, ProductType FROM Win32_OperatingSystem
+      key: host
+    each: { field: BuildNumber, op: in, value: [17763, 20348], threshold: windows-server.builds-mainstream-ended }
+    evidence: "{host}: {Caption} build {BuildNumber}"
+
+  - id: WINSRV-HOST-NAME-MISMATCH
+    title: The scanned address answered with another server's name
+    kind: misconfigured
+    lens: both
+    category: CFG
+    severity: high
+    why: The DNS name of this server leads to a machine that calls itself something else (a stale record, a reused address); every per-host finding for this name is about the wrong server, and clients that use the name reach the wrong one.
+    fix: Fix the DNS record or the server's name, then re-scan.
+    refs: [NIST-800-53:CM-8, NIST-800-53:SC-22]
+    query:
+      protocol: cim
+      wql: SELECT Name, DNSHostName, Domain FROM Win32_ComputerSystem WHERE DNSHostName <> '{HOST}'
+      key: host
+    each: any
+    evidence: "{host}: the server answering is {DNSHostName} ({Name}, {Domain})"
+
+  - id: WINSRV-PAGEFILE-NONE
+    title: No page file on the server
+    kind: misconfigured
+    category: HLT
+    severity: medium
+    why: Without a page file the commit limit is the RAM alone, services fail to allocate early under load, and no crash dump is written to explain the next outage.
+    fix: Let Windows manage the page file, or set a fixed one large enough for the kernel dump the server needs.
+    refs: [NIST-800-53:SC-5]
+    query:
+      protocol: cim
+      wql: SELECT Name, AllocatedBaseSize, CurrentUsage, PeakUsage FROM Win32_PageFileUsage
+      key: "{host}|{Name}"
+    count: { op: lt, value: 1 }
+    evidence: "{host}: no page file"
+
+  - id: WINSRV-DISK-UNHEALTHY
+    title: Physical disk reports a warning or unhealthy state
+    kind: broken
+    category: HLT
+    severity: high
+    entity: disk
+    why: A disk that reports predictive failure or errors on a server risks data loss and slows every service with retries. Virtual disks on hypervisors report healthy, which is expected.
+    fix: Move the data off or let the storage layer rebuild, and replace the disk.
+    refs: [NIST-800-53:SI-13]
+    query:
+      protocol: cim
+      namespace: root/Microsoft/Windows/Storage
+      wql: SELECT DeviceId, FriendlyName, MediaType, BusType, HealthStatus FROM MSFT_PhysicalDisk
+      key: "{host}|{DeviceId}"
+    each: { field: HealthStatus, op: ne, value: 0 }
+    evidence: "{host}: disk {FriendlyName} health {HealthStatus} (0 healthy, 1 warning, 2 unhealthy)"
+
+  # ---- services: image paths, SMB1 client, autostart -----------------------------------------
+
+  - id: WINSRV-SVC-USER-WRITABLE-PATH
+    title: Service binary lives in a folder ordinary users can write to
+    kind: misconfigured
+    lens: security
+    category: IAM
+    severity: high
+    entity: service
+    why: A service started from a profile, temp or public folder can have its program replaced by anyone who can write there, and the replacement runs with the service's rights at the next start.
+    fix: Reinstall the product under Program Files or restrict the folder to administrators; record vendor exceptions in the ignore pattern.
+    refs: [NIST-800-53:CM-6, NIST-800-53:AC-6, CIS-Controls-v8:4.1, MITRE-ATTACK:T1574.010, MITRE-ATTACK:T1543.003]
+    query:
+      protocol: cim
+      wql: SELECT Name, DisplayName, PathName, StartName, StartMode, State FROM Win32_Service
+      key: "{host}|{Name}"
+    each:
+      all:
+        - { field: PathName, op: match, value: '\\Users\\|\\AppData\\|\\(Windows\\)?Te?mp\\' }
+        - { field: PathName, op: notmatch, value: '^$', threshold: windows-server.userpath-service-ignore-pattern }
+    evidence: "{host}: {Name} runs {PathName} as {StartName}"
+
+  - id: WINSRV-SMB1-CLIENT-DRIVER
+    title: SMB1 client driver installed and not disabled
+    kind: misconfigured
+    lens: security
+    category: AUT
+    severity: high
+    why: While the SMB1 redirector can start, the server can be talked down to SMB1 when it reaches shares, and its sessions relayed; the driver state can differ from the optional feature.
+    fix: Remove the SMB1 feature, or set the mrxsmb10 driver to Disabled by policy. No row means the driver is not installed.
+    refs: [NIST-800-53:CM-7, CIS-Controls-v8:4.8, MITRE-ATTACK:T1557.001]
+    query:
+      protocol: cim
+      wql: SELECT Name, State, StartMode, Started FROM Win32_SystemDriver WHERE Name = 'mrxsmb10'
+      key: host
+    each: { field: StartMode, op: ne, value: Disabled }
+    evidence: "{host}: mrxsmb10 start mode {StartMode}, state {State}"
+
+  - id: WINSRV-STARTUP-USERPATH
+    title: Autostart entry runs a script, a script host, or a program from a temp or public folder
+    kind: misconfigured
+    lens: security
+    category: CFG
+    severity: high
+    entity: startup-entry
+    why: On a server, a Run key or Startup-folder entry that starts a script host, a script file or a program from a temp, public or AppData root folder is persistence that runs with every administrator logon.
+    fix: Remove the entry; if it is a legitimate tool, install it properly and list it in the ignore pattern.
+    refs: [NIST-800-53:CM-7, MITRE-ATTACK:T1547.001, MITRE-ATTACK:T1059]
+    query:
+      protocol: cim
+      wql: SELECT Name, Command, Location, User FROM Win32_StartupCommand
+      key: "{host}|{User}|{Location}|{Name}"
+    each:
+      all:
+        - { field: Command, op: match, value: '\b(wscript|cscript|mshta|powershell|pwsh|rundll32|regsvr32)(\.exe)?\b|\.(vbs|vbe|js|jse|wsf|wsh|hta|bat|cmd|ps1)\b|\\(Windows\\)?Te?mp\\|\\Users\\Public\\|\\AppData\\(Local|Roaming|LocalLow)\\[^\\]+\.(exe|scr|com)\b|\\Downloads\\' }
+        - { field: Command, op: notmatch, value: '^$', threshold: windows-server.startup-ignore-pattern }
+    evidence: "{host}: {Location} {Name} ({User}) -> {Command}"
+
+  # ---- network, SMB client, RDP group ----------------------------------------------------------
+
+  - id: WINSRV-DNS-PUBLIC
+    title: Server adapter uses a public DNS resolver
+    kind: misconfigured
+    lens: both
+    category: CFG
+    severity: high
+    entity: network-adapter
+    why: A domain controller or member server pointed at a public resolver cannot find the domain's records reliably; logons, replication and Group Policy fail intermittently, and DNS filtering is bypassed.
+    fix: Point the adapter at the internal resolvers (domain controllers use each other and themselves); public resolvers belong in the DNS server's forwarders only.
+    refs: [NIST-800-53:SC-20, NIST-800-53:CM-6, MITRE-ATTACK:T1071.004]
+    query:
+      protocol: cim
+      wql: SELECT Index, Description, IPEnabled, DHCPEnabled, DNSServerSearchOrder, TcpipNetbiosOptions, IPAddress, DefaultIPGateway FROM Win32_NetworkAdapterConfiguration WHERE IPEnabled = TRUE
+      key: "{host}|{Index}"
+    each: { field: DNSServerSearchOrder, op: match, value: '^(8\.8\.8\.8|8\.8\.4\.4|1\.1\.1\.1|1\.0\.0\.1|9\.9\.9\.9|149\.112\.112\.112|208\.67\.222\.222|208\.67\.220\.220|2001:4860:4860::88(88|44)|2606:4700:4700::1(111|001))$', threshold: windows-server.public-dns-pattern }
+    evidence: "{host}: {Description} uses DNS {DNSServerSearchOrder}"
+
+  - id: WINSRV-SMB-CLIENT-SIGNING-OFF
+    title: Server's SMB client does not require signing
+    kind: misconfigured
+    lens: security
+    category: AUT
+    severity: medium
+    why: Servers reach file shares, SYSVOL and backup targets as SMB clients; an unsigned session from a server is a valuable target for relay and tampering.
+    fix: Require SMB client signing by policy ('Microsoft network client - Digitally sign communications (always)').
+    refs: [NIST-800-53:SC-8, MITRE-ATTACK:T1557.001]
+    query:
+      protocol: cim
+      namespace: root/Microsoft/Windows/SMB
+      wql: SELECT * FROM MSFT_SmbClientConfiguration
+      key: host
+    each: { field: RequireSecuritySignature, op: eq, value: false }
+    evidence: "{host}: SMB client RequireSecuritySignature = {RequireSecuritySignature}"
+
+  - id: WINSRV-SMB-INSECURE-GUEST
+    title: Server's SMB client allows insecure guest logons
+    kind: misconfigured
+    lens: security
+    category: AUT
+    severity: medium
+    why: Guest logons to shares carry no identity and no signing, so a rogue server can feed this server files unnoticed.
+    fix: Disable insecure guest logons by policy and fix any share that depends on guest access.
+    refs: [NIST-800-53:IA-2, MITRE-ATTACK:T1557.001]
+    query:
+      protocol: cim
+      namespace: root/Microsoft/Windows/SMB
+      wql: SELECT * FROM MSFT_SmbClientConfiguration
+      key: host
+    each: { field: EnableInsecureGuestLogons, op: eq, value: true }
+    evidence: "{host}: EnableInsecureGuestLogons = {EnableInsecureGuestLogons}"
+
+  - id: WINSRV-RDPUSERS-BROAD
+    title: Broad group can log on to the server through Remote Desktop
+    kind: misconfigured
+    lens: security
+    category: IAM
+    severity: critical
+    entity: local-group-member
+    why: Remote Desktop is on by design on most servers, so Domain Users, Authenticated Users, Everyone or a similar group in Remote Desktop Users lets every account in the organisation open a session on the server.
+    fix: Remove the group and grant Remote Desktop to the server's administrators group only. Domain controllers have no local group and read empty.
+    refs: [NIST-800-53:AC-6, NIST-800-53:AC-17, CIS-Controls-v8:5.4, MITRE-ATTACK:T1021.001]
+    query:
+      protocol: cim
+      wql: SELECT GroupComponent, PartComponent FROM Win32_GroupUser WHERE GroupComponent = "Win32_Group.Domain='{HOST}',Name='Remote Desktop Users'"
+      key: "{host}|{PartComponent}"
+    each: { field: PartComponent, op: match, value: 'Name = "(Everyone|Authenticated Users|Users|INTERACTIVE|Domain Users|Domain Computers|Domain Guests|Guests)"' }
+    evidence: "{host}: Remote Desktop Users contains {PartComponent}"
+
+  - id: WINSRV-LOCAL-ACCOUNT-WEAK
+    title: Guest enabled or a local account needs no password on a server
+    kind: misconfigured
+    lens: security
+    category: IAM
+    severity: high
+    entity: local-account
+    why: An enabled Guest account or an enabled local account without a required password is a free logon to the server. The host filter keeps a domain controller from listing the whole domain, so DCs return nothing here.
+    fix: Disable Guest; require a password or disable the account.
+    refs: [NIST-800-53:IA-5, CIS-Controls-v8:5.2]
+    query:
+      protocol: cim
+      wql: SELECT Name, SID, Disabled, PasswordRequired, Lockout FROM Win32_UserAccount WHERE LocalAccount = TRUE AND Domain = '{HOST}'
+      key: "{host}|{Name}"
+    each:
+      all:
+        - { field: Disabled, op: eq, value: false }
+        - any:
+            - { field: SID, op: match, value: '-501$' }
+            - { field: PasswordRequired, op: eq, value: false }
+    evidence: "{host}: local account {Name} enabled, password required {PasswordRequired}"
+
+  # ---- Defender ------------------------------------------------------------------------------
+
+  - id: WINSRV-DEFENDER-TAMPER-OFF
+    title: Defender active on the server without tamper protection
+    kind: misconfigured
+    lens: security
+    category: MON
+    severity: medium
+    why: Without tamper protection, any administrator-level process can turn real-time protection off with one setting change.
+    fix: Turn tamper protection on from the Defender portal (tenant-wide) or the server's management tool.
+    refs: [NIST-800-53:SI-3, CIS-Controls-v8:10.1, MITRE-ATTACK:T1562.001]
+    query:
+      protocol: cim
+      namespace: root/Microsoft/Windows/Defender
+      wql: SELECT * FROM MSFT_MpComputerStatus
+      key: host
+    each:
+      all:
+        - { field: AMRunningMode, op: match, value: '^Normal' }
+        - { field: IsTamperProtected, op: eq, value: false }
+    evidence: "{host}: mode {AMRunningMode}, tamper protected {IsTamperProtected}"
+
+  - id: WINSRV-DEFENDER-COMPONENT-OFF
+    title: A real-time component of Defender is off on the server
+    kind: misconfigured
+    lens: security
+    category: MON
+    severity: medium
+    why: Real-time protection is on, but behaviour monitoring, downloaded-file scanning or on-access protection is off; those catch fileless activity that signatures miss.
+    fix: Remove the policy that disables the component; use exclusions for the application instead.
+    refs: [NIST-800-53:SI-3, CIS-Controls-v8:10.1, MITRE-ATTACK:T1562.001]
+    query:
+      protocol: cim
+      namespace: root/Microsoft/Windows/Defender
+      wql: SELECT * FROM MSFT_MpComputerStatus
+      key: host
+    each:
+      all:
+        - { field: AMRunningMode, op: match, value: '^Normal' }
+        - { field: RealTimeProtectionEnabled, op: eq, value: true }
+        - any:
+            - { field: BehaviorMonitorEnabled, op: eq, value: false }
+            - { field: IoavProtectionEnabled, op: eq, value: false }
+            - { field: OnAccessProtectionEnabled, op: eq, value: false }
+    evidence: "{host}: behaviour {BehaviorMonitorEnabled}, downloads {IoavProtectionEnabled}, on-access {OnAccessProtectionEnabled}"
+
+  - id: WINSRV-DEFENDER-EXCLUSIONS-BROAD
+    title: Defender excludes a whole drive, profile, temp folder or a risky file type on the server
+    kind: misconfigured
+    lens: security
+    category: MON
+    severity: high
+    why: A drive root, the Users or ProgramData folder, a temp folder, a wildcard or an executable or script extension excluded means anything dropped there is never scanned. Automatic role exclusions (SQL, Exchange, domain controller) are not listed in these values and do not fire.
+    fix: Narrow the exclusion to the application's exact folders and processes and remove extension exclusions for executable and script types.
+    refs: [NIST-800-53:SI-3, CIS-Controls-v8:10.1, MITRE-ATTACK:T1562.001]
+    query:
+      protocol: cim
+      namespace: root/Microsoft/Windows/Defender
+      wql: SELECT * FROM MSFT_MpPreference
+      key: host
+    each:
+      any:
+        - { field: ExclusionPath, op: match, value: '^[A-Za-z]:\\?\*?$|^\*(\.\*)?\\?$|\\(Users|ProgramData|Windows|Program Files( \(x86\))?|AppData(\\(Local|Roaming|LocalLow))?|Downloads|Desktop|Temp|Tmp)\\?\*?$|^%(TEMP|TMP|USERPROFILE|APPDATA|LOCALAPPDATA|PROGRAMDATA|WINDIR|SYSTEMROOT)%\\?\*?$', threshold: windows-server.defender-broad-exclusion-pattern }
+        - { field: ExclusionExtension, op: match, value: '^\.?(exe|dll|sys|scr|com|ps1|psm1|vbs|vbe|js|jse|wsf|hta|bat|cmd|msi|lnk)$', threshold: windows-server.defender-risky-extension-pattern }
+    evidence: "{host}: excluded paths {ExclusionPath}; extensions {ExclusionExtension}"
+
+  - id: WINSRV-DEFENDER-EXCLUSION-LOLBIN
+    title: Defender excludes a script host or system tool as a process on the server
+    kind: misconfigured
+    lens: security
+    category: MON
+    severity: high
+    why: Files opened by an excluded process are not scanned, so excluding PowerShell, cmd, a script host or a signed system tool blinds Defender to everything run through it.
+    fix: Remove the process exclusion; exclude the application's own binary by full path instead.
+    refs: [NIST-800-53:SI-3, MITRE-ATTACK:T1562.001, MITRE-ATTACK:T1059.001]
+    query:
+      protocol: cim
+      namespace: root/Microsoft/Windows/Defender
+      wql: SELECT * FROM MSFT_MpPreference
+      key: host
+    each: { field: ExclusionProcess, op: match, value: '(^|\\)(powershell|powershell_ise|pwsh|cmd|wscript|cscript|mshta|rundll32|regsvr32|msbuild|installutil|regasm|regsvcs|certutil|bitsadmin|wmic|explorer|svchost)(\.exe)?$', threshold: windows-server.defender-lolbin-pattern }
+    evidence: "{host}: excluded processes {ExclusionProcess}"
+
+  - id: WINSRV-DEFENDER-EXCLUSIONS-UNREADABLE
+    title: Defender exclusions could not be read on the server
+    kind: missing
+    lens: security
+    category: MON
+    severity: low
+    why: Defender hides exclusion lists from accounts that are not local administrators and returns a placeholder; the exclusion rules then have nothing to judge on this server.
+    fix: Give the scan account local administrator rights (or read exclusions through the Defender portal) and re-scan.
+    refs: [NIST-800-53:SI-3]
+    query:
+      protocol: cim
+      namespace: root/Microsoft/Windows/Defender
+      wql: SELECT * FROM MSFT_MpPreference
+      key: host
+    each: { field: ExclusionPath, op: match, value: '^N/A' }
+    evidence: "{host}: exclusions answered as {ExclusionPath}"
+
+  # ---- registry: effective settings, read-only through StdRegProv -------------------------------
+  # One row per host. A missing value is the Windows default; where that default is the insecure
+  # one, "absent" fails too. A missing key reads as exists = false.
+
+  - id: WINSRV-REG-LSA-PPL
+    title: LSA is not running as a protected process on the server
+    kind: misconfigured
+    lens: security
+    category: AUT
+    severity: high
+    why: Without LSA protection, any administrator-level process can read the credentials of every account that logged on to the server - on a domain controller or a management server, the domain's.
+    fix: Set RunAsPPL to 1 or 2 by policy after checking LSA plug-ins (smart-card, password filters) are signed.
+    refs: [NIST-800-53:SC-39, NIST-800-53:IA-5, MITRE-ATTACK:T1003.001]
+    query:
+      protocol: registry
+      path: SYSTEM\CurrentControlSet\Control\Lsa
+      values: [RunAsPPL, RunAsPPLBoot]
+      key: host
+    each:
+      all:
+        - any:
+            - { field: RunAsPPL, op: absent }
+            - { field: RunAsPPL, op: notin, value: [1, 2] }
+        - any:
+            - { field: RunAsPPLBoot, op: absent }
+            - { field: RunAsPPLBoot, op: notin, value: [1, 2] }
+    evidence: "{host}: RunAsPPL {RunAsPPL}, RunAsPPLBoot {RunAsPPLBoot}"
+
+  - id: WINSRV-REG-WDIGEST
+    title: WDigest keeps clear-text passwords in memory on the server
+    kind: misconfigured
+    lens: security
+    category: AUT
+    severity: high
+    why: With UseLogonCredential set to 1, WDigest stores the password of everyone who logs on to the server in clear text in LSASS.
+    fix: Remove the value or set it to 0 by policy and find the tool that turned it on.
+    refs: [NIST-800-53:IA-5, MITRE-ATTACK:T1003.001]
+    query:
+      protocol: registry
+      path: SYSTEM\CurrentControlSet\Control\SecurityProviders\WDigest
+      values: [UseLogonCredential]
+      key: host
+    each: { field: UseLogonCredential, op: eq, value: 1 }
+    evidence: "{host}: WDigest UseLogonCredential = {UseLogonCredential}"
+
+  - id: WINSRV-REG-LLMNR
+    title: Multicast name resolution (LLMNR) is not turned off by policy on the server
+    kind: misconfigured
+    lens: security
+    category: AUT
+    severity: medium
+    why: When DNS fails, LLMNR asks the segment and believes the first answer, handing the server's or its users' NTLM hashes to a responder tool.
+    fix: Set 'Turn off multicast name resolution' to Enabled by policy (EnableMulticast = 0).
+    refs: [NIST-800-53:CM-7, CIS-Controls-v8:4.8, MITRE-ATTACK:T1557.001]
+    query:
+      protocol: registry
+      path: SOFTWARE\Policies\Microsoft\Windows NT\DNSClient
+      values: [EnableMulticast]
+      key: host
+    each:
+      any:
+        - { field: EnableMulticast, op: absent }
+        - { field: EnableMulticast, op: ne, value: 0 }
+    evidence: "{host}: EnableMulticast = {EnableMulticast} (missing = on)"
+
+  - id: WINSRV-REG-NBT-NODETYPE
+    title: NetBIOS name resolution may use broadcasts on the server
+    kind: misconfigured
+    lens: security
+    category: AUT
+    severity: low
+    why: Any node type other than P-node lets NetBIOS names be resolved by broadcast, which a responder on the segment can answer.
+    fix: Set NodeType to 2 (P-node) by policy, or disable NetBIOS over TCP/IP on the adapters.
+    refs: [NIST-800-53:CM-7, MITRE-ATTACK:T1557.001]
+    query:
+      protocol: registry
+      path: SYSTEM\CurrentControlSet\Services\NetBT\Parameters
+      values: [NodeType, DhcpNodeType]
+      key: host
+    each:
+      any:
+        - { field: NodeType, op: absent }
+        - { field: NodeType, op: ne, value: 2 }
+    evidence: "{host}: NodeType {NodeType}, from DHCP {DhcpNodeType}"
+
+  - id: WINSRV-REG-CACHED-LOGONS
+    title: Server caches domain logons
+    kind: misconfigured
+    lens: security
+    category: AUT
+    severity: medium
+    why: Each cached logon leaves a crackable verifier of an administrator's password on the server; servers sit next to domain controllers and rarely need to log on offline.
+    fix: Set 'Number of previous logons to cache' to 1 or 0 on servers by policy.
+    refs: [NIST-800-53:IA-5, MITRE-ATTACK:T1003.005]
+    query:
+      protocol: registry
+      path: SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon
+      values: [AutoAdminLogon, DefaultUserName, DefaultPassword, CachedLogonsCount]
+      key: host
+    each:
+      any:
+        - { field: CachedLogonsCount, op: absent }
+        - { field: CachedLogonsCount, op: gt, value: 1, threshold: windows-server.cached-logons-max }
+    evidence: "{host}: CachedLogonsCount = {CachedLogonsCount} (missing = 10)"
+
+  - id: WINSRV-REG-AUTOLOGON-PASSWORD
+    title: Automatic logon password stored in clear text on the server
+    kind: misconfigured
+    lens: security
+    category: IAM
+    severity: critical
+    why: A DefaultPassword value under Winlogon is a clear-text password that anyone who can read the registry or copy the hive gets; on servers it is often a service or administrator account. The scan reports only that it is set.
+    fix: Remove DefaultPassword and automatic logon; run the workload as a service under a managed account.
+    refs: [NIST-800-53:IA-5, CIS-Controls-v8:5.2, MITRE-ATTACK:T1552.002]
+    query:
+      protocol: registry
+      path: SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon
+      values: [AutoAdminLogon, DefaultUserName, DefaultPassword, CachedLogonsCount]
+      key: host
+    each: { field: DefaultPassword, op: exists }
+    evidence: "{host}: DefaultPassword is set for {DefaultUserName} (AutoAdminLogon {AutoAdminLogon})"
+
+  - id: WINSRV-REG-AUTOLOGON
+    title: Automatic logon is turned on for the server
+    kind: misconfigured
+    lens: security
+    category: IAM
+    severity: high
+    why: A server that logs an account on by itself leaves an interactive session open to anyone with console or hypervisor access, usually for an application that should run as a service.
+    fix: Set AutoAdminLogon to 0 and move the application to a service.
+    refs: [NIST-800-53:AC-2, NIST-800-53:IA-2]
+    query:
+      protocol: registry
+      path: SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon
+      values: [AutoAdminLogon, DefaultUserName, DefaultPassword, CachedLogonsCount]
+      key: host
+    each: { field: AutoAdminLogon, op: eq, value: 1 }
+    evidence: "{host}: automatic logon as {DefaultUserName}"
+
+  - id: WINSRV-REG-HARDENED-UNC-WEAK
+    title: Hardened UNC paths for SYSVOL or NETLOGON weakened on the server
+    kind: misconfigured
+    lens: security
+    category: AUT
+    severity: high
+    why: Windows requires mutual authentication and integrity on SYSVOL and NETLOGON by default; a policy entry that sets either to 0 lets a machine in the middle serve forged Group Policy. A missing entry keeps the secure default.
+    fix: Set the \\*\SYSVOL and \\*\NETLOGON entries to RequireMutualAuthentication=1, RequireIntegrity=1 (or remove them).
+    refs: [NIST-800-53:SC-8, NIST-800-53:SC-23, MITRE-ATTACK:T1557]
+    query:
+      protocol: registry
+      path: SOFTWARE\Policies\Microsoft\Windows\NetworkProvider\HardenedPaths
+      key: host
+    each:
+      any:
+        - { field: '\\*\SYSVOL', op: match, value: '(RequireMutualAuthentication|RequireIntegrity)\s*=\s*0' }
+        - { field: '\\*\NETLOGON', op: match, value: '(RequireMutualAuthentication|RequireIntegrity)\s*=\s*0' }
+    evidence: "{host}: hardened paths weakened"
+
+  - id: WINSRV-REG-UAC-OFF
+    title: User Account Control is off or administrators elevate without a prompt on the server
+    kind: misconfigured
+    lens: security
+    category: AUT
+    severity: high
+    why: With EnableLUA at 0 every administrator process runs with full rights, and with ConsentPromptBehaviorAdmin at 0 elevation is silent; this reads the effective value, however it was set.
+    fix: Set EnableLUA to 1 and ConsentPromptBehaviorAdmin to a prompting value by policy.
+    refs: [NIST-800-53:AC-6, CIS-Controls-v8:4.1, MITRE-ATTACK:T1548.002]
+    query:
+      protocol: registry
+      path: SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System
+      values: [EnableLUA, ConsentPromptBehaviorAdmin, FilterAdministratorToken, LocalAccountTokenFilterPolicy]
+      key: host
+    each:
+      any:
+        - { field: EnableLUA, op: eq, value: 0 }
+        - { field: ConsentPromptBehaviorAdmin, op: eq, value: 0 }
+    evidence: "{host}: EnableLUA {EnableLUA}, ConsentPromptBehaviorAdmin {ConsentPromptBehaviorAdmin}"
+
+  - id: WINSRV-REG-REMOTE-UAC-OFF
+    title: Remote UAC restrictions for local accounts are turned off on the server
+    kind: misconfigured
+    lens: security
+    category: AUT
+    severity: high
+    why: LocalAccountTokenFilterPolicy = 1 gives local administrator accounts a full token over the network, so one shared local password or hash opens every such server remotely.
+    fix: Remove the value (or set 0); administer servers with domain accounts and unique LAPS-managed local passwords.
+    refs: [NIST-800-53:AC-6, NIST-800-53:AC-17, MITRE-ATTACK:T1550.002]
+    query:
+      protocol: registry
+      path: SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System
+      values: [EnableLUA, ConsentPromptBehaviorAdmin, FilterAdministratorToken, LocalAccountTokenFilterPolicy]
+      key: host
+    each: { field: LocalAccountTokenFilterPolicy, op: eq, value: 1 }
+    evidence: "{host}: LocalAccountTokenFilterPolicy = 1"
+
+  - id: WINSRV-REG-WINRM-SERVICE-INSECURE
+    title: WinRM service accepts Basic authentication or unencrypted traffic
+    kind: misconfigured
+    lens: security
+    category: AUT
+    severity: medium
+    why: Basic authentication sends reusable credentials, and unencrypted traffic exposes every remote command and its output on the wire.
+    fix: Set 'Allow Basic authentication' and 'Allow unencrypted traffic' for the WinRM service to Disabled by policy.
+    refs: [NIST-800-53:SC-8, NIST-800-53:IA-2, CIS-Controls-v8:3.10]
+    query:
+      protocol: registry
+      path: SOFTWARE\Policies\Microsoft\Windows\WinRM\Service
+      values: [AllowBasic, AllowUnencryptedTraffic]
+      key: host
+    each:
+      any:
+        - { field: AllowBasic, op: eq, value: 1 }
+        - { field: AllowUnencryptedTraffic, op: eq, value: 1 }
+    evidence: "{host}: WinRM service AllowBasic {AllowBasic}, AllowUnencryptedTraffic {AllowUnencryptedTraffic}"
+
+  - id: WINSRV-REG-WINRM-CLIENT-INSECURE
+    title: WinRM client on the server allows Basic, Digest or unencrypted traffic
+    kind: misconfigured
+    lens: security
+    category: AUT
+    severity: medium
+    why: A management server whose WinRM client offers Basic or Digest or sends unencrypted traffic leaks administrator credentials to any endpoint it connects to.
+    fix: Set Basic, Digest and unencrypted traffic for the WinRM client to Disabled by policy.
+    refs: [NIST-800-53:SC-8, NIST-800-53:IA-2]
+    query:
+      protocol: registry
+      path: SOFTWARE\Policies\Microsoft\Windows\WinRM\Client
+      values: [AllowBasic, AllowDigest, AllowUnencryptedTraffic]
+      key: host
+    each:
+      any:
+        - { field: AllowBasic, op: eq, value: 1 }
+        - { field: AllowDigest, op: eq, value: 1 }
+        - { field: AllowUnencryptedTraffic, op: eq, value: 1 }
+    evidence: "{host}: WinRM client AllowBasic {AllowBasic}, AllowDigest {AllowDigest}, AllowUnencryptedTraffic {AllowUnencryptedTraffic}"
+
+  - id: WINSRV-REG-CREDSSP-DELEGATION
+    title: Policy delegates credentials from the server through CredSSP
+    kind: misconfigured
+    lens: security
+    category: AUT
+    severity: low
+    why: Credential delegation hands reusable credentials to the listed servers; the NTLM-only variants do it to servers whose identity was never proven. A compromised target then holds an administrator's password.
+    fix: Remove the delegation policies or limit them to exact host names; never use the NTLM-only variants.
+    refs: [NIST-800-53:IA-5, NIST-800-53:AC-17, MITRE-ATTACK:T1003]
+    query:
+      protocol: registry
+      path: SOFTWARE\Policies\Microsoft\Windows\CredentialsDelegation
+      values: [AllowFreshCredentials, AllowDefaultCredentials, AllowSavedCredentials, AllowFreshCredentialsWhenNTLMOnly, AllowDefCredentialsWhenNTLMOnly]
+      key: host
+    each:
+      any:
+        - { field: AllowFreshCredentials, op: eq, value: 1 }
+        - { field: AllowDefaultCredentials, op: eq, value: 1 }
+        - { field: AllowSavedCredentials, op: eq, value: 1 }
+        - { field: AllowFreshCredentialsWhenNTLMOnly, op: eq, value: 1 }
+        - { field: AllowDefCredentialsWhenNTLMOnly, op: eq, value: 1 }
+    evidence: "{host}: fresh {AllowFreshCredentials}, default {AllowDefaultCredentials}, saved {AllowSavedCredentials}, NTLM-only {AllowFreshCredentialsWhenNTLMOnly}/{AllowDefCredentialsWhenNTLMOnly}"
+
+  - id: WINSRV-REG-KERBEROS-RC4
+    title: Kerberos on the server still allows RC4
+    kind: misconfigured
+    lens: security
+    category: AUT
+    severity: medium
+    why: RC4 tickets are the ones roasting attacks crack offline; while servers accept RC4 (the default when the policy is not set), the domain cannot drop it.
+    fix: Set 'Network security - Configure encryption types allowed for Kerberos' to AES only once RC4 dependencies are gone.
+    refs: [NIST-800-53:SC-13, NIST-800-53:IA-5, MITRE-ATTACK:T1558.003]
+    query:
+      protocol: registry
+      path: SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System\Kerberos\Parameters
+      values: [SupportedEncryptionTypes]
+      key: host
+    each:
+      any:
+        - { field: SupportedEncryptionTypes, op: absent }
+        - { field: SupportedEncryptionTypes, op: flag, value: 4 }
+    evidence: "{host}: SupportedEncryptionTypes = {SupportedEncryptionTypes} (missing = OS default with RC4)"
+
+  - id: WINSRV-REG-WSUS-HTTP
+    title: Windows Update source of the server is a plain-HTTP update server
+    kind: misconfigured
+    lens: security
+    category: LCM
+    severity: high
+    why: Update metadata over plain HTTP can be altered by a machine in the middle, which can push a signed Microsoft tool with attacker-chosen arguments as an update - with SYSTEM rights on the server.
+    fix: Move the update server (or software update point) to HTTPS and update the policy URLs.
+    refs: [NIST-800-53:SI-2, NIST-800-53:SC-8, MITRE-ATTACK:T1557]
+    query:
+      protocol: registry
+      path: SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate
+      values: [WUServer, WUStatusServer, UpdateServiceUrlAlternate]
+      key: host
+    each:
+      any:
+        - { field: WUServer, op: match, value: '^http://' }
+        - { field: WUStatusServer, op: match, value: '^http://' }
+    evidence: "{host}: update server {WUServer}, status server {WUStatusServer}"
+
+  - id: WINSRV-REG-SECUREBOOT-CA2023
+    title: Secure Boot 2023 certificate update not applied on the server
+    kind: missing
+    lens: both
+    category: PKI
+    severity: medium
+    why: The 2011 Microsoft Secure Boot certificates expire during 2026; a server that has not moved to the 2023 certificates cannot receive new boot manager and Secure Boot fixes. Servers without the servicing key (legacy BIOS, many virtual machines) are not judged.
+    fix: Let the monthly update apply the certificate update or trigger it per Microsoft's guidance; update host firmware or the hypervisor's VM template first where required.
+    refs: [NIST-800-53:SI-7, NIST-800-53:SI-2]
+    query:
+      protocol: registry
+      path: SYSTEM\CurrentControlSet\Control\SecureBoot\Servicing
+      values: [UEFICA2023Status, UEFICA2023Error, WindowsUEFICA2023Capable]
+      key: host
+    each:
+      all:
+        - { field: exists, op: eq, value: true }
+        - any:
+            - { field: UEFICA2023Status, op: absent }
+            - { field: UEFICA2023Status, op: ne, value: Updated }
+    evidence: "{host}: UEFICA2023Status {UEFICA2023Status}, error {UEFICA2023Error}, capable {WindowsUEFICA2023Capable}"
+
+  - id: WINSRV-REG-MDE-NOT-ONBOARDED
+    title: Server not onboarded to Defender for Endpoint
+    kind: missing
+    lens: security
+    category: MON
+    severity: high
+    why: Without onboarding the EDR sensor reports nothing from the server; attacks on it are invisible to the security team. Applies where Defender for Endpoint is the organisation's EDR.
+    fix: Onboard the server (management tool, Defender for Cloud or the onboarding script) and check the Sense service and its cloud connectivity.
+    refs: [NIST-800-53:SI-4, CIS-Controls-v8:13.7]
+    query:
+      protocol: registry
+      path: SOFTWARE\Microsoft\Windows Advanced Threat Protection\Status
+      values: [OnboardingState, LastConnected]
+      key: host
+    each:
+      any:
+        - { field: OnboardingState, op: absent }
+        - { field: OnboardingState, op: ne, value: 1 }
+    evidence: "{host}: OnboardingState {OnboardingState}"
+
+  - id: WINSRV-REG-APPLOCKER-AUDIT-ONLY
+    title: AppLocker executable rules in audit mode only on the server
+    kind: misconfigured
+    lens: security
+    category: CFG
+    severity: low
+    why: AppLocker set to audit logs what it would block and blocks nothing; it is usually a pilot that never finished.
+    fix: Review the AppLocker audit events, then set executable rules to Enforce rules.
+    refs: [NIST-800-53:CM-7, CIS-Controls-v8:2.5]
+    query:
+      protocol: registry
+      path: SOFTWARE\Policies\Microsoft\Windows\SrpV2\Exe
+      values: [EnforcementMode]
+      key: host
+    each: { field: EnforcementMode, op: eq, value: 0 }
+    evidence: "{host}: AppLocker EXE EnforcementMode = 0 (audit only)"
+
+  - id: WINSRV-REG-SECURITY-LOG-SIZE
+    title: Security log size not set by policy to the baseline on the server
+    kind: misconfigured
+    lens: security
+    category: LOG
+    severity: medium
+    why: A busy server overwrites a default-size Security log within hours, so logon and privilege-use evidence is gone before an incident is looked at. The policy value is in KB.
+    fix: Set 'Security - Specify the maximum log file size (KB)' to 196608 or more by policy and forward the log to a collector.
+    refs: [NIST-800-53:AU-4, NIST-800-53:AU-11, CIS-Controls-v8:8.3]
+    query:
+      protocol: registry
+      path: SOFTWARE\Policies\Microsoft\Windows\EventLog\Security
+      values: [MaxSize]
+      key: host
+    each:
+      any:
+        - { field: MaxSize, op: absent }
+        - { field: MaxSize, op: lt, value: 196608, threshold: windows-server.security-log-min-kb }
+    evidence: "{host}: Security log policy size {MaxSize} KB (missing = not set by policy)"
+
+  - id: WINSRV-REG-REBOOT-PENDING
+    title: Component servicing waits for a restart on the server
+    kind: broken
+    lens: both
+    category: LCM
+    severity: medium
+    why: The component store marked a restart as required; installed updates and features are not active and the next servicing operation (or a product upgrade's prerequisite check) may refuse to run.
+    fix: Restart the server in its maintenance window.
+    refs: [NIST-800-53:SI-2]
+    query:
+      protocol: registry
+      path: SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending
+      key: host
+    each: { field: exists, op: eq, value: true }
+    evidence: "{host}: component servicing restart pending"
+
+  - id: WINSRV-REG-REBOOT-REQUIRED-WU
+    title: Windows Update waits for a restart on the server
+    kind: broken
+    lens: both
+    category: LCM
+    severity: medium
+    why: Installed updates take effect only after a restart; until then the server runs the old, vulnerable files while reports may count it as patched.
+    fix: Restart the server in its maintenance window.
+    refs: [NIST-800-53:SI-2]
+    query:
+      protocol: registry
+      path: SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired
+      key: host
+    each: { field: exists, op: eq, value: true }
+    evidence: "{host}: Windows Update restart required"
+
+  - id: WINSRV-REG-PENDING-RENAMES
+    title: Many file replacements queued for the next boot on the server
+    kind: broken
+    category: LCM
+    severity: medium
+    why: Hundreds of queued file replacements mean updates or installs are half applied; the next boot is slow and files in use stay old until it happens. The list holds two entries per rename.
+    fix: Restart the server in its window; if the queue refills at once, find the installer that keeps adding to it.
+    refs: [NIST-800-53:SI-2]
+    query:
+      protocol: registry
+      path: SYSTEM\CurrentControlSet\Control\Session Manager
+      values: [PendingFileRenameOperations]
+      key: host
+    each: { field: PendingFileRenameOperations, op: size-gt, value: 200, threshold: windows-server.pending-rename-entries-max }
+    evidence: "{host}: pending file rename list holds more entries than the limit"
+
+  - id: WINSRV-REG-TLS10-SERVER-ON
+    title: Server still accepts TLS 1.0
+    kind: misconfigured
+    lens: security
+    category: PKI
+    severity: medium
+    why: TLS 1.0 is deprecated and open to downgrade and padding attacks; a server that has not disabled it offers it to every client. Windows Server 2025 disables it by default, so a missing key there is a false alarm to waive.
+    fix: Disable TLS 1.0 for the Schannel server side (Enabled = 0, DisabledByDefault = 1) after checking that no client still needs it.
+    refs: [NIST-800-53:SC-8, NIST-800-53:SC-13, CIS-Controls-v8:3.10]
+    query:
+      protocol: registry
+      path: SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\TLS 1.0\Server
+      values: [Enabled, DisabledByDefault]
+      key: host
+    each:
+      any:
+        - { field: Enabled, op: absent }
+        - { field: Enabled, op: ne, value: 0 }
+    evidence: "{host}: TLS 1.0 server Enabled {Enabled}, DisabledByDefault {DisabledByDefault} (missing = OS default)"
+
+  - id: WINSRV-REG-TLS11-SERVER-ON
+    title: Server still accepts TLS 1.1
+    kind: misconfigured
+    lens: security
+    category: PKI
+    severity: low
+    why: TLS 1.1 is deprecated alongside 1.0; a server that has not disabled it keeps a weaker protocol on offer. Windows Server 2025 disables it by default.
+    fix: Disable TLS 1.1 for the Schannel server side (Enabled = 0, DisabledByDefault = 1) after checking clients.
+    refs: [NIST-800-53:SC-8, NIST-800-53:SC-13]
+    query:
+      protocol: registry
+      path: SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\TLS 1.1\Server
+      values: [Enabled, DisabledByDefault]
+      key: host
+    each:
+      any:
+        - { field: Enabled, op: absent }
+        - { field: Enabled, op: ne, value: 0 }
+    evidence: "{host}: TLS 1.1 server Enabled {Enabled}, DisabledByDefault {DisabledByDefault} (missing = OS default)"
+
+  - id: WINSRV-REG-SSL3-SERVER-ON
+    title: Server explicitly enables SSL 3.0
+    kind: misconfigured
+    lens: security
+    category: PKI
+    severity: high
+    why: SSL 3.0 is broken (POODLE) and off by default on supported Windows; a non-zero Enabled value means somebody turned it back on.
+    fix: Set Enabled to 0 under the SSL 3.0 Server key and find the application that needed it.
+    refs: [NIST-800-53:SC-8, NIST-800-53:SC-13]
+    query:
+      protocol: registry
+      path: SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\SSL 3.0\Server
+      values: [Enabled, DisabledByDefault]
+      key: host
+    each: { field: Enabled, op: ne, value: 0 }
+    evidence: "{host}: SSL 3.0 server Enabled {Enabled}"
+
+  - id: WINSRV-REG-DOTNET-WEAK-CRYPTO
+    title: .NET Framework applications may use old TLS versions
+    kind: misconfigured
+    lens: security
+    category: PKI
+    severity: low
+    why: Without SchUseStrongCrypto, .NET Framework 4 applications built for older versions can still negotiate SSL 3.0 or TLS 1.0 and weak ciphers, whatever the server's own TLS settings are.
+    fix: Set SchUseStrongCrypto = 1 (and SystemDefaultTlsVersions = 1) under the .NET Framework v4.0.30319 key, in both the 64-bit and the 32-bit view.
+    refs: [NIST-800-53:SC-8, NIST-800-53:SC-13]
+    query:
+      protocol: registry
+      path: SOFTWARE\Microsoft\.NETFramework\v4.0.30319
+      values: [SchUseStrongCrypto, SystemDefaultTlsVersions]
+      key: host
+    each:
+      any:
+        - { field: SchUseStrongCrypto, op: absent }
+        - { field: SchUseStrongCrypto, op: ne, value: 1 }
+    evidence: "{host}: SchUseStrongCrypto {SchUseStrongCrypto}, SystemDefaultTlsVersions {SystemDefaultTlsVersions}"
+
+  # ---- Configuration Manager client, as the server sees it ----------------------------------
+  # Authoritative for: client installed and service state, client version, assigned site and
+  # management point, inventory last reported, cache and the health evaluation's last run.
+
+  - id: WINSRV-CCM-SERVICE-MISSING
+    title: Configuration Manager client service not installed on the server
+    kind: missing
+    lens: both
+    category: LCM
+    severity: high
+    why: Without the CcmExec service nothing deploys updates to the server or inventories it, whatever the site's records still say. The site-side rule SCCM-SERVER-NO-CLIENT names the same gap from the other side.
+    fix: Install the client, or record which other tool patches and inventories the server.
+    refs: [NIST-800-53:CM-8, NIST-800-53:SI-2]
+    query:
+      protocol: cim
+      wql: SELECT Name, DisplayName, PathName, StartName, StartMode, State FROM Win32_Service
+      key: "{host}|{Name}"
+    count:
+      op: lt
+      value: 1
+      where: { field: Name, op: eq, value: CcmExec }
+    evidence: "{host}: no CcmExec service among {rows} services"
+
+  - id: WINSRV-CCM-SERVICE-NOT-AUTO
+    title: Configuration Manager client service is not set to start automatically on the server
+    kind: misconfigured
+    lens: both
+    category: LCM
+    severity: high
+    entity: service
+    why: A client service set to Manual or Disabled stops at the next restart and the server drops out of every update deployment.
+    fix: Set CcmExec back to Automatic and find the policy or tool that changed it.
+    refs: [NIST-800-53:CM-8, NIST-800-53:SI-2]
+    query:
+      protocol: cim
+      wql: SELECT Name, DisplayName, PathName, StartName, StartMode, State FROM Win32_Service
+      key: "{host}|{Name}"
+    each:
+      all:
+        - { field: Name, op: eq, value: CcmExec }
+        - { field: StartMode, op: ne, value: Auto }
+    evidence: "{host}: CcmExec start mode {StartMode}, state {State}"
+
+  - id: WINSRV-CCM-VERSION-UNSUPPORTED
+    title: Configuration Manager client on the server is older than the oldest supported release
+    kind: broken
+    lens: both
+    category: LCM
+    severity: medium
+    why: The version the client itself reports; an unsupported client misses fixes the site relies on. The threshold is shared with the site-side rule.
+    fix: Repair or reinstall the client; check automatic client upgrade for the server's collections.
+    refs: [NIST-800-53:SI-2]
+    query:
+      protocol: cim
+      namespace: root/ccm
+      wql: SELECT ClientVersion FROM SMS_Client
+      key: host
+    each: { field: ClientVersion, op: match, value: '^5\.0+\.(\d{1,3}|[0-8]\d{3}|90\d\d|91[0-3]\d|9140)\.', threshold: sccm.client-version-unsupported-pattern }
+    evidence: "{host}: client {ClientVersion}"
+
+  - id: WINSRV-CCM-NO-ASSIGNMENT
+    title: Configuration Manager client on the server is not assigned to a site
+    kind: broken
+    lens: both
+    category: LCM
+    severity: high
+    why: An installed client without a site assignment requests no policy and receives no update deployments.
+    fix: Assign the client to the site and check the boundary group of the server's network.
+    refs: [NIST-800-53:CM-8, NIST-800-53:SI-2]
+    query:
+      protocol: cim
+      namespace: root/ccm
+      wql: SELECT Name, CurrentManagementPoint FROM SMS_Authority
+      key: "{host}|{Name}"
+    count: { op: lt, value: 1 }
+    evidence: "{host}: no site authority on the client"
+
+  - id: WINSRV-CCM-NO-MP
+    title: Configuration Manager client on the server has no current management point
+    kind: broken
+    lens: both
+    category: AVL
+    severity: medium
+    why: Without a current management point the client cannot fetch policy or report state.
+    fix: Check LocationServices.log, the boundary group of the server's network and the management point.
+    refs: [NIST-800-53:SI-4]
+    query:
+      protocol: cim
+      namespace: root/ccm
+      wql: SELECT Name, CurrentManagementPoint FROM SMS_Authority
+      key: "{host}|{Name}"
+    each: { field: CurrentManagementPoint, op: empty }
+    evidence: "{host}: assigned to {Name}, no current management point"
+
+  - id: WINSRV-CCM-WRONG-SITE
+    title: Configuration Manager client on the server assigned to an unexpected site
+    kind: misconfigured
+    lens: both
+    category: CFG
+    severity: medium
+    why: A server reporting to another site (a lab, an old hierarchy) gets none of production's update deployments. The default pattern only checks the form; set it to the organisation's site codes.
+    fix: Reassign the client to the production site.
+    refs: [NIST-800-53:CM-8]
+    query:
+      protocol: cim
+      namespace: root/ccm
+      wql: SELECT Name, CurrentManagementPoint FROM SMS_Authority
+      key: "{host}|{Name}"
+    each: { field: Name, op: notmatch, value: '^SMS:[A-Z0-9]{3}$', threshold: sccm.site-authority-pattern }
+    evidence: "{host}: assigned to {Name} via {CurrentManagementPoint}"
+
+  - id: WINSRV-CCM-HWINV-STALE
+    title: Server client has not reported hardware inventory recently (server side)
+    kind: broken
+    category: MON
+    severity: medium
+    entity: inventory-action
+    why: The client's own record of its last hardware inventory report; compared with the site's date it tells whether the server or the site's inbox is at fault.
+    fix: Read InventoryAgent.log on the server; repair WMI or trim custom inventory classes.
+    refs: [NIST-800-53:CM-8]
+    query:
+      protocol: cim
+      namespace: root/ccm/invagt
+      wql: SELECT InventoryActionID, LastCycleStartedDate, LastReportDate FROM InventoryActionStatus
+      key: "{host}|{InventoryActionID}"
+    each:
+      all:
+        - { field: InventoryActionID, op: eq, value: '{00000000-0000-0000-0000-000000000001}' }
+        - any:
+            - { field: LastReportDate, op: absent }
+            - { field: LastReportDate, op: age-gt, value: 14, threshold: windows-server.hw-inventory-max-age-days }
+    evidence: "{host}: hardware inventory last reported {LastReportDate}, last cycle started {LastCycleStartedDate}"
+
+  - id: WINSRV-CCM-HEARTBEAT-STALE
+    title: Server client has not sent its heartbeat recently (server side)
+    kind: broken
+    category: MON
+    severity: medium
+    entity: inventory-action
+    why: The heartbeat keeps the server active in the site; without it the server falls out of collections and maintenance-window deployments.
+    fix: Read InventoryAgent.log for the discovery action and check the client's management point.
+    refs: [NIST-800-53:CM-8]
+    query:
+      protocol: cim
+      namespace: root/ccm/invagt
+      wql: SELECT InventoryActionID, LastCycleStartedDate, LastReportDate FROM InventoryActionStatus
+      key: "{host}|{InventoryActionID}"
+    each:
+      all:
+        - { field: InventoryActionID, op: eq, value: '{00000000-0000-0000-0000-000000000003}' }
+        - any:
+            - { field: LastReportDate, op: absent }
+            - { field: LastReportDate, op: age-gt, value: 9, threshold: windows-server.ddr-max-age-days }
+    evidence: "{host}: heartbeat last reported {LastReportDate}"
+
+  - id: WINSRV-CCM-INVENTORY-NEVER
+    title: Server client has never run hardware inventory
+    kind: missing
+    category: MON
+    severity: medium
+    why: No hardware-inventory action is recorded, so the client never received or ran the inventory policy; inventory-based reports miss the server.
+    fix: Check the client settings deployed to the server's collections and machine policy download.
+    refs: [NIST-800-53:CM-8]
+    query:
+      protocol: cim
+      namespace: root/ccm/invagt
+      wql: SELECT InventoryActionID, LastCycleStartedDate, LastReportDate FROM InventoryActionStatus
+      key: "{host}|{InventoryActionID}"
+    count:
+      op: lt
+      value: 1
+      where: { field: InventoryActionID, op: eq, value: '{00000000-0000-0000-0000-000000000001}' }
+    evidence: "{host}: no hardware inventory action among {rows} inventory actions"
+
+  - id: WINSRV-CCM-CACHE-SMALL
+    title: Configuration Manager client cache on the server smaller than the default
+    kind: misconfigured
+    category: LCM
+    severity: low
+    why: Cumulative updates and large packages need more room than a shrunken cache allows, so their downloads fail or loop. The threshold is in MB.
+    fix: Set the cache size in the client settings for servers.
+    refs: [NIST-800-53:SI-2]
+    query:
+      protocol: cim
+      namespace: root/ccm/SoftMgmtAgent
+      wql: SELECT Size, Location FROM CacheConfig
+      key: host
+    each: { field: Size, op: lt, value: 5120, threshold: windows-server.ccm-cache-min-mb }
+    evidence: "{host}: client cache {Size} MB at {Location}"
+
+  - id: WINSRV-CCM-EVAL-NEVER
+    title: Client health evaluation has never run on the server
+    kind: missing
+    category: MON
+    severity: medium
+    why: ccmeval runs daily from a scheduled task; no record means the task is missing or the Task Scheduler is broken, so a failing client is never repaired.
+    fix: Check the 'Configuration Manager Health Evaluation' scheduled task and the Task Scheduler service; run ccmeval once and read CcmEval.log.
+    refs: [NIST-800-53:SI-4]
+    query:
+      protocol: registry
+      path: SOFTWARE\Microsoft\CCM\CcmEval
+      values: [LastEvalTime, LastSiteCode]
+      key: host
+    each: { field: exists, op: eq, value: false }
+    evidence: "{host}: no client health evaluation record"
+
+  - id: WINSRV-CCM-EVAL-STALE
+    title: Client health evaluation has not run recently on the server
+    kind: broken
+    category: MON
+    severity: medium
+    why: The daily health evaluation stopped running while the site still shows the client as active; usually the Task Scheduler or WMI on the server.
+    fix: Check the scheduled task, the Task Scheduler service and CcmEval.log.
+    refs: [NIST-800-53:SI-4]
+    query:
+      protocol: registry
+      path: SOFTWARE\Microsoft\CCM\CcmEval
+      values: [LastEvalTime, LastSiteCode]
+      key: host
+    each: { field: LastEvalTime, op: age-gt, value: 7, threshold: windows-server.client-check-max-age-days }
+    evidence: "{host}: health evaluation last ran {LastEvalTime} (site {LastSiteCode})"
+
+  # ---- event logs (7-day window per server) ------------------------------------------------
+
+  - id: WINSRV-EVT-DISK-ERROR
+    title: Disk, controller or file system errors on the server
+    kind: broken
+    category: HLT
+    severity: high
+    why: Bad blocks, paging errors, file-system corruption and failed log flushes mean data on the server is being damaged; backups taken now may carry the damage.
+    fix: Check the storage path (array, SAN, virtual disk), run a file-system check in a window and restore damaged files.
+    refs: [NIST-800-53:SI-13, NIST-800-53:CP-9]
+    query:
+      protocol: eventlog
+      log: System
+      ids: [7, 51, 55, 129, 140, 153]
+      max: 500
+      key: "{host}|{provider}|{id}|{recordId}"
+    count:
+      op: ge
+      value: 1
+      where:
+        all:
+          - { field: id, op: in, value: [7, 51, 55, 140] }
+          - { field: provider, op: match, value: '^(disk|stor\w*|iaStor\w*|nvme\w*|Ntfs|Microsoft-Windows-Ntfs|volmgr|partmgr)$', threshold: windows-server.disk-event-provider-pattern }
+    evidence: "{host}: {count} disk or file system errors in 7 days ({sample})"
+
+  - id: WINSRV-EVT-DISK-RETRY
+    title: Disk I/O retries or controller resets on the server
+    kind: broken
+    category: HLT
+    severity: medium
+    why: Retried I/O and controller resets stall every service that waits for the disk; on virtual machines they point at the storage underneath.
+    fix: Check the storage path and driver or firmware; on a VM, the datastore latency.
+    refs: [NIST-800-53:SI-13]
+    query:
+      protocol: eventlog
+      log: System
+      ids: [7, 51, 55, 129, 140, 153]
+      max: 500
+      key: "{host}|{provider}|{id}|{recordId}"
+    count:
+      op: ge
+      value: 5
+      threshold: windows-server.disk-retries-max-7d
+      where:
+        all:
+          - { field: id, op: in, value: [129, 153] }
+          - { field: provider, op: match, value: '^(disk|stor\w*|iaStor\w*|nvme\w*|Ntfs|Microsoft-Windows-Ntfs|volmgr|partmgr)$', threshold: windows-server.disk-event-provider-pattern }
+    evidence: "{host}: {count} disk retries or resets in 7 days ({sample})"
+
+  - id: WINSRV-EVT-UNEXPECTED-SHUTDOWN
+    title: Server restarted without a clean shutdown
+    kind: broken
+    category: AVL
+    severity: high
+    why: A server that restarted without a clean shutdown (power, a hang reset by hand, a crash without a dump) interrupted its services and may have corrupted data.
+    fix: Read the bugcheck code in the event and the host or hypervisor logs for the time; check power and the hang before it.
+    refs: [NIST-800-53:SI-13, NIST-800-53:SI-4]
+    query:
+      protocol: eventlog
+      log: System
+      ids: [41, 1001]
+      max: 100
+      key: "{host}|{id}|{BugcheckCode}|{recordId}"
+    count:
+      op: ge
+      value: 1
+      where:
+        all:
+          - { field: id, op: eq, value: 41 }
+          - { field: provider, op: match, value: 'Kernel-Power' }
+    evidence: "{host}: {count} unclean restarts in 7 days"
+
+  - id: WINSRV-EVT-BUGCHECK
+    title: Server crashed with a blue screen
+    kind: broken
+    category: AVL
+    severity: high
+    why: A kernel crash on a server is almost always a driver, firmware or hardware fault and repeats until fixed, taking the services down each time.
+    fix: Analyse the dump; update or remove the driver it names and check memory and storage.
+    refs: [NIST-800-53:SI-13, NIST-800-53:SI-4]
+    query:
+      protocol: eventlog
+      log: System
+      ids: [41, 1001]
+      max: 100
+      key: "{host}|{id}|{BugcheckCode}|{recordId}"
+    count:
+      op: ge
+      value: 1
+      where:
+        all:
+          - { field: id, op: eq, value: 1001 }
+          - { field: provider, op: match, value: 'WER-SystemErrorReporting|BugCheck' }
+    evidence: "{host}: {count} bugchecks in 7 days"
+
+  - id: WINSRV-EVT-SERVICE-FAIL
+    title: Services failed to start or crashed on the server
+    kind: broken
+    category: HLT
+    severity: medium
+    why: A service that fails at start or ends unexpectedly leaves its function off - often the application itself, a backup or a monitoring agent - and logon-right changes show up here first. The sample names the services.
+    fix: Read the service's own log; check its account's logon rights and fix or remove it. Services that fail by design go in the ignore pattern (display names).
+    refs: [NIST-800-53:SI-4]
+    query:
+      protocol: eventlog
+      log: System
+      ids: [7000, 7009, 7011, 7022, 7023, 7024, 7031, 7034, 7038, 7041, 7043]
+      providers: [Service Control Manager]
+      max: 2000
+      key: "{host}|{id}|{param1}|{param2}|{recordId}"
+    count:
+      op: ge
+      value: 1
+      threshold: windows-server.service-failures-max-7d
+      where:
+        all:
+          - { field: id, op: in, value: [7000, 7022, 7023, 7024, 7031, 7034, 7038, 7041] }
+          - { field: param1, op: notmatch, value: '^$', threshold: windows-server.service-fail-ignore-pattern }
+    evidence: "{host}: {count} service failures in 7 days ({sample})"
+
+  - id: WINSRV-EVT-SERVICE-TIMEOUT
+    title: Services did not answer the service manager in time on the server
+    kind: broken
+    category: HLT
+    severity: medium
+    why: A service that does not respond within 30 seconds at start or while running delays the server's start and the services that depend on it.
+    fix: Look at the named services (second value in the sample) and the CPU and disk load at the time.
+    refs: [NIST-800-53:SI-4]
+    query:
+      protocol: eventlog
+      log: System
+      ids: [7000, 7009, 7011, 7022, 7023, 7024, 7031, 7034, 7038, 7041, 7043]
+      providers: [Service Control Manager]
+      max: 2000
+      key: "{host}|{id}|{param1}|{param2}|{recordId}"
+    count:
+      op: ge
+      value: 1
+      threshold: windows-server.service-timeouts-max-7d
+      where: { field: id, op: in, value: [7009, 7011] }
+    evidence: "{host}: {count} service timeouts in 7 days ({sample})"
+
+  - id: WINSRV-EVT-SERVICE-SHUTDOWN-HANG
+    title: Service did not stop when the server shut down
+    kind: broken
+    category: HLT
+    severity: medium
+    why: A service that ignores the preshutdown request makes patch restarts wait or hang, which stretches every maintenance window.
+    fix: Find the named service's vendor fix or a stop script for the window.
+    refs: [NIST-800-53:SI-4]
+    query:
+      protocol: eventlog
+      log: System
+      ids: [7000, 7009, 7011, 7022, 7023, 7024, 7031, 7034, 7038, 7041, 7043]
+      providers: [Service Control Manager]
+      max: 2000
+      key: "{host}|{id}|{param1}|{param2}|{recordId}"
+    count:
+      op: ge
+      value: 1
+      where: { field: id, op: eq, value: 7043 }
+    evidence: "{host}: {count} services hung at shutdown in 7 days ({sample})"
+
+  - id: WINSRV-EVT-NO-DC
+    title: Server could not reach a domain controller for its secure channel
+    kind: broken
+    category: AVL
+    severity: high
+    why: Without a secure channel, the server cannot authenticate users or services against the domain; applications on it fail logons until the channel returns.
+    fix: Check DC reachability from the server's subnet and its AD site; reset the computer's secure channel if only this server is affected.
+    refs: [NIST-800-53:IA-3, NIST-800-53:SI-4]
+    query:
+      protocol: eventlog
+      log: System
+      ids: [5719, 5783]
+      max: 500
+      key: "{host}|{id}|{recordId}"
+    count:
+      op: ge
+      value: 1
+      threshold: windows-server.nodc-max-7d
+      where: { field: provider, op: match, value: 'NETLOGON' }
+    evidence: "{host}: {count} secure-channel failures in 7 days"
+
+  - id: WINSRV-EVT-KERBEROS-AP-MODIFIED
+    title: Kerberos ticket could not be decrypted by a target server
+    kind: broken
+    category: AUT
+    severity: medium
+    why: KRB_AP_ERR_MODIFIED means a ticket was encrypted for a key the target does not hold - a duplicate service name, a changed service-account password, or DNS pointing the name at another host.
+    fix: Look for the service name on two accounts (setspn -X) and check the DNS record of the target in the events.
+    refs: [NIST-800-53:IA-2, NIST-800-53:IA-5]
+    query:
+      protocol: eventlog
+      log: System
+      ids: [3, 4, 14]
+      providers: [Microsoft-Windows-Security-Kerberos]
+      max: 500
+      key: "{host}|{id}|{recordId}"
+    count:
+      op: ge
+      value: 1
+      where: { field: id, op: eq, value: 4 }
+    evidence: "{host}: {count} KRB_AP_ERR_MODIFIED errors in 7 days"
+
+  - id: WINSRV-EVT-GP-FAILURE
+    title: Group Policy processing failed on the server
+    kind: broken
+    category: CFG
+    severity: high
+    why: Group Policy could not find a DC, read SYSVOL or apply its settings; the server keeps old or partial security settings.
+    fix: Check DC and SYSVOL reachability and the error code in the events.
+    refs: [NIST-800-53:CM-6]
+    query:
+      protocol: eventlog
+      log: System
+      ids: [1006, 1030, 1053, 1054, 1055, 1058, 1129]
+      max: 500
+      key: "{host}|{id}|{ErrorCode}|{recordId}"
+    count:
+      op: ge
+      value: 2
+      threshold: windows-server.gp-failures-max-7d
+      where: { field: provider, op: match, value: 'GroupPolicy' }
+    evidence: "{host}: {count} Group Policy failures in 7 days ({sample})"
+
+  - id: WINSRV-EVT-TIME-SYNC-FAIL
+    title: Time synchronisation failing on the server
+    kind: broken
+    category: CFG
+    severity: high
+    why: A server (worse, a domain controller or the PDC emulator) that cannot sync its clock drifts; past five minutes Kerberos breaks for everything that authenticates against it.
+    fix: Check the time source chain - the PDC emulator to a reliable external source, everything else to the domain hierarchy - and UDP 123.
+    refs: [NIST-800-53:AU-8, NIST-800-53:SC-45]
+    query:
+      protocol: eventlog
+      log: System
+      ids: [36, 47, 50, 129, 134]
+      providers: [Microsoft-Windows-Time-Service]
+      max: 300
+      key: "{host}|{id}|{recordId}"
+    count: { op: ge, value: 2, threshold: windows-server.time-sync-fail-max-7d }
+    evidence: "{host}: {count} time synchronisation errors in 7 days"
+
+  - id: WINSRV-EVT-OUT-OF-MEMORY
+    title: Server ran low on virtual memory
+    kind: broken
+    category: HLT
+    severity: high
+    why: The resource-exhaustion detector fired because commit charge reached the limit; services failed to allocate and Windows may have stopped some.
+    fix: Find the process named in the event; tune its memory (for example SQL Server max memory) or add memory.
+    refs: [NIST-800-53:SC-5]
+    query:
+      protocol: eventlog
+      log: System
+      ids: [2004]
+      max: 100
+      key: "{host}|{recordId}"
+    count:
+      op: ge
+      value: 1
+      where: { field: provider, op: match, value: 'Resource-Exhaustion' }
+    evidence: "{host}: {count} low-memory events in 7 days"
+
+  - id: WINSRV-EVT-PORT-EXHAUSTION
+    title: TCP ephemeral ports ran out on the server
+    kind: broken
+    category: HLT
+    severity: high
+    why: With all ephemeral ports in use, outgoing connections fail until ports free up - every service on the server that calls another one breaks at once.
+    fix: Count connections per owning process and fix the leak; raise the dynamic port range only as a stopgap.
+    refs: [NIST-800-53:SC-5]
+    query:
+      protocol: eventlog
+      log: System
+      ids: [4199, 4227, 4231]
+      max: 300
+      key: "{host}|{id}|{recordId}"
+    count:
+      op: ge
+      value: 1
+      where:
+        all:
+          - { field: id, op: eq, value: 4231 }
+          - { field: provider, op: match, value: 'Tcpip' }
+    evidence: "{host}: {count} port exhaustion events in 7 days"
+
+  - id: WINSRV-EVT-IP-CONFLICT
+    title: IP address conflict detected on the server
+    kind: broken
+    category: CFG
+    severity: high
+    why: Another device uses the server's address; clients reach one or the other at random.
+    fix: Find the other device by the MAC address in the event and fix the address plan.
+    refs: [NIST-800-53:CM-6]
+    query:
+      protocol: eventlog
+      log: System
+      ids: [4199, 4227, 4231]
+      max: 300
+      key: "{host}|{id}|{recordId}"
+    count:
+      op: ge
+      value: 1
+      where:
+        all:
+          - { field: id, op: eq, value: 4199 }
+          - { field: provider, op: match, value: 'Tcpip' }
+    evidence: "{host}: {count} address conflicts in 7 days"
+
+  - id: WINSRV-EVT-UPDATE-INSTALL-FAIL
+    title: Windows Update installations failing on the server
+    kind: broken
+    lens: both
+    category: LCM
+    severity: medium
+    why: Updates that fail to install are retried in every window and leave the server unpatched; the sample names the updates.
+    fix: Look up the error codes; check free space and component store health.
+    refs: [NIST-800-53:SI-2]
+    query:
+      protocol: eventlog
+      log: System
+      ids: [20]
+      max: 200
+      key: "{host}|{updateTitle}|{recordId}"
+    count:
+      op: ge
+      value: 2
+      threshold: windows-server.update-fail-max-7d
+      where: { field: provider, op: match, value: 'WindowsUpdateClient' }
+    evidence: "{host}: {count} failed update installs in 7 days ({sample})"
+
+  - id: WINSRV-EVT-WMI-ERRORS
+    title: Many WMI client errors on the server
+    kind: broken
+    category: MON
+    severity: low
+    why: Monitoring, backup and security agents that fail their WMI queries retry constantly and load the WMI service; the result codes show the cause.
+    fix: Find the calling process (ClientProcessId in the events) and fix that agent's configuration or version.
+    refs: [NIST-800-53:SI-4]
+    query:
+      protocol: eventlog
+      log: Microsoft-Windows-WMI-Activity/Operational
+      ids: [5858]
+      max: 1000
+      key: "{host}|{ResultCode}|{recordId}"
+    count: { op: ge, value: 50, threshold: windows-server.wmi-errors-max-7d }
+    evidence: "{host}: {count} WMI errors in 7 days ({sample})"
+
+  - id: WINSRV-EVT-SECURITY-LOG-CLEARED
+    title: Security event log was cleared on the server
+    kind: broken
+    lens: security
+    category: LOG
+    severity: high
+    why: Clearing the Security log erases the evidence of logons and privilege use; outside a documented procedure it is an attacker covering tracks. The window is 30 days.
+    fix: Find who cleared it (account in the event) and why; treat an unexplained clear as an incident and forward the log to a collector.
+    refs: [NIST-800-53:AU-9, NIST-800-53:AU-6, MITRE-ATTACK:T1070.001]
+    query:
+      protocol: eventlog
+      log: Security
+      ids: [1102]
+      days: 30
+      max: 50
+      key: "{host}|{SubjectUserName}|{recordId}"
+    count: { op: ge, value: 1 }
+    evidence: "{host}: Security log cleared {count} times in 30 days ({sample})"

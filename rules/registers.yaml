@@ -1692,10 +1692,65 @@ rules:
     deadline: due_on
     evidence: "{title} ({key_date_id}) on {due_on}, {days_left} days left. Owner: {owner_shown}"
 
-  # The key_date register has no "payment" kind yet: payments are kind "other" whose title matches
-  # the pattern in threshold registers.payment-title-pattern (a .NET regular expression, case-
-  # insensitive; add words in the tenant's own language there). The same pattern keeps payments
-  # out of REG-KEY-OTHER-DUE and REG-KEY-DATE-PASSED so each date is reported once.
+  # A support end needs an upgrade or replacement project, which takes longer than the 14-day default
+  # notice of a key date, so the rule warns from registers.support-end-notice-days before the date
+  # even when the row's own notice_days is shorter (a longer notice_days still warns earlier).
+  - id: REG-KEY-SUPPORT-END-DUE
+    title: Product, version or model leaves vendor support soon
+    kind: missing
+    lens: both
+    category: LCM
+    severity:
+      daysLeft: due_on
+      ranges:
+        - { max: 30, value: high }
+        - { max: 90, value: medium }
+      default: low
+    entity: key-date
+    why: >-
+      After the vendor's end of support (end of maintenance, end of life, the last release a
+      compatibility matrix allows) there are no security fixes and no help when it breaks. The
+      lifecycle of application releases, telephony software, device models and hosted runtimes
+      cannot be scanned, but the dates are published in advance and rarely move; the upgrade or
+      replacement has to start long before them.
+    fix: >-
+      Plan and budget the upgrade or replacement with the owner now, so it is done before the date.
+      When it is done, move due_on to the new version's end of support (or delete the row if the
+      product is gone).
+    refs: [NIST-800-53:SA-22, CIS-Controls-v8:2.2, ISO-27001:A.8.8]
+    refresh: 1d
+    query:
+      protocol: store
+      key: key_date_id
+      name: title
+      text: |
+        SELECT k.key_date_id,
+               k.kind,
+               k.title,
+               k.due_on,
+               k.notice_days,
+               k.system_id,
+               NULLIF(TRIM(k.owner), '') AS owner,
+               COALESCE(NULLIF(TRIM(k.owner), ''), 'nobody') AS owner_shown,
+               CAST(julianday(k.due_on) - julianday(:today) AS INTEGER) AS days_left,
+               CAST(julianday(:today) - julianday(k.due_on) AS INTEGER) AS days_past,
+               CAST(julianday(k.due_on) - julianday(:today) AS INTEGER) - k.notice_days AS days_to_notice
+        FROM key_date k
+        WHERE k.kind = 'support-end'
+    each:
+      all:
+        - { field: days_left, op: ge, value: 0 }
+        - any:
+            - { field: days_to_notice, op: le, value: 0 }
+            - { field: days_left, op: le, value: 180, threshold: registers.support-end-notice-days }
+    deadline: due_on
+    evidence: "{title} ({key_date_id}) leaves vendor support {due_on}, {days_left} days left. Owner: {owner_shown}"
+
+  # Payments are key dates of kind "payment". Rows recorded before that kind existed are kind "other"
+  # whose title matches the pattern in threshold registers.payment-title-pattern (a .NET regular
+  # expression, case-insensitive; add words in the tenant's own language there), so both are read.
+  # The same test keeps payments out of REG-KEY-OTHER-DUE and REG-KEY-DATE-PASSED so each date is
+  # reported once.
   - id: REG-KEY-PAYMENT-DUE
     title: Payment due date is near
     kind: missing
@@ -1734,10 +1789,12 @@ rules:
                CAST(julianday(:today) - julianday(k.due_on) AS INTEGER) AS days_past,
                CAST(julianday(k.due_on) - julianday(:today) AS INTEGER) - k.notice_days AS days_to_notice
         FROM key_date k
-        WHERE k.kind = 'other'
+        WHERE k.kind IN ('payment', 'other')
     each:
       all:
-        - { field: title, op: match, value: '\b(pay|payment|payments|invoice|invoices|bill|billing|arrears|overdue|suspension|suspend)', threshold: registers.payment-title-pattern }
+        - any:
+            - { field: kind, op: eq, value: payment }
+            - { field: title, op: match, value: '\b(pay|payment|payments|invoice|invoices|bill|billing|arrears|overdue|suspension|suspend)', threshold: registers.payment-title-pattern }
         - { field: days_left, op: ge, value: 0 }
         - { field: days_to_notice, op: le, value: 0 }
     deadline: due_on
@@ -1776,10 +1833,12 @@ rules:
                CAST(julianday(:today) - julianday(k.due_on) AS INTEGER) AS days_past,
                CAST(julianday(k.due_on) - julianday(:today) AS INTEGER) - k.notice_days AS days_to_notice
         FROM key_date k
-        WHERE k.kind = 'other'
+        WHERE k.kind IN ('payment', 'other')
     each:
       all:
-        - { field: title, op: match, value: '\b(pay|payment|payments|invoice|invoices|bill|billing|arrears|overdue|suspension|suspend)', threshold: registers.payment-title-pattern }
+        - any:
+            - { field: kind, op: eq, value: payment }
+            - { field: title, op: match, value: '\b(pay|payment|payments|invoice|invoices|bill|billing|arrears|overdue|suspension|suspend)', threshold: registers.payment-title-pattern }
         - { field: days_left, op: lt, value: 0 }
     deadline: due_on
     evidence: "{title} ({key_date_id}) was due {due_on}, {days_past} days ago. Owner: {owner_shown}"
@@ -1838,6 +1897,7 @@ rules:
         report: high
         renewal: high
         contract: high
+        support-end: high
         price-change: medium
         other: medium
         maintenance: low
@@ -1849,7 +1909,8 @@ rules:
       occurrence will not be warned about.
     fix: >-
       If it was handled, move due_on to the next occurrence or delete the row. If it was not, treat
-      it as overdue now. Payments are reported by REG-KEY-PAYMENT-OVERDUE instead.
+      it as overdue now - a passed support-end date means the product runs without vendor fixes.
+      Payments are reported by REG-KEY-PAYMENT-OVERDUE instead.
     refresh: 1d
     query:
       protocol: store
@@ -1871,6 +1932,7 @@ rules:
     each:
       all:
         - { field: days_left, op: lt, value: 0 }
+        - { field: kind, op: ne, value: payment }
         - not:
             all:
               - { field: kind, op: eq, value: other }
@@ -1922,12 +1984,13 @@ rules:
     severity: low
     entity: key-date
     why: >-
-      Certificates, licences, renewals, contract milestones and reports all need preparation: a
-      purchase, an approval, a change window, someone else's input. With a notice period under a
-      week the warning arrives when nothing can be done in time any more.
+      Certificates, licences, renewals, contract milestones, support ends, payments and reports all
+      need preparation: a purchase, an approval, a change window, someone else's input. With a
+      notice period under a week the warning arrives when nothing can be done in time any more.
     fix: >-
       Set notice_days to the time the work really takes - for certificates and licences at least 30
-      days, for reports the time it takes to collect the figures.
+      days, for a support end the length of an upgrade project, for payments the approval cycle,
+      for reports the time it takes to collect the figures.
     refs: [NIST-800-53:SA-4, NIST-800-53:SC-17]
     refresh: 1d
     query:
@@ -1949,11 +2012,53 @@ rules:
         FROM key_date k
     each:
       all:
-        - { field: kind, op: in, value: [certificate, licence, renewal, contract, report] }
+        - { field: kind, op: in, value: [certificate, licence, renewal, contract, report, support-end, payment] }
         - { field: notice_days, op: lt, value: 7, threshold: registers.min-key-date-notice-days }
         - { field: days_left, op: ge, value: 0 }
     deadline: due_on
     evidence: "{kind} date {title} ({key_date_id}) on {due_on} has only {notice_days} days' notice. Owner: {owner_shown}"
+
+  - id: REG-KEY-SYSTEM-INACTIVE
+    title: Upcoming key date belongs to a system marked inactive
+    kind: misconfigured
+    lens: maintenance
+    category: HYG
+    severity: low
+    entity: key-date
+    why: >-
+      The date is still ahead but the system it is recorded against has been retired: someone will
+      renew a certificate, a subscription or a support plan for a service that no longer runs - or
+      the date belongs to the live system and is filed under the wrong one, so its owner never sees
+      the warning.
+    fix: >-
+      Delete the key date, or move it to the system that really needs it. If the system is still in
+      use, set it active again.
+    refs: [NIST-800-53:CM-8]
+    refresh: 1d
+    query:
+      protocol: store
+      key: key_date_id
+      name: title
+      text: |
+        SELECT k.key_date_id,
+               k.kind,
+               k.title,
+               k.due_on,
+               k.notice_days,
+               k.system_id,
+               s.active AS system_active,
+               s.name AS system_name,
+               NULLIF(TRIM(k.owner), '') AS owner,
+               COALESCE(NULLIF(TRIM(k.owner), ''), 'nobody') AS owner_shown,
+               CAST(julianday(k.due_on) - julianday(:today) AS INTEGER) AS days_left
+        FROM key_date k
+        JOIN system s ON s.system_id = k.system_id
+    each:
+      all:
+        - { field: system_active, op: eq, value: 0 }
+        - { field: days_left, op: ge, value: 0 }
+    deadline: due_on
+    evidence: "{kind} date {title} ({key_date_id}) on {due_on} belongs to system {system_name} ({system_id}), which is inactive. Owner: {owner_shown}"
 
   # ----------------------------------------------------------------- vendors
   - id: REG-VEN-SENSITIVE-NO-REVIEW
@@ -2496,7 +2601,7 @@ rules:
                  WHERE l.system_id = s.system_id
                    AND COALESCE(NULLIF(TRIM(l.expires_on), ''), '9999-12-31') >= :today) AS current_licences
         FROM system s
-        WHERE s.active = 1 AND s.system_id NOT IN ('KEEPER', 'UNMAPPED')
+        WHERE s.active = 1 AND s.system_id NOT IN ('KEEPER', 'ORG', 'UNMAPPED')
     each:
       all:
         - { field: criticality, op: eq, value: 1 }

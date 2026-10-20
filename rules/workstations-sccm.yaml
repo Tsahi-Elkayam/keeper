@@ -256,6 +256,251 @@ rules:
     each: { field: LastBootUpTime, op: age-gt, value: 30, threshold: workstations.uptime-max-days }
     evidence: "resource {ResourceID}: {Caption} build {BuildNumber}, last boot {LastBootUpTime} (as of its last inventory)"
 
+  - id: WSF-OS-PRO-BUILD-UNSUPPORTED
+    title: Home or Pro edition on a build whose shorter servicing has ended (inventory)
+    kind: broken
+    lens: both
+    category: LCM
+    severity: high
+    why: Home and Pro editions (Pro Education and Pro for Workstations too) get 24 months per feature update; 23H2 ended for them on 2025-11-11 and 24H2 on 2026-10-13, while the Enterprise-date rules still call those builds serviced. Covers devices the live scan cannot reach.
+    fix: Feature-update the device (25H2 is serviced for Pro until 2027-10-12) or move it to an Enterprise licence. Add builds to the list as dates pass.
+    refs: [NIST-800-53:SA-22, NIST-800-53:SI-2, CIS-Controls-v8:2.2]
+    query:
+      protocol: http
+      path: /wmi/SMS_G_System_OPERATING_SYSTEM
+      params:
+        $filter: "startswith(Caption,'Microsoft Windows 1') eq true"
+        $select: ResourceID,Caption,BuildNumber,LastBootUpTime
+      key: ResourceID
+    each:
+      all:
+        - { field: Caption, op: match, value: 'Windows 1[01] (Home|Pro)' }
+        - { field: Caption, op: notmatch, value: 'Enterprise|LTSC|LTSB' }
+        - { field: BuildNumber, op: in, value: [22631, 26100], threshold: workstations.pro-unsupported-builds }
+    evidence: "resource {ResourceID}: {Caption} build {BuildNumber}"
+
+  # ---- client health, as the site sees it (servers: the SCCM-SERVER-* twins in sccm.yaml) --------
+  # The site is authoritative for the client-check result, policy requests, heartbeats, status
+  # messages and blocked or unapproved records. The PC-side WS-CCM-* rules are authoritative for the
+  # service, client version, site assignment, management point and when inventory last reported;
+  # when the two disagree on inventory, the gap locates the fault (PC versus management point).
+
+  - id: WSF-CLIENT-CHECK-STALE
+    title: Active workstation client has not run the client health evaluation
+    kind: broken
+    category: HLT
+    severity: medium
+    why: ccmeval runs daily from a scheduled task; an active client with no recent result has a broken Task Scheduler or a ccmeval that fails before it reports, and "active" can no longer be trusted.
+    fix: On the PC, check the Task Scheduler service, the 'Configuration Manager Health Evaluation' task and CcmEval.log. The threshold is shared with WS-CCM-EVAL-STALE.
+    refs: [NIST-800-53:SI-4]
+    query:
+      protocol: http
+      path: /wmi/SMS_CombinedDeviceResources
+      params:
+        $filter: "startswith(DeviceOS,'Microsoft Windows NT Workstation') eq true"
+        $select: ResourceID,Name,IsClient,IsActive,IsObsolete,IsBlocked,IsApproved,SiteCode,ClientVersion,ClientCheckPass,ClientRemediationSuccess,LastClientCheckTime,LastPolicyRequest,LastDDR,LastHardwareScan,LastSoftwareScan,LastStatusMessage,LastMPServerName,LastActiveTime,DeviceOS,EPInfectionStatus,EPLastThreatName,EPLastInfectionTime
+      key: ResourceID
+      name: Name
+    each:
+      all:
+        - { field: IsClient, op: eq, value: true }
+        - { field: IsActive, op: eq, value: true }
+        - any:
+            - { field: LastClientCheckTime, op: absent }
+            - { field: LastClientCheckTime, op: age-gt, value: 7, threshold: workstations.client-check-max-age-days }
+    evidence: "{Name}: last client check {LastClientCheckTime}, check result {ClientCheckPass}"
+
+  - id: WSF-HEARTBEAT-STALE
+    title: Active workstation client has not sent a heartbeat record for days
+    kind: broken
+    category: HLT
+    severity: medium
+    why: The heartbeat discovery record keeps the device active; stale while policy requests continue, the discovery inbox is backed up or the heartbeat schedule is broken, and the device will soon drop to inactive.
+    fix: Compare with the PC's own record (WS-CCM-HEARTBEAT-STALE); if the PC sent it, look at the management point and the site's discovery inbox. The threshold is shared.
+    refs: [NIST-800-53:CM-8]
+    query:
+      protocol: http
+      path: /wmi/SMS_CombinedDeviceResources
+      params:
+        $filter: "startswith(DeviceOS,'Microsoft Windows NT Workstation') eq true"
+        $select: ResourceID,Name,IsClient,IsActive,IsObsolete,IsBlocked,IsApproved,SiteCode,ClientVersion,ClientCheckPass,ClientRemediationSuccess,LastClientCheckTime,LastPolicyRequest,LastDDR,LastHardwareScan,LastSoftwareScan,LastStatusMessage,LastMPServerName,LastActiveTime,DeviceOS,EPInfectionStatus,EPLastThreatName,EPLastInfectionTime
+      key: ResourceID
+      name: Name
+    each:
+      all:
+        - { field: IsClient, op: eq, value: true }
+        - { field: IsActive, op: eq, value: true }
+        - any:
+            - { field: LastDDR, op: absent }
+            - { field: LastDDR, op: age-gt, value: 9, threshold: workstations.ddr-max-age-days }
+    evidence: "{Name}: last heartbeat record {LastDDR}, last policy request {LastPolicyRequest}"
+
+  - id: WSF-SWINV-STALE
+    title: Active workstation's software inventory stopped reporting
+    kind: broken
+    category: HLT
+    severity: low
+    why: Software inventory ran on this device once and has not reported for a month; file-based software reports are stale for it. Devices where software inventory never ran (it is off by default) are not judged.
+    fix: Check InventoryAgent.log for the software inventory action and the client settings that enable it.
+    refs: [NIST-800-53:CM-8]
+    query:
+      protocol: http
+      path: /wmi/SMS_CombinedDeviceResources
+      params:
+        $filter: "startswith(DeviceOS,'Microsoft Windows NT Workstation') eq true"
+        $select: ResourceID,Name,IsClient,IsActive,IsObsolete,IsBlocked,IsApproved,SiteCode,ClientVersion,ClientCheckPass,ClientRemediationSuccess,LastClientCheckTime,LastPolicyRequest,LastDDR,LastHardwareScan,LastSoftwareScan,LastStatusMessage,LastMPServerName,LastActiveTime,DeviceOS,EPInfectionStatus,EPLastThreatName,EPLastInfectionTime
+      key: ResourceID
+      name: Name
+    each:
+      all:
+        - { field: IsClient, op: eq, value: true }
+        - { field: IsActive, op: eq, value: true }
+        - { field: LastSoftwareScan, op: age-gt, value: 30, threshold: workstations.sw-inventory-max-age-days }
+    evidence: "{Name}: last software scan {LastSoftwareScan}"
+
+  - id: WSF-STATUS-MESSAGE-STALE
+    title: Active workstation client sends no status messages
+    kind: broken
+    category: HLT
+    severity: medium
+    why: State and status messages carry deployment and update compliance; when none arrive from an active client, its compliance in every report is stale (certificate, management point or inbox problem).
+    fix: Check StateMessage.log on the PC and status message processing on the management point.
+    refs: [NIST-800-53:SI-4]
+    query:
+      protocol: http
+      path: /wmi/SMS_CombinedDeviceResources
+      params:
+        $filter: "startswith(DeviceOS,'Microsoft Windows NT Workstation') eq true"
+        $select: ResourceID,Name,IsClient,IsActive,IsObsolete,IsBlocked,IsApproved,SiteCode,ClientVersion,ClientCheckPass,ClientRemediationSuccess,LastClientCheckTime,LastPolicyRequest,LastDDR,LastHardwareScan,LastSoftwareScan,LastStatusMessage,LastMPServerName,LastActiveTime,DeviceOS,EPInfectionStatus,EPLastThreatName,EPLastInfectionTime
+      key: ResourceID
+      name: Name
+    each:
+      all:
+        - { field: IsClient, op: eq, value: true }
+        - { field: IsActive, op: eq, value: true }
+        - any:
+            - { field: LastStatusMessage, op: absent }
+            - { field: LastStatusMessage, op: age-gt, value: 14, threshold: workstations.status-message-max-age-days }
+    evidence: "{Name}: last status message {LastStatusMessage}"
+
+  - id: WSF-NO-ASSIGNED-SITE
+    title: Workstation client record carries no site code
+    kind: broken
+    category: CFG
+    severity: high
+    why: A client that lost its site assignment gets no policy and no deployments. The PC's own record (WS-CCM-NO-ASSIGNMENT) is authoritative when the two disagree.
+    fix: Reassign the client and check the boundary group of its network.
+    refs: [NIST-800-53:CM-8, NIST-800-53:SI-2]
+    query:
+      protocol: http
+      path: /wmi/SMS_CombinedDeviceResources
+      params:
+        $filter: "startswith(DeviceOS,'Microsoft Windows NT Workstation') eq true"
+        $select: ResourceID,Name,IsClient,IsActive,IsObsolete,IsBlocked,IsApproved,SiteCode,ClientVersion,ClientCheckPass,ClientRemediationSuccess,LastClientCheckTime,LastPolicyRequest,LastDDR,LastHardwareScan,LastSoftwareScan,LastStatusMessage,LastMPServerName,LastActiveTime,DeviceOS,EPInfectionStatus,EPLastThreatName,EPLastInfectionTime
+      key: ResourceID
+      name: Name
+    each:
+      all:
+        - { field: IsClient, op: eq, value: true }
+        - { field: IsObsolete, op: ne, value: true }
+        - { field: SiteCode, op: empty }
+    evidence: "{Name}: no site code, client {ClientVersion}"
+
+  - id: WSF-CLIENT-BLOCKED-OR-UNAPPROVED
+    title: Workstation client is blocked or not approved
+    kind: misconfigured
+    category: CFG
+    severity: medium
+    why: The site refuses policy to a blocked or unapproved client while it looks installed and healthy on the PC; with manual approval and nobody approving, new clients sit there for good.
+    fix: Approve or unblock genuine devices; set client approval to automatic for domain-joined computers.
+    refs: [NIST-800-53:CM-8]
+    query:
+      protocol: http
+      path: /wmi/SMS_CombinedDeviceResources
+      params:
+        $filter: "startswith(DeviceOS,'Microsoft Windows NT Workstation') eq true"
+        $select: ResourceID,Name,IsClient,IsActive,IsObsolete,IsBlocked,IsApproved,SiteCode,ClientVersion,ClientCheckPass,ClientRemediationSuccess,LastClientCheckTime,LastPolicyRequest,LastDDR,LastHardwareScan,LastSoftwareScan,LastStatusMessage,LastMPServerName,LastActiveTime,DeviceOS,EPInfectionStatus,EPLastThreatName,EPLastInfectionTime
+      key: ResourceID
+      name: Name
+    each:
+      all:
+        - { field: IsObsolete, op: ne, value: true }
+        - any:
+            - { field: IsBlocked, op: eq, value: true }
+            - all:
+                - { field: IsClient, op: eq, value: true }
+                - { field: IsActive, op: eq, value: true }
+                - { field: IsApproved, op: eq, value: 0 }
+    evidence: "{Name}: blocked {IsBlocked}, approved {IsApproved}"
+
+  - id: WSF-EP-INFECTED
+    title: Endpoint Protection reports an infection it could not clean
+    kind: broken
+    lens: security
+    category: MON
+    severity: high
+    why: Infection status Pending (3) or Failed (4) means the antimalware engine found a threat and has not removed it; covers devices the live scan cannot reach. Only meaningful where the site manages Endpoint Protection; elsewhere the value is 0 and nothing fires.
+    fix: Open the device in the Endpoint Protection view, run a full scan and isolate it if the threat remains.
+    refs: [NIST-800-53:SI-3, NIST-800-53:IR-4]
+    query:
+      protocol: http
+      path: /wmi/SMS_CombinedDeviceResources
+      params:
+        $filter: "startswith(DeviceOS,'Microsoft Windows NT Workstation') eq true"
+        $select: ResourceID,Name,IsClient,IsActive,IsObsolete,IsBlocked,IsApproved,SiteCode,ClientVersion,ClientCheckPass,ClientRemediationSuccess,LastClientCheckTime,LastPolicyRequest,LastDDR,LastHardwareScan,LastSoftwareScan,LastStatusMessage,LastMPServerName,LastActiveTime,DeviceOS,EPInfectionStatus,EPLastThreatName,EPLastInfectionTime
+      key: ResourceID
+      name: Name
+    each:
+      all:
+        - { field: IsClient, op: eq, value: true }
+        - { field: EPInfectionStatus, op: in, value: [3, 4] }
+    evidence: "{Name}: infection status {EPInfectionStatus}, last threat {EPLastThreatName} at {EPLastInfectionTime}"
+
+  - id: WSF-RECORD-OBSOLETE-MANY
+    title: Many obsolete workstation records still claim a client
+    kind: misconfigured
+    category: HYG
+    severity: low
+    entity: site
+    why: Reimaged PCs leave their old record behind as obsolete; when they pile up, deployments and reports count devices twice and the obsolete-record cleanup task is not keeping up.
+    fix: Check that 'Delete Obsolete Client Discovery Data' is enabled and running; delete the obsolete records.
+    refs: [NIST-800-53:CM-8]
+    query:
+      protocol: http
+      path: /wmi/SMS_R_System
+      params:
+        $filter: "Obsolete eq 1 and Client eq 1 and startswith(OperatingSystemNameandVersion,'Microsoft Windows NT Workstation') eq true"
+        $select: ResourceId,Name,Obsolete,Client
+      key: ResourceId
+      name: Name
+    count: { op: gt, value: 25, threshold: workstations.obsolete-records-max }
+    evidence: "{count} obsolete client records (sample: {sample})"
+
+  - id: WSF-SVC-DOMAIN-ACCOUNT
+    title: Inventoried service runs as a domain user account
+    kind: misconfigured
+    lens: security
+    category: IAM
+    severity: high
+    entity: service
+    why: The fleet-wide view of WS-SVC-DOMAIN-ACCOUNT from hardware inventory - it also covers PCs that are off during the live scan. The account's password sits in LSA secrets on every device that runs the service. Inventory classes carry no OS, so servers are included.
+    fix: Move the service to a group managed service account, a virtual account or LocalService and keep the account out of privileged groups.
+    refs: [NIST-800-53:IA-5, CIS-Controls-v8:5.4, MITRE-ATTACK:T1078.002]
+    query:
+      protocol: http
+      path: /wmi/SMS_G_System_SERVICE
+      params:
+        $filter: "StartName ne 'LocalSystem' and startswith(StartName,'NT ') eq false"
+        $select: ResourceID,Name,DisplayName,StartName,StartMode,State,PathName
+      key: "{ResourceID}|{Name}"
+    each:
+      all:
+        - { field: StartName, op: notmatch, value: '^\.\\' }
+        - { field: StartName, op: notmatch, value: '\$$' }
+        - { field: StartName, op: match, value: '\\|@' }
+        - { field: StartName, op: notmatch, value: '^$', threshold: workstations.service-account-allow-pattern }
+    evidence: "resource {ResourceID}: {Name} runs as {StartName} ({State})"
+
   # ---- Windows 11 hardware readiness (every inventoried device) -------------------------------
 
   - id: WSF-W11-TPM

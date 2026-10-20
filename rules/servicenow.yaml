@@ -1,10 +1,21 @@
 schema: keeper.rules/1
 system: servicenow
-name: ServiceNow work queue
+name: ServiceNow work queue and platform
 integration: servicenow
 # Endpoint: the instance URL (https://example.service-now.com). The integration adds the credentials;
 # rules only name Table API GET paths and page with sysparm_offset/sysparm_limit.
-# These rules are work inputs for "what to do today", not configuration checks.
+# The first sections are work inputs for "what to do today"; from "platform health" on, the rules
+# judge the instance itself (queues, jobs, mail, MID Servers, hardening properties, access). Those
+# read system tables (sys_properties, sys_cluster_state, sysevent, syslog, ecc_queue, sys_user_has_role
+# and others), so the integration account needs read access to them - a table it cannot read makes
+# the rule unknown, but a row-level ACL that hides rows makes a must-exist rule fire: check the
+# account's roles before trusting a "none found".
+# Time windows on large tables are filtered on the instance with relative encoded queries
+# (sys_created_onRELATIVEGT@dayofweek@ago@7 = created in the last 7 days; RELATIVELT = before),
+# not with {DAYS_AGO:n}, whose ISO form is not the encoded-query date format. Counts on large tables
+# use the Aggregate API without grouping, which answers one row: result.stats.count.
+# Where a filter names a field that may not exist on every release, the condition tests the field
+# again on the row, so an ignored filter term cannot turn into findings or silent passes.
 # Most queries ask for database values (sysparm_display_value=false): choice fields are their stored
 # codes, references are sys_ids (sysparm_exclude_reference_link=true makes them plain strings) and
 # date-times are UTC. The SLA queries ask for both (sysparm_display_value=all), which turns every field
@@ -863,3 +874,1280 @@ rules:
             - { field: last_login_time, op: empty }
             - { field: sys_updated_on, op: age-gt, value: 90, threshold: servicenow.user-dormant-days }
     evidence: "{user_name}: last sign-in {last_login_time}, record updated {sys_updated_on}"
+
+  # ---- platform health -----------------------------------------------------------------------
+
+  - id: SNOW-NODE-OFFLINE
+    title: Application node of the instance is not online
+    kind: broken
+    category: AVL
+    severity: high
+    entity: node
+    refresh: 1h
+    why: An offline node takes its share of user sessions and scheduled jobs with it; jobs pinned to it wait, and the remaining nodes carry the load.
+    fix: Open a case with the platform vendor quoting the node id; check whether jobs claimed by that node are stuck (SNOW-SCHEDULED-JOB-OVERDUE).
+    refs: [NIST-800-53:SI-4, NIST-800-53:CP-10]
+    query:
+      protocol: http
+      path: /api/now/table/sys_cluster_state
+      params:
+        sysparm_fields: sys_id,system_id,status,schedulers,most_recent_message,sys_updated_on
+        sysparm_display_value: "false"
+      paging: offset
+      pageSize: 1000
+      items: result
+      key: system_id
+      name: system_id
+    each: { field: status, op: ne, value: online }
+    evidence: "node {system_id}: status {status}, schedulers {schedulers}, last message {most_recent_message}"
+
+  - id: SNOW-EVENT-QUEUE-BACKLOG
+    title: Events wait in the event queue long after they were due
+    kind: broken
+    category: HLT
+    severity: medium
+    entity: instance
+    refresh: 1h
+    why: Notifications, script actions and integrations run from the event queue. Events still waiting half an hour after their processing time mean the queue is flooded or its job is stuck, and every mail and follow-up behind them is late.
+    fix: Find the event name that floods the queue (group the waiting events by name), stop or throttle its source, and check that the event processor jobs run.
+    refs: [NIST-800-53:SI-4]
+    query:
+      protocol: http
+      path: /api/now/stats/sysevent
+      params:
+        sysparm_query: "state=ready^process_onRELATIVELT@minute@ago@30"
+        sysparm_count: "true"
+      paging: none
+      items: result
+      key: "-"
+    each: { field: stats.count, op: gt, value: 100, threshold: servicenow.event-backlog-max }
+    evidence: "{stats.count} events still waiting more than 30 minutes after their processing time"
+
+  - id: SNOW-SCHEDULED-JOB-OVERDUE
+    title: Scheduled job is more than an hour past its next run time
+    kind: broken
+    category: HLT
+    severity: medium
+    entity: scheduled-job
+    refresh: 1h
+    why: A job whose next run time passed an hour ago either never started (the schedulers are busy or a node is gone) or is still claimed by a run that hung; the work it does - imports, cleanups, SLA timers, reports - silently stops.
+    fix: Check the job's state and claiming node; release a job claimed by a node that is offline, fix or delete a job left in error, and find the long runner that starves the schedulers.
+    refs: [NIST-800-53:SI-4]
+    query:
+      protocol: http
+      path: /api/now/table/sys_trigger
+      params:
+        sysparm_query: "next_actionRELATIVELT@minute@ago@60"
+        sysparm_fields: sys_id,name,next_action,state,claimed_by,trigger_type
+        sysparm_display_value: all
+        sysparm_exclude_reference_link: "true"
+      paging: offset
+      pageSize: 1000
+      items: result
+      key: sys_id.value
+      name: name.display_value
+    each: { field: next_action.value, op: age-gt, value: 0.04, threshold: servicenow.job-overdue-days }
+    evidence: "{name.display_value}: next run was {next_action.display_value}, state {state.display_value}, claimed by {claimed_by.display_value}"
+
+  - id: SNOW-EMAIL-SEND-STUCK
+    title: Outgoing mail is stuck in the send queue
+    kind: broken
+    category: HLT
+    severity: high
+    entity: instance
+    refresh: 1h
+    why: Mail still ready to send half an hour after it was created means the instance cannot hand mail to its relay. Approvals, notifications and password resets stop reaching people, and nobody is told - the message that would say so is also stuck.
+    fix: Check the outbound mail account and the relay it points at (credentials, OAuth token, connector), fix it, and let the queue drain; confirm with the mail diagnostics page.
+    refs: [NIST-800-53:SI-4]
+    query:
+      protocol: http
+      path: /api/now/stats/sys_email
+      params:
+        sysparm_query: "type=send-ready^sys_created_onRELATIVELT@minute@ago@30"
+        sysparm_count: "true"
+      paging: none
+      items: result
+      key: "-"
+    each: { field: stats.count, op: gt, value: 0, threshold: servicenow.email-stuck-max }
+    evidence: "{stats.count} outgoing messages waiting more than 30 minutes to be sent"
+
+  - id: SNOW-EMAIL-SEND-FAILED
+    title: Outgoing mail failed in the last week
+    kind: broken
+    category: HLT
+    severity: medium
+    entity: instance
+    refresh: 6h
+    why: Messages in send-failed were refused by the relay - a broken credential, a rejected sender or a policy change. Each one is a notification or approval request that never arrived.
+    fix: Read the error on the failed messages, fix the relay or sender configuration, and resend what still matters.
+    refs: [NIST-800-53:SI-4]
+    query:
+      protocol: http
+      path: /api/now/stats/sys_email
+      params:
+        sysparm_query: "type=send-failed^sys_created_onRELATIVEGT@dayofweek@ago@7"
+        sysparm_count: "true"
+      paging: none
+      items: result
+      key: "-"
+    each: { field: stats.count, op: gt, value: 10, threshold: servicenow.email-failed-max }
+    evidence: "{stats.count} outgoing messages failed in the last 7 days"
+
+  - id: SNOW-TRANSACTION-SLOW
+    title: Many user transactions took longer than ten seconds this week
+    kind: broken
+    category: HLT
+    severity: low
+    entity: instance
+    refresh: 1d
+    why: Slow pages are usually one heavy business rule, report or list filter; people work around them, and the instance gets the blame for a single configuration.
+    fix: Group the slow transactions by URL, find the rule, script or report behind the worst ones, and fix or index it.
+    refs: [NIST-800-53:SI-4]
+    query:
+      protocol: http
+      path: /api/now/stats/syslog_transaction
+      params:
+        sysparm_query: "response_time>10000^sys_created_onRELATIVEGT@dayofweek@ago@7"
+        sysparm_count: "true"
+      paging: none
+      items: result
+      key: "-"
+    each: { field: stats.count, op: gt, value: 100, threshold: servicenow.slow-transactions-max }
+    evidence: "{stats.count} transactions over 10 seconds in the last 7 days"
+
+  - id: SNOW-MID-SERVER-STALE
+    title: MID Server reports Up but has not checked in recently
+    kind: broken
+    category: MON
+    severity: medium
+    entity: mid-server
+    refresh: 1h
+    why: The status stays Up after the MID Server's host or service has stopped; its last check-in shows the truth. Discovery and integrations routed to it queue up until someone notices.
+    fix: Check the MID Server service and its host, restart it, and look at its log for the reason it stopped reporting.
+    refs: [NIST-800-53:SI-4]
+    query:
+      protocol: http
+      path: /api/now/table/ecc_agent
+      params:
+        sysparm_fields: sys_id,name,status,validated,last_refreshed,version,host_name
+        sysparm_display_value: "false"
+      paging: offset
+      pageSize: 1000
+      items: result
+      key: sys_id
+      name: name
+    each:
+      all:
+        - { field: status, op: eq, value: Up }
+        - { field: last_refreshed, op: age-gt, value: 0.02, threshold: servicenow.mid-checkin-max-days }
+    evidence: "{name}: status {status}, last refreshed {last_refreshed}"
+
+  - id: SNOW-ECC-OUTPUT-BACKLOG
+    title: Work for MID Servers waits in the queue
+    kind: broken
+    category: MON
+    severity: medium
+    entity: instance
+    refresh: 1h
+    why: Output messages still ready after half an hour are probes and commands no MID Server picked up - a MID that is down, overloaded or not allowed to run them. Discovery, orchestration and integrations that need the MID stall behind them.
+    fix: Look at which agent and topic the waiting messages are for, fix that MID Server (service, capacity, application or capability settings) or move the work to a cluster.
+    refs: [NIST-800-53:SI-4]
+    query:
+      protocol: http
+      path: /api/now/stats/ecc_queue
+      params:
+        sysparm_query: "queue=output^state=ready^sys_created_onRELATIVELT@minute@ago@30"
+        sysparm_count: "true"
+      paging: none
+      items: result
+      key: "-"
+    each: { field: stats.count, op: gt, value: 10, threshold: servicenow.ecc-backlog-max }
+    evidence: "{stats.count} MID Server messages waiting more than 30 minutes"
+
+  - id: SNOW-ECC-INPUT-ERRORS
+    title: Many MID Server results failed to process in the last day
+    kind: broken
+    category: LOG
+    severity: low
+    entity: instance
+    refresh: 6h
+    why: Input messages in error are results the instance could not process - failing probes, credentials or sensors. Repeated errors from one topic usually mean a discovery or integration that has quietly stopped producing data.
+    fix: Group the errored input messages by topic and agent, and fix the probe, credential or sensor behind the largest group.
+    refs: [NIST-800-53:SI-4]
+    query:
+      protocol: http
+      path: /api/now/stats/ecc_queue
+      params:
+        sysparm_query: "queue=input^state=error^sys_created_onRELATIVEGT@dayofweek@ago@1"
+        sysparm_count: "true"
+      paging: none
+      items: result
+      key: "-"
+    each: { field: stats.count, op: gt, value: 50, threshold: servicenow.ecc-errors-max }
+    evidence: "{stats.count} MID Server input messages in error in the last day"
+
+  - id: SNOW-MID-NO-CLUSTER
+    title: No MID Server cluster is defined
+    kind: missing
+    category: AVL
+    severity: medium
+    entity: instance
+    refresh: 7d
+    why: Without a cluster every job is tied to one MID Server, so its host's patch reboot or failure stops discovery and integrations until someone repoints them by hand.
+    fix: Create a failover (or load-balance) cluster of at least two MID Servers and point discovery schedules and integrations at the cluster. If the instance uses no MID Server at all, disable this rule with an override.
+    refs: [NIST-800-53:CP-10, NIST-800-53:SC-36]
+    query:
+      protocol: http
+      path: /api/now/table/ecc_agent_cluster
+      params:
+        sysparm_fields: sys_id,name
+        sysparm_display_value: "false"
+      paging: offset
+      pageSize: 1000
+      items: result
+      key: sys_id
+      name: name
+    count: none
+    evidence: "no MID Server cluster defined"
+
+  - id: SNOW-MID-ISSUE-OPEN
+    title: MID Server issue unresolved for more than a day
+    kind: broken
+    category: MON
+    severity: medium
+    entity: mid-issue
+    refresh: 6h
+    why: The instance records MID Server problems it detects (memory, disk, connectivity, upgrade failures) as issues; open ones are failures the MID is already living with.
+    fix: Read the issue, fix its cause on the MID Server host, and resolve it; route these issues to the team that runs the MID hosts.
+    refs: [NIST-800-53:SI-4]
+    query:
+      protocol: http
+      path: /api/now/table/ecc_agent_issue
+      params:
+        sysparm_query: "state!=resolved"
+        sysparm_fields: sys_id,mid_server,state,source,message,sys_created_on
+        sysparm_display_value: all
+        sysparm_exclude_reference_link: "true"
+      paging: offset
+      pageSize: 1000
+      items: result
+      key: sys_id.value
+      name: message.display_value
+    each: { field: sys_created_on.value, op: age-gt, value: 1, threshold: servicenow.mid-issue-max-days }
+    evidence: "{mid_server.display_value}: {message.display_value} (state {state.display_value}, since {sys_created_on.display_value})"
+
+  - id: SNOW-MID-CERT-CHECK-DISABLED
+    title: MID Server does not validate the instance's certificate
+    kind: misconfigured
+    lens: security
+    category: AUT
+    severity: medium
+    entity: mid-property
+    refresh: 1d
+    why: With certificate chain or host-name checking switched off, a MID Server talks to whoever answers for the instance's name, so an interception on its network path receives every credential and command it handles.
+    fix: Import the CA that issues the intercepting or internal certificate into the MID Server's trust store, then set the check property back to true (or delete the override).
+    refs: [NIST-800-53:SC-23, NIST-800-53:SC-8]
+    query:
+      protocol: http
+      path: /api/now/table/ecc_agent_property
+      params:
+        sysparm_query: "nameLIKEcheck_cert^value=false"
+        sysparm_fields: sys_id,name,value,ecc_agent
+        sysparm_display_value: all
+        sysparm_exclude_reference_link: "true"
+      paging: offset
+      pageSize: 1000
+      items: result
+      key: sys_id.value
+      name: name.value
+    each:
+      all:
+        - { field: name.value, op: match, value: check_cert }
+        - { field: value.value, op: eq, value: "false" }
+    evidence: "{name.value} = false on {ecc_agent.display_value}"
+
+  # ---- platform properties (one read of the hardening, session, sign-in and version properties) --
+  # A property that is not in sys_properties keeps its built-in default and is not judged here.
+
+  - id: SNOW-HARDENING-PROPERTY-OFF
+    title: Security hardening property is not at its secure value
+    kind: misconfigured
+    lens: security
+    category: CFG
+    severity: high
+    entity: property
+    refresh: 1d
+    why: These properties switch the platform's own protections - output escaping, CSRF tokens, secure cookies, clickjacking headers, the script sandbox, ACL checks on client-side record access and group-by results, strict SOAP and UI-action checks, blank-password refusal and certificate validation on outbound calls. Instances upgraded from old releases often still carry the insecure value, and an administrator may have turned one off to make a customisation work.
+    fix: Test the secure value on a sub-production instance, fix what breaks there, then set it in production. Record any property that must stay insecure as an exception with the reason.
+    refs: [NIST-800-53:CM-6, NIST-800-53:SC-23, NIST-800-53:SI-10, CIS-Controls-v8:4.1]
+    query:
+      protocol: http
+      path: /api/now/table/sys_properties
+      params:
+        sysparm_query: "nameINglide.ui.escape_text,glide.ui.escape_all_script,glide.ui.escape_html_list_field,glide.html.escape_script,glide.ui.secure_cookies,glide.set_x_frame_options,glide.security.use_csrf_token,glide.security.strict.actions,glide.soap.strict_security,glide.security.groupby_acl_check,glide.script.use.sandbox,glide.script.secure.ajaxgliderecord,glide.script.allow.ajaxevaluate,glide.login.no_blank_password,com.glide.communications.httpclient.verify_hostname,com.glide.communications.trustmanager_trust_all,glide.attachment.extensions,glide.security.file.mime_type.validation,glide.ui.attachment.force_download_all_mime_types,glide.ui.session_timeout,glide.ui.forgetme,glide.authenticate.multisso.enabled,glide.authenticate.multifactor,glide.war^ORnameSTARTSWITHglide.basicauth.required."
+        sysparm_fields: sys_id,name,value,sys_updated_on,sys_updated_by
+        sysparm_display_value: "false"
+      paging: offset
+      pageSize: 1000
+      items: result
+      key: name
+      name: name
+    each:
+      any:
+        - all:
+            - { field: name, op: in, value: [glide.ui.escape_text, glide.ui.escape_all_script, glide.ui.escape_html_list_field, glide.html.escape_script, glide.ui.secure_cookies, glide.set_x_frame_options, glide.security.use_csrf_token, glide.security.strict.actions, glide.soap.strict_security, glide.security.groupby_acl_check, glide.script.use.sandbox, glide.script.secure.ajaxgliderecord, glide.login.no_blank_password, com.glide.communications.httpclient.verify_hostname] }
+            - { field: value, op: ne, value: "true" }
+        - all:
+            - { field: name, op: in, value: [glide.script.allow.ajaxevaluate, com.glide.communications.trustmanager_trust_all] }
+            - { field: value, op: ne, value: "false" }
+    evidence: "{name} = '{value}' (last changed {sys_updated_on} by {sys_updated_by})"
+
+  - id: SNOW-PROCESSOR-AUTH-NOT-REQUIRED
+    title: A request processor accepts requests without authentication
+    kind: misconfigured
+    lens: security
+    category: AUT
+    severity: high
+    entity: property
+    refresh: 1d
+    why: The glide.basicauth.required properties make the export, SOAP, WSDL, import and scripted processors demand credentials. Set to false, the processor answers anonymous requests as the guest user, so data is exposed to anyone who can reach the instance wherever an access control lets guest read it.
+    fix: Set the property back to true. If an integration relies on anonymous access, give it its own account with web-service access only.
+    refs: [NIST-800-53:IA-2, NIST-800-53:AC-3, NIST-800-53:AC-14]
+    query:
+      protocol: http
+      path: /api/now/table/sys_properties
+      params:
+        sysparm_query: "nameINglide.ui.escape_text,glide.ui.escape_all_script,glide.ui.escape_html_list_field,glide.html.escape_script,glide.ui.secure_cookies,glide.set_x_frame_options,glide.security.use_csrf_token,glide.security.strict.actions,glide.soap.strict_security,glide.security.groupby_acl_check,glide.script.use.sandbox,glide.script.secure.ajaxgliderecord,glide.script.allow.ajaxevaluate,glide.login.no_blank_password,com.glide.communications.httpclient.verify_hostname,com.glide.communications.trustmanager_trust_all,glide.attachment.extensions,glide.security.file.mime_type.validation,glide.ui.attachment.force_download_all_mime_types,glide.ui.session_timeout,glide.ui.forgetme,glide.authenticate.multisso.enabled,glide.authenticate.multifactor,glide.war^ORnameSTARTSWITHglide.basicauth.required."
+        sysparm_fields: sys_id,name,value,sys_updated_on,sys_updated_by
+        sysparm_display_value: "false"
+      paging: offset
+      pageSize: 1000
+      items: result
+      key: name
+      name: name
+    each:
+      all:
+        - { field: name, op: match, value: '^glide\.basicauth\.required\.' }
+        - { field: value, op: ne, value: "true" }
+    evidence: "{name} = '{value}' (last changed {sys_updated_on} by {sys_updated_by})"
+
+  - id: SNOW-ATTACHMENT-POLICY-WEAK
+    title: Attachment uploads are not restricted
+    kind: misconfigured
+    lens: security
+    category: CFG
+    severity: medium
+    entity: property
+    refresh: 1d
+    why: An empty extension list accepts any file type; without MIME validation a file can claim to be what it is not; without forced download an uploaded HTML or SVG file runs in the instance's origin when someone opens it. Attachments arrive from mail and portals, not only from staff.
+    fix: Set glide.attachment.extensions to the types the business needs, and turn on MIME-type validation and forced download.
+    refs: [NIST-800-53:SI-3, NIST-800-53:CM-7, ISO-27001:A.8.7]
+    query:
+      protocol: http
+      path: /api/now/table/sys_properties
+      params:
+        sysparm_query: "nameINglide.ui.escape_text,glide.ui.escape_all_script,glide.ui.escape_html_list_field,glide.html.escape_script,glide.ui.secure_cookies,glide.set_x_frame_options,glide.security.use_csrf_token,glide.security.strict.actions,glide.soap.strict_security,glide.security.groupby_acl_check,glide.script.use.sandbox,glide.script.secure.ajaxgliderecord,glide.script.allow.ajaxevaluate,glide.login.no_blank_password,com.glide.communications.httpclient.verify_hostname,com.glide.communications.trustmanager_trust_all,glide.attachment.extensions,glide.security.file.mime_type.validation,glide.ui.attachment.force_download_all_mime_types,glide.ui.session_timeout,glide.ui.forgetme,glide.authenticate.multisso.enabled,glide.authenticate.multifactor,glide.war^ORnameSTARTSWITHglide.basicauth.required."
+        sysparm_fields: sys_id,name,value,sys_updated_on,sys_updated_by
+        sysparm_display_value: "false"
+      paging: offset
+      pageSize: 1000
+      items: result
+      key: name
+      name: name
+    each:
+      any:
+        - all:
+            - { field: name, op: eq, value: glide.attachment.extensions }
+            - { field: value, op: empty }
+        - all:
+            - { field: name, op: in, value: [glide.security.file.mime_type.validation, glide.ui.attachment.force_download_all_mime_types] }
+            - { field: value, op: ne, value: "true" }
+    evidence: "{name} = '{value}' (last changed {sys_updated_on} by {sys_updated_by})"
+
+  - id: SNOW-SESSION-TIMEOUT-LONG
+    title: Sessions stay open too long or can be remembered
+    kind: misconfigured
+    lens: security
+    category: AUT
+    severity: low
+    entity: property
+    refresh: 1d
+    why: A long idle timeout, or a "remember me" option, leaves a signed-in session usable on a shared or unattended device long after its owner walked away.
+    fix: Set glide.ui.session_timeout to 30 minutes or less and glide.ui.forgetme to true; let single sign-on bring people back in quickly instead.
+    refs: [NIST-800-53:AC-11, NIST-800-53:AC-12]
+    query:
+      protocol: http
+      path: /api/now/table/sys_properties
+      params:
+        sysparm_query: "nameINglide.ui.escape_text,glide.ui.escape_all_script,glide.ui.escape_html_list_field,glide.html.escape_script,glide.ui.secure_cookies,glide.set_x_frame_options,glide.security.use_csrf_token,glide.security.strict.actions,glide.soap.strict_security,glide.security.groupby_acl_check,glide.script.use.sandbox,glide.script.secure.ajaxgliderecord,glide.script.allow.ajaxevaluate,glide.login.no_blank_password,com.glide.communications.httpclient.verify_hostname,com.glide.communications.trustmanager_trust_all,glide.attachment.extensions,glide.security.file.mime_type.validation,glide.ui.attachment.force_download_all_mime_types,glide.ui.session_timeout,glide.ui.forgetme,glide.authenticate.multisso.enabled,glide.authenticate.multifactor,glide.war^ORnameSTARTSWITHglide.basicauth.required."
+        sysparm_fields: sys_id,name,value,sys_updated_on,sys_updated_by
+        sysparm_display_value: "false"
+      paging: offset
+      pageSize: 1000
+      items: result
+      key: name
+      name: name
+    each:
+      any:
+        - all:
+            - { field: name, op: eq, value: glide.ui.session_timeout }
+            - { field: value, op: gt, value: 30, threshold: servicenow.session-timeout-max-minutes }
+        - all:
+            - { field: name, op: eq, value: glide.ui.forgetme }
+            - { field: value, op: ne, value: "true" }
+    evidence: "{name} = '{value}'"
+
+  - id: SNOW-SSO-NOT-ENABLED
+    title: Single sign-on is not enabled on the instance
+    kind: missing
+    lens: security
+    category: AUT
+    severity: high
+    entity: instance
+    refresh: 1d
+    why: Without single sign-on every user signs in with an instance password that the directory's leaver process, MFA and conditional access never touch. A property that is not set counts as off.
+    fix: Configure the identity provider in multi-provider single sign-on, set glide.authenticate.multisso.enabled to true, make the provider the default and keep local passwords for documented emergency accounts only.
+    refs: [NIST-800-53:IA-2, NIST-800-53:IA-8, CIS-Controls-v8:6.7, ISO-27001:A.8.5]
+    query:
+      protocol: http
+      path: /api/now/table/sys_properties
+      params:
+        sysparm_query: "nameINglide.ui.escape_text,glide.ui.escape_all_script,glide.ui.escape_html_list_field,glide.html.escape_script,glide.ui.secure_cookies,glide.set_x_frame_options,glide.security.use_csrf_token,glide.security.strict.actions,glide.soap.strict_security,glide.security.groupby_acl_check,glide.script.use.sandbox,glide.script.secure.ajaxgliderecord,glide.script.allow.ajaxevaluate,glide.login.no_blank_password,com.glide.communications.httpclient.verify_hostname,com.glide.communications.trustmanager_trust_all,glide.attachment.extensions,glide.security.file.mime_type.validation,glide.ui.attachment.force_download_all_mime_types,glide.ui.session_timeout,glide.ui.forgetme,glide.authenticate.multisso.enabled,glide.authenticate.multifactor,glide.war^ORnameSTARTSWITHglide.basicauth.required."
+        sysparm_fields: sys_id,name,value,sys_updated_on,sys_updated_by
+        sysparm_display_value: "false"
+      paging: offset
+      pageSize: 1000
+      items: result
+      key: name
+      name: name
+    count:
+      op: lt
+      value: 1
+      where:
+        all:
+          - { field: name, op: eq, value: glide.authenticate.multisso.enabled }
+          - { field: value, op: eq, value: "true" }
+    evidence: "glide.authenticate.multisso.enabled is not set to true ({rows} properties read)"
+
+  - id: SNOW-LOCAL-MFA-OFF
+    title: Multi-factor authentication for local sign-in is off
+    kind: missing
+    lens: security
+    category: AUT
+    severity: medium
+    entity: instance
+    refresh: 1d
+    why: Accounts that still sign in with an instance password - emergency administrators, people outside the identity provider - are protected by that password alone. Single sign-on users get MFA at the provider; this covers everyone else. A property that is not set counts as off.
+    fix: Set glide.authenticate.multifactor to true and enrol the remaining local accounts, or remove their passwords so they must use single sign-on.
+    refs: [NIST-800-53:IA-2(1), CIS-Controls-v8:6.5]
+    query:
+      protocol: http
+      path: /api/now/table/sys_properties
+      params:
+        sysparm_query: "nameINglide.ui.escape_text,glide.ui.escape_all_script,glide.ui.escape_html_list_field,glide.html.escape_script,glide.ui.secure_cookies,glide.set_x_frame_options,glide.security.use_csrf_token,glide.security.strict.actions,glide.soap.strict_security,glide.security.groupby_acl_check,glide.script.use.sandbox,glide.script.secure.ajaxgliderecord,glide.script.allow.ajaxevaluate,glide.login.no_blank_password,com.glide.communications.httpclient.verify_hostname,com.glide.communications.trustmanager_trust_all,glide.attachment.extensions,glide.security.file.mime_type.validation,glide.ui.attachment.force_download_all_mime_types,glide.ui.session_timeout,glide.ui.forgetme,glide.authenticate.multisso.enabled,glide.authenticate.multifactor,glide.war^ORnameSTARTSWITHglide.basicauth.required."
+        sysparm_fields: sys_id,name,value,sys_updated_on,sys_updated_by
+        sysparm_display_value: "false"
+      paging: offset
+      pageSize: 1000
+      items: result
+      key: name
+      name: name
+    count:
+      op: lt
+      value: 1
+      where:
+        all:
+          - { field: name, op: eq, value: glide.authenticate.multifactor }
+          - { field: value, op: eq, value: "true" }
+    evidence: "glide.authenticate.multifactor is not set to true ({rows} properties read)"
+
+  # The default pattern matches nothing, so the rule reports every release until the tenant sets
+  # threshold.servicenow.supported-families to the families the vendor currently supports, for
+  # example ^glide-(family-a|family-b)- - a release check that passes without that list proves nothing.
+  - id: SNOW-RELEASE-OLD
+    title: Instance runs a release family not on the supported list
+    kind: broken
+    category: LCM
+    severity: medium
+    entity: property
+    refresh: 1d
+    why: The vendor supports only the newest release families; an instance left on an older one stops receiving security patches and is forced into a rushed upgrade when its support ends.
+    fix: Plan the family upgrade with the platform owner. Keep threshold.servicenow.supported-families current, and record the running family's end of support as a support-end key date so REG-KEY-SUPPORT-END-DUE warns well ahead.
+    refs: [NIST-800-53:SI-2, NIST-800-53:SA-22, ISO-27001:A.8.8]
+    query:
+      protocol: http
+      path: /api/now/table/sys_properties
+      params:
+        sysparm_query: "nameINglide.ui.escape_text,glide.ui.escape_all_script,glide.ui.escape_html_list_field,glide.html.escape_script,glide.ui.secure_cookies,glide.set_x_frame_options,glide.security.use_csrf_token,glide.security.strict.actions,glide.soap.strict_security,glide.security.groupby_acl_check,glide.script.use.sandbox,glide.script.secure.ajaxgliderecord,glide.script.allow.ajaxevaluate,glide.login.no_blank_password,com.glide.communications.httpclient.verify_hostname,com.glide.communications.trustmanager_trust_all,glide.attachment.extensions,glide.security.file.mime_type.validation,glide.ui.attachment.force_download_all_mime_types,glide.ui.session_timeout,glide.ui.forgetme,glide.authenticate.multisso.enabled,glide.authenticate.multifactor,glide.war^ORnameSTARTSWITHglide.basicauth.required."
+        sysparm_fields: sys_id,name,value,sys_updated_on,sys_updated_by
+        sysparm_display_value: "false"
+      paging: offset
+      pageSize: 1000
+      items: result
+      key: name
+      name: name
+    each:
+      all:
+        - { field: name, op: eq, value: glide.war }
+        - { field: value, op: notmatch, value: '(?!)', threshold: servicenow.supported-families }
+    evidence: "release {value} is not matched by threshold.servicenow.supported-families"
+
+  # ---- lifecycle -----------------------------------------------------------------------------
+
+  - id: SNOW-STORE-APP-UPDATE-PENDING
+    title: Store application update available for half a year
+    kind: broken
+    category: LCM
+    severity: medium
+    entity: store-app
+    refresh: 1d
+    why: Store applications are patched by updating them, separately from the family upgrade; an update ignored for months carries its fixes - security ones included - with it.
+    fix: Review the release notes, update the application on a sub-production instance, then in production in the next window.
+    refs: [NIST-800-53:SI-2, ISO-27001:A.8.8]
+    query:
+      protocol: http
+      path: /api/now/table/sys_store_app
+      params:
+        sysparm_query: "active=true^update_available=true"
+        sysparm_fields: sys_id,name,scope,version,latest_version,update_available,active,sys_updated_on
+        sysparm_display_value: "false"
+      paging: offset
+      pageSize: 1000
+      items: result
+      key: sys_id
+      name: name
+    each:
+      all:
+        - { field: update_available, op: eq, value: "true" }
+        - { field: sys_updated_on, op: age-gt, value: 180, threshold: servicenow.store-update-max-days }
+    evidence: "{name} {version} (latest {latest_version}), record unchanged since {sys_updated_on}"
+
+  - id: SNOW-UPDATE-SET-IN-PROGRESS-OLD
+    title: Update set left in progress for more than a month
+    kind: misconfigured
+    category: CFG
+    severity: medium
+    entity: update-set
+    refresh: 1d
+    why: An update set in progress for weeks collects unrelated changes and is never promoted cleanly; on a production instance it means configuration is being changed there directly, outside the release path.
+    fix: Complete and promote it, or mark it ignore after moving its changes; develop on the sub-production instance and promote from there. The Default set of each scope is excluded.
+    refs: [NIST-800-53:CM-3, NIST-800-53:CM-5]
+    query:
+      protocol: http
+      path: /api/now/table/sys_update_set
+      params:
+        sysparm_query: "state=in progress^name!=Default"
+        sysparm_fields: sys_id,name,state,application,sys_created_on,sys_created_by
+        sysparm_display_value: "false"
+        sysparm_exclude_reference_link: "true"
+      paging: offset
+      pageSize: 1000
+      items: result
+      key: sys_id
+      name: name
+    each:
+      all:
+        - { field: state, op: eq, value: in progress }
+        - { field: name, op: ne, value: Default }
+        - { field: sys_created_on, op: age-gt, value: 30, threshold: servicenow.update-set-max-days }
+    evidence: "{name}: in progress since {sys_created_on}, created by {sys_created_by}"
+
+  # ---- logs and audit ------------------------------------------------------------------------
+
+  - id: SNOW-SYSLOG-ERROR-STORM
+    title: Error log entries piled up in the last day
+    kind: broken
+    category: LOG
+    severity: medium
+    entity: instance
+    refresh: 6h
+    why: Hundreds of script and platform errors a day are usually one broken business rule, integration or scheduled script repeating; it costs performance and hides the errors that matter.
+    fix: Group the day's errors by source and message, fix the top one or two, and look again tomorrow.
+    refs: [NIST-800-53:SI-4, NIST-800-53:SI-11]
+    query:
+      protocol: http
+      path: /api/now/stats/syslog
+      params:
+        sysparm_query: "level=2^sys_created_onRELATIVEGT@dayofweek@ago@1"
+        sysparm_count: "true"
+      paging: none
+      items: result
+      key: "-"
+    each: { field: stats.count, op: gt, value: 500, threshold: servicenow.syslog-errors-max }
+    evidence: "{stats.count} error log entries in the last day"
+
+  - id: SNOW-IMPORT-SET-ERRORS
+    title: Data import finished with errors this week
+    kind: broken
+    category: LOG
+    severity: medium
+    entity: import-run
+    refresh: 6h
+    why: A transform that ends with errors leaves part of the source unloaded - users not created, CIs not updated - and the next run usually repeats it, so the target table drifts from its source.
+    fix: Open the transform history, fix the source data or the transform map, and rerun the import.
+    refs: [NIST-800-53:SI-4, ISO-27001:A.5.14]
+    query:
+      protocol: http
+      path: /api/now/table/sys_import_set_run
+      params:
+        sysparm_query: "sys_created_onRELATIVEGT@dayofweek@ago@7^errors>0"
+        sysparm_fields: sys_id,set,state,errors,inserts,updates,sys_created_on
+        sysparm_display_value: all
+        sysparm_exclude_reference_link: "true"
+      paging: offset
+      pageSize: 1000
+      items: result
+      key: sys_id.value
+      name: set.display_value
+    each:
+      all:
+        - { field: errors.value, op: gt, value: 0 }
+        - { field: sys_created_on.value, op: age-lt, value: 7 }
+    evidence: "{set.display_value}: {errors.value} errors ({inserts.value} inserted, {updates.value} updated) on {sys_created_on.display_value}"
+
+  - id: SNOW-FLOW-ERRORS
+    title: Flows ended in error this week
+    kind: broken
+    category: LOG
+    severity: medium
+    entity: instance
+    refresh: 6h
+    why: A flow in error stops half way - a request approved but never fulfilled, an account not created, a notification not sent - and the person waiting is not told.
+    fix: Open the flow executions in error, fix the action or data that failed, and restart or complete the records left behind.
+    refs: [NIST-800-53:SI-4]
+    query:
+      protocol: http
+      path: /api/now/stats/sys_flow_context
+      params:
+        sysparm_query: "state=ERROR^sys_created_onRELATIVEGT@dayofweek@ago@7"
+        sysparm_count: "true"
+      paging: none
+      items: result
+      key: "-"
+    each: { field: stats.count, op: gt, value: 5, threshold: servicenow.flow-errors-max }
+    evidence: "{stats.count} flow executions ended in error in the last 7 days"
+
+  - id: SNOW-OUTBOUND-HTTP-FAILING
+    title: Outbound integration calls fail repeatedly
+    kind: broken
+    category: LOG
+    severity: medium
+    entity: instance
+    refresh: 6h
+    why: Outbound REST and SOAP calls answered with an error status are integrations that stopped working - an expired credential, a moved endpoint, a firewall change - while the records they should update go stale.
+    fix: Group the failed calls by endpoint, renew the credential or fix the endpoint of the top failures, and replay what was lost.
+    refs: [NIST-800-53:SI-4, ISO-27001:A.5.14]
+    query:
+      protocol: http
+      path: /api/now/stats/sys_outbound_http_log
+      params:
+        sysparm_query: "response_status>=400^sys_created_onRELATIVEGT@dayofweek@ago@7"
+        sysparm_count: "true"
+      paging: none
+      items: result
+      key: "-"
+    each: { field: stats.count, op: gt, value: 50, threshold: servicenow.outbound-errors-max }
+    evidence: "{stats.count} outbound calls answered with an error status in the last 7 days"
+
+  - id: SNOW-LOGIN-FAILED-BURST
+    title: Many failed sign-ins in the last week
+    kind: broken
+    lens: security
+    category: IAM
+    severity: medium
+    entity: instance
+    refresh: 6h
+    why: A rise in failed sign-ins is password guessing against local accounts, a broken integration retrying with an old password, or single sign-on falling back to the login form; each needs a different answer.
+    fix: Group the failed sign-in events by user and source address; lock or fix the accounts concerned, update the integration's credential, and restrict the login form to emergency accounts.
+    refs: [NIST-800-53:AC-7, NIST-800-53:AU-6]
+    query:
+      protocol: http
+      path: /api/now/stats/sysevent
+      params:
+        sysparm_query: "name=login.failed^sys_created_onRELATIVEGT@dayofweek@ago@7"
+        sysparm_count: "true"
+      paging: none
+      items: result
+      key: "-"
+    each: { field: stats.count, op: gt, value: 100, threshold: servicenow.failed-logins-max }
+    evidence: "{stats.count} failed sign-ins in the last 7 days"
+
+  # ---- exposure ------------------------------------------------------------------------------
+
+  - id: SNOW-IP-ACCESS-CONTROL-NONE
+    title: No IP address access control is active
+    kind: missing
+    lens: security
+    category: CFG
+    severity: medium
+    entity: instance
+    refresh: 7d
+    why: Without an IP access rule the instance's login page and APIs answer the whole internet, so a stolen password or token works from anywhere and password guessing is open to everyone.
+    fix: Allow the organisation's egress ranges (and the vendors' documented ranges) and deny the rest, at least for administrative and integration access; if the instance must serve the public, record that decision as an exception.
+    refs: [NIST-800-53:AC-17, NIST-800-53:SC-7]
+    query:
+      protocol: http
+      path: /api/now/table/ip_access
+      params:
+        sysparm_query: "active=true"
+        sysparm_fields: sys_id,active,type,range_start,range_end
+        sysparm_display_value: "false"
+      paging: offset
+      pageSize: 1000
+      items: result
+      key: sys_id
+    count: { op: lt, value: 1, where: { field: active, op: eq, value: "true" } }
+    evidence: "no active IP address access rule ({rows} rules read)"
+
+  - id: SNOW-REST-OPERATION-NO-AUTH
+    title: Scripted REST resource answers without authentication
+    kind: misconfigured
+    lens: security
+    category: AUT
+    severity: high
+    entity: rest-resource
+    refresh: 1d
+    why: A scripted REST resource that does not require authentication runs its script for any caller who can reach the instance, with whatever the script reads or writes.
+    fix: Turn on "requires authentication" (and ACL authorization) for the resource; if it must be public, make sure the script returns nothing sensitive and record the exception.
+    refs: [NIST-800-53:IA-2, NIST-800-53:AC-3, NIST-800-53:AC-14]
+    query:
+      protocol: http
+      path: /api/now/table/sys_ws_operation
+      params:
+        sysparm_query: "active=true^requires_authentication=false"
+        sysparm_fields: sys_id,name,http_method,operation_uri,active,requires_authentication,requires_acl_authorization
+        sysparm_display_value: "false"
+      paging: offset
+      pageSize: 1000
+      items: result
+      key: sys_id
+      name: name
+    each:
+      all:
+        - { field: active, op: eq, value: "true" }
+        - { field: requires_authentication, op: eq, value: "false" }
+    evidence: "{http_method} {operation_uri} ({name}) requires no authentication; ACL authorization {requires_acl_authorization}"
+
+  - id: SNOW-REST-MESSAGE-CLEARTEXT
+    title: Outbound REST message uses plain HTTP
+    kind: misconfigured
+    lens: security
+    category: CFG
+    severity: medium
+    entity: rest-message
+    refresh: 1d
+    why: An integration over plain HTTP sends its credentials and the records it carries in clear text across every network on the way.
+    fix: Change the endpoint to HTTPS (the target system needs a certificate) and rotate any credential that has travelled in clear text.
+    refs: [NIST-800-53:SC-8, ISO-27001:A.8.24]
+    query:
+      protocol: http
+      path: /api/now/table/sys_rest_message
+      params:
+        sysparm_query: "rest_endpointSTARTSWITHhttp:"
+        sysparm_fields: sys_id,name,rest_endpoint,authentication_type
+        sysparm_display_value: "false"
+      paging: offset
+      pageSize: 1000
+      items: result
+      key: sys_id
+      name: name
+    each: { field: rest_endpoint, op: match, value: '^http://' }
+    evidence: "{name}: endpoint {rest_endpoint} (authentication {authentication_type})"
+
+  - id: SNOW-INBOUND-EMAIL-ACTION-OPEN
+    title: Inbound mail action creates records from any sender
+    kind: misconfigured
+    lens: security
+    category: CFG
+    severity: medium
+    entity: inbound-action
+    refresh: 1d
+    why: An action that creates records from new mail with no sender, role or condition restriction lets anyone who can send mail to the instance open records, attach files and trigger the workflows behind them - including with a forged sender.
+    fix: Add a condition or sender restriction (known users, the organisation's domains), require a role where the table allows it, and filter attachments; if open intake is intended, record the exception.
+    refs: [NIST-800-53:SI-3, NIST-800-53:SI-8, ISO-27001:A.8.7]
+    query:
+      protocol: http
+      path: /api/now/table/sysevent_in_email_action
+      params:
+        sysparm_query: "active=true^type=new^fromISEMPTY^required_rolesISEMPTY"
+        sysparm_fields: sys_id,name,table,type,from,required_roles,filter_condition,condition,active
+        sysparm_display_value: "false"
+        sysparm_exclude_reference_link: "true"
+      paging: offset
+      pageSize: 1000
+      items: result
+      key: sys_id
+      name: name
+    each:
+      all:
+        - { field: active, op: eq, value: "true" }
+        - { field: type, op: eq, value: new }
+        - { field: from, op: empty }
+        - { field: required_roles, op: empty }
+        - { field: filter_condition, op: empty }
+        - { field: condition, op: empty }
+    evidence: "{name} creates {table} records from new mail by any sender, with no condition"
+
+  - id: SNOW-GUEST-USER-HAS-ROLE
+    title: The guest user holds a role
+    kind: misconfigured
+    lens: security
+    category: IAM
+    severity: high
+    entity: role-grant
+    refresh: 1d
+    why: Unauthenticated sessions run as the guest user, so any role it holds is granted to everyone who reaches the instance, without signing in.
+    fix: Remove the role from the guest user; give public pages what they need through access controls on the specific records instead.
+    refs: [NIST-800-53:AC-6, NIST-800-53:AC-14, ISO-27001:A.5.15]
+    query:
+      protocol: http
+      path: /api/now/table/sys_user_has_role
+      params:
+        sysparm_query: "user.user_name=guest"
+        sysparm_fields: sys_id,user,role,inherited,granted_by
+        sysparm_display_value: all
+        sysparm_exclude_reference_link: "true"
+      paging: offset
+      pageSize: 1000
+      items: result
+      key: sys_id.value
+      name: role.display_value
+    each: any
+    evidence: "guest holds {role.display_value} (inherited {inherited.display_value})"
+
+  # ---- CMDB and content ----------------------------------------------------------------------
+
+  - id: SNOW-CMDB-SERVICE-NO-OWNER
+    title: Operational service CI has no owner or no support group
+    kind: missing
+    category: HYG
+    severity: medium
+    entity: ci
+    refresh: 1d
+    why: Business and technical services are what incidents, changes and outages are reported against; one without an owner or a support group has nobody to decide on its changes or answer for its outages.
+    fix: Set the owner and the support group of the service, and make both mandatory for the service classes.
+    refs: [NIST-800-53:CM-8(2), CIS-Controls-v8:1.1]
+    query:
+      protocol: http
+      path: /api/now/table/cmdb_ci_service
+      params:
+        sysparm_query: "operational_status=1"
+        sysparm_fields: sys_id,name,sys_class_name,owned_by,managed_by,support_group,operational_status
+        sysparm_display_value: "false"
+        sysparm_exclude_reference_link: "true"
+      paging: offset
+      pageSize: 1000
+      items: result
+      key: sys_id
+      name: name
+    each:
+      any:
+        - { field: owned_by, op: empty }
+        - { field: support_group, op: empty }
+    evidence: "{name} ({sys_class_name}): owner '{owned_by}', support group '{support_group}'"
+
+  - id: SNOW-CI-OWNER-INACTIVE
+    title: Installed CI is owned or managed by an inactive user
+    kind: misconfigured
+    category: HYG
+    severity: medium
+    entity: ci
+    refresh: 1d
+    why: A CI whose owner or manager has left routes approvals and risk decisions to nobody; the leaver process deactivated the person but not their responsibilities.
+    fix: Reassign the CIs of each departed user to their successor or team, and add reassignment to the leaver checklist.
+    refs: [NIST-800-53:CM-8, NIST-800-53:PS-4]
+    query:
+      protocol: http
+      path: /api/now/table/cmdb_ci
+      params:
+        sysparm_query: "install_status=1^owned_by.active=false^ORmanaged_by.active=false"
+        sysparm_fields: sys_id,name,sys_class_name,owned_by,managed_by
+        sysparm_display_value: all
+        sysparm_exclude_reference_link: "true"
+      paging: offset
+      pageSize: 1000
+      items: result
+      key: sys_id.value
+      name: name.display_value
+    each: any
+    evidence: "{name.display_value} ({sys_class_name.display_value}): owner {owned_by.display_value}, manager {managed_by.display_value}"
+
+  - id: SNOW-CMDB-DEDUP-TASK-OLD
+    title: CMDB duplicate task open for more than a month
+    kind: broken
+    category: HYG
+    severity: low
+    entity: task
+    refresh: 1d
+    why: Each open de-duplication task is a CI recorded twice; incidents, changes and discovery updates split between the copies until they are merged.
+    fix: Work the task - merge the duplicates or mark them as different - and fix the identification rule that let discovery create the second copy.
+    refs: [NIST-800-53:CM-8]
+    query:
+      protocol: http
+      path: /api/now/table/reconcile_duplicate_task
+      params:
+        sysparm_query: "active=true"
+        sysparm_fields: sys_id,number,short_description,state,assignment_group,sys_created_on
+        sysparm_display_value: "false"
+        sysparm_exclude_reference_link: "true"
+      paging: offset
+      pageSize: 1000
+      items: result
+      key: number
+      name: short_description
+    each: { field: sys_created_on, op: age-gt, value: 30, threshold: servicenow.dedup-task-max-days }
+    evidence: "{number} open since {sys_created_on}: {short_description}"
+
+  - id: SNOW-DISCOVERY-NONE-RECENT
+    title: Discovery has not run in the last week
+    kind: missing
+    category: MON
+    severity: medium
+    entity: instance
+    refresh: 1d
+    why: When no discovery has run for a week the CMDB is kept by hand and drifts from the estate; the CI-level discovery rules then report the symptom one server at a time.
+    fix: Check the discovery schedules, the MID Servers they use and their credentials, and run one. If the instance does not use Discovery, disable this rule with an override.
+    refs: [NIST-800-53:CM-8(3), CIS-Controls-v8:1.3]
+    query:
+      protocol: http
+      path: /api/now/table/discovery_status
+      params:
+        sysparm_query: "sys_created_onRELATIVEGT@dayofweek@ago@7"
+        sysparm_fields: sys_id,number,state,dscheduler,sys_created_on
+        sysparm_display_value: "false"
+        sysparm_exclude_reference_link: "true"
+      paging: offset
+      pageSize: 1000
+      items: result
+      key: sys_id
+    count: { op: lt, value: 1, where: { field: sys_created_on, op: age-lt, value: 7 } }
+    evidence: "no discovery run created in the last 7 days ({rows} rows read)"
+
+  - id: SNOW-KB-ARTICLE-EXPIRED
+    title: Published knowledge article is past its valid-to date
+    kind: broken
+    category: HYG
+    severity: low
+    entity: kb-article
+    refresh: 7d
+    why: An article past its valid-to date has dropped out of search but is still published; the instructions in it are the ones nobody has confirmed since.
+    fix: Have the knowledge base owner review the article and extend its date, update it or retire it.
+    refs: [ISO-27001:A.5.37]
+    query:
+      protocol: http
+      path: /api/now/table/kb_knowledge
+      params:
+        sysparm_query: "workflow_state=published^valid_toISNOTEMPTY"
+        sysparm_fields: sys_id,number,short_description,valid_to,kb_knowledge_base,author
+        sysparm_display_value: "false"
+        sysparm_exclude_reference_link: "true"
+      paging: offset
+      pageSize: 1000
+      items: result
+      key: number
+      name: short_description
+    each: { field: valid_to, op: until-lt, value: 0 }
+    deadline: valid_to
+    evidence: "{number} valid to {valid_to}: {short_description}"
+
+  - id: SNOW-KB-OWNER-INACTIVE
+    title: Knowledge base is owned by an inactive user
+    kind: misconfigured
+    category: HYG
+    severity: low
+    entity: knowledge-base
+    refresh: 7d
+    why: The knowledge base owner approves and retires articles; with the owner gone, expired and wrong articles stay published.
+    fix: Assign a current owner (and managers) to the knowledge base.
+    refs: [ISO-27001:A.5.37]
+    query:
+      protocol: http
+      path: /api/now/table/kb_knowledge_base
+      params:
+        sysparm_query: "active=true^owner.active=false"
+        sysparm_fields: sys_id,title,owner,active
+        sysparm_display_value: all
+        sysparm_exclude_reference_link: "true"
+      paging: offset
+      pageSize: 1000
+      items: result
+      key: sys_id.value
+      name: title.display_value
+    each: any
+    evidence: "{title.display_value}: owner {owner.display_value} is inactive"
+
+  # ---- identity and access -------------------------------------------------------------------
+
+  - id: SNOW-ELEVATED-ROLE-COUNT
+    title: Too many active users hold an elevated-privilege role
+    kind: misconfigured
+    lens: security
+    category: IAM
+    severity: medium
+    entity: instance
+    refresh: 1d
+    why: Elevated roles (security_admin and the others flagged as elevated) change access controls and security settings; they are meant to be held by a few and switched on only for the task. Counted per distinct user.
+    fix: Remove the elevated roles from everyone who does not change security settings, and keep the rest to a named few with strong authentication.
+    refs: [NIST-800-53:AC-6(5), NIST-800-53:AC-6(9), CIS-Controls-v8:5.4]
+    query:
+      protocol: http
+      path: /api/now/stats/sys_user_has_role
+      params:
+        sysparm_query: "role.elevated_privilege=true^user.active=true"
+        sysparm_group_by: user
+        sysparm_count: "true"
+      paging: none
+      items: result
+      key: "groupby_fields[].value"
+    count: { op: gt, value: 5, threshold: servicenow.max-elevated-holders }
+    evidence: "{count} active users hold an elevated-privilege role"
+
+  - id: SNOW-IMPERSONATOR-ROLE-COUNT
+    title: Too many active users can impersonate others
+    kind: misconfigured
+    lens: security
+    category: IAM
+    severity: medium
+    entity: instance
+    refresh: 1d
+    why: Impersonation lets the holder act as any user - approve, read their records, change their data - and the audit trail then names the impersonated person. Counted per distinct user.
+    fix: Keep the impersonator role to the few who test or support the platform, and review its use in the impersonation events.
+    refs: [NIST-800-53:AC-6(9), ISO-27001:A.8.15]
+    query:
+      protocol: http
+      path: /api/now/stats/sys_user_has_role
+      params:
+        sysparm_query: "role.name=impersonator^user.active=true"
+        sysparm_group_by: user
+        sysparm_count: "true"
+      paging: none
+      items: result
+      key: "groupby_fields[].value"
+    count: { op: gt, value: 10, threshold: servicenow.max-impersonators }
+    evidence: "{count} active users hold the impersonator role"
+
+  - id: SNOW-ITIL-ROLE-DIRECT
+    title: Fulfiller role granted directly to users
+    kind: misconfigured
+    category: IAM
+    severity: low
+    entity: instance
+    refresh: 1d
+    why: Direct grants of the fulfiller role bypass the groups that joiner, mover and leaver processes manage, so they survive role changes and keep paid fulfiller licences in use.
+    fix: Grant the role through the assignment groups and remove the direct grants.
+    refs: [NIST-800-53:AC-2, CIS-Controls-v8:6.8]
+    query:
+      protocol: http
+      path: /api/now/table/sys_user_has_role
+      params:
+        sysparm_query: "role.name=itil^user.active=true^inherited=false"
+        sysparm_fields: sys_id,user,role,inherited
+        sysparm_display_value: all
+        sysparm_exclude_reference_link: "true"
+      paging: offset
+      pageSize: 1000
+      items: result
+      key: user.display_value
+    count: { op: gt, value: 0, threshold: servicenow.max-direct-itil-grants }
+    evidence: "{count} direct grants of the itil role, for example: {sample}"
+
+  - id: SNOW-GROUP-MANAGER-INACTIVE
+    title: Active group is managed by an inactive user
+    kind: misconfigured
+    category: IAM
+    severity: medium
+    entity: group
+    refresh: 1d
+    why: Group managers approve membership and many approval flows route to them; a departed manager leaves those approvals and the group's membership decisions with nobody.
+    fix: Assign a current manager, and add group ownership to the leaver checklist.
+    refs: [NIST-800-53:AC-2, NIST-800-53:PS-4]
+    query:
+      protocol: http
+      path: /api/now/table/sys_user_group
+      params:
+        sysparm_query: "active=true^manager.active=false"
+        sysparm_fields: sys_id,name,manager,active
+        sysparm_display_value: all
+        sysparm_exclude_reference_link: "true"
+      paging: offset
+      pageSize: 1000
+      items: result
+      key: sys_id.value
+      name: name.display_value
+    each: any
+    evidence: "{name.display_value}: manager {manager.display_value} is inactive"
+
+  - id: SNOW-APPROVAL-APPROVER-INACTIVE
+    title: Approval request waits for an inactive user
+    kind: broken
+    category: CFG
+    severity: medium
+    entity: approval
+    refresh: 6h
+    why: An approval assigned to someone who has left never completes; the change or request behind it waits until someone notices.
+    fix: Reassign the approval, and set up approval delegation or a group approver so departures do not block it.
+    refs: [NIST-800-53:CM-3, NIST-800-53:PS-4]
+    query:
+      protocol: http
+      path: /api/now/table/sysapproval_approver
+      params:
+        sysparm_query: "state=requested^approver.active=false"
+        sysparm_fields: sys_id,approver,state,sysapproval,document_id,sys_created_on,due_date
+        sysparm_display_value: all
+        sysparm_exclude_reference_link: "true"
+      paging: offset
+      pageSize: 1000
+      items: result
+      key: sys_id.value
+      name: approver.display_value
+    each: any
+    evidence: "{sysapproval.display_value} waits since {sys_created_on.display_value} for inactive user {approver.display_value}"
+
+  # ---- requests, incidents and changes -------------------------------------------------------
+
+  - id: SNOW-REQUEST-ITEM-OLD
+    title: Requested item open for more than a month
+    kind: broken
+    category: HYG
+    severity: low
+    entity: request-item
+    refresh: 1d
+    why: A request item open for weeks is someone still waiting for access, equipment or a service - or a fulfilled request nobody closed, which skews every backlog figure.
+    fix: Fulfil and close it, or update the requester with a date; close the ones already delivered.
+    refs: [NIST-800-53:IR-4]
+    query:
+      protocol: http
+      path: /api/now/table/sc_req_item
+      params:
+        sysparm_query: "active=true"
+        sysparm_fields: sys_id,number,short_description,state,opened_at,assignment_group,assigned_to,cat_item
+        sysparm_display_value: "false"
+        sysparm_exclude_reference_link: "true"
+      paging: offset
+      pageSize: 1000
+      items: result
+      key: number
+      name: short_description
+    each: { field: opened_at, op: age-gt, value: 30, threshold: servicenow.request-item-max-days }
+    evidence: "{number} open since {opened_at}: {short_description}"
+
+  - id: SNOW-INCIDENT-P1-NO-PROBLEM
+    title: Resolved priority 1 or 2 incident has no problem record
+    kind: missing
+    category: HYG
+    severity: medium
+    entity: incident
+    refresh: 1d
+    why: A major outage closed without a problem record is fixed but not understood; the cause is still there and the next occurrence starts from nothing.
+    fix: Open a problem record for the incident (or link an existing one) and track the root cause and its fix there.
+    refs: [NIST-800-53:IR-4, NIST-800-53:IR-4(4)]
+    query:
+      protocol: http
+      path: /api/now/table/incident
+      params:
+        sysparm_query: "priorityIN1,2^stateIN6,7^problem_idISEMPTY^opened_atRELATIVEGT@dayofweek@ago@90"
+        sysparm_fields: sys_id,number,short_description,priority,state,problem_id,opened_at,resolved_at
+        sysparm_display_value: "false"
+        sysparm_exclude_reference_link: "true"
+      paging: offset
+      pageSize: 1000
+      items: result
+      key: number
+      name: short_description
+    each:
+      all:
+        - { field: priority, op: in, value: [1, 2] }
+        - { field: state, op: in, value: [6, 7] }
+        - { field: problem_id, op: empty }
+        - { field: opened_at, op: age-lt, value: 90 }
+    evidence: "{number} P{priority} resolved {resolved_at} with no problem record: {short_description}"
+
+  - id: SNOW-PROBLEM-OLD-NO-CAUSE
+    title: Problem open for half a year with no cause recorded
+    kind: missing
+    category: HYG
+    severity: low
+    entity: problem
+    refresh: 7d
+    why: A problem with no recorded cause after six months is not being investigated; it keeps the incidents linked to it open-ended and the problem queue meaningless.
+    fix: Record what is known about the cause and the next step, or close the problem as not pursued.
+    refs: [NIST-800-53:IR-4]
+    query:
+      protocol: http
+      path: /api/now/table/problem
+      params:
+        sysparm_query: "active=true"
+        sysparm_fields: sys_id,number,short_description,state,opened_at,assigned_to,cause_notes
+        sysparm_display_value: "false"
+        sysparm_exclude_reference_link: "true"
+      paging: offset
+      pageSize: 1000
+      items: result
+      key: number
+      name: short_description
+    each:
+      all:
+        - { field: opened_at, op: age-gt, value: 180, threshold: servicenow.problem-no-cause-max-days }
+        - { field: cause_notes, op: exists }
+        - { field: cause_notes, op: empty }
+    evidence: "{number} open since {opened_at} with no cause notes: {short_description}"
+
+  - id: SNOW-P1-NO-MAJOR-INCIDENT-RECORD
+    title: Priority 1 incident not handled as a major incident
+    kind: missing
+    category: HYG
+    severity: medium
+    entity: incident
+    refresh: 1d
+    why: A priority 1 incident that never entered the major-incident process had no coordinator, no stakeholder updates and no review afterwards. Judged only where the major-incident fields exist.
+    fix: Propose and accept priority 1 incidents as major incidents, and run the post-incident review for the ones that were missed.
+    refs: [NIST-800-53:IR-4, NIST-800-53:IR-8]
+    query:
+      protocol: http
+      path: /api/now/table/incident
+      params:
+        sysparm_query: "priority=1^opened_atRELATIVEGT@dayofweek@ago@180"
+        sysparm_fields: sys_id,number,short_description,priority,state,major_incident_state,opened_at
+        sysparm_display_value: "false"
+        sysparm_exclude_reference_link: "true"
+      paging: offset
+      pageSize: 1000
+      items: result
+      key: number
+      name: short_description
+    each:
+      all:
+        - { field: priority, op: eq, value: 1 }
+        - { field: opened_at, op: age-lt, value: 180 }
+        - { field: major_incident_state, op: exists }
+        - { field: major_incident_state, op: empty }
+    evidence: "{number} P1 opened {opened_at} never entered the major-incident process: {short_description}"
+
+  - id: SNOW-CHANGE-NO-CI
+    title: Open normal or emergency change names no configuration item
+    kind: missing
+    category: CFG
+    severity: medium
+    entity: change
+    refresh: 6h
+    why: Without an affected CI the change cannot be checked for conflicts, its risk is guessed, and an outage after it is not traced back to it.
+    fix: Set the affected CI (and the impacted services) before the change is assessed; make the field mandatory for normal and emergency changes.
+    refs: [NIST-800-53:CM-3, NIST-800-53:CM-4]
+    query:
+      protocol: http
+      path: /api/now/table/change_request
+      params:
+        sysparm_query: "active=true^type!=standard^cmdb_ciISEMPTY"
+        sysparm_fields: sys_id,number,short_description,type,state,cmdb_ci,start_date
+        sysparm_display_value: "false"
+        sysparm_exclude_reference_link: "true"
+      paging: offset
+      pageSize: 1000
+      items: result
+      key: number
+      name: short_description
+    each:
+      all:
+        - { field: type, op: ne, value: standard }
+        - { field: cmdb_ci, op: empty }
+    evidence: "{number} ({type}, state {state}) starts {start_date} with no configuration item: {short_description}"

@@ -1846,6 +1846,720 @@ rules:
     deadline: due_on
     evidence: "{title} ({item}): {status_text}; was due {due_on}. Latest attestation: {latest_state}"
 
+  # ----------------------------------------------- systems and applications (target = the system)
+  # Duties every business application, appliance or SaaS service has, whatever the product: written
+  # once and attested per system, with the system id as target. Products with an API get scan rules
+  # in their own file as well; these cover the part no API shows.
+  - id: OBL-SYS-RUNBOOK
+    title: System operations record not reviewed within the interval
+    kind: missing
+    lens: both
+    category: HYG
+    severity: medium
+    entity: obligation
+    why: >-
+      When the only knowledge of how a system is built, what it depends on and how it is recovered
+      sits with one person or with the vendor, every outage, audit and staff change starts with an
+      investigation. Records nobody refreshes describe hosts and accounts that no longer exist.
+    fix: >-
+      Write or refresh the system's operations record: hosts and their roles (no addresses),
+      dependencies and systems that share its hosts, service accounts by name, backup and recovery
+      steps, vendor and escalation path, and the design decisions behind it. Then attest obligation
+      sys.runbook with the system as target and the document's location as evidence.
+    refs: [ISO-27001:A.5.37, NIST-800-53:CM-8, NIST-800-53:CP-2, CIS-Controls-v8:1.1]
+    refresh: 1d
+    query:
+      protocol: store
+      key: item
+      name: title
+      text: |
+        WITH t AS (
+          SELECT DISTINCT a.target FROM attestation a WHERE a.obligation = 'sys.runbook'
+          UNION
+          SELECT '-' WHERE NOT EXISTS (SELECT 1 FROM attestation a WHERE a.obligation = 'sys.runbook')
+        ),
+        s AS (
+          SELECT t.target,
+                 (SELECT MAX(a.done_on) FROM attestation a
+                   WHERE a.obligation = 'sys.runbook' AND a.target = t.target AND a.state = 'yes'
+                     AND NULLIF(TRIM(a.done_on), '') IS NOT NULL) AS last_done,
+                 (SELECT la.state FROM latest_attestation la
+                   WHERE la.obligation = 'sys.runbook' AND la.target = t.target) AS latest_state
+          FROM t
+        )
+        SELECT 'sys.runbook' AS obligation,
+               'System operations record (runbook) current' AS title,
+               s.target,
+               CASE WHEN s.target = '-' THEN 'sys.runbook' ELSE 'sys.runbook@' || s.target END AS item,
+               s.last_done,
+               COALESCE(s.latest_state, 'none') AS latest_state,
+               CASE WHEN s.last_done IS NULL THEN 'never attested as done'
+                    ELSE 'last done ' || s.last_done || ', ' || CAST(julianday(:today) - julianday(s.last_done) AS INTEGER) || ' days ago' END AS status_text,
+               CASE WHEN s.last_done IS NULL THEN :today
+                    ELSE date(s.last_done, '+' || COALESCE((SELECT st.value FROM setting st WHERE st.key = 'threshold.obligations.sys.runbook.interval-days'), '365') || ' days') END AS due_on
+        FROM s
+    each:
+      all:
+        - { field: latest_state, op: ne, value: na }
+        - any:
+            - { field: last_done, op: absent }
+            - { field: last_done, op: age-gt, value: 365, threshold: obligations.sys.runbook.interval-days }
+    deadline: due_on
+    evidence: "{title} ({item}): {status_text}; was due {due_on}. Latest attestation: {latest_state}"
+
+  - id: OBL-APP-BACKUP-VERIFIED
+    title: Application-level copy not verified within the interval
+    kind: missing
+    lens: both
+    category: BCK
+    severity: high
+    entity: obligation
+    why: >-
+      Image backups of a host and the vendor's own backups do not cover what a rebuild needs: the
+      data of a SaaS service, a database bundled with the product, its keys and keystores, the
+      licence file, project sources. When the product or its vendor is gone, only a copy kept
+      outside the host, in a format readable without the product, brings the data back. A restore
+      test proves a copy works; this proves a recent one exists at all.
+    fix: >-
+      Schedule the application's export (database dump, configuration, keys, licence, SaaS export)
+      to storage outside the host, newer than the last change, with any passphrase escrowed in the
+      vault. Then attest obligation app.backup-verified with the system as target and the copy's
+      location and date as evidence.
+    refs: [NIST-800-53:CP-9, CIS-Controls-v8:11.2, ISO-27001:A.8.13]
+    refresh: 1d
+    query:
+      protocol: store
+      key: item
+      name: title
+      text: |
+        WITH t AS (
+          SELECT DISTINCT a.target FROM attestation a WHERE a.obligation = 'app.backup-verified'
+          UNION
+          SELECT '-' WHERE NOT EXISTS (SELECT 1 FROM attestation a WHERE a.obligation = 'app.backup-verified')
+        ),
+        s AS (
+          SELECT t.target,
+                 (SELECT MAX(a.done_on) FROM attestation a
+                   WHERE a.obligation = 'app.backup-verified' AND a.target = t.target AND a.state = 'yes'
+                     AND NULLIF(TRIM(a.done_on), '') IS NOT NULL) AS last_done,
+                 (SELECT la.state FROM latest_attestation la
+                   WHERE la.obligation = 'app.backup-verified' AND la.target = t.target) AS latest_state
+          FROM t
+        )
+        SELECT 'app.backup-verified' AS obligation,
+               'Application data, configuration and keys copied off the host' AS title,
+               s.target,
+               CASE WHEN s.target = '-' THEN 'app.backup-verified' ELSE 'app.backup-verified@' || s.target END AS item,
+               s.last_done,
+               COALESCE(s.latest_state, 'none') AS latest_state,
+               CASE WHEN s.last_done IS NULL THEN 'never attested as done'
+                    ELSE 'last done ' || s.last_done || ', ' || CAST(julianday(:today) - julianday(s.last_done) AS INTEGER) || ' days ago' END AS status_text,
+               CASE WHEN s.last_done IS NULL THEN :today
+                    ELSE date(s.last_done, '+' || COALESCE((SELECT st.value FROM setting st WHERE st.key = 'threshold.obligations.app.backup-verified.interval-days'), '30') || ' days') END AS due_on
+        FROM s
+    each:
+      all:
+        - { field: latest_state, op: ne, value: na }
+        - any:
+            - { field: last_done, op: absent }
+            - { field: last_done, op: age-gt, value: 30, threshold: obligations.app.backup-verified.interval-days }
+    deadline: due_on
+    evidence: "{title} ({item}): {status_text}; was due {due_on}. Latest attestation: {latest_state}"
+
+  - id: OBL-APP-SSO-ENFORCED
+    title: Application sign-in through the identity provider not confirmed within the interval
+    kind: missing
+    lens: security
+    category: AUT
+    severity: high
+    entity: obligation
+    why: >-
+      Offboarding, MFA and conditional access reach an application only when people sign in to it
+      through the identity provider. A local or vendor-side password outlives every leaver process
+      and every MFA rollout. The directory side of single sign-on is scanned; whether the
+      application still accepts local passwords, and from whom, is visible only in the application.
+    fix: >-
+      Turn on the federation the product supports (SAML, OIDC or integrated Windows authentication)
+      with MFA at the identity provider; where it cannot federate, enforce the product's own MFA and
+      lockout. Keep local accounts only for documented emergency and integration use, and make sure
+      no self-service page signs people in by a public identifier alone. Attest obligation
+      app.sso-enforced with the system as target and the remaining local accounts as evidence.
+    refs: [NIST-800-53:IA-2(1), NIST-800-53:IA-8, CIS-Controls-v8:6.3, CIS-Controls-v8:6.7, ISO-27001:A.8.5]
+    refresh: 1d
+    query:
+      protocol: store
+      key: item
+      name: title
+      text: |
+        WITH t AS (
+          SELECT DISTINCT a.target FROM attestation a WHERE a.obligation = 'app.sso-enforced'
+          UNION
+          SELECT '-' WHERE NOT EXISTS (SELECT 1 FROM attestation a WHERE a.obligation = 'app.sso-enforced')
+        ),
+        s AS (
+          SELECT t.target,
+                 (SELECT MAX(a.done_on) FROM attestation a
+                   WHERE a.obligation = 'app.sso-enforced' AND a.target = t.target AND a.state = 'yes'
+                     AND NULLIF(TRIM(a.done_on), '') IS NOT NULL) AS last_done,
+                 (SELECT la.state FROM latest_attestation la
+                   WHERE la.obligation = 'app.sso-enforced' AND la.target = t.target) AS latest_state
+          FROM t
+        )
+        SELECT 'app.sso-enforced' AS obligation,
+               'Interactive sign-in only through the identity provider, with MFA' AS title,
+               s.target,
+               CASE WHEN s.target = '-' THEN 'app.sso-enforced' ELSE 'app.sso-enforced@' || s.target END AS item,
+               s.last_done,
+               COALESCE(s.latest_state, 'none') AS latest_state,
+               CASE WHEN s.last_done IS NULL THEN 'never attested as done'
+                    ELSE 'last done ' || s.last_done || ', ' || CAST(julianday(:today) - julianday(s.last_done) AS INTEGER) || ' days ago' END AS status_text,
+               CASE WHEN s.last_done IS NULL THEN :today
+                    ELSE date(s.last_done, '+' || COALESCE((SELECT st.value FROM setting st WHERE st.key = 'threshold.obligations.app.sso-enforced.interval-days'), '365') || ' days') END AS due_on
+        FROM s
+    each:
+      all:
+        - { field: latest_state, op: ne, value: na }
+        - any:
+            - { field: last_done, op: absent }
+            - { field: last_done, op: age-gt, value: 365, threshold: obligations.app.sso-enforced.interval-days }
+    deadline: due_on
+    evidence: "{title} ({item}): {status_text}; was due {due_on}. Latest attestation: {latest_state}"
+
+  - id: OBL-APP-AUDIT-TRAIL
+    title: Application audit trail not confirmed within the interval
+    kind: missing
+    lens: security
+    category: MON
+    severity: high
+    entity: obligation
+    why: >-
+      For SaaS services and appliances the only record of who signed in, read personal data,
+      changed or exported records is the product's own, and self-hosted products keep it for days
+      by default. When the record never leaves the system, an incident or a data-subject complaint
+      cannot be answered, and rules on access to personal data ask for years, not days.
+    fix: >-
+      Enable the product's audit features (sign-ins, reads of personal data where required, changes,
+      exports), set the retention the policy requires, and send the record off the host - an export
+      to the central log store or a scheduled pull from the vendor. Attest obligation
+      app.audit-trail with the system as target and a sample export as evidence.
+    refs: [NIST-800-53:AU-2, NIST-800-53:AU-11, NIST-800-53:AU-6(3), CIS-Controls-v8:8.2, CIS-Controls-v8:8.9, ISO-27001:A.8.15]
+    refresh: 1d
+    query:
+      protocol: store
+      key: item
+      name: title
+      text: |
+        WITH t AS (
+          SELECT DISTINCT a.target FROM attestation a WHERE a.obligation = 'app.audit-trail'
+          UNION
+          SELECT '-' WHERE NOT EXISTS (SELECT 1 FROM attestation a WHERE a.obligation = 'app.audit-trail')
+        ),
+        s AS (
+          SELECT t.target,
+                 (SELECT MAX(a.done_on) FROM attestation a
+                   WHERE a.obligation = 'app.audit-trail' AND a.target = t.target AND a.state = 'yes'
+                     AND NULLIF(TRIM(a.done_on), '') IS NOT NULL) AS last_done,
+                 (SELECT la.state FROM latest_attestation la
+                   WHERE la.obligation = 'app.audit-trail' AND la.target = t.target) AS latest_state
+          FROM t
+        )
+        SELECT 'app.audit-trail' AS obligation,
+               'Application audit trail enabled, retained and exported' AS title,
+               s.target,
+               CASE WHEN s.target = '-' THEN 'app.audit-trail' ELSE 'app.audit-trail@' || s.target END AS item,
+               s.last_done,
+               COALESCE(s.latest_state, 'none') AS latest_state,
+               CASE WHEN s.last_done IS NULL THEN 'never attested as done'
+                    ELSE 'last done ' || s.last_done || ', ' || CAST(julianday(:today) - julianday(s.last_done) AS INTEGER) || ' days ago' END AS status_text,
+               CASE WHEN s.last_done IS NULL THEN :today
+                    ELSE date(s.last_done, '+' || COALESCE((SELECT st.value FROM setting st WHERE st.key = 'threshold.obligations.app.audit-trail.interval-days'), '365') || ' days') END AS due_on
+        FROM s
+    each:
+      all:
+        - { field: latest_state, op: ne, value: na }
+        - any:
+            - { field: last_done, op: absent }
+            - { field: last_done, op: age-gt, value: 365, threshold: obligations.app.audit-trail.interval-days }
+    deadline: due_on
+    evidence: "{title} ({item}): {status_text}; was due {due_on}. Latest attestation: {latest_state}"
+
+  - id: OBL-APP-INTERFACE-INVENTORY
+    title: Application interfaces not inventoried within the interval
+    kind: missing
+    lens: security
+    category: CFG
+    severity: high
+    entity: obligation
+    why: >-
+      Integrations are where personal data leaves the application's access control: file drops,
+      database links, mail attachments and API feeds set up once and then forgotten. Nobody knows
+      which one carries what until it breaks or leaks, and a clear-text channel is invisible from
+      inside the application.
+    fix: >-
+      List every data exchange of the system - source and target, channel and protocol,
+      authentication, owner, what happens when it fails and how batch files are reconciled - from
+      the product's connector list and the integrator's documentation. Move clear-text flows (plain
+      FTP or HTTP, unencrypted database links, personal data in mail) to encrypted ones. Attest
+      obligation app.interface-inventory with the system as target and the list's location as
+      evidence.
+    refs: [NIST-800-53:CA-3, NIST-800-53:SC-8, NIST-800-53:AC-4, CIS-Controls-v8:3.10, ISO-27001:A.5.14, ISO-27001:A.8.24]
+    refresh: 1d
+    query:
+      protocol: store
+      key: item
+      name: title
+      text: |
+        WITH t AS (
+          SELECT DISTINCT a.target FROM attestation a WHERE a.obligation = 'app.interface-inventory'
+          UNION
+          SELECT '-' WHERE NOT EXISTS (SELECT 1 FROM attestation a WHERE a.obligation = 'app.interface-inventory')
+        ),
+        s AS (
+          SELECT t.target,
+                 (SELECT MAX(a.done_on) FROM attestation a
+                   WHERE a.obligation = 'app.interface-inventory' AND a.target = t.target AND a.state = 'yes'
+                     AND NULLIF(TRIM(a.done_on), '') IS NOT NULL) AS last_done,
+                 (SELECT la.state FROM latest_attestation la
+                   WHERE la.obligation = 'app.interface-inventory' AND la.target = t.target) AS latest_state
+          FROM t
+        )
+        SELECT 'app.interface-inventory' AS obligation,
+               'Every data exchange of the system listed, none in clear text' AS title,
+               s.target,
+               CASE WHEN s.target = '-' THEN 'app.interface-inventory' ELSE 'app.interface-inventory@' || s.target END AS item,
+               s.last_done,
+               COALESCE(s.latest_state, 'none') AS latest_state,
+               CASE WHEN s.last_done IS NULL THEN 'never attested as done'
+                    ELSE 'last done ' || s.last_done || ', ' || CAST(julianday(:today) - julianday(s.last_done) AS INTEGER) || ' days ago' END AS status_text,
+               CASE WHEN s.last_done IS NULL THEN :today
+                    ELSE date(s.last_done, '+' || COALESCE((SELECT st.value FROM setting st WHERE st.key = 'threshold.obligations.app.interface-inventory.interval-days'), '365') || ' days') END AS due_on
+        FROM s
+    each:
+      all:
+        - { field: latest_state, op: ne, value: na }
+        - any:
+            - { field: last_done, op: absent }
+            - { field: last_done, op: age-gt, value: 365, threshold: obligations.app.interface-inventory.interval-days }
+    deadline: due_on
+    evidence: "{title} ({item}): {status_text}; was due {due_on}. Latest attestation: {latest_state}"
+
+  - id: OBL-APP-SOD-REVIEW
+    title: Segregation of duties not reviewed within the interval
+    kind: missing
+    lens: security
+    category: IAM
+    severity: high
+    entity: obligation
+    why: >-
+      In a system that moves money or changes pay, one person who can both enter and approve - or
+      change a payee's bank details without a second check - can commit fraud the system will
+      record as normal work. Small teams lose this separation quietly when people cover for each
+      other, and administrators of the platform often can edit business data too.
+    fix: >-
+      Export the role matrix, confirm that no one can both enter and approve (or release) the same
+      transaction, that bank-detail changes are verified out of band, and that platform
+      administrators cannot edit business data; separate the roles or record a compensating review.
+      Attest obligation app.sod-review with the system as target and the matrix as evidence.
+    refs: [NIST-800-53:AC-5, NIST-800-53:AC-6, ISO-27001:A.5.3]
+    refresh: 1d
+    query:
+      protocol: store
+      key: item
+      name: title
+      text: |
+        WITH t AS (
+          SELECT DISTINCT a.target FROM attestation a WHERE a.obligation = 'app.sod-review'
+          UNION
+          SELECT '-' WHERE NOT EXISTS (SELECT 1 FROM attestation a WHERE a.obligation = 'app.sod-review')
+        ),
+        s AS (
+          SELECT t.target,
+                 (SELECT MAX(a.done_on) FROM attestation a
+                   WHERE a.obligation = 'app.sod-review' AND a.target = t.target AND a.state = 'yes'
+                     AND NULLIF(TRIM(a.done_on), '') IS NOT NULL) AS last_done,
+                 (SELECT la.state FROM latest_attestation la
+                   WHERE la.obligation = 'app.sod-review' AND la.target = t.target) AS latest_state
+          FROM t
+        )
+        SELECT 'app.sod-review' AS obligation,
+               'Maker-checker separation in financial and payroll systems reviewed' AS title,
+               s.target,
+               CASE WHEN s.target = '-' THEN 'app.sod-review' ELSE 'app.sod-review@' || s.target END AS item,
+               s.last_done,
+               COALESCE(s.latest_state, 'none') AS latest_state,
+               CASE WHEN s.last_done IS NULL THEN 'never attested as done'
+                    ELSE 'last done ' || s.last_done || ', ' || CAST(julianday(:today) - julianday(s.last_done) AS INTEGER) || ' days ago' END AS status_text,
+               CASE WHEN s.last_done IS NULL THEN :today
+                    ELSE date(s.last_done, '+' || COALESCE((SELECT st.value FROM setting st WHERE st.key = 'threshold.obligations.app.sod-review.interval-days'), '365') || ' days') END AS due_on
+        FROM s
+    each:
+      all:
+        - { field: latest_state, op: ne, value: na }
+        - any:
+            - { field: last_done, op: absent }
+            - { field: last_done, op: age-gt, value: 365, threshold: obligations.app.sod-review.interval-days }
+    deadline: due_on
+    evidence: "{title} ({item}): {status_text}; was due {due_on}. Latest attestation: {latest_state}"
+
+  - id: OBL-SYS-ALERT-ROUTING
+    title: Alert and notice routing not tested within the interval
+    kind: missing
+    lens: both
+    category: MON
+    severity: medium
+    entity: obligation
+    why: >-
+      A product's alerts, scheduled reports, vendor notices (maintenance, security, renewal) and
+      device mails go to whoever installed it. When that person leaves or changes role they stop
+      reaching anyone, and nothing shows it: the first sign is the outage or the lapsed renewal the
+      notice was about.
+    fix: >-
+      Point every recipient field of the system at a monitored shared mailbox or group, subscribe
+      that group to the vendor's notices, send a test alert and check that it arrived. Attest
+      obligation sys.alert-routing with the system as target and the test date as evidence.
+    refs: [NIST-800-53:IR-6, NIST-800-53:SI-4(5), ISO-27001:A.5.24, ISO-27001:A.8.16]
+    refresh: 1d
+    query:
+      protocol: store
+      key: item
+      name: title
+      text: |
+        WITH t AS (
+          SELECT DISTINCT a.target FROM attestation a WHERE a.obligation = 'sys.alert-routing'
+          UNION
+          SELECT '-' WHERE NOT EXISTS (SELECT 1 FROM attestation a WHERE a.obligation = 'sys.alert-routing')
+        ),
+        s AS (
+          SELECT t.target,
+                 (SELECT MAX(a.done_on) FROM attestation a
+                   WHERE a.obligation = 'sys.alert-routing' AND a.target = t.target AND a.state = 'yes'
+                     AND NULLIF(TRIM(a.done_on), '') IS NOT NULL) AS last_done,
+                 (SELECT la.state FROM latest_attestation la
+                   WHERE la.obligation = 'sys.alert-routing' AND la.target = t.target) AS latest_state
+          FROM t
+        )
+        SELECT 'sys.alert-routing' AS obligation,
+               'Alerts and vendor notices routed to a monitored group and tested' AS title,
+               s.target,
+               CASE WHEN s.target = '-' THEN 'sys.alert-routing' ELSE 'sys.alert-routing@' || s.target END AS item,
+               s.last_done,
+               COALESCE(s.latest_state, 'none') AS latest_state,
+               CASE WHEN s.last_done IS NULL THEN 'never attested as done'
+                    ELSE 'last done ' || s.last_done || ', ' || CAST(julianday(:today) - julianday(s.last_done) AS INTEGER) || ' days ago' END AS status_text,
+               CASE WHEN s.last_done IS NULL THEN :today
+                    ELSE date(s.last_done, '+' || COALESCE((SELECT st.value FROM setting st WHERE st.key = 'threshold.obligations.sys.alert-routing.interval-days'), '365') || ' days') END AS due_on
+        FROM s
+    each:
+      all:
+        - { field: latest_state, op: ne, value: na }
+        - any:
+            - { field: last_done, op: absent }
+            - { field: last_done, op: age-gt, value: 365, threshold: obligations.sys.alert-routing.interval-days }
+    deadline: due_on
+    evidence: "{title} ({item}): {status_text}; was due {due_on}. Latest attestation: {latest_state}"
+
+  - id: OBL-SYS-HARDENING-REVIEW
+    title: System hardening not reviewed within the interval
+    kind: missing
+    lens: security
+    category: CFG
+    severity: high
+    entity: obligation
+    why: >-
+      Appliances, SaaS admin panels and the runtimes bundled with products keep their installer
+      defaults for years: default credentials, management over plain HTTP or Telnet, sample and
+      manager applications, unlimited sessions, open sharing and upload settings, SNMP v1/v2c. No
+      scan reads these settings; they live only in admin pages.
+    fix: >-
+      Walk the vendor's hardening guide (or the matching benchmark) for the system, export the
+      settings, fix each deviation or record it as an exception with a reason - default credentials
+      changed, management on HTTPS or SSH only, samples removed, session limits set, sharing and
+      uploads restricted, SNMP v3, installed add-ons approved. Attest obligation
+      sys.hardening-review with the system as target and the export as evidence.
+    refs: [NIST-800-53:CM-6, NIST-800-53:CM-7, CIS-Controls-v8:4.1, CIS-Controls-v8:4.7, ISO-27001:A.8.9]
+    refresh: 1d
+    query:
+      protocol: store
+      key: item
+      name: title
+      text: |
+        WITH t AS (
+          SELECT DISTINCT a.target FROM attestation a WHERE a.obligation = 'sys.hardening-review'
+          UNION
+          SELECT '-' WHERE NOT EXISTS (SELECT 1 FROM attestation a WHERE a.obligation = 'sys.hardening-review')
+        ),
+        s AS (
+          SELECT t.target,
+                 (SELECT MAX(a.done_on) FROM attestation a
+                   WHERE a.obligation = 'sys.hardening-review' AND a.target = t.target AND a.state = 'yes'
+                     AND NULLIF(TRIM(a.done_on), '') IS NOT NULL) AS last_done,
+                 (SELECT la.state FROM latest_attestation la
+                   WHERE la.obligation = 'sys.hardening-review' AND la.target = t.target) AS latest_state
+          FROM t
+        )
+        SELECT 'sys.hardening-review' AS obligation,
+               'Vendor hardening guide applied, deviations recorded' AS title,
+               s.target,
+               CASE WHEN s.target = '-' THEN 'sys.hardening-review' ELSE 'sys.hardening-review@' || s.target END AS item,
+               s.last_done,
+               COALESCE(s.latest_state, 'none') AS latest_state,
+               CASE WHEN s.last_done IS NULL THEN 'never attested as done'
+                    ELSE 'last done ' || s.last_done || ', ' || CAST(julianday(:today) - julianday(s.last_done) AS INTEGER) || ' days ago' END AS status_text,
+               CASE WHEN s.last_done IS NULL THEN :today
+                    ELSE date(s.last_done, '+' || COALESCE((SELECT st.value FROM setting st WHERE st.key = 'threshold.obligations.sys.hardening-review.interval-days'), '365') || ' days') END AS due_on
+        FROM s
+    each:
+      all:
+        - { field: latest_state, op: ne, value: na }
+        - any:
+            - { field: last_done, op: absent }
+            - { field: last_done, op: age-gt, value: 365, threshold: obligations.sys.hardening-review.interval-days }
+    deadline: due_on
+    evidence: "{title} ({item}): {status_text}; was due {due_on}. Latest attestation: {latest_state}"
+
+  - id: OBL-SYS-NETWORK-EXPOSURE-REVIEW
+    title: Reachability of administrative interfaces not confirmed within the interval
+    kind: missing
+    lens: security
+    category: CFG
+    severity: high
+    entity: obligation
+    why: >-
+      A console that resets passwords, stops integrations or exports data should be reachable from
+      the administrators' segment only. Keeper scans from one host and cannot tell what a user
+      network or a vendor connection can reach, so only the network team's confirmation shows it.
+      Internet exposure is the external scan's job; this covers the internal paths.
+    fix: >-
+      List the system's administrative interfaces (web consoles, SSH, database and management
+      ports), have the network team confirm that only the management segment reaches them, move or
+      restrict the rest with firewall or security-group rules, then attest obligation
+      sys.network-exposure-review with the system as target and the rule identifiers as evidence.
+    refs: [NIST-800-53:SC-7, NIST-800-53:AC-17, CIS-Controls-v8:12.8, ISO-27001:A.8.20]
+    refresh: 1d
+    query:
+      protocol: store
+      key: item
+      name: title
+      text: |
+        WITH t AS (
+          SELECT DISTINCT a.target FROM attestation a WHERE a.obligation = 'sys.network-exposure-review'
+          UNION
+          SELECT '-' WHERE NOT EXISTS (SELECT 1 FROM attestation a WHERE a.obligation = 'sys.network-exposure-review')
+        ),
+        s AS (
+          SELECT t.target,
+                 (SELECT MAX(a.done_on) FROM attestation a
+                   WHERE a.obligation = 'sys.network-exposure-review' AND a.target = t.target AND a.state = 'yes'
+                     AND NULLIF(TRIM(a.done_on), '') IS NOT NULL) AS last_done,
+                 (SELECT la.state FROM latest_attestation la
+                   WHERE la.obligation = 'sys.network-exposure-review' AND la.target = t.target) AS latest_state
+          FROM t
+        )
+        SELECT 'sys.network-exposure-review' AS obligation,
+               'Administrative interfaces reachable from the management segment only' AS title,
+               s.target,
+               CASE WHEN s.target = '-' THEN 'sys.network-exposure-review' ELSE 'sys.network-exposure-review@' || s.target END AS item,
+               s.last_done,
+               COALESCE(s.latest_state, 'none') AS latest_state,
+               CASE WHEN s.last_done IS NULL THEN 'never attested as done'
+                    ELSE 'last done ' || s.last_done || ', ' || CAST(julianday(:today) - julianday(s.last_done) AS INTEGER) || ' days ago' END AS status_text,
+               CASE WHEN s.last_done IS NULL THEN :today
+                    ELSE date(s.last_done, '+' || COALESCE((SELECT st.value FROM setting st WHERE st.key = 'threshold.obligations.sys.network-exposure-review.interval-days'), '365') || ' days') END AS due_on
+        FROM s
+    each:
+      all:
+        - { field: latest_state, op: ne, value: na }
+        - any:
+            - { field: last_done, op: absent }
+            - { field: last_done, op: age-gt, value: 365, threshold: obligations.sys.network-exposure-review.interval-days }
+    deadline: due_on
+    evidence: "{title} ({item}): {status_text}; was due {due_on}. Latest attestation: {latest_state}"
+
+  - id: OBL-PRIVACY-DATABASE-RECORD
+    title: Personal-data record of a system not reviewed within the interval
+    kind: missing
+    lens: security
+    category: HYG
+    severity: high
+    entity: obligation
+    why: >-
+      Whether a system may hold personal data, for what purpose, for how long and who may see it is
+      answered by documents, not settings - and those documents expire when the law, the purpose or
+      the system changes. Special categories (biometrics, health records, minors, footage and call
+      recordings) need the data-protection officer's explicit approval, and a retention period that
+      nothing enforces means data is kept for ever.
+    fix: >-
+      With the data-protection officer, prepare or refresh the system's record: definitions
+      document and security level, purpose, retention per data type with its legal basis and the
+      last disposal run, the access model, and the approval of any special category or notice to
+      data subjects. Align the product's retention settings with it, then attest obligation
+      privacy.database-record with the system as target.
+    refs: [NIST-800-53:PT-3, NIST-800-53:PM-5(1), NIST-800-53:SI-12, ISO-27001:A.5.34, ISO-27001:A.5.33, ISO-27001:A.8.10]
+    refresh: 1d
+    query:
+      protocol: store
+      key: item
+      name: title
+      text: |
+        WITH t AS (
+          SELECT DISTINCT a.target FROM attestation a WHERE a.obligation = 'privacy.database-record'
+          UNION
+          SELECT '-' WHERE NOT EXISTS (SELECT 1 FROM attestation a WHERE a.obligation = 'privacy.database-record')
+        ),
+        s AS (
+          SELECT t.target,
+                 (SELECT MAX(a.done_on) FROM attestation a
+                   WHERE a.obligation = 'privacy.database-record' AND a.target = t.target AND a.state = 'yes'
+                     AND NULLIF(TRIM(a.done_on), '') IS NOT NULL) AS last_done,
+                 (SELECT la.state FROM latest_attestation la
+                   WHERE la.obligation = 'privacy.database-record' AND la.target = t.target) AS latest_state
+          FROM t
+        )
+        SELECT 'privacy.database-record' AS obligation,
+               'Personal-data record (purpose, retention, access) reviewed' AS title,
+               s.target,
+               CASE WHEN s.target = '-' THEN 'privacy.database-record' ELSE 'privacy.database-record@' || s.target END AS item,
+               s.last_done,
+               COALESCE(s.latest_state, 'none') AS latest_state,
+               CASE WHEN s.last_done IS NULL THEN 'never attested as done'
+                    ELSE 'last done ' || s.last_done || ', ' || CAST(julianday(:today) - julianday(s.last_done) AS INTEGER) || ' days ago' END AS status_text,
+               CASE WHEN s.last_done IS NULL THEN :today
+                    ELSE date(s.last_done, '+' || COALESCE((SELECT st.value FROM setting st WHERE st.key = 'threshold.obligations.privacy.database-record.interval-days'), '365') || ' days') END AS due_on
+        FROM s
+    each:
+      all:
+        - { field: latest_state, op: ne, value: na }
+        - any:
+            - { field: last_done, op: absent }
+            - { field: last_done, op: age-gt, value: 365, threshold: obligations.privacy.database-record.interval-days }
+    deadline: due_on
+    evidence: "{title} ({item}): {status_text}; was due {due_on}. Latest attestation: {latest_state}"
+
+  - id: OBL-TEL-EMERGENCY-CALL-TEST
+    title: Emergency calling not tested within the interval
+    kind: missing
+    lens: both
+    category: AVL
+    severity: critical
+    entity: obligation
+    why: >-
+      A route-list change, a carrier migration or a failed trunk can stop emergency numbers working
+      while ordinary calls still go through, and nobody finds out until someone needs help.
+    fix: >-
+      Together with the carrier, test-call the emergency numbers from each main site, check that
+      the route has a fallback path, fix the route list if needed, then attest obligation
+      tel.emergency-call-test with the telephony system as target.
+    refs: [NIST-800-53:CP-8, ISO-27001:A.5.29]
+    refresh: 1d
+    query:
+      protocol: store
+      key: item
+      name: title
+      text: |
+        WITH t AS (
+          SELECT DISTINCT a.target FROM attestation a WHERE a.obligation = 'tel.emergency-call-test'
+          UNION
+          SELECT '-' WHERE NOT EXISTS (SELECT 1 FROM attestation a WHERE a.obligation = 'tel.emergency-call-test')
+        ),
+        s AS (
+          SELECT t.target,
+                 (SELECT MAX(a.done_on) FROM attestation a
+                   WHERE a.obligation = 'tel.emergency-call-test' AND a.target = t.target AND a.state = 'yes'
+                     AND NULLIF(TRIM(a.done_on), '') IS NOT NULL) AS last_done,
+                 (SELECT la.state FROM latest_attestation la
+                   WHERE la.obligation = 'tel.emergency-call-test' AND la.target = t.target) AS latest_state
+          FROM t
+        )
+        SELECT 'tel.emergency-call-test' AS obligation,
+               'Emergency numbers test-called, route with fallback' AS title,
+               s.target,
+               CASE WHEN s.target = '-' THEN 'tel.emergency-call-test' ELSE 'tel.emergency-call-test@' || s.target END AS item,
+               s.last_done,
+               COALESCE(s.latest_state, 'none') AS latest_state,
+               CASE WHEN s.last_done IS NULL THEN 'never attested as done'
+                    ELSE 'last done ' || s.last_done || ', ' || CAST(julianday(:today) - julianday(s.last_done) AS INTEGER) || ' days ago' END AS status_text,
+               CASE WHEN s.last_done IS NULL THEN :today
+                    ELSE date(s.last_done, '+' || COALESCE((SELECT st.value FROM setting st WHERE st.key = 'threshold.obligations.tel.emergency-call-test.interval-days'), '365') || ' days') END AS due_on
+        FROM s
+    each:
+      all:
+        - { field: latest_state, op: ne, value: na }
+        - any:
+            - { field: last_done, op: absent }
+            - { field: last_done, op: age-gt, value: 365, threshold: obligations.tel.emergency-call-test.interval-days }
+    deadline: due_on
+    evidence: "{title} ({item}): {status_text}; was due {due_on}. Latest attestation: {latest_state}"
+
+  # One-off, not recurring: a decommission done is done, so a 'yes' never expires here (the template's
+  # interval would reopen every retired system each quarter). Targets are the systems attested for it
+  # plus every system the register marks inactive; there is no '-' row, because nothing retired means
+  # nothing to do. The interval (default 90 days) is how long a decommission may stay open: the
+  # deadline counts from the first attestation for the target, or from the last save of the inactive
+  # system row (which stands in for the day it was retired).
+  - id: OBL-SYS-DECOMMISSION
+    title: Retired system has an open decommission
+    kind: missing
+    lens: both
+    category: HYG
+    severity: medium
+    entity: obligation
+    why: >-
+      Decommissions stall at "switched off": the disk with the database, the DNS name and firewall
+      rules, the service and API accounts, the vendor's copy of the data, the backup and monitoring
+      jobs and the contract all outlive the service, and each is a cost or a way in that nobody
+      watches any more.
+    fix: >-
+      Work through the decommission checklist: data exported or disposed of with a record,
+      application accounts and API keys revoked, directory and service accounts disabled, DNS names
+      and firewall rules removed, monitoring and backup jobs deleted, licences and contracts ended,
+      disks wiped, documentation closed. Attest obligation sys.decommission with the system as
+      target - 'no' with the open items while it runs, 'yes' only when the last item is closed - and
+      mark the system inactive so the licence and contract rules catch what still costs money.
+    refs: [NIST-800-53:CM-8, NIST-800-53:MP-6, NIST-800-53:SA-9, CIS-Controls-v8:1.1, ISO-27001:A.8.10, ISO-27001:A.5.20]
+    refresh: 1d
+    query:
+      protocol: store
+      key: item
+      name: title
+      text: |
+        WITH t AS (
+          SELECT DISTINCT a.target FROM attestation a WHERE a.obligation = 'sys.decommission'
+          UNION
+          SELECT sy.system_id FROM system sy
+           WHERE sy.active = 0 AND sy.system_id NOT IN ('KEEPER', 'ORG', 'UNMAPPED')
+        ),
+        s AS (
+          SELECT t.target,
+                 (SELECT MAX(a.done_on) FROM attestation a
+                   WHERE a.obligation = 'sys.decommission' AND a.target = t.target AND a.state = 'yes'
+                     AND NULLIF(TRIM(a.done_on), '') IS NOT NULL) AS last_done,
+                 (SELECT la.state FROM latest_attestation la
+                   WHERE la.obligation = 'sys.decommission' AND la.target = t.target) AS latest_state,
+                 (SELECT substr(MIN(a.recorded_at), 1, 10) FROM attestation a
+                   WHERE a.obligation = 'sys.decommission' AND a.target = t.target) AS first_recorded,
+                 (SELECT substr(sy.updated_at, 1, 10) FROM system sy
+                   WHERE sy.system_id = t.target AND sy.active = 0) AS inactive_since
+          FROM t
+        )
+        SELECT 'sys.decommission' AS obligation,
+               'Decommission of a retired system closed' AS title,
+               s.target,
+               'sys.decommission@' || s.target AS item,
+               s.last_done,
+               COALESCE(s.latest_state, 'none') AS latest_state,
+               COALESCE(s.first_recorded, s.inactive_since, :today) AS open_since,
+               CASE WHEN s.last_done IS NOT NULL THEN 'closed on ' || s.last_done
+                    ELSE 'open since ' || COALESCE(s.first_recorded, s.inactive_since, :today) || ', never attested as closed' END AS status_text,
+               date(COALESCE(s.first_recorded, s.inactive_since, :today),
+                    '+' || COALESCE((SELECT st.value FROM setting st WHERE st.key = 'threshold.obligations.sys.decommission.interval-days'), '90') || ' days') AS due_on
+        FROM s
+    each:
+      all:
+        - { field: latest_state, op: ne, value: na }
+        - { field: last_done, op: absent }
+    deadline: due_on
+    evidence: "{title} ({item}): {status_text}; due {due_on}. Latest attestation: {latest_state}"
+
   # ----------------------------------------------- every attestation, any obligation
   - id: OBL-ATTESTATION-EXPIRED
     title: Attestation has expired
@@ -1867,6 +2581,15 @@ rules:
         iam.break-glass-test: high
         pki.ca-key-backup: high
         pki.template-review: high
+        app.backup-verified: high
+        app.sso-enforced: high
+        app.audit-trail: high
+        app.interface-inventory: high
+        app.sod-review: high
+        sys.hardening-review: high
+        sys.network-exposure-review: high
+        privacy.database-record: high
+        tel.emergency-call-test: critical
         iam.stale-account-cleanup: low
         licence.review: low
         sec.awareness-training: low
@@ -1960,6 +2683,15 @@ rules:
         iam.break-glass-test: high
         pki.ca-key-backup: high
         pki.template-review: high
+        app.backup-verified: high
+        app.sso-enforced: high
+        app.audit-trail: high
+        app.interface-inventory: high
+        app.sod-review: high
+        sys.hardening-review: high
+        sys.network-exposure-review: high
+        privacy.database-record: high
+        tel.emergency-call-test: critical
         iam.stale-account-cleanup: low
         licence.review: low
         sec.awareness-training: low

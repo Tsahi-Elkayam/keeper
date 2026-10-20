@@ -81,3 +81,61 @@ From `docs/proposals/certificates-registers-imports.md`; the rest of that docume
 - REG-VEN-REFERENCE-DANGLING: cannot occur. The store opens with foreign keys on and contract.vendor_id and licence.vendor_id reference vendor, so a dangling vendor id is refused on write. Source: schema.
 - TLS-SAN-INTERNAL-NAME: waits for the public/private issuer classification above. Source: tls-runner.
 - TLS-PROTOCOL-NO-TLS13: waits for per-version probing (see TLS 1.3 support above). Source: tls-runner.
+
+## Applications and business systems catalogue
+
+From `docs/proposals/catalog-apps-business.md`. Shipped: the generic obligations (OBL-SYS-*, OBL-APP-*,
+OBL-PRIVACY-DATABASE-RECORD, OBL-TEL-EMERGENCY-CALL-TEST), REG-KEY-SUPPORT-END-DUE and
+REG-KEY-SYSTEM-INACTIVE, the TLS-target guidance in certificates.yaml, and the ServiceNow platform,
+exposure and access rules. Source label `servicenow` = the ServiceNow section of that proposal; its
+lines belong with the ServiceNow items in `infrastructure.md`, which this change did not edit.
+
+### Registers and obligations
+
+- Nothing writes `system_dependency`: REG-CON-ENDING-PLANNED counts dependants and OBL-SYS-RUNBOOK asks for dependencies and co-hosted systems, but no handler accepts dependency rows, so the count is 0 unless the table is edited by hand - needs a review.system-dependency handler. Source: schema.
+- Per-system obligations know only attested targets: a system that was never attested for OBL-APP-BACKUP-VERIFIED (or any per-system duty) is covered by the single "-" row only. Joining every active system (as OBL-SYS-DECOMMISSION does for inactive ones) would demand every duty of every system - needs per-system applicability (which duties apply to which kind of system) on top of the obligation catalogue above. Source: schema.
+- The severity maps of OBL-ATTESTATION-EXPIRED and OBL-ATTESTED-NO are hand-kept copies of each obligation rule's severity, and drift when a rule changes - needs the severity read from the `rule` table. (OBL-ATTESTATION-UNKNOWN-ID has no id list to maintain; it matches the rule catalogue by naming convention.) Source: loader.
+- One-off obligations: OBL-SYS-DECOMMISSION departs from the template (a 'yes' never expires; targets include inactive systems; no "-" row). The day a system was retired is approximated by the last save of its system row - needs a retired_on date on `system`. Source: schema.
+- Payments: since migration 005 the `payment` kind exists and REG-KEY-PAYMENT-DUE / -OVERDUE read it next to the old title pattern on kind `other`; a `suspension` kind is still missing (see the payment line above). Source: schema.
+- Product versions against support dates: a support-end key date is typed in by hand even where a scan reads the running version (a release family, a firmware build) - needs a version-to-lifecycle table and version comparison. Source: evaluator.
+
+### ServiceNow - not expressible yet
+
+- Per-object filters: SNOW-DISCOVERY-SCHEDULE-STALE (newest discovery_status per active schedule) and SNOW-SCOPED-APP-NO-REPO (sys_repo_config per scoped app) put the parent's sys_id into `sysparm_query`, but `for_each` fills placeholders in the path only, and the must-exist would have to be judged per parent - needs for_each placeholders in params plus per-parent counts. Partial: SNOW-DISCOVERY-NONE-RECENT (no run at all in 7 days). Source: servicenow.
+- Tenant values inside a query: SNOW-CONTENT-LEGACY-REFERENCE (text LIKE a tenant pattern), SNOW-PII-FIELD-NO-ACL (one ACL lookup per tenant-listed field), SNOW-VENDOR-USER-PRIVILEGED (a tenant marker on company or source) - needs thresholds in params (the gap in `infrastructure.md`). The last one could filter client-side, but a dot-walked field comes back under a literal key such as "user.company", which a field path cannot address - needs a quoted path segment. Source: servicenow; evaluator.
+- Production or test: SNOW-TEST-INSTANCE-SENDS-MAIL and SNOW-DELEGATED-DEVELOPER-PROD are right on one kind of instance and wrong on the other - needs an environment label on the integration (the same gap as per-target labels for TLS above). Source: servicenow.
+- List fields: SNOW-NOTIFICATION-INACTIVE-RECIPIENT dot-walks `recipient_users`, a list of sys_ids that encoded queries cannot dot-walk - needs a per-recipient lookup. Source: servicenow.
+
+### ServiceNow - unverified details, rule not written
+
+- SNOW-EMAIL-ACCOUNT-ERROR: the error and last-poll fields of sys_email_account are not confirmed. Source: servicenow.
+- SNOW-UPGRADE-SKIPS-UNREVIEWED: the disposition and resolution codes of sys_upgrade_history_log are not confirmed; the proposed `resolution_status!=reviewed` likely matches every skip of every past upgrade. Source: servicenow.
+- SNOW-DISCOVERY-SCHEDULE-PINNED-MID: the stored values of the MID selection field are not confirmed; a wrong value would pass silently. Source: servicenow.
+- SNOW-CLONE-TO-TEST-STALE: the completion field of clone_instance is not confirmed. Source: servicenow.
+- SNOW-TABLE-NO-CLEANUP and SNOW-AUDIT-FLUSH-RULE-SHORT: the unit of sys_auto_flush age and which tables rotate instead of flushing are not confirmed. Source: servicenow.
+- SNOW-AUDIT-SECURITY-TABLES-OFF: which dictionary attribute marks a table as audited is not confirmed, and the proposed glide.sys.audit property was not found in the vendor's property lists. Source: servicenow.
+- SNOW-DISCOVERY-AUTH-FAILURES and SNOW-DISCOVERY-UNCLASSIFIED-MANY: depend on log message wording and discovery_device_history fields; a LIKE over a large log table may also time out. Source: servicenow.
+- SNOW-CATALOG-ITEM-OWNER-INACTIVE: the owner field of sc_cat_item depends on the release. Source: servicenow.
+- SNOW-SCHEDULED-IMPORT-STALE: the proposed field (run_start) is when the schedule starts, not the last run. Source: servicenow.
+- SNOW-MONITORING-EVENTS-NONE: em_event exists only with event management, and `monitoring` is not a base contact type. Source: servicenow.
+
+### ServiceNow - reviewed and not shipped
+
+- SNOW-GUEST-USER-UNLOCKED: wrong - public pages and the login page run as the guest user, so it must stay usable; replaced by SNOW-GUEST-USER-HAS-ROLE. Source: servicenow.
+- SNOW-USER-LOCAL-LOGIN: wrong - an empty `source` does not mean a local password (users provisioned by a connector or SCIM have none either); SNOW-SSO-NOT-ENABLED and SNOW-LOCAL-MFA-OFF cover the risk. Source: servicenow.
+- SNOW-INTEGRATION-USER-INTERACTIVE and -ADMIN: the internal-integration-user flag already blocks interactive sign-in, and a filter on a field older releases lack is ignored, which would report every user. Source: servicenow.
+- SNOW-BASIC-AUTH-ALLOWED: shipped as SNOW-PROCESSOR-AUTH-NOT-REQUIRED - the glide.basicauth.required properties decide whether a processor demands credentials at all, not whether basic authentication is allowed. Source: servicenow.
+- SNOW-LEGACY-WORKFLOW-ACTIVE: `published` is on wf_workflow_version, not wf_workflow, and an info list of legacy workflows is a migration plan, not a finding. Source: servicenow.
+- SNOW-PUBLIC-PAGE-ACTIVE, SNOW-SP-PAGE-PUBLIC, SNOW-KB-ARTICLE-PUBLIC: the base system ships public pages, so the list is noise without an approved baseline - needs a diff against a tenant baseline. Source: servicenow.
+- SNOW-ACL-RECENTLY-CHANGED, SNOW-ELEVATION-EVENT, SNOW-IMPERSONATION-EVENT, SNOW-LOCAL-LOGIN-EVENT: info lists; upgrades rewrite every base ACL, so the first needs the upgrade accounts filtered out. Source: servicenow.
+- SNOW-ARCHIVE-RULE-NONE: the retention decision belongs to OBL-PRIVACY-DATABASE-RECORD. SNOW-MID-NOTIFICATION-INACTIVE: covered by OBL-SYS-ALERT-ROUTING. SNOW-CMDB-NO-RECONCILIATION-RULES and SNOW-CLONE-NO-DATA-EXCLUSION: the base system ships defaults, so "none" never fires. SNOW-EMAIL-FILTER-NONE: table not confirmed. Source: servicenow.
+- SNOW-CMDB-APP-NO-OWNER: shipped for services as SNOW-CMDB-SERVICE-NO-OWNER; business applications carry no operational status and use other owner fields. The wf_context "faulted" sibling of SNOW-FLOW-ERRORS was left out with the legacy workflows. Source: servicenow.
+- Corrected while writing: `{DAYS_AGO:n}` in `sysparm_query` (its ISO form is not the encoded-query date format) became relative encoded queries; SNOW-EVENT-QUEUE-BACKLOG counts events past their processing time, not all ready events; SNOW-ELEVATED-ROLE-HOLDER became a per-user count (SNOW-ELEVATED-ROLE-COUNT, and SNOW-IMPERSONATOR-ROLE-COUNT), because a high finding per holder buries the work queue; SNOW-SCHEDULED-JOB-OVERDUE dropped the unconfirmed state code; SNOW-RELEASE-OLD reports until the supported-family pattern is set, instead of passing with a stale default. Source: servicenow.
+
+### ServiceNow - to confirm on the first real run
+
+- The relative operators with the minute and dayofweek units (RELATIVEGT@dayofweek@ago@7, RELATIVELT@minute@ago@30) are accepted in `sysparm_query`; an ignored term widens the count and shows as a loud finding, not a pass.
+- The Aggregate API without grouping answers `result` as one object carrying `stats.count` (an array would be read as rows too).
+- Field names marked likely in the proposal: sys_cluster_state.status `online`, sys_trigger.next_action, ecc_agent.last_refreshed (refreshed by the heartbeat), ecc_agent_issue.state `resolved`, ecc_agent_property names containing check_cert, sys_store_app.update_available, sys_import_set_run.errors, sys_outbound_http_log.response_status, sysevent.process_on, problem.cause_notes, incident.major_incident_state.
+- Property names: glide.login.no_blank_password and glide.authenticate.multifactor (the other hardening, attachment and session properties are in the vendor's high-security and security-properties lists).
+- The integration account can read sys_properties, sys_user_has_role, the ecc_* tables, sysevent, syslog and sys_cluster_state; the Aggregate API refuses (403) when any row is hidden by an ACL, which makes those rules unknown.

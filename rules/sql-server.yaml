@@ -480,7 +480,7 @@ rules:
     severity: medium
     entity: instance
     refresh: 7d
-    why: Cumulative updates carry security and stability fixes; the default pattern flags 2017 below its final CU and 2016 below SP3. Add current minimums for newer versions in the threshold.
+    why: Cumulative updates carry security and stability fixes; the default pattern flags 2016 below SP3, 2017 below its final CU, 2019 below its final CU32 (15.0.4430) and 2022 below CU25 (16.0.4255), plus 2019 and 2022 at RTM. Security-only (GDR) branch builds are reported by SQL-BUILD-GDR-BRANCH instead. Raise the 2022 floor as new CUs ship.
     fix: Apply the latest cumulative update (and GDR) for the version.
     refs: [NIST-800-53:SI-2]
     query:
@@ -495,7 +495,7 @@ rules:
                     WHEN 15 THEN '2030-01-08' WHEN 16 THEN '2033-01-11' END AS support_end
         FROM (SELECT CAST(PARSENAME(CAST(SERVERPROPERTY('ProductVersion') AS nvarchar(128)), 4) AS int) AS major_version) AS v
       key: instance
-    each: { field: product_version, op: match, value: '^(14\.0\.([0-2]\d{3}|3[0-3]\d\d|34[0-4]\d|345[0-5])\.|13\.0\.([0-5]\d{3}|6[0-2]\d\d)\.)', threshold: sql.outdated-build-pattern }
+    each: { field: product_version, op: match, value: '^(14\.0\.([0-2]\d{3}|3[0-3]\d\d|34[0-4]\d|345[0-5])\.|13\.0\.([0-5]\d{3}|6[0-2]\d\d)\.|15\.0\.(2000|4([0-3]\d\d|4[0-2]\d))\.|16\.0\.(1000|4([01]\d\d|2[0-4]\d|25[0-4]))\.)', threshold: sql.outdated-build-pattern }
     evidence: "{instance}: build {product_version} {product_level}"
 
   - id: SQL-EVALUATION-EDITION
@@ -1000,3 +1000,760 @@ rules:
       name: certificate_name
     each: { field: expiry_date, op: until-lt, value: 30, threshold: sql.certificate-notice-days }
     evidence: "{target}: expires {expiry_date}"
+
+  # ---- privileged logins and server permissions ------------------------------------------------
+
+  - id: SQL-SYSADMIN-SQL-LOGIN
+    title: SQL-authenticated login is a sysadmin
+    kind: misconfigured
+    lens: security
+    category: IAM
+    severity: high
+    entity: login
+    refresh: 7d
+    why: An enabled SQL login other than sa in sysadmin has a password outside the domain's policy and MFA; guessed or leaked from a connection string, it owns the instance and, through the engine, the host.
+    fix: Replace it with a Windows group login; an application that demands sysadmin is a finding to take to its vendor. Accepted logins go in the allow pattern.
+    refs: [NIST-800-53:AC-6, NIST-800-53:IA-2, CIS-Controls-v8:5.4, CIS-MSSQL:3.1, MITRE-ATTACK:T1078.001]
+    query:
+      protocol: sql
+      text: |-
+        SELECT CAST(SERVERPROPERTY('ServerName') AS nvarchar(256)) + N'/sysadmin/' + m.name AS target,
+               m.name AS member_name, m.type_desc, m.is_disabled, m.create_date
+        FROM sys.server_role_members AS rm
+        JOIN sys.server_principals AS r ON r.principal_id = rm.role_principal_id
+        JOIN sys.server_principals AS m ON m.principal_id = rm.member_principal_id
+        WHERE r.name = N'sysadmin' AND m.principal_id <> 1
+          AND m.name NOT LIKE N'NT SERVICE\%' AND m.name NOT LIKE N'NT AUTHORITY\%'
+      key: target
+      name: member_name
+    each:
+      all:
+        - { field: is_disabled, op: eq, value: 0 }
+        - { field: type_desc, op: eq, value: SQL_LOGIN }
+        - { field: member_name, op: notmatch, value: '^$', threshold: sql.sysadmin-sql-login-allow-pattern }
+    evidence: "{target}: SQL login {member_name} is sysadmin (created {create_date})"
+
+  - id: SQL-SYSADMIN-USER-ACCOUNT
+    title: Individual Windows account is a sysadmin
+    kind: misconfigured
+    lens: security
+    category: IAM
+    severity: medium
+    entity: login
+    refresh: 7d
+    why: Sysadmin granted to a person's (or a service's) own Windows login outlives job changes and escapes the group reviews that cover everyone else.
+    fix: Grant sysadmin through one reviewed AD group and drop the individual login.
+    refs: [NIST-800-53:AC-2, NIST-800-53:AC-6, CIS-Controls-v8:5.4]
+    query:
+      protocol: sql
+      text: |-
+        SELECT CAST(SERVERPROPERTY('ServerName') AS nvarchar(256)) + N'/sysadmin/' + m.name AS target,
+               m.name AS member_name, m.type_desc, m.is_disabled, m.create_date
+        FROM sys.server_role_members AS rm
+        JOIN sys.server_principals AS r ON r.principal_id = rm.role_principal_id
+        JOIN sys.server_principals AS m ON m.principal_id = rm.member_principal_id
+        WHERE r.name = N'sysadmin' AND m.principal_id <> 1
+          AND m.name NOT LIKE N'NT SERVICE\%' AND m.name NOT LIKE N'NT AUTHORITY\%'
+      key: target
+      name: member_name
+    each:
+      all:
+        - { field: is_disabled, op: eq, value: 0 }
+        - { field: type_desc, op: eq, value: WINDOWS_LOGIN }
+    evidence: "{target}: Windows login {member_name} is sysadmin"
+
+  - id: SQL-SECURITYADMIN-MEMBER
+    title: Member of securityadmin or serveradmin
+    kind: misconfigured
+    lens: security
+    category: IAM
+    severity: medium
+    entity: login
+    refresh: 7d
+    why: securityadmin can grant itself any permission and serveradmin can reconfigure and stop the engine; both are close to sysadmin yet are rarely reviewed.
+    fix: Move the member to a narrower role, or to sysadmin under the same review; accepted members go in the allow pattern.
+    refs: [NIST-800-53:AC-6, CIS-Controls-v8:5.4]
+    query:
+      protocol: sql
+      text: |-
+        SELECT CAST(SERVERPROPERTY('ServerName') AS nvarchar(256)) + N'/' + r.name + N'/' + m.name AS target,
+               r.name AS role_name, m.name AS member_name, m.type_desc, m.is_disabled
+        FROM sys.server_role_members AS rm
+        JOIN sys.server_principals AS r ON r.principal_id = rm.role_principal_id
+        JOIN sys.server_principals AS m ON m.principal_id = rm.member_principal_id
+        WHERE r.name IN (N'securityadmin', N'serveradmin')
+          AND m.name NOT LIKE N'NT SERVICE\%' AND m.name NOT LIKE N'NT AUTHORITY\%'
+      key: target
+      name: member_name
+    each:
+      all:
+        - { field: is_disabled, op: eq, value: 0 }
+        - { field: member_name, op: notmatch, value: '^$', threshold: sql.powerful-role-allow-pattern }
+    evidence: "{target}: {member_name} ({type_desc}) in {role_name}"
+
+  - id: SQL-CONTROL-SERVER-GRANT
+    title: CONTROL SERVER or login-control permission granted outside sysadmin
+    kind: misconfigured
+    lens: security
+    category: IAM
+    severity: high
+    entity: permission
+    refresh: 7d
+    why: CONTROL SERVER, IMPERSONATE ANY LOGIN, ALTER ANY LOGIN or ALTER ANY SERVER ROLE granted directly makes a hidden sysadmin that role reviews never list.
+    fix: Revoke the permission and put the login in a server role that matches its job.
+    refs: [NIST-800-53:AC-6, CIS-Controls-v8:5.4, MITRE-ATTACK:T1078]
+    query:
+      protocol: sql
+      text: |-
+        SELECT CAST(SERVERPROPERTY('ServerName') AS nvarchar(256)) + N'/' + p.name + N'/' + sp.permission_name AS target,
+               p.name AS grantee, p.type_desc, sp.permission_name, sp.state_desc,
+               IS_SRVROLEMEMBER('sysadmin', p.name) AS is_sysadmin
+        FROM sys.server_permissions AS sp
+        JOIN sys.server_principals AS p ON p.principal_id = sp.grantee_principal_id
+        WHERE sp.class = 100 AND sp.state IN ('G', 'W')
+          AND sp.permission_name IN (N'CONTROL SERVER', N'IMPERSONATE ANY LOGIN', N'ALTER ANY LOGIN', N'ALTER ANY SERVER ROLE')
+          AND p.name NOT LIKE N'##%'
+      key: target
+      name: grantee
+    each:
+      any:
+        - { field: is_sysadmin, op: absent }
+        - { field: is_sysadmin, op: eq, value: 0 }
+    evidence: "{target}: {grantee} ({type_desc}) holds {permission_name} ({state_desc})"
+
+  - id: SQL-LOGIN-PASSWORD-OLD
+    title: Sysadmin SQL login password not changed for over a year
+    kind: misconfigured
+    lens: security
+    category: IAM
+    severity: medium
+    entity: login
+    refresh: 7d
+    why: A sysadmin password unchanged for a year sits in connection strings, scripts and old tickets everywhere; whoever saw it once still has it.
+    fix: Rotate the password and update its users, or move them to Windows authentication.
+    refs: [NIST-800-53:IA-5, CIS-MSSQL:4.2]
+    query:
+      protocol: sql
+      text: |-
+        SELECT CAST(SERVERPROPERTY('ServerName') AS nvarchar(256)) + N'/' + name AS target, name AS login_name, is_disabled,
+               LOGINPROPERTY(name, 'PasswordLastSetTime') AS password_last_set,
+               LOGINPROPERTY(name, 'IsLocked') AS is_locked,
+               LOGINPROPERTY(name, 'BadPasswordCount') AS bad_password_count,
+               LOGINPROPERTY(name, 'LockoutTime') AS lockout_time,
+               IS_SRVROLEMEMBER('sysadmin', name) AS is_sysadmin
+        FROM sys.sql_logins
+        WHERE name NOT LIKE N'##%'
+      key: target
+      name: login_name
+    each:
+      all:
+        - { field: is_disabled, op: eq, value: 0 }
+        - { field: is_sysadmin, op: eq, value: 1 }
+        - { field: password_last_set, op: age-gt, value: 365, threshold: sql.sysadmin-password-max-age-days }
+    evidence: "{target}: password last set {password_last_set}"
+
+  - id: SQL-LOGIN-LOCKED
+    title: SQL login is locked out
+    kind: broken
+    lens: both
+    category: IAM
+    severity: high
+    entity: login
+    refresh: 1h
+    why: A locked SQL login is either password guessing in progress or an application hammering the instance with a stale password; both need a person today.
+    fix: Read the failed-login records, then unlock the login or fix the application's password.
+    refs: [NIST-800-53:AC-7, MITRE-ATTACK:T1110]
+    query:
+      protocol: sql
+      text: |-
+        SELECT CAST(SERVERPROPERTY('ServerName') AS nvarchar(256)) + N'/' + name AS target, name AS login_name, is_disabled,
+               LOGINPROPERTY(name, 'PasswordLastSetTime') AS password_last_set,
+               LOGINPROPERTY(name, 'IsLocked') AS is_locked,
+               LOGINPROPERTY(name, 'BadPasswordCount') AS bad_password_count,
+               LOGINPROPERTY(name, 'LockoutTime') AS lockout_time,
+               IS_SRVROLEMEMBER('sysadmin', name) AS is_sysadmin
+        FROM sys.sql_logins
+        WHERE name NOT LIKE N'##%'
+      key: target
+      name: login_name
+    each:
+      all:
+        - { field: is_disabled, op: eq, value: 0 }
+        - { field: is_locked, op: eq, value: 1 }
+    evidence: "{target}: locked since {lockout_time} ({bad_password_count} bad passwords)"
+
+  - id: SQL-SVC-DOMAIN-USER-ACCOUNT
+    title: SQL Server service runs under a domain user account
+    kind: misconfigured
+    lens: security
+    category: IAM
+    severity: medium
+    entity: service
+    refresh: 7d
+    why: A domain user account with a service name registered is the classic Kerberoasting target, and its password is stored in LSA secrets on the host.
+    fix: Move the service to a group managed service account (supported since SQL Server 2016) and register the service name on it.
+    refs: [NIST-800-53:IA-5, CIS-MSSQL:3.5, MITRE-ATTACK:T1558.003]
+    query:
+      protocol: sql
+      text: |-
+        SELECT CAST(SERVERPROPERTY('ServerName') AS nvarchar(256)) + N'/' + servicename AS target,
+               servicename, startup_type_desc, status_desc, service_account
+        FROM sys.dm_server_services
+      key: target
+      name: servicename
+    each:
+      all:
+        - { field: service_account, op: match, value: '\\' }
+        - { field: service_account, op: notmatch, value: '^(NT SERVICE|NT AUTHORITY)\\|^\.\\' }
+        - { field: service_account, op: notmatch, value: '\$$' }
+    evidence: "{target}: runs as {service_account}"
+
+  - id: SQL-SA-NOT-RENAMED
+    title: The sa login still carries its default name
+    kind: misconfigured
+    lens: security
+    category: IAM
+    severity: low
+    entity: instance
+    refresh: 7d
+    why: Password guessing against SQL Server starts with the name sa; a renamed (and disabled) built-in administrator gives the guesser nothing to aim at.
+    fix: Rename the login with ALTER LOGIN in a change window and keep it disabled.
+    refs: [CIS-MSSQL:2.14, NIST-800-53:AC-2]
+    query:
+      protocol: sql
+      text: |-
+        SELECT name, is_disabled FROM sys.server_principals WHERE principal_id = 1
+      key: instance
+    each: { field: name, op: eq, value: sa }
+    evidence: "{instance}: the built-in administrator is still named sa (disabled {is_disabled})"
+
+  # ---- database ownership, encryption, containment (one read of sys.databases) -----------------
+
+  - id: SQL-DB-OWNER-ORPHAN
+    title: Database owned by a login that no longer exists
+    kind: misconfigured
+    lens: both
+    category: IAM
+    severity: medium
+    entity: database
+    refresh: 7d
+    why: When the owner's login is gone (typically a departed administrator's Windows account), jobs, Service Broker, replication and failover can fail on the database, and TRUSTWORTHY on it cannot be judged.
+    fix: Change the owner with ALTER AUTHORIZATION to the standard owner login (for example a disabled sa).
+    refs: [NIST-800-53:AC-2, NIST-800-53:CM-6]
+    query:
+      protocol: sql
+      text: |-
+        SELECT CAST(SERVERPROPERTY('ServerName') AS nvarchar(256)) + N'/' + d.name AS target,
+               d.name AS database_name, d.database_id, SUSER_SNAME(d.owner_sid) AS owner_name,
+               sp.type_desc AS owner_type, d.is_encrypted, d.containment_desc, d.log_reuse_wait_desc,
+               d.state_desc, d.is_read_only, d.create_date
+        FROM sys.databases AS d
+        LEFT JOIN sys.server_principals AS sp ON sp.sid = d.owner_sid
+        WHERE d.source_database_id IS NULL
+      key: target
+      name: database_name
+    each:
+      all:
+        - { field: database_id, op: gt, value: 4 }
+        - { field: owner_name, op: absent }
+    evidence: "{target}: owner login not found"
+
+  - id: SQL-DB-OWNER-INDIVIDUAL
+    title: User database owned by a person's Windows login
+    kind: misconfigured
+    lens: security
+    category: IAM
+    severity: low
+    entity: database
+    refresh: 7d
+    why: The owner's rights reach into the database through ownership chaining and TRUSTWORTHY, and the database breaks when that person's account is removed.
+    fix: Change the owner to the standard owner login with ALTER AUTHORIZATION.
+    refs: [NIST-800-53:AC-6]
+    query:
+      protocol: sql
+      text: |-
+        SELECT CAST(SERVERPROPERTY('ServerName') AS nvarchar(256)) + N'/' + d.name AS target,
+               d.name AS database_name, d.database_id, SUSER_SNAME(d.owner_sid) AS owner_name,
+               sp.type_desc AS owner_type, d.is_encrypted, d.containment_desc, d.log_reuse_wait_desc,
+               d.state_desc, d.is_read_only, d.create_date
+        FROM sys.databases AS d
+        LEFT JOIN sys.server_principals AS sp ON sp.sid = d.owner_sid
+        WHERE d.source_database_id IS NULL
+      key: target
+      name: database_name
+    each:
+      all:
+        - { field: database_id, op: gt, value: 4 }
+        - { field: owner_type, op: eq, value: WINDOWS_LOGIN }
+    evidence: "{target}: owned by {owner_name}"
+
+  - id: SQL-DB-TDE-OFF
+    title: User database not encrypted at rest
+    kind: misconfigured
+    lens: security
+    category: CFG
+    severity: low
+    entity: database
+    refresh: 7d
+    why: Without transparent data encryption a stolen backup file or a copied data file is the whole database in clear. Standard edition includes TDE from SQL Server 2019. Limit the pattern to the databases that must be encrypted.
+    fix: Enable TDE with a certificate whose backup is kept off the host, or record why not.
+    refs: [NIST-800-53:SC-28, CIS-Controls-v8:3.11]
+    query:
+      protocol: sql
+      text: |-
+        SELECT CAST(SERVERPROPERTY('ServerName') AS nvarchar(256)) + N'/' + d.name AS target,
+               d.name AS database_name, d.database_id, SUSER_SNAME(d.owner_sid) AS owner_name,
+               sp.type_desc AS owner_type, d.is_encrypted, d.containment_desc, d.log_reuse_wait_desc,
+               d.state_desc, d.is_read_only, d.create_date
+        FROM sys.databases AS d
+        LEFT JOIN sys.server_principals AS sp ON sp.sid = d.owner_sid
+        WHERE d.source_database_id IS NULL
+      key: target
+      name: database_name
+    each:
+      all:
+        - { field: database_id, op: gt, value: 4 }
+        - { field: state_desc, op: eq, value: ONLINE }
+        - { field: is_encrypted, op: eq, value: 0 }
+        - { field: database_name, op: match, value: '.', threshold: sql.tde-required-database-pattern }
+    evidence: "{target}: not encrypted"
+
+  - id: SQL-DB-CONTAINED
+    title: Contained database present
+    kind: misconfigured
+    lens: security
+    category: IAM
+    severity: low
+    entity: database
+    refresh: 7d
+    why: Users of a contained database can authenticate inside it, outside the instance's login policy, the sa review and the login rules of this pack; those users are not read here.
+    fix: Review the database's own users; keep 'contained database authentication' off where nothing needs it.
+    refs: [CIS-MSSQL:3.4, NIST-800-53:IA-5]
+    query:
+      protocol: sql
+      text: |-
+        SELECT CAST(SERVERPROPERTY('ServerName') AS nvarchar(256)) + N'/' + d.name AS target,
+               d.name AS database_name, d.database_id, SUSER_SNAME(d.owner_sid) AS owner_name,
+               sp.type_desc AS owner_type, d.is_encrypted, d.containment_desc, d.log_reuse_wait_desc,
+               d.state_desc, d.is_read_only, d.create_date
+        FROM sys.databases AS d
+        LEFT JOIN sys.server_principals AS sp ON sp.sid = d.owner_sid
+        WHERE d.source_database_id IS NULL
+      key: target
+      name: database_name
+    each: { field: containment_desc, op: ne, value: NONE }
+    evidence: "{target}: containment {containment_desc}"
+
+  - id: SQL-DB-LOG-REUSE-WAIT
+    title: Transaction log cannot truncate because of replication, mirroring or an availability replica
+    kind: broken
+    category: HLT
+    severity: medium
+    entity: database
+    refresh: 6h
+    why: Unlike a missing log backup, these waits do not clear by backing up; the log grows until its volume is full. Short-lived waits (active transaction, checkpoints) are left out.
+    fix: Fix the replication log reader, resume the replica or finish the mirror; for a publisher that no longer exists, clear the replication marks after confirming.
+    refs: [NIST-800-53:SC-5]
+    query:
+      protocol: sql
+      text: |-
+        SELECT CAST(SERVERPROPERTY('ServerName') AS nvarchar(256)) + N'/' + d.name AS target,
+               d.name AS database_name, d.database_id, SUSER_SNAME(d.owner_sid) AS owner_name,
+               sp.type_desc AS owner_type, d.is_encrypted, d.containment_desc, d.log_reuse_wait_desc,
+               d.state_desc, d.is_read_only, d.create_date
+        FROM sys.databases AS d
+        LEFT JOIN sys.server_principals AS sp ON sp.sid = d.owner_sid
+        WHERE d.source_database_id IS NULL
+      key: target
+      name: database_name
+    each:
+      all:
+        - { field: state_desc, op: eq, value: ONLINE }
+        - { field: log_reuse_wait_desc, op: in, value: [REPLICATION, AVAILABILITY_REPLICA, DATABASE_MIRRORING], threshold: sql.log-reuse-wait-blocking }
+    evidence: "{target}: log waiting on {log_reuse_wait_desc}"
+
+  - id: SQL-TDE-IN-PROGRESS
+    title: Encryption, decryption or key change stuck in progress
+    kind: broken
+    lens: both
+    category: CFG
+    severity: medium
+    entity: database
+    refresh: 6h
+    why: A database left mid-encryption, mid-decryption or mid-key-change is only partly protected; a suspended scan or a read-only database usually keeps it there.
+    fix: Resume the encryption scan (ALTER DATABASE ... SET ENCRYPTION RESUME) or finish the key rotation.
+    refs: [NIST-800-53:SC-28]
+    query:
+      protocol: sql
+      text: |-
+        SELECT CAST(SERVERPROPERTY('ServerName') AS nvarchar(256)) + N'/' + DB_NAME(database_id) AS target,
+               DB_NAME(database_id) AS database_name, encryption_state, percent_complete, key_algorithm, key_length
+        FROM sys.dm_database_encryption_state
+        WHERE database_id <> 2
+      key: target
+      name: database_name
+    each: { field: encryption_state, op: in, value: [2, 4, 5] }
+    evidence: "{target}: encryption state {encryption_state} (2 encrypting, 4 key change, 5 decrypting), {percent_complete}% done"
+
+  # ---- backups: where and how --------------------------------------------------------------------
+
+  - id: SQL-BACKUP-LOCAL-DISK
+    title: Newest full backup was written to a local drive
+    kind: misconfigured
+    lens: both
+    category: BCK
+    severity: high
+    entity: backup-media
+    refresh: 1d
+    why: A backup on the server's own drive dies with the server and is the first thing ransomware encrypts. Backups through a backup product (virtual device) or to a URL pass.
+    fix: Back up to a share on an immutable or off-host target, or through the backup product; a drive letter that is a mounted backup appliance goes in the allow pattern.
+    refs: [NIST-800-53:CP-9, CIS-Controls-v8:11.4]
+    query:
+      protocol: sql
+      text: |-
+        SELECT CAST(SERVERPROPERTY('ServerName') AS nvarchar(256)) + N'/' + b.database_name + N'/' + CAST(mf.family_sequence_number AS nvarchar(4)) AS target,
+               b.database_name, b.backup_finish_date, b.has_backup_checksums, b.is_copy_only, mf.device_type, mf.physical_device_name
+        FROM msdb.dbo.backupset AS b
+        JOIN msdb.dbo.backupmediafamily AS mf ON mf.media_set_id = b.media_set_id
+        WHERE b.type = 'D'
+          AND b.backup_set_id = (SELECT MAX(b2.backup_set_id) FROM msdb.dbo.backupset AS b2 WHERE b2.database_name = b.database_name AND b2.type = 'D')
+          AND b.database_name IN (SELECT name FROM sys.databases WHERE state_desc = 'ONLINE' AND name <> N'tempdb')
+      key: target
+      name: database_name
+    each:
+      all:
+        - { field: device_type, op: eq, value: 2 }
+        - { field: physical_device_name, op: match, value: '^[A-Za-z]:\\' }
+        - { field: physical_device_name, op: notmatch, value: '^$', threshold: sql.local-backup-path-allow-pattern }
+    evidence: "{target}: last full backup {backup_finish_date} to {physical_device_name}"
+
+  - id: SQL-BACKUP-NO-CHECKSUM
+    title: Newest full backup taken without checksums
+    kind: misconfigured
+    category: BCK
+    severity: low
+    entity: backup-media
+    why: A native backup without checksums copies corrupt pages silently, and the damage is found at restore time. Backups through a backup product's virtual device are not judged.
+    fix: Back up WITH CHECKSUM, or set the server option 'backup checksum default' to 1.
+    refs: [NIST-800-53:CP-9, NIST-800-53:SI-7]
+    query:
+      protocol: sql
+      text: |-
+        SELECT CAST(SERVERPROPERTY('ServerName') AS nvarchar(256)) + N'/' + b.database_name + N'/' + CAST(mf.family_sequence_number AS nvarchar(4)) AS target,
+               b.database_name, b.backup_finish_date, b.has_backup_checksums, b.is_copy_only, mf.device_type, mf.physical_device_name
+        FROM msdb.dbo.backupset AS b
+        JOIN msdb.dbo.backupmediafamily AS mf ON mf.media_set_id = b.media_set_id
+        WHERE b.type = 'D'
+          AND b.backup_set_id = (SELECT MAX(b2.backup_set_id) FROM msdb.dbo.backupset AS b2 WHERE b2.database_name = b.database_name AND b2.type = 'D')
+          AND b.database_name IN (SELECT name FROM sys.databases WHERE state_desc = 'ONLINE' AND name <> N'tempdb')
+      key: target
+      name: database_name
+    each:
+      all:
+        - { field: device_type, op: in, value: [2, 9] }
+        - { field: has_backup_checksums, op: eq, value: 0 }
+    evidence: "{target}: last full backup {backup_finish_date} has no checksums"
+
+  # ---- connections, persistence, audit -----------------------------------------------------------
+
+  - id: SQL-CONNECTIONS-UNENCRYPTED
+    title: TCP sessions without encryption
+    kind: misconfigured
+    lens: security
+    category: PKI
+    severity: medium
+    entity: instance
+    refresh: 1h
+    why: Any unencrypted TCP session proves Force Encryption is off and the client did not ask for TLS; SQL-login credentials and the data cross the wire in clear. The sample names the client addresses.
+    fix: Turn on Force Encryption with a CA-issued certificate and set Encrypt=True in the applications' connection strings.
+    refs: [NIST-800-53:SC-8, CIS-MSSQL:7.3]
+    query:
+      protocol: sql
+      text: |-
+        SELECT session_id, net_transport, encrypt_option, auth_scheme, client_net_address, local_tcp_port
+        FROM sys.dm_exec_connections
+        WHERE net_transport = N'TCP'
+      key: "{instance}|{client_net_address}|{session_id}"
+    count:
+      op: gt
+      value: 0
+      threshold: sql.unencrypted-connections-max
+      where: { field: encrypt_option, op: eq, value: 'FALSE' }
+    evidence: "{host}: {count} unencrypted TCP sessions ({sample})"
+
+  - id: SQL-STARTUP-PROCS
+    title: Stored procedure marked to run at startup
+    kind: misconfigured
+    lens: security
+    category: CFG
+    severity: high
+    entity: procedure
+    refresh: 7d
+    why: Startup procedures run with sysadmin rights at every engine start, which makes them a persistence mechanism. Procedures the product creates itself (SSIS catalog, replication) are in the default allow pattern.
+    fix: Read the procedure; turn the startup option off (sp_procoption) unless it is documented.
+    refs: [NIST-800-53:CM-7, MITRE-ATTACK:T1505.001]
+    query:
+      protocol: sql
+      text: |-
+        SELECT CAST(SERVERPROPERTY('ServerName') AS nvarchar(256)) + N'/startup/' + name AS target,
+               name AS procedure_name, create_date, modify_date
+        FROM master.sys.procedures
+        WHERE OBJECTPROPERTY(object_id, 'ExecIsStartup') = 1
+      key: target
+      name: procedure_name
+    each: { field: procedure_name, op: notmatch, value: '^(sp_ssis_startup|sp_MSrepl_startup)$', threshold: sql.startup-proc-allow-pattern }
+    evidence: "{target}: runs at startup (changed {modify_date})"
+
+  - id: SQL-LOGON-TRIGGER
+    title: Server-level logon trigger present
+    kind: misconfigured
+    lens: security
+    category: CFG
+    severity: medium
+    entity: trigger
+    refresh: 7d
+    why: A logon trigger runs at every connection as its owner - a persistence and data-capture point - and a broken one locks everybody out, sa included.
+    fix: Read the trigger; drop it or document it, and keep the dedicated admin connection available for recovery.
+    refs: [NIST-800-53:CM-7, MITRE-ATTACK:T1505.001]
+    query:
+      protocol: sql
+      text: |-
+        SELECT CAST(SERVERPROPERTY('ServerName') AS nvarchar(256)) + N'/trigger/' + t.name AS target,
+               t.name AS trigger_name, t.is_disabled, t.create_date, t.modify_date
+        FROM sys.server_triggers AS t
+        WHERE EXISTS (SELECT 1 FROM sys.server_trigger_events AS e WHERE e.object_id = t.object_id AND e.type_desc = N'LOGON')
+      key: target
+      name: trigger_name
+    each:
+      all:
+        - { field: is_disabled, op: eq, value: 0 }
+        - { field: trigger_name, op: notmatch, value: '^$', threshold: sql.logon-trigger-allow-pattern }
+    evidence: "{target}: logon trigger enabled (changed {modify_date})"
+
+  - id: SQL-AUDIT-NO-FAILED-LOGIN
+    title: No enabled audit records failed logins
+    kind: missing
+    lens: security
+    category: LOG
+    severity: medium
+    entity: instance
+    refresh: 7d
+    why: An audit may exist without recording login failures, which is what a lockout or a password-guessing investigation needs; the registry login-auditing level is not readable here.
+    fix: Add FAILED_LOGIN_GROUP (with the login-change and role-member-change groups) to an enabled server audit specification.
+    refs: [NIST-800-53:AU-2, NIST-800-53:AU-12, CIS-MSSQL:5.3, CIS-MSSQL:5.4]
+    query:
+      protocol: sql
+      text: |-
+        SELECT s.name AS specification, s.is_state_enabled, d.audit_action_name
+        FROM sys.server_audit_specifications AS s
+        JOIN sys.server_audit_specification_details AS d ON d.server_specification_id = s.server_specification_id
+        JOIN sys.server_audits AS a ON a.audit_guid = s.audit_guid
+        WHERE s.is_state_enabled = 1 AND a.is_state_enabled = 1
+          AND d.audit_action_name IN (N'FAILED_LOGIN_GROUP', N'LOGIN_CHANGE_PASSWORD_GROUP', N'SERVER_ROLE_MEMBER_CHANGE_GROUP')
+      key: "{instance}|{specification}|{audit_action_name}"
+    count:
+      op: lt
+      value: 1
+      where: { field: audit_action_name, op: eq, value: FAILED_LOGIN_GROUP }
+    evidence: "{host}: no enabled audit specification with FAILED_LOGIN_GROUP"
+
+  # ---- Agent, memory, jobs -------------------------------------------------------------------------
+
+  - id: SQL-AGENT-STARTUP-NOT-AUTO
+    title: SQL Server Agent running but not set to start automatically
+    kind: misconfigured
+    category: AVL
+    severity: medium
+    entity: service
+    refresh: 7d
+    why: After the next restart of the host no job runs - backups, integrity checks, maintenance - and nobody is told.
+    fix: Set the Agent service to Automatic in SQL Server Configuration Manager.
+    refs: [NIST-800-53:CP-9, NIST-800-53:CM-6]
+    query:
+      protocol: sql
+      text: |-
+        SELECT CAST(SERVERPROPERTY('ServerName') AS nvarchar(256)) + N'/' + servicename AS target,
+               servicename, startup_type_desc, status_desc, service_account
+        FROM sys.dm_server_services
+      key: target
+      name: servicename
+    each:
+      all:
+        - { field: servicename, op: match, value: '^SQL Server Agent' }
+        - { field: status_desc, op: eq, value: Running }
+        - { field: startup_type_desc, op: notmatch, value: '^Automatic' }
+    evidence: "{target}: running, startup {startup_type_desc}"
+
+  - id: SQL-OS-MEMORY-LOW
+    title: Windows signals low memory to SQL Server
+    kind: broken
+    category: HLT
+    severity: medium
+    entity: instance
+    refresh: 1h
+    why: Windows is trimming SQL Server; plans and data pages are evicted and every query slows. It often comes with max server memory left at the default or another consumer on the host.
+    fix: Set max server memory with headroom for the OS and agents, find the other consumer, or add memory.
+    refs: [NIST-800-53:SC-5]
+    query:
+      protocol: sql
+      text: |-
+        SELECT m.total_physical_memory_kb, m.available_physical_memory_kb, m.system_memory_state_desc,
+               p.physical_memory_in_use_kb, p.process_physical_memory_low, p.process_virtual_memory_low
+        FROM sys.dm_os_sys_memory AS m
+        CROSS JOIN sys.dm_os_process_memory AS p
+      key: instance
+    each:
+      any:
+        - { field: system_memory_state_desc, op: match, value: 'memory is low' }
+        - { field: process_physical_memory_low, op: eq, value: 1 }
+        - { field: process_virtual_memory_low, op: eq, value: 1 }
+    evidence: "{instance}: {system_memory_state_desc}; {available_physical_memory_kb} KB of {total_physical_memory_kb} KB free"
+
+  - id: SQL-AGENT-NO-OPERATOR
+    title: No enabled Agent operator
+    kind: missing
+    category: MON
+    severity: medium
+    entity: instance
+    refresh: 7d
+    why: Without an operator no job failure or alert can notify anyone, so a backup that fails nightly stays unnoticed.
+    fix: Create an operator with a team mailbox, configure Database Mail, and add the operator to every backup and integrity job.
+    refs: [NIST-800-53:SI-4, NIST-800-53:IR-6]
+    query:
+      protocol: sql
+      text: |-
+        SELECT id, name, enabled, email_address FROM msdb.dbo.sysoperators
+      key: "{instance}|{name}"
+    count:
+      op: lt
+      value: 1
+      where: { field: enabled, op: eq, value: 1 }
+    evidence: "{host}: no enabled operator"
+
+  - id: SQL-AGENT-ALERTS-NONE
+    title: No alerts for high-severity and corruption errors
+    kind: missing
+    category: MON
+    severity: medium
+    entity: instance
+    refresh: 7d
+    why: Errors of severity 19 to 25 and errors 823, 824 and 825 mean corruption or an engine fault; without alerts they are found at restore time.
+    fix: Create the standard alert set (severities 19-25, errors 823-825) with a notification to the operator.
+    refs: [NIST-800-53:SI-4, NIST-800-53:SI-7]
+    query:
+      protocol: sql
+      text: |-
+        SELECT id, name, enabled, severity, message_id, has_notification FROM msdb.dbo.sysalerts
+      key: "{instance}|{name}"
+    count:
+      op: lt
+      value: 1
+      where:
+        all:
+          - { field: enabled, op: eq, value: 1 }
+          - any:
+              - { field: severity, op: ge, value: 19 }
+              - { field: message_id, op: in, value: [823, 824, 825] }
+    evidence: "{host}: no enabled alert for severities 19-25 or errors 823-825"
+
+  - id: SQL-AGENT-JOB-RUNNING-LONG
+    title: Agent job running for more than 12 hours
+    kind: broken
+    category: HLT
+    severity: medium
+    entity: job
+    refresh: 1h
+    why: A backup or maintenance job still running after half a day is usually hung, holding locks and blocking its next run. Agent times are server-local, so the age can be off by the server's time-zone offset.
+    fix: Look at the running step and its blocking session; stop the job if it is wedged.
+    refs: [NIST-800-53:SI-4]
+    query:
+      protocol: sql
+      text: |-
+        SELECT CAST(SERVERPROPERTY('ServerName') AS nvarchar(256)) + N'/' + j.name AS target,
+               j.name AS job_name, a.start_execution_date, a.last_executed_step_id
+        FROM msdb.dbo.sysjobactivity AS a
+        JOIN msdb.dbo.sysjobs AS j ON j.job_id = a.job_id
+        WHERE a.session_id = (SELECT MAX(session_id) FROM msdb.dbo.syssessions)
+          AND a.start_execution_date IS NOT NULL AND a.stop_execution_date IS NULL
+      key: target
+      name: job_name
+    each: { field: start_execution_date, op: age-gt, value: 0.5, threshold: sql.job-max-run-days }
+    evidence: "{target}: running since {start_execution_date} (last step {last_executed_step_id})"
+
+  # ---- version lifecycle and exposure ------------------------------------------------------------
+
+  - id: SQL-VERSION-MAINSTREAM-ENDED
+    title: SQL Server version in extended support only
+    kind: broken
+    lens: both
+    category: LCM
+    severity: low
+    entity: instance
+    refresh: 7d
+    why: SQL Server 2017 left mainstream support in 2022 and 2019 on 2025-02-28; they get security fixes only, no more cumulative updates. It is the planning signal before SQL-VERSION-EOS.
+    fix: Plan the upgrade to a version in mainstream support; add major versions to the list as dates pass.
+    refs: [NIST-800-53:SA-22]
+    query:
+      protocol: sql
+      text: |-
+        SELECT CAST(SERVERPROPERTY('ProductVersion') AS nvarchar(128)) AS product_version,
+               CAST(SERVERPROPERTY('ProductLevel') AS nvarchar(128)) AS product_level,
+               CAST(SERVERPROPERTY('Edition') AS nvarchar(128)) AS edition,
+               v.major_version,
+               CASE v.major_version WHEN 9 THEN '2016-04-12' WHEN 10 THEN '2019-07-09' WHEN 11 THEN '2022-07-12'
+                    WHEN 12 THEN '2024-07-09' WHEN 13 THEN '2026-07-14' WHEN 14 THEN '2027-10-12'
+                    WHEN 15 THEN '2030-01-08' WHEN 16 THEN '2033-01-11' END AS support_end
+        FROM (SELECT CAST(PARSENAME(CAST(SERVERPROPERTY('ProductVersion') AS nvarchar(128)), 4) AS int) AS major_version) AS v
+      key: instance
+    each: { field: major_version, op: in, value: [14, 15], threshold: sql.major-versions-mainstream-ended }
+    evidence: "{instance}: version {product_version}, extended support until {support_end}"
+
+  - id: SQL-BUILD-GDR-BRANCH
+    title: SQL Server on the security-only (GDR) update branch
+    kind: misconfigured
+    lens: both
+    category: LCM
+    severity: low
+    entity: instance
+    refresh: 7d
+    why: The GDR branch gets security fixes but none of the cumulative updates' reliability and performance fixes, and moving to the CU branch later is a one-way step to plan.
+    fix: Move the instance to the cumulative-update branch at the next window, or record why it stays on GDR.
+    refs: [NIST-800-53:SI-2]
+    query:
+      protocol: sql
+      text: |-
+        SELECT CAST(SERVERPROPERTY('ProductVersion') AS nvarchar(128)) AS product_version,
+               CAST(SERVERPROPERTY('ProductLevel') AS nvarchar(128)) AS product_level,
+               CAST(SERVERPROPERTY('Edition') AS nvarchar(128)) AS edition,
+               v.major_version,
+               CASE v.major_version WHEN 9 THEN '2016-04-12' WHEN 10 THEN '2019-07-09' WHEN 11 THEN '2022-07-12'
+                    WHEN 12 THEN '2024-07-09' WHEN 13 THEN '2026-07-14' WHEN 14 THEN '2027-10-12'
+                    WHEN 15 THEN '2030-01-08' WHEN 16 THEN '2033-01-11' END AS support_end
+        FROM (SELECT CAST(PARSENAME(CAST(SERVERPROPERTY('ProductVersion') AS nvarchar(128)), 4) AS int) AS major_version) AS v
+      key: instance
+    each: { field: product_version, op: match, value: '^(15\.0\.(200[1-9]|20[1-9]\d|2[1-9]\d\d)|16\.0\.(100[1-9]|10[1-9]\d|1[1-9]\d\d))\.', threshold: sql.gdr-branch-pattern }
+    evidence: "{instance}: build {product_version} {product_level} (GDR branch)"
+
+  - id: SQL-TCP-DEFAULT-PORT
+    title: Database engine listens on the default port 1433
+    kind: misconfigured
+    lens: security
+    category: CFG
+    severity: low
+    entity: listener
+    refresh: 7d
+    why: Scanners and worms try 1433 first; a non-default port is obscurity, not protection, but it removes the instance from the cheapest sweeps.
+    fix: Move the instance to a fixed non-default port and update the clients' connection strings or aliases.
+    refs: [CIS-MSSQL:2.11, NIST-800-53:CM-7]
+    query:
+      protocol: sql
+      text: |-
+        SELECT listener_id, ip_address, port, type_desc, state_desc
+        FROM sys.dm_tcp_listener_states
+        WHERE type_desc = N'TSQL'
+      key: "{instance}|{listener_id}"
+    each:
+      all:
+        - { field: port, op: eq, value: 1433 }
+        - { field: ip_address, op: notin, value: ['127.0.0.1', '::1'] }
+    evidence: "{instance}: listening on {ip_address}:{port}"
