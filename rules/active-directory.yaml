@@ -1,0 +1,2192 @@
+schema: keeper.rules/1
+system: active-directory
+name: Active Directory
+integration: ldap
+
+# Generic Active Directory checks, read over LDAP only (one domain per integration).
+# Thresholds (threshold.<name>) let a tenant tune every number; the value here is the default.
+# Rules that name a domain group by its DN (Domain Admins, Enterprise Admins, Schema Admins,
+# Protected Users, DnsAdmins) assume the English default names; builtin groups are found by SID.
+
+defaults:
+  kind: misconfigured
+  lens: security
+  refresh: 1d
+
+rules:
+
+  # ---------------------------------------------------------------- population (coverage sanity)
+
+  - id: AD-POP-USERS-NONE
+    title: No user accounts are visible to the reader
+    kind: broken
+    lens: maintenance
+    category: MON
+    severity: high
+    entity: user
+    why: Every user rule, and the hybrid identity pack that joins these rows to the cloud directory, reads this inventory. An empty answer from a working query means the integration's identity cannot see the users, so every user rule would pass without having looked.
+    fix: Check the integration's account and its read rights on the domain partition, then rescan.
+    query:
+      protocol: ldap
+      filter: '(&{USER}(!{UAC:2048}))'
+      attributes: [sAMAccountName, userPrincipalName, objectSid, userAccountControl, lastLogonTimestamp, pwdLastSet, whenCreated, accountExpires, msExchRecipientTypeDetails]
+      key: sAMAccountName
+      name: userPrincipalName
+    count: none
+    evidence: "The user inventory query returned {count} rows"
+
+  - id: AD-POP-COMPUTERS-NONE
+    title: No enabled computer accounts are visible to the reader
+    kind: broken
+    lens: maintenance
+    category: MON
+    severity: high
+    entity: computer
+    why: Computer rules, and other rule packs that scan hosts found here, depend on this list. An empty answer means the reader cannot see the computer objects.
+    fix: Check the integration's account and its read rights on the computer OUs, then rescan.
+    query:
+      protocol: ldap
+      filter: '(&{COMPUTER}{ENABLED})'
+      attributes: [sAMAccountName, dNSHostName, operatingSystem, operatingSystemVersion, lastLogonTimestamp, userAccountControl, pwdLastSet, whenCreated, adminCount, servicePrincipalName, msDS-SupportedEncryptionTypes, msDS-AllowedToDelegateTo, msDS-AllowedToActOnBehalfOfOtherIdentity, ms-Mcs-AdmPwdExpirationTime, msLAPS-PasswordExpirationTime]
+      key: sAMAccountName
+      name: dNSHostName
+    count: none
+    evidence: "The enabled-computer query returned {count} rows"
+
+  # ---------------------------------------------------------------- user accounts
+
+  # One user inventory query (all user objects except trust accounts) feeds the rules below and the
+  # hybrid identity pack, which joins these rows to the cloud directory on objectSid.
+
+  - id: AD-USER-NO-DC-LOGON
+    title: Enabled user with no domain controller logon for a long time
+    lens: both
+    category: HYG
+    severity: info
+    entity: user
+    why: lastLogonTimestamp records only authentication against a domain controller and ignores cloud sign-ins - users who work only in cloud services (password hash sync, no contact with a DC) look stale here while active. This is a list to reconcile with cloud sign-in data, not the authority for disabling accounts. Expired accounts and shared, room and equipment mailbox objects are left out.
+    fix: Join the list with cloud sign-in activity (the hybrid identity rules do this) and disable only accounts that are idle in both places, after owner confirmation.
+    refs: [NIST-800-53:AC-2(3), CIS-CONTROLS-8:5.3, PINGCASTLE:S-Inactive]
+    query:
+      protocol: ldap
+      filter: '(&{USER}(!{UAC:2048}))'
+      attributes: [sAMAccountName, userPrincipalName, objectSid, userAccountControl, lastLogonTimestamp, pwdLastSet, whenCreated, accountExpires, msExchRecipientTypeDetails]
+      key: sAMAccountName
+      name: userPrincipalName
+    each:
+      all:
+        - { field: userAccountControl, op: noflag, value: 2 }
+        - any:
+            - { field: accountExpires, op: absent }
+            - { field: accountExpires, op: eq, value: 0 }
+            - not: { field: accountExpires, op: until-lt, value: 0 }
+        - any:
+            - { field: msExchRecipientTypeDetails, op: absent }
+            - { field: msExchRecipientTypeDetails, op: notin, value: [4, 16, 32, 8589934592, 17179869184, 34359738368] }
+        - { field: lastLogonTimestamp, op: age-gt, value: 180, threshold: ad.stale-user-days }
+    evidence: "{sAMAccountName} - last domain logon {lastLogonTimestamp}"
+
+  - id: AD-USER-NEVER-LOGGED-ON
+    title: Enabled user account created long ago and never used
+    lens: both
+    category: HYG
+    severity: low
+    entity: user
+    why: An account created long ago with no logon on record is usually a provisioning leftover that may still hold the initial password someone set or shared. Cloud-only use also leaves no domain logon, so confirm against cloud sign-ins. Expired accounts and resource mailbox objects are left out.
+    fix: Confirm the account is still needed; otherwise disable and delete it. Give new accounts an expiry date so unclaimed ones lapse.
+    refs: [NIST-800-53:AC-2(3), CIS-CONTROLS-8:5.3]
+    query:
+      protocol: ldap
+      filter: '(&{USER}(!{UAC:2048}))'
+      attributes: [sAMAccountName, userPrincipalName, objectSid, userAccountControl, lastLogonTimestamp, pwdLastSet, whenCreated, accountExpires, msExchRecipientTypeDetails]
+      key: sAMAccountName
+      name: userPrincipalName
+    each:
+      all:
+        - { field: userAccountControl, op: noflag, value: 2 }
+        - any:
+            - { field: accountExpires, op: absent }
+            - { field: accountExpires, op: eq, value: 0 }
+            - not: { field: accountExpires, op: until-lt, value: 0 }
+        - any:
+            - { field: msExchRecipientTypeDetails, op: absent }
+            - { field: msExchRecipientTypeDetails, op: notin, value: [4, 16, 32, 8589934592, 17179869184, 34359738368] }
+        - { field: lastLogonTimestamp, op: absent }
+        - { field: whenCreated, op: age-gt, value: 30, threshold: ad.never-logged-on-days }
+    evidence: "{sAMAccountName} - created {whenCreated}, no domain logon recorded"
+
+  - id: AD-USER-RESOURCE-MAILBOX-ENABLED
+    title: Enabled user object behind a shared, room or equipment mailbox
+    category: IAM
+    severity: medium
+    entity: user
+    why: Shared, room and equipment mailboxes are opened through delegated permissions, not by signing in as the mailbox; an enabled account with a password behind one is a shared credential nobody owns.
+    fix: Disable the user object. Accounts that must sign in themselves (for example meeting-room devices) go into the threshold list ad.enabled-resource-accounts with a documented owner.
+    refs: [NIST-800-53:AC-2, NIST-800-53:IA-2]
+    query:
+      protocol: ldap
+      filter: '(&{USER}(!{UAC:2048}))'
+      attributes: [sAMAccountName, userPrincipalName, objectSid, userAccountControl, lastLogonTimestamp, pwdLastSet, whenCreated, accountExpires, msExchRecipientTypeDetails]
+      key: sAMAccountName
+      name: userPrincipalName
+    each:
+      all:
+        - { field: userAccountControl, op: noflag, value: 2 }
+        - { field: msExchRecipientTypeDetails, op: in, value: [4, 16, 32, 8589934592, 17179869184, 34359738368] }
+        - { field: sAMAccountName, op: notin, value: [], threshold: ad.enabled-resource-accounts }
+    evidence: "{sAMAccountName} - enabled, msExchRecipientTypeDetails {msExchRecipientTypeDetails}, last domain logon '{lastLogonTimestamp}'"
+
+  - id: AD-USER-DISABLED-RECENT-PASSWORD
+    title: Disabled account whose password was set recently
+    category: IAM
+    severity: medium
+    entity: user
+    why: A fresh password on an account that has been disabled for a while means someone is preparing to reuse it, a reset reached the wrong account, or an attacker is staging it; each needs an explanation.
+    fix: Find who reset the password and why; if the account is not being reinstated, set a random password and leave it disabled.
+    refs: [NIST-800-53:AC-2(4), NIST-800-53:IA-5]
+    query:
+      protocol: ldap
+      filter: '(&{USER}(!{UAC:2048}))'
+      attributes: [sAMAccountName, userPrincipalName, objectSid, userAccountControl, lastLogonTimestamp, pwdLastSet, whenCreated, accountExpires, msExchRecipientTypeDetails]
+      key: sAMAccountName
+      name: userPrincipalName
+    each:
+      all:
+        - { field: userAccountControl, op: flag, value: 2 }
+        - { field: pwdLastSet, op: age-lt, value: 30, threshold: ad.disabled-password-reset-days }
+        - { field: whenCreated, op: age-gt, value: 30, threshold: ad.disabled-password-reset-days }
+    evidence: "{sAMAccountName} - disabled, password set {pwdLastSet}, created {whenCreated}"
+
+  - id: AD-USER-PASSWORD-OLD
+    title: Enabled user whose password has not changed for a long time
+    lens: both
+    category: IAM
+    severity: medium
+    entity: user
+    why: A password that stays the same for years survives every leak, phishing campaign and staff change in that period.
+    fix: Ask the owner to change it, or expire it. For service accounts, move to a group managed service account.
+    refs: [NIST-800-53:IA-5(1)]
+    query:
+      protocol: ldap
+      filter: '(&{USER}(!{UAC:2048}))'
+      attributes: [sAMAccountName, userPrincipalName, objectSid, userAccountControl, lastLogonTimestamp, pwdLastSet, whenCreated, accountExpires, msExchRecipientTypeDetails]
+      key: sAMAccountName
+      name: userPrincipalName
+    each:
+      all:
+        - { field: userAccountControl, op: noflag, value: 2 }
+        - { field: pwdLastSet, op: ne, value: 0 }
+        - { field: pwdLastSet, op: age-gt, value: 365, threshold: ad.user-password-max-age-days }
+    evidence: "{sAMAccountName} - password last set {pwdLastSet}"
+
+  - id: AD-USER-GUEST-ENABLED
+    title: Built-in Guest account is enabled
+    category: IAM
+    severity: high
+    entity: user
+    why: The built-in Guest account (RID 501) gives unauthenticated-grade access a name and a session; it should never be usable in a domain.
+    fix: Disable the Guest account and find what depended on it.
+    refs: [NIST-800-53:AC-2, CIS-CONTROLS-8:4.7, MITRE-ATTACK:T1078.001]
+    query:
+      protocol: ldap
+      filter: '(&{USER}(!{UAC:2048}))'
+      attributes: [sAMAccountName, userPrincipalName, objectSid, userAccountControl, lastLogonTimestamp, pwdLastSet, whenCreated, accountExpires, msExchRecipientTypeDetails]
+      key: sAMAccountName
+      name: userPrincipalName
+    each:
+      all:
+        - { field: userAccountControl, op: noflag, value: 2 }
+        - { field: objectSid, op: match, value: '-501$' }
+    evidence: "{sAMAccountName} ({objectSid}) is enabled"
+
+  - id: AD-USER-LOGON-SCRIPT
+    title: Enabled users still assigned a logon script
+    lens: both
+    category: CFG
+    severity: low
+    entity: user
+    why: Logon scripts named in scriptPath run at every sign-in with the user's rights; they are a common, unreviewed way to change local group membership or map shares on servers that no longer exist, and their content is not visible over LDAP.
+    fix: Review the scripts in NETLOGON, move what is still needed to Group Policy preferences, and clear scriptPath.
+    refs: [NIST-800-53:CM-7]
+    query:
+      protocol: ldap
+      filter: '(&{USER}{ENABLED}(scriptPath=*))'
+      attributes: [sAMAccountName, scriptPath]
+      key: sAMAccountName
+    count: { op: gt, value: 0, threshold: ad.logon-script-users-max }
+    evidence: "{count} enabled users run a logon script, for example {sample}"
+
+  - id: AD-USER-PASSWORD-NEVER-EXPIRES
+    title: Enabled user whose password never expires
+    category: IAM
+    severity: medium
+    entity: user
+    why: The flag exempts the account from the password policy, so a leaked password stays valid indefinitely.
+    fix: Clear "password never expires". Move service accounts to group managed service accounts, which rotate their own passwords.
+    refs: [NIST-800-53:IA-5(1), PINGCASTLE:S-PwdNeverExpires]
+    query:
+      protocol: ldap
+      filter: '(&{USER}{ENABLED}{UAC:65536})'
+      attributes: [sAMAccountName, displayName, pwdLastSet]
+      key: sAMAccountName
+      name: displayName
+    each: any
+    evidence: "{sAMAccountName} - password never expires, last set {pwdLastSet}"
+
+  - id: AD-USER-PASSWORD-NOT-REQUIRED
+    title: Enabled user allowed to have an empty password
+    category: IAM
+    severity: high
+    entity: user
+    why: PASSWD_NOTREQD lets the account be given an empty password regardless of policy, so it may already have none.
+    fix: Clear the flag and set a strong password on the account.
+    refs: [NIST-800-53:IA-5, PINGCASTLE:S-PwdNotRequired]
+    query:
+      protocol: ldap
+      filter: '(&{USER}{ENABLED}{UAC:32})'
+      attributes: [sAMAccountName, displayName, pwdLastSet]
+      key: sAMAccountName
+      name: displayName
+    each: any
+    evidence: "{sAMAccountName} - PASSWD_NOTREQD set"
+
+  - id: AD-USER-REVERSIBLE-ENCRYPTION
+    title: Enabled user whose password is stored with reversible encryption
+    category: IAM
+    severity: critical
+    entity: user
+    why: The password is kept in a form that can be decrypted, so anyone who reads the directory database or a backup gets it in clear text.
+    fix: Clear "store password using reversible encryption" and reset the password so the reversible copy is discarded.
+    refs: [NIST-800-53:IA-5(1), PINGCASTLE:S-Reversible]
+    query:
+      protocol: ldap
+      filter: '(&{USER}{ENABLED}{UAC:128})'
+      attributes: [sAMAccountName, displayName, pwdLastSet]
+      key: sAMAccountName
+      name: displayName
+    each: any
+    evidence: "{sAMAccountName} - reversible encryption allowed"
+
+  - id: AD-USER-DES-ONLY
+    title: Enabled user limited to DES Kerberos keys
+    category: AUT
+    severity: high
+    entity: user
+    why: DES is broken and disabled on current Windows; an account restricted to it either fails to authenticate or forces the weakest tickets.
+    fix: Clear USE_DES_KEY_ONLY, enable AES on the account and reset its password so AES keys exist.
+    refs: [NIST-800-53:SC-13, PINGCASTLE:S-DesEnabled]
+    query:
+      protocol: ldap
+      filter: '(&{USER}{ENABLED}{UAC:2097152})'
+      attributes: [sAMAccountName, displayName]
+      key: sAMAccountName
+      name: displayName
+    each: any
+    evidence: "{sAMAccountName} - USE_DES_KEY_ONLY set"
+
+  - id: AD-USER-ASREP-ROASTABLE
+    title: Enabled user without Kerberos pre-authentication (AS-REP roastable)
+    category: AUT
+    severity: critical
+    entity: user
+    why: Without pre-authentication anyone on the network can ask the domain controller for data encrypted with the account's key and crack the password offline.
+    fix: Clear "do not require Kerberos preauthentication"; fix or replace whatever application needed it.
+    refs: [MITRE-ATTACK:T1558.004, NIST-800-53:IA-2, PINGCASTLE:S-NoPreAuth]
+    query:
+      protocol: ldap
+      filter: '(&{USER}{ENABLED}{UAC:4194304})'
+      attributes: [sAMAccountName, displayName]
+      key: sAMAccountName
+      name: displayName
+    each: any
+    evidence: "{sAMAccountName} - DONT_REQ_PREAUTH set"
+
+  - id: AD-USER-KERBEROASTABLE
+    title: Enabled user account with a service principal name (Kerberoastable)
+    category: AUT
+    severity: high
+    entity: user
+    why: Any domain user can request a service ticket for an account with an SPN and try to crack its password offline; human-set service passwords are the usual target.
+    fix: Move the service to a group managed service account; otherwise give the account a long random password and AES-only encryption.
+    refs: [MITRE-ATTACK:T1558.003, PINGCASTLE:P-Kerberoasting]
+    query:
+      protocol: ldap
+      filter: '(&{USER}{ENABLED}(servicePrincipalName=*)(!(sAMAccountName=krbtgt)))'
+      attributes: [sAMAccountName, displayName, pwdLastSet, msDS-SupportedEncryptionTypes, servicePrincipalName]
+      key: sAMAccountName
+      name: displayName
+    each: any
+    evidence: "{sAMAccountName} - SPN {servicePrincipalName}"
+
+  - id: AD-USER-KERBEROASTABLE-OLD-PASSWORD
+    title: Kerberoastable account whose password is old
+    category: AUT
+    severity: critical
+    entity: user
+    why: The older a service account password, the more likely it was set by hand, is short, and has already been captured; old ones are the first to crack.
+    fix: Rotate the password now with a long random value, then move the service to a group managed service account.
+    refs: [MITRE-ATTACK:T1558.003, NIST-800-53:IA-5(1), PINGCASTLE:P-Kerberoasting]
+    query:
+      protocol: ldap
+      filter: '(&{USER}{ENABLED}(servicePrincipalName=*)(!(sAMAccountName=krbtgt)))'
+      attributes: [sAMAccountName, displayName, pwdLastSet, msDS-SupportedEncryptionTypes, servicePrincipalName]
+      key: sAMAccountName
+      name: displayName
+    each: { field: pwdLastSet, op: age-gt, value: 365, threshold: ad.service-password-max-age-days }
+    evidence: "{sAMAccountName} - SPN account, password last set {pwdLastSet}"
+
+  - id: AD-USER-KERBEROASTABLE-RC4
+    title: Kerberoastable account that still accepts RC4 tickets
+    category: AUT
+    severity: medium
+    entity: user
+    why: When RC4 is allowed (or the encryption types are unset, which falls back to RC4) an attacker can request an RC4 ticket, which cracks far faster than AES.
+    fix: Set msDS-SupportedEncryptionTypes to AES only (24) and reset the password so AES keys exist; check the service still works.
+    refs: [MITRE-ATTACK:T1558.003, NIST-800-53:SC-13, MS-KB:5021131]
+    query:
+      protocol: ldap
+      filter: '(&{USER}{ENABLED}(servicePrincipalName=*)(!(sAMAccountName=krbtgt)))'
+      attributes: [sAMAccountName, displayName, pwdLastSet, msDS-SupportedEncryptionTypes, servicePrincipalName]
+      key: sAMAccountName
+      name: displayName
+    each:
+      any:
+        - { field: msDS-SupportedEncryptionTypes, op: absent }
+        - { field: msDS-SupportedEncryptionTypes, op: eq, value: 0 }
+        - { field: msDS-SupportedEncryptionTypes, op: flag, value: 4 }
+    evidence: "{sAMAccountName} - msDS-SupportedEncryptionTypes '{msDS-SupportedEncryptionTypes}' (empty means the RC4 default)"
+
+  - id: AD-USER-UNCONSTRAINED-DELEGATION
+    title: User account trusted for unconstrained delegation
+    category: AUT
+    severity: critical
+    entity: user
+    why: Every user who authenticates to a service running as this account hands it a reusable ticket, so whoever controls the account can impersonate them anywhere.
+    fix: Remove TRUSTED_FOR_DELEGATION; use constrained or resource-based delegation to named services instead.
+    refs: [MITRE-ATTACK:T1558, NIST-800-53:AC-6, PINGCASTLE:P-UnconstrainedDelegation]
+    query:
+      protocol: ldap
+      filter: '(&{USER}{ENABLED}{UAC:524288})'
+      attributes: [sAMAccountName, displayName]
+      key: sAMAccountName
+      name: displayName
+    each: any
+    evidence: "{sAMAccountName} - TRUSTED_FOR_DELEGATION set"
+
+  - id: AD-USER-PROTOCOL-TRANSITION
+    title: User account allowed to delegate with protocol transition
+    category: AUT
+    severity: high
+    entity: user
+    why: TRUSTED_TO_AUTH_FOR_DELEGATION lets the account obtain tickets as any user to its delegation targets without that user ever authenticating.
+    fix: Remove protocol transition unless the design needs it, and keep the target list as small as possible.
+    refs: [MITRE-ATTACK:T1558, NIST-800-53:AC-6]
+    query:
+      protocol: ldap
+      filter: '(&{USER}{ENABLED}{UAC:16777216})'
+      attributes: [sAMAccountName, displayName, msDS-AllowedToDelegateTo]
+      key: sAMAccountName
+      name: displayName
+    each: any
+    evidence: "{sAMAccountName} - protocol transition to {msDS-AllowedToDelegateTo}"
+
+  - id: AD-USER-DELEGATION-SENSITIVE-SPN
+    title: User account delegates to a directory or Kerberos service
+    category: AUT
+    severity: high
+    entity: user
+    why: Delegation to ldap, gc or krbtgt services lets the account act as any user against the directory itself, which on a domain controller amounts to domain control.
+    fix: Remove ldap/, gc/ and krbtgt/ targets from msDS-AllowedToDelegateTo unless a documented design needs them.
+    refs: [MITRE-ATTACK:T1558, NIST-800-53:AC-6]
+    query:
+      protocol: ldap
+      filter: '(&{USER}{ENABLED}(msDS-AllowedToDelegateTo=*))'
+      attributes: [sAMAccountName, displayName, msDS-AllowedToDelegateTo]
+      key: sAMAccountName
+      name: displayName
+    each: { field: msDS-AllowedToDelegateTo, op: match, value: '^(ldap|gc|krbtgt)/' }
+    evidence: "{sAMAccountName} - delegates to {msDS-AllowedToDelegateTo}"
+
+  - id: AD-USER-RBCD
+    title: User account carries resource-based delegation rights
+    category: AUT
+    severity: high
+    entity: user
+    why: Resource-based delegation on a user object (krbtgt above all) is unusual and is a known persistence and escalation artefact.
+    fix: Review who is listed in msDS-AllowedToActOnBehalfOfOtherIdentity and clear it unless a design needs it.
+    refs: [MITRE-ATTACK:T1558, NIST-800-53:AC-6]
+    query:
+      protocol: ldap
+      filter: '(&{USER}(msDS-AllowedToActOnBehalfOfOtherIdentity=*))'
+      attributes: [sAMAccountName, displayName]
+      key: sAMAccountName
+      name: displayName
+    each: any
+    evidence: "{sAMAccountName} - msDS-AllowedToActOnBehalfOfOtherIdentity is set"
+
+  - id: AD-USER-SIDHISTORY
+    title: Enabled user carries SID history
+    category: IAM
+    severity: medium
+    entity: user
+    why: SID history grants the rights of another identity silently; group reviews do not show it.
+    fix: Clear sIDHistory once a migration is finished and resources are re-permissioned.
+    refs: [MITRE-ATTACK:T1134.005, PINGCASTLE:S-SIDHistory]
+    query:
+      protocol: ldap
+      filter: '(&{USER}{ENABLED}(sIDHistory=*))'
+      attributes: [sAMAccountName, displayName, sIDHistory]
+      key: sAMAccountName
+      name: displayName
+    each: any
+    evidence: "{sAMAccountName} - sIDHistory {sIDHistory}"
+
+  - id: AD-USER-SIDHISTORY-PRIVILEGED
+    title: SID history holds a privileged group or account SID
+    category: IAM
+    severity: critical
+    entity: user
+    why: A privileged well-known SID in sIDHistory makes the account an administrator without any group membership - a classic persistence technique.
+    fix: Treat as an incident; clear sIDHistory and find out how it was written.
+    refs: [MITRE-ATTACK:T1134.005, NIST-800-53:AC-6]
+    query:
+      protocol: ldap
+      filter: '(&{USER}{ENABLED}(sIDHistory=*))'
+      attributes: [sAMAccountName, displayName, sIDHistory]
+      key: sAMAccountName
+      name: displayName
+    each: { field: sIDHistory, op: match, value: '-(498|500|512|516|518|519|520|521)$|^S-1-5-32-5(44|48|49|50|51)$' }
+    evidence: "{sAMAccountName} - sIDHistory {sIDHistory}"
+
+  - id: AD-USER-PRIMARY-GROUP
+    title: Enabled user with a non-default primary group
+    lens: both
+    category: IAM
+    severity: low
+    entity: user
+    why: Primary group membership is not listed in the group's member attribute, so it hides from most membership reviews.
+    fix: Set the primary group back to Domain Users (RID 513) and grant the group by normal membership.
+    refs: [PINGCASTLE:S-PrimaryGroup]
+    query:
+      protocol: ldap
+      filter: '(&{USER}{ENABLED}(!{UAC:2048})(!(primaryGroupID=513)))'
+      attributes: [sAMAccountName, displayName, primaryGroupID]
+      key: sAMAccountName
+      name: displayName
+    each: any
+    evidence: "{sAMAccountName} - primaryGroupID {primaryGroupID}"
+
+  - id: AD-USER-CLEARTEXT-PASSWORD-ATTRIBUTE
+    title: User carries a legacy password attribute
+    category: IAM
+    severity: high
+    entity: user
+    why: userPassword, unixUserPassword and similar legacy attributes often hold a password in clear or weakly hashed form that ordinary users can read.
+    fix: Clear the attribute, reset the account password, and find the tool that wrote it.
+    refs: [NIST-800-53:IA-5(1)]
+    query:
+      protocol: ldap
+      filter: '(&{USER}(|(userPassword=*){IFATTR:unixUserPassword|(unixUserPassword=*)}{IFATTR:msSFU30Password|(msSFU30Password=*)}{IFATTR:orclCommonAttribute|(orclCommonAttribute=*)}))'
+      attributes: [sAMAccountName, displayName]
+      key: sAMAccountName
+      name: displayName
+    each: any
+    evidence: "{sAMAccountName} - a legacy password attribute is populated (value not read)"
+
+  - id: AD-USER-NO-AES
+    title: User with Kerberos encryption types that exclude AES
+    category: AUT
+    severity: medium
+    entity: user
+    why: An explicit encryption-type value without AES pins the account to RC4 or DES, both weak and being removed from Windows.
+    fix: Add AES128 and AES256 to msDS-SupportedEncryptionTypes (or set 24) and reset the password.
+    refs: [NIST-800-53:SC-13, MS-KB:5021131]
+    query:
+      protocol: ldap
+      filter: '(&{USER}{ENABLED}(msDS-SupportedEncryptionTypes=*))'
+      attributes: [sAMAccountName, displayName, msDS-SupportedEncryptionTypes]
+      key: sAMAccountName
+      name: displayName
+    each:
+      all:
+        - { field: msDS-SupportedEncryptionTypes, op: gt, value: 0 }
+        - { field: msDS-SupportedEncryptionTypes, op: noflag, value: 8 }
+        - { field: msDS-SupportedEncryptionTypes, op: noflag, value: 16 }
+    evidence: "{sAMAccountName} - msDS-SupportedEncryptionTypes {msDS-SupportedEncryptionTypes}"
+
+  - id: AD-USER-DISABLED-IN-ADMIN-GROUP
+    title: Disabled account still a member of an administrative group
+    lens: both
+    category: IAM
+    severity: medium
+    entity: user
+    why: Membership survives the disable; re-enabling the account restores full administrative rights in one step, and nobody reviews disabled objects.
+    fix: Remove disabled accounts from Administrators, Domain Admins, Enterprise Admins and Schema Admins.
+    refs: [NIST-800-53:AC-2, NIST-800-53:AC-6(7)]
+    query:
+      protocol: ldap
+      filter: '(&{USER}{UAC:2}(|(memberOf:1.2.840.113556.1.4.1941:=CN=Administrators,CN=Builtin,{DOMAINDN})(memberOf:1.2.840.113556.1.4.1941:=CN=Domain Admins,CN=Users,{DOMAINDN})(memberOf:1.2.840.113556.1.4.1941:=CN=Enterprise Admins,CN=Users,{ROOTDN})(memberOf:1.2.840.113556.1.4.1941:=CN=Schema Admins,CN=Users,{ROOTDN})))'
+      attributes: [sAMAccountName, displayName, memberOf]
+      key: sAMAccountName
+      name: displayName
+    each: any
+    evidence: "{sAMAccountName} - disabled, member of {memberOf}"
+
+  # ---------------------------------------------------------------- privileged accounts (adminCount=1)
+
+  - id: AD-PRIV-COUNT
+    title: Too many enabled privileged accounts
+    category: IAM
+    severity: medium
+    entity: user
+    why: adminCount=1 marks accounts that are, or were, in a protected group; every one of them is a path to the domain, so the number should be small and known.
+    fix: Review the list, remove standing membership that is not needed, and clean up orphaned adminCount marks.
+    refs: [NIST-800-53:AC-6(5), CIS-CONTROLS-8:5.4]
+    query:
+      protocol: ldap
+      filter: '(&{USER}{ENABLED}(adminCount=1))'
+      attributes: [sAMAccountName, displayName, objectSid, userAccountControl, pwdLastSet, lastLogonTimestamp, servicePrincipalName, mail]
+      key: sAMAccountName
+      name: displayName
+    count: { op: gt, value: 20, threshold: ad.privileged-accounts-max }
+    evidence: "{count} enabled accounts with adminCount=1: {sample}"
+
+  - id: AD-PRIV-NOT-PROTECTED-USERS
+    title: Privileged account outside the Protected Users group
+    category: IAM
+    severity: high
+    entity: user
+    why: Protected Users stops NTLM, DES/RC4, delegation and long-lived cached credentials for its members - the cheapest control against credential theft for administrators.
+    fix: Add human administrator accounts to Protected Users after checking they do not rely on NTLM or delegation. Service accounts are excluded from this rule.
+    refs: [NIST-800-53:IA-2, PINGCASTLE:P-ProtectedUsers]
+    query:
+      protocol: ldap
+      filter: '(&{USER}{ENABLED}(adminCount=1)(!(servicePrincipalName=*))(!(memberOf:1.2.840.113556.1.4.1941:=CN=Protected Users,CN=Users,{DOMAINDN})))'
+      attributes: [sAMAccountName, displayName]
+      key: sAMAccountName
+      name: displayName
+    each: any
+    evidence: "{sAMAccountName} - privileged, not in Protected Users"
+
+  - id: AD-PRIV-DELEGABLE
+    title: Privileged account that can be delegated
+    category: IAM
+    severity: high
+    entity: user
+    why: Without "account is sensitive and cannot be delegated" a compromised delegating service can impersonate the administrator to any other service.
+    fix: Set NOT_DELEGATED ("account is sensitive and cannot be delegated") on every privileged account.
+    refs: [MITRE-ATTACK:T1558, PINGCASTLE:P-Delegated]
+    query:
+      protocol: ldap
+      filter: '(&{USER}{ENABLED}(adminCount=1))'
+      attributes: [sAMAccountName, displayName, objectSid, userAccountControl, pwdLastSet, lastLogonTimestamp, servicePrincipalName, mail]
+      key: sAMAccountName
+      name: displayName
+    each: { field: userAccountControl, op: noflag, value: 1048576 }
+    evidence: "{sAMAccountName} - userAccountControl {userAccountControl} lacks NOT_DELEGATED"
+
+  - id: AD-PRIV-PASSWORD-NEVER-EXPIRES
+    title: Privileged account whose password never expires
+    category: IAM
+    severity: high
+    entity: user
+    why: An administrator password exempt from the policy stays valid after any leak and after the person leaves.
+    fix: Clear "password never expires" and rotate the password; vault break-glass accounts and rotate them on a schedule.
+    refs: [NIST-800-53:IA-5(1)]
+    query:
+      protocol: ldap
+      filter: '(&{USER}{ENABLED}(adminCount=1))'
+      attributes: [sAMAccountName, displayName, objectSid, userAccountControl, pwdLastSet, lastLogonTimestamp, servicePrincipalName, mail]
+      key: sAMAccountName
+      name: displayName
+    each: { field: userAccountControl, op: flag, value: 65536 }
+    evidence: "{sAMAccountName} - password never expires, last set {pwdLastSet}"
+
+  - id: AD-PRIV-STALE
+    title: Privileged account not used recently
+    lens: both
+    category: IAM
+    severity: high
+    entity: user
+    why: Standing administrative rights on an account nobody uses are risk with no benefit; such accounts are rarely noticed when an attacker starts using them.
+    fix: Remove the account from privileged groups or disable it; keep break-glass accounts documented and monitored.
+    refs: [NIST-800-53:AC-2(3), CIS-CONTROLS-8:5.3, PINGCASTLE:P-Inactive]
+    query:
+      protocol: ldap
+      filter: '(&{USER}{ENABLED}(adminCount=1))'
+      attributes: [sAMAccountName, displayName, objectSid, userAccountControl, pwdLastSet, lastLogonTimestamp, servicePrincipalName, mail]
+      key: sAMAccountName
+      name: displayName
+    each:
+      any:
+        - { field: lastLogonTimestamp, op: age-gt, value: 90, threshold: ad.stale-privileged-days }
+        - { field: lastLogonTimestamp, op: absent }
+    evidence: "{sAMAccountName} - last logon '{lastLogonTimestamp}'"
+
+  - id: AD-PRIV-PASSWORD-OLD
+    title: Privileged account whose password is old
+    category: IAM
+    severity: high
+    entity: user
+    why: An old administrator password has outlived every leak, every departure and every incident since it was set.
+    fix: Rotate the password; for shared or break-glass accounts, rotate on a schedule from a vault.
+    refs: [NIST-800-53:IA-5(1)]
+    query:
+      protocol: ldap
+      filter: '(&{USER}{ENABLED}(adminCount=1))'
+      attributes: [sAMAccountName, displayName, objectSid, userAccountControl, pwdLastSet, lastLogonTimestamp, servicePrincipalName, mail]
+      key: sAMAccountName
+      name: displayName
+    each:
+      all:
+        - { field: pwdLastSet, op: ne, value: 0 }
+        - { field: pwdLastSet, op: age-gt, value: 365, threshold: ad.privileged-password-max-age-days }
+    evidence: "{sAMAccountName} - password last set {pwdLastSet}"
+
+  - id: AD-PRIV-SPN
+    title: Privileged account with a service principal name
+    category: AUT
+    severity: critical
+    entity: user
+    why: Any domain user can request a ticket for this account and crack it offline; if it cracks, the attacker holds administrative rights.
+    fix: Take the service out of privileged groups (grant only the rights it needs) or move it to a group managed service account.
+    refs: [MITRE-ATTACK:T1558.003, NIST-800-53:AC-6]
+    query:
+      protocol: ldap
+      filter: '(&{USER}{ENABLED}(adminCount=1))'
+      attributes: [sAMAccountName, displayName, objectSid, userAccountControl, pwdLastSet, lastLogonTimestamp, servicePrincipalName, mail]
+      key: sAMAccountName
+      name: displayName
+    each: { field: servicePrincipalName, op: notempty }
+    evidence: "{sAMAccountName} - privileged with SPN {servicePrincipalName}"
+
+  - id: AD-PRIV-MAIL
+    title: Privileged account has a mail address
+    category: IAM
+    severity: low
+    entity: user
+    why: An administrator account that receives mail can be phished directly; administrative and daily-use identities should be separate.
+    fix: Use a separate, mail-less account for administration and keep mail on the daily account.
+    refs: [NIST-800-53:AC-6(2), CIS-CONTROLS-8:5.4]
+    query:
+      protocol: ldap
+      filter: '(&{USER}{ENABLED}(adminCount=1))'
+      attributes: [sAMAccountName, displayName, objectSid, userAccountControl, pwdLastSet, lastLogonTimestamp, servicePrincipalName, mail]
+      key: sAMAccountName
+      name: displayName
+    each: { field: mail, op: exists }
+    evidence: "{sAMAccountName} - mail {mail}"
+
+  - id: AD-PRIV-ORPHAN-ADMINCOUNT
+    title: Account marked adminCount=1 but no longer in a protected group
+    lens: both
+    category: IAM
+    severity: low
+    entity: user
+    why: The mark is left behind when an account leaves a protected group; inheritance stays blocked, so delegated permissions do not apply and the old administrative ACL lingers.
+    fix: Clear adminCount and re-enable permission inheritance on the object.
+    refs: [NIST-800-53:AC-6]
+    query:
+      protocol: ldap
+      filter: '(&{USER}(adminCount=1)(!(sAMAccountName=krbtgt*))(!(memberOf:1.2.840.113556.1.4.1941:=CN=Administrators,CN=Builtin,{DOMAINDN}))(!(memberOf:1.2.840.113556.1.4.1941:=CN=Domain Admins,CN=Users,{DOMAINDN}))(!(memberOf:1.2.840.113556.1.4.1941:=CN=Enterprise Admins,CN=Users,{ROOTDN}))(!(memberOf:1.2.840.113556.1.4.1941:=CN=Schema Admins,CN=Users,{ROOTDN}))(!(memberOf:1.2.840.113556.1.4.1941:=CN=Account Operators,CN=Builtin,{DOMAINDN}))(!(memberOf:1.2.840.113556.1.4.1941:=CN=Server Operators,CN=Builtin,{DOMAINDN}))(!(memberOf:1.2.840.113556.1.4.1941:=CN=Print Operators,CN=Builtin,{DOMAINDN}))(!(memberOf:1.2.840.113556.1.4.1941:=CN=Backup Operators,CN=Builtin,{DOMAINDN}))(!(memberOf:1.2.840.113556.1.4.1941:=CN=Replicator,CN=Builtin,{DOMAINDN}))(!(memberOf:1.2.840.113556.1.4.1941:=CN=Key Admins,CN=Users,{DOMAINDN}))(!(memberOf:1.2.840.113556.1.4.1941:=CN=Enterprise Key Admins,CN=Users,{ROOTDN})))'
+      attributes: [sAMAccountName, displayName, userAccountControl]
+      key: sAMAccountName
+      name: displayName
+    each: any
+    evidence: "{sAMAccountName} - adminCount=1 without protected-group membership"
+
+  - id: AD-PRIV-BUILTIN-ADMIN-IN-USE
+    title: Built-in Administrator account used recently
+    category: IAM
+    severity: medium
+    entity: user
+    why: The RID-500 account cannot be locked out and is shared by nature; regular use means work that cannot be attributed to a person.
+    fix: Use personal administrator accounts; keep RID 500 as a vaulted break-glass account with a long password and alert on its use.
+    refs: [NIST-800-53:AC-2, CIS-CONTROLS-8:5.4]
+    query:
+      protocol: ldap
+      filter: '(&{USER}{ENABLED}(adminCount=1))'
+      attributes: [sAMAccountName, displayName, objectSid, userAccountControl, pwdLastSet, lastLogonTimestamp, servicePrincipalName, mail]
+      key: sAMAccountName
+      name: displayName
+    each:
+      all:
+        - { field: objectSid, op: match, value: '-500$' }
+        - { field: lastLogonTimestamp, op: age-lt, value: 30, threshold: ad.builtin-admin-quiet-days }
+    evidence: "{sAMAccountName} (RID 500) - last logon {lastLogonTimestamp}"
+
+  # ---------------------------------------------------------------- groups
+
+  - id: AD-GROUP-DOMAIN-ADMINS-SIZE
+    title: Domain Admins has more enabled members than expected
+    category: IAM
+    severity: high
+    entity: group
+    why: Every Domain Admin is full control of the domain behind one password; the group should hold a handful of named, monitored accounts.
+    fix: Remove members who do not need standing domain-wide rights and delegate narrower permissions instead. Nested members are counted.
+    refs: [NIST-800-53:AC-6(5), CIS-CONTROLS-8:5.4]
+    query:
+      protocol: ldap
+      filter: '(&{USER}{ENABLED}(memberOf:1.2.840.113556.1.4.1941:=CN=Domain Admins,CN=Users,{DOMAINDN}))'
+      attributes: [sAMAccountName, displayName]
+      key: sAMAccountName
+      name: displayName
+    count: { op: gt, value: 5, threshold: ad.domain-admins-max }
+    evidence: "{count} enabled members (nested included): {sample}"
+
+  - id: AD-GROUP-ENTERPRISE-ADMINS-SIZE
+    title: Enterprise Admins has standing members
+    category: IAM
+    severity: high
+    entity: group
+    why: Enterprise Admins controls every domain in the forest and is needed only for forest-level changes.
+    fix: Keep at most a break-glass account in the group and add others just in time. Nested members are counted.
+    refs: [NIST-800-53:AC-6(5), CIS-CONTROLS-8:5.4]
+    query:
+      protocol: ldap
+      filter: '(&{USER}{ENABLED}(memberOf:1.2.840.113556.1.4.1941:=CN=Enterprise Admins,CN=Users,{ROOTDN}))'
+      attributes: [sAMAccountName, displayName]
+      key: sAMAccountName
+      name: displayName
+    count: { op: gt, value: 1, threshold: ad.enterprise-admins-max }
+    evidence: "{count} enabled members (nested included): {sample}"
+
+  - id: AD-GROUP-SCHEMA-ADMINS-SIZE
+    title: Schema Admins is not empty
+    category: IAM
+    severity: medium
+    entity: group
+    why: Schema Admins can change the forest schema irreversibly; membership is needed only during a planned schema update.
+    fix: Empty the group, including the built-in Administrator, and add a member only for the duration of a schema change.
+    refs: [NIST-800-53:AC-6(5), PINGCASTLE:P-SchemaAdmin]
+    query:
+      protocol: ldap
+      filter: '(&{USER}{ENABLED}(memberOf:1.2.840.113556.1.4.1941:=CN=Schema Admins,CN=Users,{ROOTDN}))'
+      attributes: [sAMAccountName, displayName]
+      key: sAMAccountName
+      name: displayName
+    count: { op: gt, value: 0, threshold: ad.schema-admins-max }
+    evidence: "{count} enabled members (nested included): {sample}"
+
+  - id: AD-GROUP-ADMINISTRATORS-DIRECT-MEMBERS
+    title: Builtin Administrators has direct members beyond the defaults
+    category: IAM
+    severity: high
+    entity: group
+    why: Direct members of the domain's Administrators group are administrators on every domain controller and bypass reviews that look only at Domain Admins.
+    fix: Keep only Domain Admins, Enterprise Admins and the built-in Administrator as direct members; grant other needs through narrower delegation.
+    refs: [NIST-800-53:AC-6(5), CIS-CONTROLS-8:5.4]
+    query:
+      protocol: ldap
+      filter: '(objectSid=S-1-5-32-544)'
+      attributes: [cn, member]
+      key: cn
+    each: { field: member, op: notmatch, value: '^CN=(Domain Admins|Enterprise Admins|Administrator),CN=Users,DC=' }
+    evidence: "{cn} direct members - {member}"
+
+  - id: AD-GROUP-DNSADMINS-SIZE
+    title: DnsAdmins has enabled members
+    category: IAM
+    severity: medium
+    entity: group
+    why: DnsAdmins members can make the DNS service on a domain controller load a DLL of their choice as SYSTEM, so the group is administrative in practice.
+    fix: Empty the group or limit it to tier-0 administrators; delegate DNS record management through zone permissions instead.
+    refs: [NIST-800-53:AC-6(5), MITRE-ATTACK:T1574.002]
+    query:
+      protocol: ldap
+      filter: '(&{USER}{ENABLED}(memberOf:1.2.840.113556.1.4.1941:=CN=DnsAdmins,CN=Users,{DOMAINDN}))'
+      attributes: [sAMAccountName, displayName]
+      key: sAMAccountName
+      name: displayName
+    count: { op: gt, value: 0, threshold: ad.dnsadmins-max }
+    evidence: "{count} enabled members (nested included): {sample}"
+
+  - id: AD-GROUP-OPERATORS-NOT-EMPTY
+    title: Built-in operator group has members
+    category: IAM
+    severity: high
+    entity: group
+    why: Account, Server, Print and Backup Operators can each reach domain-controller level control (backup rights read the directory database, server operators run code on DCs); they should be empty.
+    fix: Remove the members and delegate the specific tasks they performed through OU-level permissions.
+    refs: [NIST-800-53:AC-6(5), CIS-CONTROLS-8:5.4]
+    query:
+      protocol: ldap
+      filter: '(|(objectSid=S-1-5-32-548)(objectSid=S-1-5-32-549)(objectSid=S-1-5-32-550)(objectSid=S-1-5-32-551))'
+      attributes: [cn, member]
+      key: cn
+    each: { field: member, op: notempty }
+    evidence: "{cn} members - {member}"
+
+  - id: AD-GROUP-PRE2000-ANONYMOUS
+    title: Pre-Windows 2000 Compatible Access contains Everyone or Anonymous
+    category: IAM
+    severity: high
+    entity: group
+    why: These members let unauthenticated callers read user and group data across the domain - the first step of most reconnaissance.
+    fix: Remove Everyone and Anonymous Logon from the group after checking no legacy system still needs anonymous reads.
+    refs: [NIST-800-53:AC-14, MITRE-ATTACK:T1087.002]
+    query:
+      protocol: ldap
+      filter: '(objectSid=S-1-5-32-554)'
+      attributes: [cn, member]
+      key: cn
+    each: { field: member, op: match, value: '^CN=(S-1-1-0|S-1-5-7),CN=ForeignSecurityPrincipals,' }
+    evidence: "{cn} members - {member}"
+
+  - id: AD-GROUP-PRE2000-AUTHENTICATED-USERS
+    title: Pre-Windows 2000 Compatible Access contains Authenticated Users
+    category: IAM
+    severity: medium
+    entity: group
+    why: The membership gives every authenticated principal, computers included, broad read access to user and group attributes that newer permissions would otherwise restrict.
+    fix: Remove Authenticated Users once no legacy application depends on it; test on a pilot first.
+    refs: [NIST-800-53:AC-6]
+    query:
+      protocol: ldap
+      filter: '(objectSid=S-1-5-32-554)'
+      attributes: [cn, member]
+      key: cn
+    each: { field: member, op: match, value: '^CN=S-1-5-11,CN=ForeignSecurityPrincipals,' }
+    evidence: "{cn} members - {member}"
+
+  - id: AD-GROUP-BUILTIN-BROAD-MEMBER
+    title: Builtin group grants rights to a broad principal
+    category: IAM
+    severity: high
+    entity: group
+    why: Everyone, Authenticated Users, Domain Users or Domain Computers inside a builtin group such as Remote Desktop Users or Administrators hands that right to the whole domain on every domain controller.
+    fix: Remove the broad principal and grant the right to a specific group.
+    refs: [NIST-800-53:AC-6]
+    query:
+      protocol: ldap
+      filter: '(|(objectSid=S-1-5-32-544)(objectSid=S-1-5-32-548)(objectSid=S-1-5-32-549)(objectSid=S-1-5-32-550)(objectSid=S-1-5-32-551)(objectSid=S-1-5-32-552)(objectSid=S-1-5-32-555)(objectSid=S-1-5-32-556)(objectSid=S-1-5-32-558)(objectSid=S-1-5-32-559)(objectSid=S-1-5-32-562)(objectSid=S-1-5-32-569)(objectSid=S-1-5-32-573)(objectSid=S-1-5-32-578)(objectSid=S-1-5-32-579)(objectSid=S-1-5-32-580)(objectSid=S-1-5-32-582))'
+      attributes: [cn, member]
+      key: cn
+    each: { field: member, op: match, value: '^CN=(S-1-1-0|S-1-5-7|S-1-5-11|S-1-5-2|S-1-5-4),CN=ForeignSecurityPrincipals,|^CN=(Domain Users|Domain Computers|Domain Guests),CN=Users,' }
+    evidence: "{cn} members - {member}"
+
+  - id: AD-GROUP-EMPTY
+    title: Empty security groups
+    lens: maintenance
+    category: HYG
+    severity: low
+    entity: group
+    why: Groups with no members clutter the access model and are easy to re-use by mistake for something they were never reviewed for.
+    fix: Confirm with the owner and delete, or document why the group must exist empty.
+    query:
+      protocol: ldap
+      filter: '(&(objectClass=group)(!(member=*))(!(isCriticalSystemObject=TRUE))(groupType:1.2.840.113556.1.4.803:=2147483648))'
+      attributes: [cn, whenCreated]
+      key: distinguishedName
+      name: cn
+    count: { op: gt, value: 0, threshold: ad.empty-groups-max }
+    evidence: "{count} empty security groups, for example {sample}"
+
+  # ---------------------------------------------------------------- Kerberos
+
+  - id: AD-KRB-KRBTGT-PASSWORD-AGE
+    title: krbtgt account password not rotated recently
+    category: AUT
+    severity: high
+    entity: user
+    why: Forged tickets signed with the krbtgt key stay valid until the key is changed twice; an old key means any past compromise still works.
+    fix: Reset the krbtgt password twice with full replication in between, on a regular schedule and after any suspected compromise. Read-only DC and cloud Kerberos krbtgt accounts are included.
+    refs: [MITRE-ATTACK:T1558.001, NIST-800-53:IA-5, PINGCASTLE:A-Krbtgt]
+    query:
+      protocol: ldap
+      filter: '(&{USER}(sAMAccountName=krbtgt*))'
+      attributes: [sAMAccountName, pwdLastSet]
+      key: sAMAccountName
+    each: { field: pwdLastSet, op: age-gt, value: 180, threshold: ad.krbtgt-max-age-days }
+    evidence: "{sAMAccountName} - password last set {pwdLastSet}"
+
+  # ---------------------------------------------------------------- domain policy (domain head)
+
+  - id: AD-DOM-MACHINE-ACCOUNT-QUOTA
+    title: Ordinary users may add computers to the domain
+    category: CFG
+    severity: medium
+    entity: domain
+    why: A machine account quota above zero lets any user create computer accounts, a common first step in delegation and relay attacks.
+    fix: Set ms-DS-MachineAccountQuota to 0 and delegate domain join to a named group on the target OUs.
+    refs: [MITRE-ATTACK:T1136.002, NIST-800-53:AC-6, PINGCASTLE:S-ADRegistration]
+    refresh: 7d
+    query:
+      protocol: ldap
+      scope: base
+      filter: '(objectClass=domainDNS)'
+      attributes: [name, minPwdLength, pwdHistoryLength, pwdProperties, lockoutThreshold, ms-DS-MachineAccountQuota, msDS-Behavior-Version, gPLink]
+      key: distinguishedName
+      name: name
+    each: { field: ms-DS-MachineAccountQuota, op: gt, value: 0, threshold: ad.machine-account-quota-max }
+    evidence: "{name} - ms-DS-MachineAccountQuota {ms-DS-MachineAccountQuota}"
+
+  - id: AD-DOM-MIN-PASSWORD-LENGTH
+    title: Domain password policy allows short passwords
+    category: IAM
+    severity: high
+    entity: domain
+    why: The default domain policy is the floor for every account without a fine-grained policy; short passwords fall to guessing and offline cracking quickly.
+    fix: Raise the minimum length in the policy linked at the domain root (or use fine-grained policies for the accounts that need longer ones).
+    refs: [NIST-800-53:IA-5(1), CIS-CONTROLS-8:5.2]
+    refresh: 7d
+    query:
+      protocol: ldap
+      scope: base
+      filter: '(objectClass=domainDNS)'
+      attributes: [name, minPwdLength, pwdHistoryLength, pwdProperties, lockoutThreshold, ms-DS-MachineAccountQuota, msDS-Behavior-Version, gPLink]
+      key: distinguishedName
+      name: name
+    each: { field: minPwdLength, op: lt, value: 14, threshold: ad.min-password-length }
+    evidence: "{name} - minPwdLength {minPwdLength}"
+
+  - id: AD-DOM-PASSWORD-HISTORY
+    title: Domain password policy keeps a short password history
+    category: IAM
+    severity: medium
+    entity: domain
+    why: With a short history users can cycle back to a password that has already leaked.
+    fix: Set the password history to the threshold value (24 by default) in the root-linked password policy.
+    refs: [NIST-800-53:IA-5(1)]
+    refresh: 7d
+    query:
+      protocol: ldap
+      scope: base
+      filter: '(objectClass=domainDNS)'
+      attributes: [name, minPwdLength, pwdHistoryLength, pwdProperties, lockoutThreshold, ms-DS-MachineAccountQuota, msDS-Behavior-Version, gPLink]
+      key: distinguishedName
+      name: name
+    each: { field: pwdHistoryLength, op: lt, value: 24, threshold: ad.password-history-min }
+    evidence: "{name} - pwdHistoryLength {pwdHistoryLength}"
+
+  - id: AD-DOM-NO-LOCKOUT
+    title: Domain policy has no account lockout threshold
+    category: IAM
+    severity: medium
+    entity: domain
+    why: Without a lockout threshold an attacker can guess passwords against every account without limit.
+    fix: Set a lockout threshold (for example 10) with a short lockout duration so spraying is slowed without easy denial of service.
+    refs: [MITRE-ATTACK:T1110.003, NIST-800-53:AC-7]
+    refresh: 7d
+    query:
+      protocol: ldap
+      scope: base
+      filter: '(objectClass=domainDNS)'
+      attributes: [name, minPwdLength, pwdHistoryLength, pwdProperties, lockoutThreshold, ms-DS-MachineAccountQuota, msDS-Behavior-Version, gPLink]
+      key: distinguishedName
+      name: name
+    each: { field: lockoutThreshold, op: eq, value: 0 }
+    evidence: "{name} - lockoutThreshold {lockoutThreshold}"
+
+  - id: AD-DOM-COMPLEXITY-OFF
+    title: Domain policy has complexity off without long passphrases
+    category: IAM
+    severity: medium
+    entity: domain
+    why: Complexity can be dropped when long passphrases are required; with neither, the policy accepts short dictionary words.
+    fix: Turn complexity on, or raise the minimum length to passphrase level.
+    refs: [NIST-800-53:IA-5(1)]
+    refresh: 7d
+    query:
+      protocol: ldap
+      scope: base
+      filter: '(objectClass=domainDNS)'
+      attributes: [name, minPwdLength, pwdHistoryLength, pwdProperties, lockoutThreshold, ms-DS-MachineAccountQuota, msDS-Behavior-Version, gPLink]
+      key: distinguishedName
+      name: name
+    each:
+      all:
+        - { field: pwdProperties, op: noflag, value: 1 }
+        - { field: minPwdLength, op: lt, value: 15, threshold: ad.passphrase-min-length }
+    evidence: "{name} - pwdProperties {pwdProperties}, minPwdLength {minPwdLength}"
+
+  - id: AD-DOM-REVERSIBLE-ENCRYPTION
+    title: Domain policy stores every password with reversible encryption
+    category: IAM
+    severity: critical
+    entity: domain
+    why: With the domain-wide setting on, each password changed afterwards is kept in a decryptable form for every account.
+    fix: Turn off "store passwords using reversible encryption" in the root-linked policy, then force password changes.
+    refs: [NIST-800-53:IA-5(1)]
+    refresh: 7d
+    query:
+      protocol: ldap
+      scope: base
+      filter: '(objectClass=domainDNS)'
+      attributes: [name, minPwdLength, pwdHistoryLength, pwdProperties, lockoutThreshold, ms-DS-MachineAccountQuota, msDS-Behavior-Version, gPLink]
+      key: distinguishedName
+      name: name
+    each: { field: pwdProperties, op: flag, value: 16 }
+    evidence: "{name} - pwdProperties {pwdProperties}"
+
+  - id: AD-DOM-FUNCTIONAL-LEVEL
+    title: Domain functional level below the target
+    lens: both
+    category: LCM
+    severity: medium
+    entity: domain
+    why: Older functional levels keep newer protections off (for example rolling of expiring NTLM secrets and current Kerberos defaults) and signal old domain controllers.
+    fix: Retire the old domain controllers and raise the domain functional level (7 = Windows Server 2016).
+    refs: [NIST-800-53:CM-2]
+    refresh: 7d
+    query:
+      protocol: ldap
+      scope: base
+      filter: '(objectClass=domainDNS)'
+      attributes: [name, minPwdLength, pwdHistoryLength, pwdProperties, lockoutThreshold, ms-DS-MachineAccountQuota, msDS-Behavior-Version, gPLink]
+      key: distinguishedName
+      name: name
+    each: { field: msDS-Behavior-Version, op: lt, value: 7, threshold: ad.min-functional-level }
+    evidence: "{name} - domain functional level {msDS-Behavior-Version}"
+
+  - id: AD-DOM-ROOT-NO-GPO
+    title: No Group Policy linked at the domain root
+    category: CFG
+    severity: medium
+    entity: domain
+    why: Domain password, lockout and Kerberos policy come only from GPOs linked at the domain root; with none linked the domain runs on built-in defaults nobody chose.
+    fix: Link the Default Domain Policy (or the domain's password policy GPO) at the domain root.
+    refs: [NIST-800-53:CM-6]
+    refresh: 7d
+    query:
+      protocol: ldap
+      scope: base
+      filter: '(objectClass=domainDNS)'
+      attributes: [name, minPwdLength, pwdHistoryLength, pwdProperties, lockoutThreshold, ms-DS-MachineAccountQuota, msDS-Behavior-Version, gPLink]
+      key: distinguishedName
+      name: name
+    each:
+      any:
+        - { field: gPLink, op: absent }
+        - { field: gPLink, op: notmatch, value: 'LDAP://' }
+    evidence: "{name} - gPLink '{gPLink}'"
+
+  - id: AD-DOM-DC-OU-NO-GPO
+    title: No Group Policy linked to the Domain Controllers OU
+    category: CFG
+    severity: medium
+    entity: domain
+    why: User rights and audit settings for domain controllers normally come from a GPO on this OU; without one they fall back to local defaults.
+    fix: Link the Default Domain Controllers Policy, or the domain controller baseline GPO, to the Domain Controllers OU.
+    refs: [NIST-800-53:CM-6]
+    refresh: 7d
+    query:
+      protocol: ldap
+      base: 'OU=Domain Controllers,{DOMAINDN}'
+      scope: base
+      filter: '(objectClass=organizationalUnit)'
+      attributes: [ou, gPLink]
+      key: distinguishedName
+    each:
+      any:
+        - { field: gPLink, op: absent }
+        - { field: gPLink, op: notmatch, value: 'LDAP://' }
+    evidence: "{distinguishedName} - gPLink '{gPLink}'"
+
+  # ---------------------------------------------------------------- forest settings (configuration partition)
+
+  - id: AD-FOREST-FUNCTIONAL-LEVEL
+    title: Forest functional level below the target
+    lens: both
+    category: LCM
+    severity: medium
+    entity: domain
+    why: Forest-wide features such as current trust and Kerberos behaviour depend on the forest level, and a low level means old domain controllers somewhere in the forest.
+    fix: Raise every domain first, then the forest functional level (7 = Windows Server 2016).
+    refs: [NIST-800-53:CM-2]
+    refresh: 7d
+    query:
+      protocol: ldap
+      base: 'CN=Partitions,{CONFIGDN}'
+      scope: base
+      filter: '(objectClass=crossRefContainer)'
+      attributes: [cn, msDS-Behavior-Version, msDS-EnabledFeature]
+      key: distinguishedName
+    each: { field: msDS-Behavior-Version, op: lt, value: 7, threshold: ad.min-functional-level }
+    evidence: "Forest functional level {msDS-Behavior-Version}"
+
+  - id: AD-FOREST-RECYCLE-BIN-OFF
+    title: Active Directory Recycle Bin is not enabled
+    kind: missing
+    lens: both
+    category: BCK
+    severity: medium
+    entity: domain
+    why: Without the Recycle Bin a deleted user, group or OU comes back only through an authoritative restore from backup, and its links are lost.
+    fix: Enable the Recycle Bin optional feature (forest functional level 2008 R2 or higher); note it cannot be turned off again.
+    refs: [NIST-800-53:CP-9, NIST-800-53:CP-10, PINGCASTLE:P-RecycleBin]
+    refresh: 7d
+    query:
+      protocol: ldap
+      base: 'CN=Partitions,{CONFIGDN}'
+      scope: base
+      filter: '(objectClass=crossRefContainer)'
+      attributes: [cn, msDS-Behavior-Version, msDS-EnabledFeature]
+      key: distinguishedName
+    each:
+      any:
+        - { field: msDS-EnabledFeature, op: absent }
+        - not: { field: msDS-EnabledFeature, op: match, value: '^CN=Recycle Bin Feature,' }
+    evidence: "Enabled optional features - '{msDS-EnabledFeature}'"
+
+  - id: AD-FOREST-TOMBSTONE-LIFETIME
+    title: Tombstone lifetime is short or unset
+    lens: maintenance
+    category: BCK
+    severity: low
+    entity: domain
+    why: The tombstone lifetime bounds how old a usable backup can be and how long a domain controller may stay offline; unset means the old 60-day default.
+    fix: Set tombstoneLifetime to at least 180 days.
+    refs: [NIST-800-53:CP-9]
+    refresh: 7d
+    query:
+      protocol: ldap
+      base: 'CN=Directory Service,CN=Windows NT,CN=Services,{CONFIGDN}'
+      scope: base
+      filter: '(objectClass=nTDSService)'
+      attributes: [cn, tombstoneLifetime, dSHeuristics]
+      key: distinguishedName
+    each:
+      any:
+        - { field: tombstoneLifetime, op: absent }
+        - { field: tombstoneLifetime, op: lt, value: 180, threshold: ad.min-tombstone-days }
+    evidence: "tombstoneLifetime '{tombstoneLifetime}'"
+
+  - id: AD-FOREST-DSH-ANONYMOUS-LDAP
+    title: dSHeuristics allows anonymous LDAP operations
+    category: CFG
+    severity: high
+    entity: domain
+    why: The seventh dSHeuristics character set to 2 lets unauthenticated clients search the directory wherever permissions allow anonymous reads.
+    fix: Set the seventh character back to 0 after finding the clients that bind anonymously.
+    refs: [NIST-800-53:AC-14, MITRE-ATTACK:T1087.002, PINGCASTLE:A-DsHeuristicsAnonymous]
+    refresh: 7d
+    query:
+      protocol: ldap
+      base: 'CN=Directory Service,CN=Windows NT,CN=Services,{CONFIGDN}'
+      scope: base
+      filter: '(objectClass=nTDSService)'
+      attributes: [cn, tombstoneLifetime, dSHeuristics]
+      key: distinguishedName
+    each:
+      all:
+        - { field: dSHeuristics, op: exists }
+        - { field: dSHeuristics, op: match, value: '^.{6}2' }
+    evidence: "dSHeuristics {dSHeuristics}"
+
+  - id: AD-FOREST-DSH-ADMINSDEXMASK
+    title: dSHeuristics removes operator groups from AdminSDHolder protection
+    category: CFG
+    severity: medium
+    entity: domain
+    why: A non-zero sixteenth character excludes operator groups from AdminSDHolder, so changed permissions on them are no longer reset - often a leftover or a persistence trick.
+    fix: Set the sixteenth character to 0 unless a documented design needs the exclusion.
+    refs: [NIST-800-53:AC-6, PINGCASTLE:A-DsHeuristicsAdminSDExMask]
+    refresh: 7d
+    query:
+      protocol: ldap
+      base: 'CN=Directory Service,CN=Windows NT,CN=Services,{CONFIGDN}'
+      scope: base
+      filter: '(objectClass=nTDSService)'
+      attributes: [cn, tombstoneLifetime, dSHeuristics]
+      key: distinguishedName
+    each:
+      all:
+        - { field: dSHeuristics, op: exists }
+        - { field: dSHeuristics, op: match, value: '^.{15}[1-9a-fA-F]' }
+    evidence: "dSHeuristics {dSHeuristics}"
+
+  - id: AD-FOREST-DSH-ANONYMOUS-NSPI
+    title: dSHeuristics allows anonymous NSPI (address book) access
+    category: CFG
+    severity: medium
+    entity: domain
+    why: A non-zero eighth character lets anonymous callers use the address-book RPC interface to enumerate directory objects.
+    fix: Set the eighth character to 0.
+    refs: [NIST-800-53:AC-14, PINGCASTLE:A-DsHeuristicsAllowAnonNSPI]
+    refresh: 7d
+    query:
+      protocol: ldap
+      base: 'CN=Directory Service,CN=Windows NT,CN=Services,{CONFIGDN}'
+      scope: base
+      filter: '(objectClass=nTDSService)'
+      attributes: [cn, tombstoneLifetime, dSHeuristics]
+      key: distinguishedName
+    each:
+      all:
+        - { field: dSHeuristics, op: exists }
+        - { field: dSHeuristics, op: match, value: '^.{7}[^0]' }
+    evidence: "dSHeuristics {dSHeuristics}"
+
+  - id: AD-FOREST-DSH-AUTHZ-CHECKS-OFF
+    title: dSHeuristics turns off the LDAP add and owner-rights hardening
+    category: CFG
+    severity: medium
+    entity: domain
+    why: A 2 in the 28th or 29th character disables the checks that stop non-administrators from setting dangerous attributes or abusing implicit owner rights on computer objects.
+    fix: Set both characters to 1 (enforce) after reviewing the audit events the hardening logs.
+    refs: [CVE-2021-42291, MS-KB:5008383]
+    refresh: 7d
+    query:
+      protocol: ldap
+      base: 'CN=Directory Service,CN=Windows NT,CN=Services,{CONFIGDN}'
+      scope: base
+      filter: '(objectClass=nTDSService)'
+      attributes: [cn, tombstoneLifetime, dSHeuristics]
+      key: distinguishedName
+    each:
+      all:
+        - { field: dSHeuristics, op: exists }
+        - { field: dSHeuristics, op: match, value: '^.{27}2|^.{28}2' }
+    evidence: "dSHeuristics {dSHeuristics}"
+
+  # ---------------------------------------------------------------- trusts
+
+  - id: AD-TRUST-REVIEW
+    title: Domain trust to review
+    category: IAM
+    severity: info
+    entity: trust
+    why: Every trust is an authentication path into or out of the domain and should have an owner and a reason.
+    fix: Confirm the trust is still needed, who owns the other side, and that its direction and filtering match the design; remove trusts nobody owns.
+    refs: [NIST-800-53:AC-20, MITRE-ATTACK:T1482]
+    refresh: 7d
+    query:
+      protocol: ldap
+      filter: '(objectClass=trustedDomain)'
+      attributes: [cn, trustPartner, flatName, trustDirection, trustType, trustAttributes, msDS-SupportedEncryptionTypes, whenCreated, whenChanged]
+      key: cn
+      name: trustPartner
+    each: any
+    evidence: "{trustPartner} - direction {trustDirection}, type {trustType}, attributes {trustAttributes}, created {whenCreated}"
+
+  - id: AD-TRUST-SID-FILTERING-OFF
+    title: External trust without SID filtering
+    category: IAM
+    severity: high
+    entity: trust
+    why: Without quarantine (SID filtering) the trusted domain can present any SID, including this domain's administrator SIDs, through SID history.
+    fix: Enable SID filtering (quarantine) on the trust once migrations that relied on SID history are complete.
+    refs: [MITRE-ATTACK:T1134.005, NIST-800-53:AC-20]
+    refresh: 7d
+    query:
+      protocol: ldap
+      filter: '(objectClass=trustedDomain)'
+      attributes: [cn, trustPartner, flatName, trustDirection, trustType, trustAttributes, msDS-SupportedEncryptionTypes, whenCreated, whenChanged]
+      key: cn
+      name: trustPartner
+    each:
+      all:
+        - { field: trustDirection, op: in, value: [2, 3] }
+        - { field: trustType, op: in, value: [1, 2] }
+        - { field: trustAttributes, op: noflag, value: 4 }
+        - { field: trustAttributes, op: noflag, value: 8 }
+        - { field: trustAttributes, op: noflag, value: 32 }
+    evidence: "{trustPartner} - trustAttributes {trustAttributes} (no quarantine bit)"
+
+  - id: AD-TRUST-FOREST-SIDHISTORY
+    title: Forest trust accepts SID history
+    category: IAM
+    severity: high
+    entity: trust
+    why: Treating a forest trust as external relaxes SID filtering, so SIDs from the other forest's history are honoured here.
+    fix: Clear TRUST_ATTRIBUTE_TREAT_AS_EXTERNAL on the trust unless a migration currently needs it.
+    refs: [MITRE-ATTACK:T1134.005, NIST-800-53:AC-20]
+    refresh: 7d
+    query:
+      protocol: ldap
+      filter: '(objectClass=trustedDomain)'
+      attributes: [cn, trustPartner, flatName, trustDirection, trustType, trustAttributes, msDS-SupportedEncryptionTypes, whenCreated, whenChanged]
+      key: cn
+      name: trustPartner
+    each:
+      all:
+        - { field: trustAttributes, op: flag, value: 8 }
+        - { field: trustAttributes, op: flag, value: 64 }
+        - { field: trustAttributes, op: noflag, value: 1024 }
+    evidence: "{trustPartner} - trustAttributes {trustAttributes}"
+
+  - id: AD-TRUST-TGT-DELEGATION
+    title: Forest trust allows TGT delegation
+    category: AUT
+    severity: high
+    entity: trust
+    why: With TGT delegation enabled, services with unconstrained delegation in the other forest receive reusable tickets of this forest's users.
+    fix: Clear TRUST_ATTRIBUTE_CROSS_ORGANIZATION_ENABLE_TGT_DELEGATION on the trust.
+    refs: [MITRE-ATTACK:T1558, NIST-800-53:AC-20]
+    refresh: 7d
+    query:
+      protocol: ldap
+      filter: '(objectClass=trustedDomain)'
+      attributes: [cn, trustPartner, flatName, trustDirection, trustType, trustAttributes, msDS-SupportedEncryptionTypes, whenCreated, whenChanged]
+      key: cn
+      name: trustPartner
+    each:
+      all:
+        - { field: trustAttributes, op: flag, value: 8 }
+        - { field: trustAttributes, op: flag, value: 2048 }
+    evidence: "{trustPartner} - trustAttributes {trustAttributes}"
+
+  - id: AD-TRUST-NO-AES
+    title: Trust does not use AES for Kerberos
+    category: AUT
+    severity: medium
+    entity: trust
+    why: A trust with no AES encryption types falls back to RC4 for referral tickets, which is weak and is being removed from Windows.
+    fix: Enable "the other domain supports Kerberos AES encryption" on both sides of the trust.
+    refs: [NIST-800-53:SC-13]
+    refresh: 7d
+    query:
+      protocol: ldap
+      filter: '(objectClass=trustedDomain)'
+      attributes: [cn, trustPartner, flatName, trustDirection, trustType, trustAttributes, msDS-SupportedEncryptionTypes, whenCreated, whenChanged]
+      key: cn
+      name: trustPartner
+    each:
+      all:
+        - { field: trustType, op: eq, value: 2 }
+        - { field: trustAttributes, op: noflag, value: 256 }
+        - any:
+            - { field: msDS-SupportedEncryptionTypes, op: absent }
+            - all:
+                - { field: msDS-SupportedEncryptionTypes, op: noflag, value: 8 }
+                - { field: msDS-SupportedEncryptionTypes, op: noflag, value: 16 }
+    evidence: "{trustPartner} - msDS-SupportedEncryptionTypes '{msDS-SupportedEncryptionTypes}'"
+
+  # ---------------------------------------------------------------- computers (servers and workstations)
+
+  - id: AD-COMP-STALE
+    title: Enabled computer account not seen for a long time
+    lens: maintenance
+    category: HYG
+    severity: medium
+    entity: computer
+    why: Stale computer objects hide real assets, skew every count and keep DNS records, delegations and LAPS passwords alive for machines that are gone.
+    fix: Disable the object, move it to a quarantine OU, and delete it after the retention period.
+    refs: [NIST-800-53:CM-8, PINGCASTLE:S-C-Inactive]
+    query:
+      protocol: ldap
+      filter: '(&{COMPUTER}{ENABLED})'
+      attributes: [sAMAccountName, dNSHostName, operatingSystem, operatingSystemVersion, lastLogonTimestamp, userAccountControl, pwdLastSet, whenCreated, adminCount, servicePrincipalName, msDS-SupportedEncryptionTypes, msDS-AllowedToDelegateTo, msDS-AllowedToActOnBehalfOfOtherIdentity, ms-Mcs-AdmPwdExpirationTime, msLAPS-PasswordExpirationTime]
+      key: sAMAccountName
+      name: dNSHostName
+    each:
+      all:
+        - { field: sAMAccountName, op: ne, value: 'AZUREADSSOACC$' }
+        - any:
+            - { field: servicePrincipalName, op: absent }
+            - not: { field: servicePrincipalName, op: match, value: '^MSClusterVirtualServer/' }
+        - any:
+            - { field: lastLogonTimestamp, op: age-gt, value: 180, threshold: ad.stale-computer-days }
+            - all:
+                - { field: lastLogonTimestamp, op: absent }
+                - { field: whenCreated, op: age-gt, value: 180, threshold: ad.stale-computer-days }
+    evidence: "{dNSHostName} ({sAMAccountName}) - last logon '{lastLogonTimestamp}', created {whenCreated}"
+
+  - id: AD-COMP-OS-SERVER-2012
+    title: Active server on Windows Server 2012 or 2012 R2 (extended security updates ended October 2026)
+    lens: both
+    category: LCM
+    severity: critical
+    entity: computer
+    why: Extended support for Windows Server 2012 and 2012 R2 ended in October 2023 and the last paid extended-security-update year ended on 13 October 2026, so these servers get no security fixes at all from now on.
+    fix: Migrate or upgrade each server to a supported Windows Server release; until then isolate it and restrict who can reach it.
+    refs: [NIST-800-53:SA-22, NIST-800-53:SI-2, CIS-CONTROLS-8:2.2]
+    query:
+      protocol: ldap
+      filter: '(&{COMPUTER}{ENABLED})'
+      attributes: [sAMAccountName, dNSHostName, operatingSystem, operatingSystemVersion, lastLogonTimestamp, userAccountControl, pwdLastSet, whenCreated, adminCount, servicePrincipalName, msDS-SupportedEncryptionTypes, msDS-AllowedToDelegateTo, msDS-AllowedToActOnBehalfOfOtherIdentity, ms-Mcs-AdmPwdExpirationTime, msLAPS-PasswordExpirationTime]
+      key: sAMAccountName
+      name: dNSHostName
+    each:
+      all:
+        - { field: lastLogonTimestamp, op: age-lt, value: 180, threshold: ad.active-computer-days }
+        - { field: operatingSystem, op: match, value: '^(Windows|Hyper-V|Microsoft).*\b2012\b' }
+    evidence: "{dNSHostName} - {operatingSystem} {operatingSystemVersion}, last logon {lastLogonTimestamp}"
+
+  - id: AD-COMP-OS-LEGACY
+    title: Active computer on a long-unsupported Windows version
+    lens: both
+    category: LCM
+    severity: critical
+    entity: computer
+    why: Windows XP to 8.1, Server 2000 to 2008 R2 (and Small Business Server 2011) and the old semi-annual server releases have had no security updates for years; each one is an unpatched host holding a domain account.
+    fix: Replace or upgrade the host, or isolate it on a restricted network until it is gone.
+    refs: [NIST-800-53:SA-22, NIST-800-53:SI-2, CIS-CONTROLS-8:2.2]
+    query:
+      protocol: ldap
+      filter: '(&{COMPUTER}{ENABLED})'
+      attributes: [sAMAccountName, dNSHostName, operatingSystem, operatingSystemVersion, lastLogonTimestamp, userAccountControl, pwdLastSet, whenCreated, adminCount, servicePrincipalName, msDS-SupportedEncryptionTypes, msDS-AllowedToDelegateTo, msDS-AllowedToActOnBehalfOfOtherIdentity, ms-Mcs-AdmPwdExpirationTime, msLAPS-PasswordExpirationTime]
+      key: sAMAccountName
+      name: dNSHostName
+    each:
+      all:
+        - { field: lastLogonTimestamp, op: age-lt, value: 180, threshold: ad.active-computer-days }
+        - any:
+            - { field: operatingSystem, op: match, value: '^Windows (NT|2000 Professional|XP|Vista|7|8)\b' }
+            - { field: operatingSystem, op: match, value: '^(Windows|Hyper-V|Microsoft).*\b(2000|2003|2008|2011)\b' }
+            - all:
+                - { field: operatingSystem, op: match, value: '^Windows Server (Standard|Datacenter)' }
+                - { field: operatingSystem, op: notmatch, value: '\b20\d\d\b' }
+    evidence: "{dNSHostName} - {operatingSystem} {operatingSystemVersion}, last logon {lastLogonTimestamp}"
+
+  - id: AD-COMP-OS-WIN10
+    title: Active computer on Windows 10 past end of support
+    lens: both
+    category: LCM
+    severity: high
+    entity: computer
+    why: Windows 10 outside the long-term servicing editions left support on 14 October 2025 (and the 2015 and 2016 long-term editions have ended too); without paid extended security updates it gets no fixes.
+    fix: Upgrade to a supported Windows 11 release, or record the extended-security-update coverage for the device as an exception.
+    refs: [NIST-800-53:SI-2, CIS-CONTROLS-8:2.2]
+    query:
+      protocol: ldap
+      filter: '(&{COMPUTER}{ENABLED})'
+      attributes: [sAMAccountName, dNSHostName, operatingSystem, operatingSystemVersion, lastLogonTimestamp, userAccountControl, pwdLastSet, whenCreated, adminCount, servicePrincipalName, msDS-SupportedEncryptionTypes, msDS-AllowedToDelegateTo, msDS-AllowedToActOnBehalfOfOtherIdentity, ms-Mcs-AdmPwdExpirationTime, msLAPS-PasswordExpirationTime]
+      key: sAMAccountName
+      name: dNSHostName
+    each:
+      all:
+        - { field: lastLogonTimestamp, op: age-lt, value: 180, threshold: ad.active-computer-days }
+        - { field: operatingSystem, op: match, value: '^Windows 10\b' }
+        - any:
+            - { field: operatingSystem, op: notmatch, value: 'LTS[BC]' }
+            - { field: operatingSystemVersion, op: match, value: '\((10240|14393)\)' }
+    evidence: "{dNSHostName} - {operatingSystem} {operatingSystemVersion}"
+
+  - id: AD-COMP-OS-WIN11
+    title: Active computer on a Windows 11 release past its servicing end
+    lens: both
+    category: LCM
+    severity: high
+    entity: computer
+    why: Windows 11 21H2 and 22H2 no longer get updates, 23H2 Home and Pro ended in 2025 (Enterprise and Education in November 2026), and 24H2 Home and Pro ended in October 2026.
+    fix: Apply the current Windows 11 feature update.
+    refs: [NIST-800-53:SI-2, CIS-CONTROLS-8:2.2]
+    query:
+      protocol: ldap
+      filter: '(&{COMPUTER}{ENABLED})'
+      attributes: [sAMAccountName, dNSHostName, operatingSystem, operatingSystemVersion, lastLogonTimestamp, userAccountControl, pwdLastSet, whenCreated, adminCount, servicePrincipalName, msDS-SupportedEncryptionTypes, msDS-AllowedToDelegateTo, msDS-AllowedToActOnBehalfOfOtherIdentity, ms-Mcs-AdmPwdExpirationTime, msLAPS-PasswordExpirationTime]
+      key: sAMAccountName
+      name: dNSHostName
+    each:
+      all:
+        - { field: lastLogonTimestamp, op: age-lt, value: 180, threshold: ad.active-computer-days }
+        - { field: operatingSystem, op: match, value: '^Windows 11\b' }
+        - any:
+            - { field: operatingSystemVersion, op: match, value: '\((22000|22621|22631)\)' }
+            - all:
+                - { field: operatingSystemVersion, op: match, value: '\(26100\)' }
+                - { field: operatingSystem, op: notmatch, value: 'Enterprise|Education' }
+    evidence: "{dNSHostName} - {operatingSystem} {operatingSystemVersion}"
+
+  - id: AD-COMP-OS-SERVER-2016
+    title: Active server on Windows Server 2016 (support ends January 2027)
+    lens: maintenance
+    category: LCM
+    severity: medium
+    entity: computer
+    why: Extended support for Windows Server 2016 ends in January 2027; an upgrade or migration takes longer than the time left.
+    fix: Plan and schedule the upgrade or migration of each server now.
+    refs: [NIST-800-53:SA-22, CIS-CONTROLS-8:2.2]
+    query:
+      protocol: ldap
+      filter: '(&{COMPUTER}{ENABLED})'
+      attributes: [sAMAccountName, dNSHostName, operatingSystem, operatingSystemVersion, lastLogonTimestamp, userAccountControl, pwdLastSet, whenCreated, adminCount, servicePrincipalName, msDS-SupportedEncryptionTypes, msDS-AllowedToDelegateTo, msDS-AllowedToActOnBehalfOfOtherIdentity, ms-Mcs-AdmPwdExpirationTime, msLAPS-PasswordExpirationTime]
+      key: sAMAccountName
+      name: dNSHostName
+    each:
+      all:
+        - { field: lastLogonTimestamp, op: age-lt, value: 180, threshold: ad.active-computer-days }
+        - { field: operatingSystem, op: match, value: 'Server 2016' }
+    evidence: "{dNSHostName} - {operatingSystem} {operatingSystemVersion}"
+
+  - id: AD-COMP-UNCONSTRAINED-DELEGATION
+    title: Computer other than a domain controller trusted for unconstrained delegation
+    category: AUT
+    severity: critical
+    entity: computer
+    why: Anyone who controls the host captures reusable tickets of every user who connects to it, and can coerce a domain controller into connecting.
+    fix: Remove TRUSTED_FOR_DELEGATION; use constrained or resource-based delegation to named services.
+    refs: [MITRE-ATTACK:T1558, MITRE-ATTACK:T1187, PINGCASTLE:P-UnconstrainedDelegation]
+    query:
+      protocol: ldap
+      filter: '(&{COMPUTER}{ENABLED})'
+      attributes: [sAMAccountName, dNSHostName, operatingSystem, operatingSystemVersion, lastLogonTimestamp, userAccountControl, pwdLastSet, whenCreated, adminCount, servicePrincipalName, msDS-SupportedEncryptionTypes, msDS-AllowedToDelegateTo, msDS-AllowedToActOnBehalfOfOtherIdentity, ms-Mcs-AdmPwdExpirationTime, msLAPS-PasswordExpirationTime]
+      key: sAMAccountName
+      name: dNSHostName
+    each:
+      all:
+        - { field: userAccountControl, op: flag, value: 524288 }
+        - { field: userAccountControl, op: noflag, value: 8192 }
+    evidence: "{dNSHostName} - userAccountControl {userAccountControl}"
+
+  - id: AD-COMP-PROTOCOL-TRANSITION
+    title: Computer allowed to delegate with protocol transition
+    category: AUT
+    severity: high
+    entity: computer
+    why: The host can obtain tickets as any user to its delegation targets without that user authenticating; control of the host gives that impersonation.
+    fix: Remove protocol transition unless required and keep the delegation targets minimal. Read-only domain controllers are excluded.
+    refs: [MITRE-ATTACK:T1558, NIST-800-53:AC-6]
+    query:
+      protocol: ldap
+      filter: '(&{COMPUTER}{ENABLED})'
+      attributes: [sAMAccountName, dNSHostName, operatingSystem, operatingSystemVersion, lastLogonTimestamp, userAccountControl, pwdLastSet, whenCreated, adminCount, servicePrincipalName, msDS-SupportedEncryptionTypes, msDS-AllowedToDelegateTo, msDS-AllowedToActOnBehalfOfOtherIdentity, ms-Mcs-AdmPwdExpirationTime, msLAPS-PasswordExpirationTime]
+      key: sAMAccountName
+      name: dNSHostName
+    each:
+      all:
+        - { field: userAccountControl, op: flag, value: 16777216 }
+        - { field: userAccountControl, op: noflag, value: 67108864 }
+    evidence: "{dNSHostName} - protocol transition to '{msDS-AllowedToDelegateTo}'"
+
+  - id: AD-COMP-DELEGATION-SENSITIVE-SPN
+    title: Computer delegates to a directory or Kerberos service
+    category: AUT
+    severity: high
+    entity: computer
+    why: Delegation to ldap, gc or krbtgt services lets the host act as any user against the directory, which against a domain controller amounts to domain control.
+    fix: Remove ldap/, gc/ and krbtgt/ entries from msDS-AllowedToDelegateTo unless a documented design needs them.
+    refs: [MITRE-ATTACK:T1558, NIST-800-53:AC-6]
+    query:
+      protocol: ldap
+      filter: '(&{COMPUTER}{ENABLED})'
+      attributes: [sAMAccountName, dNSHostName, operatingSystem, operatingSystemVersion, lastLogonTimestamp, userAccountControl, pwdLastSet, whenCreated, adminCount, servicePrincipalName, msDS-SupportedEncryptionTypes, msDS-AllowedToDelegateTo, msDS-AllowedToActOnBehalfOfOtherIdentity, ms-Mcs-AdmPwdExpirationTime, msLAPS-PasswordExpirationTime]
+      key: sAMAccountName
+      name: dNSHostName
+    each: { field: msDS-AllowedToDelegateTo, op: match, value: '^(ldap|gc|krbtgt)/' }
+    evidence: "{dNSHostName} - delegates to {msDS-AllowedToDelegateTo}"
+
+  - id: AD-COMP-LAPS-MISSING
+    title: Active Windows computer without a LAPS-managed local administrator password
+    category: IAM
+    severity: high
+    entity: computer
+    why: Without LAPS the local Administrator password is usually the same on many machines, so one compromised computer opens the rest.
+    fix: Deploy Windows LAPS by policy to every computer OU. Devices that back up to Entra ID only show here too - record them as exceptions.
+    refs: [MITRE-ATTACK:T1078.003, NIST-800-53:IA-5, PINGCASTLE:A-LAPS-Not-Installed]
+    query:
+      protocol: ldap
+      filter: '(&{COMPUTER}{ENABLED})'
+      attributes: [sAMAccountName, dNSHostName, operatingSystem, operatingSystemVersion, lastLogonTimestamp, userAccountControl, pwdLastSet, whenCreated, adminCount, servicePrincipalName, msDS-SupportedEncryptionTypes, msDS-AllowedToDelegateTo, msDS-AllowedToActOnBehalfOfOtherIdentity, ms-Mcs-AdmPwdExpirationTime, msLAPS-PasswordExpirationTime]
+      key: sAMAccountName
+      name: dNSHostName
+    each:
+      all:
+        - { field: userAccountControl, op: noflag, value: 8192 }
+        - { field: userAccountControl, op: noflag, value: 67108864 }
+        - { field: operatingSystem, op: match, value: '^Windows' }
+        - { field: lastLogonTimestamp, op: age-lt, value: 180, threshold: ad.active-computer-days }
+        - { field: ms-Mcs-AdmPwdExpirationTime, op: absent }
+        - { field: msLAPS-PasswordExpirationTime, op: absent }
+    evidence: "{dNSHostName} - {operatingSystem}, no LAPS expiry attribute"
+
+  - id: AD-COMP-LAPS-OVERDUE
+    title: LAPS password on an active computer is overdue for rotation
+    kind: broken
+    category: IAM
+    severity: medium
+    entity: computer
+    why: The computer is in use but its LAPS password expired long ago, so the LAPS client or policy is not working and the password has stopped rotating.
+    fix: Check the LAPS policy and client events on the host and its permission to write the password attribute.
+    refs: [NIST-800-53:IA-5(1)]
+    query:
+      protocol: ldap
+      filter: '(&{COMPUTER}{ENABLED})'
+      attributes: [sAMAccountName, dNSHostName, operatingSystem, operatingSystemVersion, lastLogonTimestamp, userAccountControl, pwdLastSet, whenCreated, adminCount, servicePrincipalName, msDS-SupportedEncryptionTypes, msDS-AllowedToDelegateTo, msDS-AllowedToActOnBehalfOfOtherIdentity, ms-Mcs-AdmPwdExpirationTime, msLAPS-PasswordExpirationTime]
+      key: sAMAccountName
+      name: dNSHostName
+    each:
+      all:
+        - { field: lastLogonTimestamp, op: age-lt, value: 30, threshold: ad.machine-active-days }
+        - any:
+            - all:
+                - { field: msLAPS-PasswordExpirationTime, op: exists }
+                - { field: msLAPS-PasswordExpirationTime, op: age-gt, value: 14, threshold: ad.laps-overdue-days }
+            - all:
+                - { field: msLAPS-PasswordExpirationTime, op: absent }
+                - { field: ms-Mcs-AdmPwdExpirationTime, op: age-gt, value: 14, threshold: ad.laps-overdue-days }
+    evidence: "{dNSHostName} - LAPS expiry '{msLAPS-PasswordExpirationTime}{ms-Mcs-AdmPwdExpirationTime}', last logon {lastLogonTimestamp}"
+
+  - id: AD-COMP-NO-OS
+    title: Enabled computer object with no operating system recorded
+    lens: maintenance
+    category: HYG
+    severity: low
+    entity: computer
+    why: A computer object that never recorded an operating system is usually pre-staged and never joined, a non-Windows device, or a broken object - none of them managed.
+    fix: Identify the owner; delete objects that were never joined.
+    refs: [NIST-800-53:CM-8]
+    query:
+      protocol: ldap
+      filter: '(&{COMPUTER}{ENABLED})'
+      attributes: [sAMAccountName, dNSHostName, operatingSystem, operatingSystemVersion, lastLogonTimestamp, userAccountControl, pwdLastSet, whenCreated, adminCount, servicePrincipalName, msDS-SupportedEncryptionTypes, msDS-AllowedToDelegateTo, msDS-AllowedToActOnBehalfOfOtherIdentity, ms-Mcs-AdmPwdExpirationTime, msLAPS-PasswordExpirationTime]
+      key: sAMAccountName
+      name: dNSHostName
+    each:
+      all:
+        - { field: operatingSystem, op: absent }
+        - { field: sAMAccountName, op: ne, value: 'AZUREADSSOACC$' }
+        - any:
+            - { field: servicePrincipalName, op: absent }
+            - not: { field: servicePrincipalName, op: match, value: '^MSClusterVirtualServer/' }
+    evidence: "{sAMAccountName} - created {whenCreated}, last logon '{lastLogonTimestamp}'"
+
+  - id: AD-COMP-MACHINE-PASSWORD-STUCK
+    title: Active computer whose machine password stopped rotating
+    kind: broken
+    lens: both
+    category: AUT
+    severity: medium
+    entity: computer
+    why: Windows changes its machine password every 30 days by default; an active computer with an old one has a broken secure channel or rotation disabled by policy.
+    fix: Check the secure channel on the host and the "disable machine account password changes" and maximum-age policies.
+    refs: [NIST-800-53:IA-5(1)]
+    query:
+      protocol: ldap
+      filter: '(&{COMPUTER}{ENABLED})'
+      attributes: [sAMAccountName, dNSHostName, operatingSystem, operatingSystemVersion, lastLogonTimestamp, userAccountControl, pwdLastSet, whenCreated, adminCount, servicePrincipalName, msDS-SupportedEncryptionTypes, msDS-AllowedToDelegateTo, msDS-AllowedToActOnBehalfOfOtherIdentity, ms-Mcs-AdmPwdExpirationTime, msLAPS-PasswordExpirationTime]
+      key: sAMAccountName
+      name: dNSHostName
+    each:
+      all:
+        - { field: userAccountControl, op: noflag, value: 8192 }
+        - { field: operatingSystem, op: match, value: '^Windows' }
+        - { field: lastLogonTimestamp, op: age-lt, value: 30, threshold: ad.machine-active-days }
+        - { field: pwdLastSet, op: ne, value: 0 }
+        - { field: pwdLastSet, op: age-gt, value: 90, threshold: ad.machine-password-max-age-days }
+    evidence: "{dNSHostName} - machine password set {pwdLastSet}, last logon {lastLogonTimestamp}"
+
+  - id: AD-COMP-NO-AES
+    title: Computer with Kerberos encryption types that exclude AES
+    category: AUT
+    severity: medium
+    entity: computer
+    why: An explicit encryption-type value without AES forces RC4 or DES tickets for the host, both weak and being removed from Windows.
+    fix: Allow AES128 and AES256 for the computer (by policy or msDS-SupportedEncryptionTypes) and let the machine password rotate.
+    refs: [NIST-800-53:SC-13, MS-KB:5021131]
+    query:
+      protocol: ldap
+      filter: '(&{COMPUTER}{ENABLED})'
+      attributes: [sAMAccountName, dNSHostName, operatingSystem, operatingSystemVersion, lastLogonTimestamp, userAccountControl, pwdLastSet, whenCreated, adminCount, servicePrincipalName, msDS-SupportedEncryptionTypes, msDS-AllowedToDelegateTo, msDS-AllowedToActOnBehalfOfOtherIdentity, ms-Mcs-AdmPwdExpirationTime, msLAPS-PasswordExpirationTime]
+      key: sAMAccountName
+      name: dNSHostName
+    each:
+      all:
+        - { field: msDS-SupportedEncryptionTypes, op: gt, value: 0 }
+        - { field: msDS-SupportedEncryptionTypes, op: noflag, value: 8 }
+        - { field: msDS-SupportedEncryptionTypes, op: noflag, value: 16 }
+    evidence: "{dNSHostName} - msDS-SupportedEncryptionTypes {msDS-SupportedEncryptionTypes}"
+
+  - id: AD-COMP-ADMINCOUNT
+    title: Computer other than a domain controller in a protected group
+    category: IAM
+    severity: high
+    entity: computer
+    why: adminCount=1 on a member computer means it is, or was, in a protected group such as Administrators; whoever controls that host holds those rights.
+    fix: Remove the computer from protected groups and grant the specific rights it needs; then clear adminCount.
+    refs: [NIST-800-53:AC-6]
+    query:
+      protocol: ldap
+      filter: '(&{COMPUTER}{ENABLED})'
+      attributes: [sAMAccountName, dNSHostName, operatingSystem, operatingSystemVersion, lastLogonTimestamp, userAccountControl, pwdLastSet, whenCreated, adminCount, servicePrincipalName, msDS-SupportedEncryptionTypes, msDS-AllowedToDelegateTo, msDS-AllowedToActOnBehalfOfOtherIdentity, ms-Mcs-AdmPwdExpirationTime, msLAPS-PasswordExpirationTime]
+      key: sAMAccountName
+      name: dNSHostName
+    each:
+      all:
+        - { field: adminCount, op: eq, value: 1 }
+        - { field: userAccountControl, op: noflag, value: 8192 }
+        - { field: userAccountControl, op: noflag, value: 67108864 }
+    evidence: "{dNSHostName} ({sAMAccountName}) - adminCount=1"
+
+  - id: AD-COMP-SEAMLESS-SSO-KEY-AGE
+    title: Seamless single sign-on computer account key not rotated
+    category: AUT
+    severity: medium
+    entity: computer
+    why: The AZUREADSSOACC$ account key decrypts the Kerberos tickets the cloud accepts for seamless sign-on; anyone holding it can forge sign-ins, so the key should roll regularly.
+    fix: Roll the seamless single sign-on Kerberos decryption key from the sync server, on a schedule.
+    refs: [NIST-800-53:IA-5, MITRE-ATTACK:T1558]
+    query:
+      protocol: ldap
+      filter: '(&{COMPUTER}{ENABLED})'
+      attributes: [sAMAccountName, dNSHostName, operatingSystem, operatingSystemVersion, lastLogonTimestamp, userAccountControl, pwdLastSet, whenCreated, adminCount, servicePrincipalName, msDS-SupportedEncryptionTypes, msDS-AllowedToDelegateTo, msDS-AllowedToActOnBehalfOfOtherIdentity, ms-Mcs-AdmPwdExpirationTime, msLAPS-PasswordExpirationTime]
+      key: sAMAccountName
+      name: dNSHostName
+    each:
+      all:
+        - { field: sAMAccountName, op: eq, value: 'AZUREADSSOACC$' }
+        - { field: pwdLastSet, op: age-gt, value: 30, threshold: ad.seamless-sso-key-max-age-days }
+    evidence: "{sAMAccountName} - key last set {pwdLastSet}"
+
+  - id: AD-COMP-DEFAULT-CONTAINER
+    title: Enabled computers in the default Computers container
+    lens: maintenance
+    category: CFG
+    severity: low
+    entity: computer
+    why: CN=Computers is a container, not an OU, so no GPO can be linked to it; computers there miss LAPS, baselines and delegated administration.
+    fix: Move the computers to managed OUs and redirect new computer objects there (redircmp).
+    refs: [NIST-800-53:CM-6]
+    query:
+      protocol: ldap
+      base: 'CN=Computers,{DOMAINDN}'
+      scope: onelevel
+      filter: '(&{COMPUTER}{ENABLED})'
+      attributes: [sAMAccountName, dNSHostName, operatingSystem, operatingSystemVersion, lastLogonTimestamp, userAccountControl]
+      key: sAMAccountName
+      name: dNSHostName
+    count: { op: gt, value: 0, threshold: ad.default-container-computers-max }
+    evidence: "{count} enabled computers in CN=Computers: {sample}"
+
+  - id: AD-COMP-CREATED-BY-USER
+    title: Computers joined by ordinary users through the machine account quota
+    category: IAM
+    severity: low
+    entity: computer
+    why: mS-DS-CreatorSID marks computers created through the quota; their creator keeps write rights on the object, which is enough for resource-based delegation abuse.
+    fix: Review the creators, reset ownership to an administrative group, and set the machine account quota to 0.
+    refs: [MITRE-ATTACK:T1136.002, NIST-800-53:AC-6]
+    query:
+      protocol: ldap
+      filter: '(&{COMPUTER}{ENABLED}(mS-DS-CreatorSID=*))'
+      attributes: [sAMAccountName, dNSHostName, operatingSystem, operatingSystemVersion, lastLogonTimestamp, userAccountControl]
+      key: sAMAccountName
+      name: dNSHostName
+    count: { op: gt, value: 0, threshold: ad.user-created-computers-max }
+    evidence: "{count} computers created through the quota, for example {sample}"
+
+  # ---------------------------------------------------------------- domain controllers (computer objects)
+
+  - id: AD-DC-NOT-IN-DC-OU
+    title: Domain controller account outside the Domain Controllers OU
+    lens: both
+    category: CFG
+    severity: high
+    entity: computer
+    why: A DC object moved out of the Domain Controllers OU stops receiving the DC policy (user rights, audit) and may receive policies meant for member servers.
+    fix: Move the account back into OU=Domain Controllers.
+    refs: [NIST-800-53:CM-6]
+    query:
+      protocol: ldap
+      filter: '(&{COMPUTER}{ENABLED})'
+      attributes: [sAMAccountName, dNSHostName, operatingSystem, operatingSystemVersion, lastLogonTimestamp, userAccountControl, pwdLastSet, whenCreated, adminCount, servicePrincipalName, msDS-SupportedEncryptionTypes, msDS-AllowedToDelegateTo, msDS-AllowedToActOnBehalfOfOtherIdentity, ms-Mcs-AdmPwdExpirationTime, msLAPS-PasswordExpirationTime]
+      key: sAMAccountName
+      name: dNSHostName
+    each:
+      all:
+        - any:
+            - { field: userAccountControl, op: flag, value: 8192 }
+            - { field: userAccountControl, op: flag, value: 67108864 }
+        - { field: distinguishedName, op: notmatch, value: '^CN=[^,]+,OU=Domain Controllers,DC=' }
+    evidence: "{dNSHostName} - {distinguishedName}"
+
+  - id: AD-DC-STALE
+    title: Domain controller account not seen recently
+    kind: broken
+    lens: maintenance
+    category: AVL
+    severity: high
+    entity: computer
+    why: A domain controller that has not authenticated for weeks is offline or was removed without metadata cleanup; clients and replication partners still try to use it.
+    fix: Bring the DC back or remove it properly (demote, or metadata cleanup and DNS record removal).
+    refs: [NIST-800-53:CP-10, NIST-800-53:CM-8]
+    query:
+      protocol: ldap
+      filter: '(&{COMPUTER}{ENABLED})'
+      attributes: [sAMAccountName, dNSHostName, operatingSystem, operatingSystemVersion, lastLogonTimestamp, userAccountControl, pwdLastSet, whenCreated, adminCount, servicePrincipalName, msDS-SupportedEncryptionTypes, msDS-AllowedToDelegateTo, msDS-AllowedToActOnBehalfOfOtherIdentity, ms-Mcs-AdmPwdExpirationTime, msLAPS-PasswordExpirationTime]
+      key: sAMAccountName
+      name: dNSHostName
+    each:
+      all:
+        - any:
+            - { field: userAccountControl, op: flag, value: 8192 }
+            - { field: userAccountControl, op: flag, value: 67108864 }
+        - any:
+            - { field: lastLogonTimestamp, op: age-gt, value: 30, threshold: ad.stale-dc-days }
+            - { field: lastLogonTimestamp, op: absent }
+    evidence: "{dNSHostName} - last logon '{lastLogonTimestamp}'"
+
+  - id: AD-DC-RBCD
+    title: Domain controller account carries resource-based delegation rights
+    category: AUT
+    severity: critical
+    entity: computer
+    why: Whoever is listed in msDS-AllowedToActOnBehalfOfOtherIdentity on a DC can obtain tickets to that DC as any user, including domain administrators.
+    fix: Treat as an incident - clear the attribute and find out who wrote it.
+    refs: [MITRE-ATTACK:T1558, NIST-800-53:AC-6]
+    query:
+      protocol: ldap
+      filter: '(&{COMPUTER}{ENABLED})'
+      attributes: [sAMAccountName, dNSHostName, operatingSystem, operatingSystemVersion, lastLogonTimestamp, userAccountControl, pwdLastSet, whenCreated, adminCount, servicePrincipalName, msDS-SupportedEncryptionTypes, msDS-AllowedToDelegateTo, msDS-AllowedToActOnBehalfOfOtherIdentity, ms-Mcs-AdmPwdExpirationTime, msLAPS-PasswordExpirationTime]
+      key: sAMAccountName
+      name: dNSHostName
+    each:
+      all:
+        - any:
+            - { field: userAccountControl, op: flag, value: 8192 }
+            - { field: userAccountControl, op: flag, value: 67108864 }
+        - { field: msDS-AllowedToActOnBehalfOfOtherIdentity, op: exists }
+    evidence: "{dNSHostName} - msDS-AllowedToActOnBehalfOfOtherIdentity is set"
+
+  - id: AD-DC-COUNT
+    title: Fewer writable domain controllers than required
+    kind: missing
+    lens: maintenance
+    category: AVL
+    severity: high
+    entity: computer
+    why: With a single writable domain controller its failure stops authentication and directory changes, and recovery depends entirely on backups.
+    fix: Add domain controllers so the domain survives the loss of any one of them.
+    refs: [NIST-800-53:CP-7, NIST-800-53:SC-36]
+    query:
+      protocol: ldap
+      filter: '(&{COMPUTER}{ENABLED}{UAC:8192})'
+      attributes: [sAMAccountName, dNSHostName, operatingSystem, operatingSystemVersion, lastLogonTimestamp, userAccountControl]
+      key: sAMAccountName
+      name: dNSHostName
+    count: { op: lt, value: 2, threshold: ad.min-dcs }
+    evidence: "{count} writable domain controllers: {sample}"
+
+  # ---------------------------------------------------------------- fine-grained password policies
+
+  - id: AD-PSO-MIN-LENGTH
+    title: Fine-grained password policy allows short passwords
+    category: IAM
+    severity: medium
+    entity: policy
+    why: Fine-grained policies usually cover administrators and service accounts, which need longer passwords than the domain floor, not shorter. The container is readable by administrators only by default.
+    fix: Raise msDS-MinimumPasswordLength on the policy.
+    refs: [NIST-800-53:IA-5(1)]
+    refresh: 7d
+    query:
+      protocol: ldap
+      base: 'CN=Password Settings Container,CN=System,{DOMAINDN}'
+      scope: onelevel
+      filter: '(objectClass=msDS-PasswordSettings)'
+      attributes: [cn, msDS-PasswordSettingsPrecedence, msDS-MinimumPasswordLength, msDS-PasswordHistoryLength, msDS-PasswordComplexityEnabled, msDS-PasswordReversibleEncryptionEnabled, msDS-LockoutThreshold, msDS-PSOAppliesTo]
+      key: cn
+    each: { field: msDS-MinimumPasswordLength, op: lt, value: 14, threshold: ad.pso-min-password-length }
+    evidence: "{cn} - minimum length {msDS-MinimumPasswordLength}, applies to {msDS-PSOAppliesTo}"
+
+  - id: AD-PSO-REVERSIBLE-ENCRYPTION
+    title: Fine-grained password policy stores passwords with reversible encryption
+    category: IAM
+    severity: critical
+    entity: policy
+    why: Every account the policy applies to gets its password stored in decryptable form.
+    fix: Set msDS-PasswordReversibleEncryptionEnabled to FALSE and force password changes for the covered accounts.
+    refs: [NIST-800-53:IA-5(1)]
+    refresh: 7d
+    query:
+      protocol: ldap
+      base: 'CN=Password Settings Container,CN=System,{DOMAINDN}'
+      scope: onelevel
+      filter: '(objectClass=msDS-PasswordSettings)'
+      attributes: [cn, msDS-PasswordSettingsPrecedence, msDS-MinimumPasswordLength, msDS-PasswordHistoryLength, msDS-PasswordComplexityEnabled, msDS-PasswordReversibleEncryptionEnabled, msDS-LockoutThreshold, msDS-PSOAppliesTo]
+      key: cn
+    each: { field: msDS-PasswordReversibleEncryptionEnabled, op: eq, value: 'TRUE' }
+    evidence: "{cn} - reversible encryption on, applies to {msDS-PSOAppliesTo}"
+
+  - id: AD-PSO-COMPLEXITY-OFF
+    title: Fine-grained password policy has complexity off without long passphrases
+    category: IAM
+    severity: medium
+    entity: policy
+    why: Without complexity and without a passphrase-length minimum, the policy accepts short dictionary words for the accounts it covers.
+    fix: Turn complexity on or raise the minimum length to passphrase level.
+    refs: [NIST-800-53:IA-5(1)]
+    refresh: 7d
+    query:
+      protocol: ldap
+      base: 'CN=Password Settings Container,CN=System,{DOMAINDN}'
+      scope: onelevel
+      filter: '(objectClass=msDS-PasswordSettings)'
+      attributes: [cn, msDS-PasswordSettingsPrecedence, msDS-MinimumPasswordLength, msDS-PasswordHistoryLength, msDS-PasswordComplexityEnabled, msDS-PasswordReversibleEncryptionEnabled, msDS-LockoutThreshold, msDS-PSOAppliesTo]
+      key: cn
+    each:
+      all:
+        - { field: msDS-PasswordComplexityEnabled, op: eq, value: 'FALSE' }
+        - { field: msDS-MinimumPasswordLength, op: lt, value: 15, threshold: ad.passphrase-min-length }
+    evidence: "{cn} - complexity off, minimum length {msDS-MinimumPasswordLength}"
+
+  # ---------------------------------------------------------------- sites, replication and FSMO
+
+  - id: AD-SITE-SUBNET-NO-SITE
+    title: Subnet object not associated with a site
+    lens: maintenance
+    category: CFG
+    severity: low
+    entity: domain
+    why: Clients in a subnet with no site find no local domain controller and may authenticate across slow links.
+    fix: Assign the subnet to the site that serves it, or delete it.
+    refs: [NIST-800-53:CM-6]
+    refresh: 7d
+    query:
+      protocol: ldap
+      base: 'CN=Subnets,CN=Sites,{CONFIGDN}'
+      scope: onelevel
+      filter: '(&(objectClass=subnet)(!(siteObject=*)))'
+      attributes: [cn, description]
+      key: cn
+    each: any
+    evidence: "Subnet {cn} has no site"
+
+  - id: AD-REPL-CONNECTION-UNMANAGED
+    title: Replication connection that is manual or disabled
+    lens: maintenance
+    category: AVL
+    severity: low
+    entity: domain
+    why: Hand-made connections are not maintained by the topology generator and outlive the design they were made for; disabled ones silently cut a replication path.
+    fix: Delete manual connections so the KCC manages topology, or document why one must stay; re-enable or remove disabled ones. Read-only DC connections are excluded.
+    refs: [NIST-800-53:CP-10]
+    refresh: 7d
+    query:
+      protocol: ldap
+      base: 'CN=Sites,{CONFIGDN}'
+      filter: '(&(objectClass=nTDSConnection)(!(options:1.2.840.113556.1.4.803:=64))(|(!(options:1.2.840.113556.1.4.803:=1))(enabledConnection=FALSE)))'
+      attributes: [cn, fromServer, options, enabledConnection]
+      key: distinguishedName
+    each: any
+    evidence: "{distinguishedName} - from {fromServer}, options '{options}', enabled '{enabledConnection}'"
+
+  - id: AD-FSMO-DELETED-OWNER-DOMAIN
+    title: Domain operations master role held by a deleted domain controller
+    kind: broken
+    lens: maintenance
+    category: AVL
+    severity: critical
+    entity: domain
+    why: The PDC emulator, RID master or infrastructure master role points at a removed DC, so password changes, RID allocation or cross-domain reference updates stop.
+    fix: Seize the role onto a live domain controller.
+    refs: [NIST-800-53:CP-10]
+    refresh: 7d
+    query:
+      protocol: ldap
+      filter: '(fSMORoleOwner=*)'
+      attributes: [fSMORoleOwner]
+      key: distinguishedName
+    each: { field: fSMORoleOwner, op: match, value: '(\\0A|\n)DEL:' }
+    evidence: "{distinguishedName} - role owner {fSMORoleOwner}"
+
+  - id: AD-FSMO-DELETED-OWNER-CONFIG
+    title: Domain naming master role held by a deleted domain controller
+    kind: broken
+    lens: maintenance
+    category: AVL
+    severity: high
+    entity: domain
+    why: With the domain naming master on a removed DC no domain or application partition can be added or removed in the forest.
+    fix: Seize the role onto a live domain controller in the forest root domain.
+    refs: [NIST-800-53:CP-10]
+    refresh: 7d
+    query:
+      protocol: ldap
+      base: config
+      filter: '(fSMORoleOwner=*)'
+      attributes: [fSMORoleOwner]
+      key: distinguishedName
+    each: { field: fSMORoleOwner, op: match, value: '(\\0A|\n)DEL:' }
+    evidence: "{distinguishedName} - role owner {fSMORoleOwner}"
+
+  - id: AD-FSMO-DELETED-OWNER-SCHEMA
+    title: Schema master role held by a deleted domain controller
+    kind: broken
+    lens: maintenance
+    category: AVL
+    severity: high
+    entity: domain
+    why: With the schema master on a removed DC the schema cannot be extended, which blocks adding newer domain controllers.
+    fix: Seize the schema master role onto a live domain controller.
+    refs: [NIST-800-53:CP-10]
+    refresh: 7d
+    query:
+      protocol: ldap
+      base: schema
+      scope: base
+      filter: '(objectClass=dMD)'
+      attributes: [fSMORoleOwner]
+      key: distinguishedName
+    each: { field: fSMORoleOwner, op: match, value: '(\\0A|\n)DEL:' }
+    evidence: "Schema master {fSMORoleOwner}"
+
+  # ---------------------------------------------------------------- object hygiene
+
+  - id: AD-HYG-CONFLICT-OBJECTS
+    title: Replication conflict objects in the domain partition
+    lens: maintenance
+    category: HYG
+    severity: low
+    entity: domain
+    why: CNF objects are duplicates created when two DCs wrote the same name; they can carry permissions and memberships that reviews miss.
+    fix: Compare each conflict object with its original, keep the right one, and delete the other.
+    refs: [NIST-800-53:CM-8]
+    query:
+      protocol: ldap
+      filter: '(name=*\0ACNF:*)'
+      attributes: [name, objectClass, whenCreated]
+      key: distinguishedName
+    each: any
+    evidence: "{distinguishedName} - created {whenCreated}"
+
+  - id: AD-HYG-LOSTANDFOUND
+    title: Objects in the LostAndFound container
+    lens: maintenance
+    category: HYG
+    severity: low
+    entity: domain
+    why: Objects land here when their parent was deleted on another DC during replication; they are outside every OU, policy and delegation.
+    fix: Move each object to its proper OU or delete it.
+    refs: [NIST-800-53:CM-8]
+    query:
+      protocol: ldap
+      base: 'CN=LostAndFound,{DOMAINDN}'
+      scope: onelevel
+      filter: '(objectClass=*)'
+      attributes: [name, objectClass, whenCreated]
+      key: distinguishedName
+    each: any
+    evidence: "{distinguishedName} - created {whenCreated}"
+
+  # ---------------------------------------------------------------- group policy objects
+
+  - id: AD-GPO-ALL-DISABLED
+    title: GPO with both user and computer settings disabled
+    lens: maintenance
+    category: HYG
+    severity: low
+    entity: gpo
+    why: A fully disabled GPO does nothing but still costs processing where it is linked and confuses reviews.
+    fix: Back it up and delete it, or re-enable the half that is meant to apply.
+    refs: [NIST-800-53:CM-6]
+    refresh: 7d
+    query:
+      protocol: ldap
+      base: 'CN=Policies,CN=System,{DOMAINDN}'
+      scope: onelevel
+      filter: '(objectClass=groupPolicyContainer)'
+      attributes: [cn, displayName, flags, versionNumber, gPCFileSysPath]
+      key: cn
+      name: displayName
+    each: { field: flags, op: eq, value: 3 }
+    evidence: "{displayName} ({cn}) - flags {flags}"
+
+  - id: AD-GPO-PATH-OUTSIDE-SYSVOL
+    title: GPO file path points outside SYSVOL
+    category: CFG
+    severity: high
+    entity: gpo
+    why: Clients load the policy files from gPCFileSysPath; a path to another share lets whoever controls that share push settings and scripts to every computer the GPO applies to.
+    fix: Point gPCFileSysPath back to the domain's SYSVOL Policies folder and find out who changed it.
+    refs: [MITRE-ATTACK:T1484.001, NIST-800-53:CM-5]
+    refresh: 7d
+    query:
+      protocol: ldap
+      base: 'CN=Policies,CN=System,{DOMAINDN}'
+      scope: onelevel
+      filter: '(objectClass=groupPolicyContainer)'
+      attributes: [cn, displayName, flags, versionNumber, gPCFileSysPath]
+      key: cn
+      name: displayName
+    each: { field: gPCFileSysPath, op: notmatch, value: '^\\\\[^\\]+\\sysvol\\' }
+    evidence: "{displayName} ({cn}) - {gPCFileSysPath}"
+
+  - id: AD-GPO-EMPTY
+    title: GPO that has never been edited (version 0)
+    lens: maintenance
+    category: HYG
+    severity: low
+    entity: gpo
+    why: A GPO at version 0 has never held a setting; where it is linked it still costs a lookup at every refresh and it misleads anyone reading the policy map.
+    fix: Delete the GPO, or finish configuring it if it was created for a purpose.
+    refs: [NIST-800-53:CM-6]
+    refresh: 7d
+    query:
+      protocol: ldap
+      base: 'CN=Policies,CN=System,{DOMAINDN}'
+      scope: onelevel
+      filter: '(objectClass=groupPolicyContainer)'
+      attributes: [cn, displayName, flags, versionNumber, gPCFileSysPath]
+      key: cn
+      name: displayName
+    each: { field: versionNumber, op: eq, value: 0 }
+    evidence: "{displayName} ({cn}) - versionNumber {versionNumber}"
+
+  - id: AD-GPO-DDCP-LINKED-OUTSIDE-DC-OU
+    title: Default Domain Controllers Policy linked outside the Domain Controllers OU
+    category: CFG
+    severity: high
+    entity: domain
+    why: The domain controller policy carries DC user rights; linked at the domain root or on member OUs it replaces those rights on ordinary servers and workstations, removing privileges services need and granting DC-grade rights where they do not belong.
+    fix: Remove every link of the Default Domain Controllers Policy except the one on OU=Domain Controllers, after checking what the affected computers will lose.
+    refs: [NIST-800-53:CM-6, NIST-800-53:AC-6]
+    refresh: 7d
+    query:
+      protocol: ldap
+      filter: '(&(|(objectClass=organizationalUnit)(objectClass=domainDNS))(gPLink=*6AC1786C-016F-11D2-945F-00C04FB984F9*))'
+      attributes: [name, gPLink]
+      key: distinguishedName
+    each: { field: distinguishedName, op: notmatch, value: '^OU=Domain Controllers,DC=' }
+    evidence: "{distinguishedName} links the Default Domain Controllers Policy"
+
+  - id: AD-GPO-ENFORCED-AT-ROOT
+    title: GPO link enforced at the domain root
+    lens: both
+    category: CFG
+    severity: low
+    entity: domain
+    why: An enforced link at the domain root wins over every OU-level GPO, including the Domain Controllers OU and server baselines, so settings such as time source, screen lock or firewall cannot be set differently where they must be.
+    fix: Review each enforced root link; drop the enforcement unless the setting truly must win everywhere, and check its effect on the Domain Controllers OU.
+    refs: [NIST-800-53:CM-6]
+    refresh: 7d
+    query:
+      protocol: ldap
+      scope: base
+      filter: '(objectClass=domainDNS)'
+      attributes: [name, minPwdLength, pwdHistoryLength, pwdProperties, lockoutThreshold, ms-DS-MachineAccountQuota, msDS-Behavior-Version, gPLink]
+      key: distinguishedName
+      name: name
+    each: { field: gPLink, op: match, value: ';[23]\]' }
+    evidence: "{name} - gPLink {gPLink}"
+
+  # ---------------------------------------------------------------- schema and SYSVOL replication
+
+  - id: AD-SCHEMA-NO-LAPS
+    title: No LAPS schema in the forest
+    kind: missing
+    category: IAM
+    severity: high
+    entity: domain
+    why: Neither Windows LAPS nor legacy LAPS attributes exist, so no computer can have a managed local administrator password.
+    fix: Extend the schema for Windows LAPS and deploy the LAPS policy.
+    refs: [MITRE-ATTACK:T1078.003, NIST-800-53:IA-5]
+    refresh: 7d
+    query:
+      protocol: ldap
+      base: schema
+      scope: onelevel
+      filter: '(|(lDAPDisplayName=ms-Mcs-AdmPwdExpirationTime)(lDAPDisplayName=msLAPS-PasswordExpirationTime))'
+      attributes: [lDAPDisplayName]
+      key: lDAPDisplayName
+    count: none
+    evidence: "LAPS schema attributes found - {count}"
+
+  - id: AD-SYSVOL-FRS
+    title: SYSVOL still replicated by FRS
+    lens: both
+    category: LCM
+    severity: high
+    entity: domain
+    why: FRS is deprecated, unreliable under load, and blocks promotion of newer domain controllers.
+    fix: Migrate SYSVOL replication to DFSR (dfsrmig) through to the eliminated state.
+    refs: [NIST-800-53:SA-22]
+    refresh: 7d
+    query:
+      protocol: ldap
+      filter: '(objectClass=nTFRSSubscriber)'
+      attributes: [cn]
+      key: distinguishedName
+    count: some
+    evidence: "{count} FRS subscriber objects, for example {sample}"

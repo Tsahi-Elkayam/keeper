@@ -1,0 +1,9 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <ItemGroup>
+    <ProjectReference Include="..\..\..\review\src\Keeper.Review\Keeper.Review.csproj" />
+    <ProjectReference Include="..\..\..\runners\src\Keeper.Runners\Keeper.Runners.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <EmbeddedResource Include="Migrations\*.sql" LogicalName="push/%(Filename)%(Extension)" />
+  </ItemGroup>
+</Project>

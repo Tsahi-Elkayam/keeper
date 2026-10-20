@@ -23,6 +23,10 @@
     <Project Path="components/review/src/Keeper.Review/Keeper.Review.csproj" />
     <Project Path="components/review/src/keeper-load/keeper-load.csproj" />
     <Project Path="components/review/src/keeper-track/keeper-track.csproj" />
+    <Project Path="components/review/src/Keeper.Review.Cli/Keeper.Review.Cli.csproj" />
+    <Project Path="components/review/src/keeper-decide/keeper-decide.csproj" />
+    <Project Path="components/review/src/keeper-system/keeper-system.csproj" />
+    <Project Path="components/review/src/keeper-register/keeper-register.csproj" />
     <Project Path="components/review/tests/Keeper.Review.Tests/Keeper.Review.Tests.csproj" />
   </Folder>
   <Folder Name="/rules/">
@@ -56,5 +60,29 @@
   <Folder Name="/home/">
     <Project Path="components/home/src/Keeper.Home/Keeper.Home.csproj" />
     <Project Path="components/home/tests/Keeper.Home.Tests/Keeper.Home.Tests.csproj" />
+  </Folder>
+  <Folder Name="/rank/">
+    <Project Path="components/rank/src/Keeper.Rank/Keeper.Rank.csproj" />
+    <Project Path="components/rank/src/keeper-rank/keeper-rank.csproj" />
+    <Project Path="components/rank/tests/Keeper.Rank.Tests/Keeper.Rank.Tests.csproj" />
+  </Folder>
+  <Folder Name="/report/">
+    <Project Path="components/report/src/Keeper.Report/Keeper.Report.csproj" />
+    <Project Path="components/report/src/keeper-today/keeper-today.csproj" />
+    <Project Path="components/report/src/keeper-report/keeper-report.csproj" />
+    <Project Path="components/report/tests/Keeper.Report.Tests/Keeper.Report.Tests.csproj" />
+  </Folder>
+  <Folder Name="/push/">
+    <Project Path="components/push/src/Keeper.Push/Keeper.Push.csproj" />
+    <Project Path="components/push/src/keeper-push/keeper-push.csproj" />
+    <Project Path="components/push/tests/Keeper.Push.Tests/Keeper.Push.Tests.csproj" />
+  </Folder>
+  <Folder Name="/keeper/">
+    <Project Path="components/keeper/src/Keeper.Composition/Keeper.Composition.csproj" />
+    <Project Path="components/keeper/src/keeper-db/keeper-db.csproj" />
+    <Project Path="components/keeper/src/keeper-qm/keeper-qm.csproj" />
+    <Project Path="components/keeper/src/keeper-query/keeper-query.csproj" />
+    <Project Path="components/keeper/src/keeper-run/keeper-run.csproj" />
+    <Project Path="components/keeper/src/keeper/keeper.csproj" />
   </Folder>
 </Solution>

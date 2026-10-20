@@ -63,9 +63,12 @@ public sealed partial class CimRunner : IRunner
                 options.AddDestinationCredentials(new CimCredential(PasswordAuthenticationMechanism.Kerberos, credential.Domain, credential.UserName, password));
             }
 
+            if (Expand(query.Text("wql")!, host) is not { } wql)
+                return RunnerResult.Failed($"{host}: not a host name {{HOST}} can stand for");
+
             using var session = CimSession.Create(host, options);
             var rows = new List<JsonObject>();
-            foreach (var instance in session.QueryInstances(query.Text("namespace") ?? "root/cimv2", "WQL", query.Text("wql")))
+            foreach (var instance in session.QueryInstances(query.Text("namespace") ?? "root/cimv2", "WQL", wql))
             {
                 cancellationToken.ThrowIfCancellationRequested();
                 using (instance)
@@ -84,8 +87,24 @@ public sealed partial class CimRunner : IRunner
         }
     }
 
+    /// <summary>
+    /// {HOST} becomes the target's computer name - its first DNS label, upper case - which is what
+    /// local accounts and groups carry as their Domain (Win32_Group.Domain='PC01',Name='Administrators').
+    /// The name is checked strictly first: targets come from scanned data and must not reach WQL raw.
+    /// </summary>
+    public static string? Expand(string wql, string target)
+    {
+        if (!wql.Contains("{HOST}", StringComparison.Ordinal))
+            return wql;
+        var name = target.Split('.')[0].ToUpperInvariant();
+        return HostName().IsMatch(name) ? wql.Replace("{HOST}", name, StringComparison.Ordinal) : null;
+    }
+
     [GeneratedRegex(@"^\s*select\s", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)]
     private static partial Regex Select();
+
+    [GeneratedRegex("^[A-Z0-9][A-Z0-9-]{0,62}$", RegexOptions.CultureInvariant)]
+    private static partial Regex HostName();
 
     [GeneratedRegex(@"^root(/[A-Za-z0-9_]+)*$", RegexOptions.CultureInvariant)]
     private static partial Regex Namespace();

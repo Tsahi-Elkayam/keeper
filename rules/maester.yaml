@@ -1,0 +1,118 @@
+schema: keeper.rules/1
+system: maester
+name: Maester Microsoft 365 tests (imported)
+integration: files
+# Input: the JSON results file Maester writes for every run.
+#   Install-Module Maester; Connect-Maester; Invoke-Maester -NonInteractive
+#   -> ./test-results/TestResults-<yyyy-MM-dd-HHmmss>.json (plus .html and .md)
+#   (or choose the file with -OutputJsonFile <path>.json)
+# Copy TestResults-*.json into imports\maester\. The newest matching file is read.
+# Each test is an object in the top-level Tests array with Id, Title, Name, Severity
+# (Critical, High, Medium, Low, Info or empty), Result (Passed, Failed, Skipped, NotRun, Error,
+# Investigate), Block and Tag.
+rules:
+  - id: MAESTER-FAILED
+    title: Maester test failed
+    kind: misconfigured
+    lens: security
+    category: CFG
+    severity: medium
+    entity: maester-test
+    why: >-
+      A Maester test checks one Microsoft 365 or Entra setting against a security baseline
+      (Maester's own, the Entra security config analyser, CISA SCuBA or CIS). A failed test means
+      the tenant is not configured the way the baseline expects.
+    fix: >-
+      Open the test in the Maester HTML report (or its HelpUrl) and follow the remediation, then run
+      Invoke-Maester again and copy the new TestResults-*.json into imports\maester\. A test that
+      does not apply can be excluded in maester-config.json.
+    refresh: 1d
+    query:
+      protocol: file
+      key: Id
+      name: Title
+      path: "maester/TestResults-*.json"
+      format: json
+      items: Tests
+    each: { field: Result, op: eq, value: Failed }
+    emit:
+      check: "MAESTER-{Id}"
+      title: "{Title}"
+      severity:
+        field: Severity
+        map: { Critical: critical, High: high, Medium: medium, Low: low, Info: info }
+        default: medium
+    evidence: "{Id} failed: {Title} (block {Block}) [{_file}]"
+
+  - id: MAESTER-TEST-ERROR
+    title: Maester test could not run
+    kind: missing
+    lens: security
+    category: MON
+    severity: low
+    entity: maester-test
+    why: >-
+      The test errored instead of producing a verdict - usually missing Graph permissions, a module
+      that is not connected (Exchange, Teams) or a throttled call. Its setting is unchecked, which
+      is not the same as compliant.
+    fix: >-
+      Read the error in the Maester report, grant the missing permission or connect the missing
+      service (Connect-Maester -Service All), then run Invoke-Maester again.
+    refresh: 1d
+    query:
+      protocol: file
+      key: Id
+      name: Title
+      path: "maester/TestResults-*.json"
+      format: json
+      items: Tests
+    each: { field: Result, op: eq, value: Error }
+    evidence: "{Id} errored: {Title} (block {Block}) [{_file}]"
+
+  - id: MAESTER-INVESTIGATE
+    title: Maester test needs investigation
+    kind: misconfigured
+    lens: security
+    category: CFG
+    severity: low
+    entity: maester-test
+    why: >-
+      Maester could not decide pass or fail on its own and asks a person to look at the details -
+      for example a setting that is only acceptable with a documented reason.
+    fix: >-
+      Read the test's details in the Maester report and decide. Fix the setting, or exclude the test
+      in maester-config.json with the reason recorded.
+    refresh: 1d
+    query:
+      protocol: file
+      key: Id
+      name: Title
+      path: "maester/TestResults-*.json"
+      format: json
+      items: Tests
+    each: { field: Result, op: eq, value: Investigate }
+    evidence: "{Id} needs investigation: {Title} (block {Block}) [{_file}]"
+
+  - id: MAESTER-REPORT-STALE
+    title: Maester results are out of date
+    kind: missing
+    lens: security
+    category: MON
+    severity: medium
+    entity: maester-report
+    why: >-
+      The Maester findings are only as current as the run they came from. Old results hide new
+      misconfigurations and keep reporting ones that were fixed.
+    fix: >-
+      Schedule Invoke-Maester (for example in a pipeline) and copy each new TestResults-*.json into
+      imports\maester\.
+    refresh: 1d
+    # A small object every results file carries, so this rule reads one row per file.
+    query:
+      protocol: file
+      key: _file
+      path: "maester/TestResults-*.json"
+      format: json
+      items: PowerShellInfo
+    each: { field: _modified, op: age-gt, value: 35, threshold: maester.max-report-age-days }
+    evidence: "{_file} was written {_modified}"

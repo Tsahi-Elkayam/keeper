@@ -1,0 +1,94 @@
+schema: keeper.rules/1
+system: scubagear
+name: CISA ScubaGear Microsoft 365 baseline (imported)
+integration: files
+# Input: the files ScubaGear writes into its time-stamped output folder.
+#   Install-Module ScubaGear; Initialize-SCuBA
+#   Invoke-SCuBA -ProductNames aad, defender, exo, powerplatform, sharepoint, teams
+#   -> M365BaselineConformance_<timestamp>\ScubaResults.csv
+#      M365BaselineConformance_<timestamp>\ScubaResults_<uuid>.json (plus HTML reports, ActionPlan.csv)
+# Copy ScubaResults.csv AND ScubaResults_*.json into imports\scubagear\.
+# The controls are read from the CSV: the JSON nests them per product and per group, which the
+# file runner cannot flatten. The CSV has one row per control with the columns "Control ID",
+# Requirement, Result (Pass, Fail, Warning, N/A, Error, Omitted, ...), Criticality (Shall, Should,
+# .../3rd Party, .../Not-Implemented) and Details. A failed SHALL is Fail; an unmet SHOULD is Warning.
+rules:
+  - id: SCUBA-FAILED
+    title: ScubaGear baseline control not met
+    kind: misconfigured
+    lens: security
+    category: CFG
+    severity: medium
+    entity: scuba-control
+    why: >-
+      The tenant does not meet a control of CISA's secure configuration baseline for Microsoft 365.
+      SHALL controls are the baseline's mandatory requirements; SHOULD controls are strong
+      recommendations.
+    fix: >-
+      Read the control's details in the ScubaGear report and change the setting. If the control is
+      covered another way, record that in the ScubaGear configuration (omission with a reason and an
+      expiry) rather than leaving it failing. Re-run Invoke-SCuBA and copy the new files into
+      imports\scubagear\.
+    refresh: 1d
+    query:
+      protocol: file
+      key: Control ID
+      name: Requirement
+      path: "scubagear/ScubaResults*.csv"
+      format: csv
+    each: { field: Result, op: in, value: [Fail, Warning] }
+    emit:
+      check: "SCUBA-{Control ID}"
+      title: "{Requirement}"
+      severity:
+        field: Criticality
+        map: { Shall: high, Should: medium }
+        default: medium
+    evidence: "{Control ID} {Result} ({Criticality}): {Details}"
+
+  - id: SCUBA-TEST-ERROR
+    title: ScubaGear control could not be evaluated
+    kind: missing
+    lens: security
+    category: MON
+    severity: low
+    entity: scuba-control
+    why: >-
+      ScubaGear could not evaluate the control - missing permissions, a product it could not
+      connect to, or missing test results. The setting is unchecked, which is not the same as
+      compliant.
+    fix: >-
+      Check the ScubaGear console output for the failing product, fix the permission or connection,
+      and run Invoke-SCuBA again.
+    refresh: 1d
+    query:
+      protocol: file
+      key: Control ID
+      name: Requirement
+      path: "scubagear/ScubaResults*.csv"
+      format: csv
+    each: { field: Result, op: match, value: '^Error' }
+    evidence: "{Control ID} {Result}: {Details}"
+
+  - id: SCUBA-REPORT-STALE
+    title: ScubaGear results are out of date
+    kind: missing
+    lens: security
+    category: MON
+    severity: medium
+    entity: scuba-report
+    why: >-
+      The ScubaGear findings are only as current as the run they came from. Old results hide new
+      misconfigurations and keep reporting ones that were fixed.
+    fix: >-
+      Schedule Invoke-SCuBA and copy each run's ScubaResults.csv and ScubaResults_*.json into
+      imports\scubagear\.
+    refresh: 1d
+    query:
+      protocol: file
+      key: ReportUUID
+      path: "scubagear/ScubaResults*.json"
+      format: json
+      items: MetaData
+    each: { field: TimestampZulu, op: age-gt, value: 35, threshold: scubagear.max-report-age-days }
+    evidence: "ScubaGear {ToolVersion} report {ReportUUID} ran {TimestampZulu} [{_file}]"

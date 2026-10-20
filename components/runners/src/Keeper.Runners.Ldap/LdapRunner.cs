@@ -73,7 +73,7 @@ public sealed class LdapRunner : IRunner
                 var response = (SearchResponse)connection.SendRequest(request, context.Timeout);
                 foreach (SearchResultEntry entry in response.Entries)
                 {
-                    rows.Add(Row(entry));
+                    rows.Add(Row(entry, connection, context.Timeout));
                     if (rows.Count >= MaxRows)
                         return RunnerResult.Partial(rows, $"stopped at {MaxRows} entries");
                 }
@@ -152,19 +152,64 @@ public sealed class LdapRunner : IRunner
         _ => LdapMacros.Expand(text, now, contexts, _ => false),
     };
 
-    private static JsonObject Row(SearchResultEntry entry)
+    private static JsonObject Row(SearchResultEntry entry, LdapConnection connection, TimeSpan timeout)
     {
         var row = new JsonObject { ["distinguishedName"] = entry.DistinguishedName };
         foreach (DirectoryAttribute attribute in entry.Attributes.Values)
         {
-            if (SecretAttributes.IsSecret(attribute.Name))
+            var values = Values(attribute);
+            var name = attribute.Name;
+            // A value list longer than the server's limit (1,500 members in AD) comes back as
+            // member;range=0-1499. Reading only that page would make a member rule pass on a partial list.
+            if (RangeOf(name) is { } range)
+            {
+                name = range.Attribute;
+                values.AddRange(RestOfRange(connection, entry.DistinguishedName, range, timeout));
+            }
+            if (SecretAttributes.IsSecret(name))
                 continue;
-            var values = new List<object>();
-            for (var i = 0; i < attribute.Count; i++)
-                values.Add(attribute[i]);
-            row[attribute.Name] = LdapValues.Convert(attribute.Name, values);
+            row[name] = LdapValues.Convert(name, values);
         }
         return row;
+    }
+
+    private static List<object> Values(DirectoryAttribute attribute)
+    {
+        var values = new List<object>();
+        for (var i = 0; i < attribute.Count; i++)
+            values.Add(attribute[i]);
+        return values;
+    }
+
+    public sealed record Range(string Attribute, long? High);
+
+    /// <summary>"member;range=0-1499" -> (member, 1499); "member;range=1500-*" -> (member, null = the last page).</summary>
+    public static Range? RangeOf(string name)
+    {
+        var at = name.IndexOf(";range=", StringComparison.OrdinalIgnoreCase);
+        if (at <= 0)
+            return null;
+        var bounds = name[(at + ";range=".Length)..].Split('-');
+        if (bounds.Length != 2)
+            return null;
+        return new Range(name[..at], bounds[1] == "*" ? null : long.Parse(bounds[1], NumberStyles.None, CultureInfo.InvariantCulture));
+    }
+
+    private static IEnumerable<object> RestOfRange(LdapConnection connection, string dn, Range first, TimeSpan timeout)
+    {
+        var range = first;
+        for (var page = 0; range.High is { } high && page < 10_000; page++)
+        {
+            var response = (SearchResponse)connection.SendRequest(
+                new SearchRequest(dn, "(objectClass=*)", SearchScope.Base, $"{range.Attribute};range={high + 1}-*"), timeout);
+            var next = response.Entries.Count == 0 ? null : response.Entries[0].Attributes.Values.Cast<DirectoryAttribute>()
+                .FirstOrDefault(a => RangeOf(a.Name)?.Attribute.Equals(range.Attribute, StringComparison.OrdinalIgnoreCase) == true);
+            if (next is null)
+                throw new FormatException($"{dn}: the server stopped returning {range.Attribute} after value {high}");
+            foreach (var value in Values(next))
+                yield return value;
+            range = RangeOf(next.Name)!;
+        }
     }
 
     private static bool Balanced(string filter)

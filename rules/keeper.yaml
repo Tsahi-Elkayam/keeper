@@ -1,0 +1,221 @@
+schema: keeper.rules/1
+system: keeper
+name: Keeper itself
+integration: keeper
+# Keeper watching itself: a credential about to expire, a scan that stopped, a system nobody scans.
+# Each of these hides other findings, so they surface as findings of their own.
+defaults:
+  lens: maintenance
+  refresh: 1d
+rules:
+  - id: KEEPER-SECRET-EXPIRY
+    title: A credential Keeper reads with expires soon
+    kind: broken
+    lens: both
+    category: AUT
+    entity: integration-secret
+    severity:
+      daysLeft: secret_expires_on
+      ranges: [ { max: 0, value: critical }, { max: 7, value: high }, { max: 30, value: medium } ]
+      default: low
+    deadline: secret_expires_on
+    why: When the secret or certificate an integration signs in with expires, every scan through it fails and its systems go dark.
+    fix: Renew it at the source, then store it again with keeper integration set-secret <id> <name> --expires <yyyy-MM-dd>.
+    query:
+      protocol: store
+      text: >
+        SELECT integration_id || '/' || secret_name AS id, integration_id, type, secret_name, secret_expires_on
+        FROM integration_status
+        WHERE enabled = 1 AND secret_name IS NOT NULL AND secret_expires_on IS NOT NULL
+      key: id
+    each: { field: secret_expires_on, op: until-lt, value: 45, threshold: keeper.secret-notice-days }
+    evidence: "{integration_id}: {secret_name} expires {secret_expires_on}"
+
+  - id: KEEPER-SECRET-NO-EXPIRY
+    title: A credential Keeper reads has no recorded expiry date
+    kind: missing
+    category: AUT
+    severity: low
+    entity: integration-secret
+    why: Without the date, Keeper cannot warn before the credential expires; the first sign is a failed scan.
+    fix: Record when it expires - keeper integration set-secret <id> <name> --expires <yyyy-MM-dd> - or the date it must next be rotated.
+    query:
+      protocol: store
+      text: >
+        SELECT integration_id || '/' || secret_name AS id, integration_id, type, secret_name, secret_set_at
+        FROM integration_status
+        WHERE enabled = 1 AND secret_name IS NOT NULL AND secret_expires_on IS NULL
+      key: id
+    each: any
+    evidence: "{integration_id}: {secret_name} (set {secret_set_at}) has no expiry"
+
+  - id: KEEPER-INTEGRATION-TEST-FAILED
+    title: An integration's last connection test failed
+    kind: broken
+    category: MON
+    severity: high
+    entity: integration
+    why: Scans through an integration that cannot connect report nothing, so its systems look clean when they are unseen.
+    fix: Read the test detail, fix the account, network path or certificate, then keeper scan <system> --test.
+    query:
+      protocol: store
+      text: >
+        SELECT i.integration_id, i.type, t.state, t.at, t.detail
+        FROM integration i
+        JOIN integration_test t ON t.test_id = (SELECT MAX(x.test_id) FROM integration_test x WHERE x.integration_id = i.integration_id)
+        WHERE i.enabled = 1
+      key: integration_id
+    each: { field: state, op: ne, value: ok }
+    evidence: "{integration_id} ({type}): {state} at {at} - {detail}"
+
+  - id: KEEPER-INTEGRATION-UNUSED
+    title: An integration is set up but has never been tested or scanned through
+    kind: missing
+    category: MON
+    severity: medium
+    entity: integration
+    why: Keeper holds a credential for it, yet none of its systems has been looked at.
+    fix: Run keeper scan <system> --test, then keeper run; or remove the integration if it is not needed.
+    query:
+      protocol: store
+      text: >
+        SELECT i.integration_id, i.type, i.changed_at
+        FROM integration i
+        WHERE i.enabled = 1
+          AND NOT EXISTS (SELECT 1 FROM integration_test t WHERE t.integration_id = i.integration_id)
+          AND NOT EXISTS (SELECT 1 FROM run r WHERE r.instance = i.integration_id)
+      key: integration_id
+    each: any
+    evidence: "{integration_id} ({type}) added {changed_at}, never used"
+
+  - id: KEEPER-SCAN-STALE
+    title: A system has not been scanned recently
+    kind: broken
+    category: MON
+    severity: medium
+    entity: scan
+    why: Findings from an old scan may be fixed or may have grown; Keeper cannot tell which.
+    fix: Run keeper run (or keeper scan <system>), and schedule it daily.
+    query:
+      protocol: store
+      text: >
+        SELECT instance || '/' || system AS id, instance, system, started_at, status
+        FROM latest_run
+      key: id
+    each: { field: started_at, op: age-gt, value: 7, threshold: keeper.scan-stale-days }
+    evidence: "{system} via {instance}: last scanned {started_at}"
+
+  - id: KEEPER-SCAN-FAILED
+    title: A system's newest scan failed or saw only part of it
+    kind: broken
+    category: MON
+    severity:
+      field: status
+      map: { failed: high, partial: low }
+      default: medium
+    entity: scan
+    why: Whatever the scan could not read is a blind spot, not a pass.
+    fix: keeper blind-spots shows which queries and rules failed and why - usually a missing permission.
+    query:
+      protocol: store
+      text: >
+        SELECT instance || '/' || system AS id, instance, system, status, started_at
+        FROM latest_run
+      key: id
+    each: { field: status, op: ne, value: ok }
+    evidence: "{system} via {instance}: {status} at {started_at}"
+
+  - id: KEEPER-RULES-FAILING
+    title: Rules could not run in a system's newest scan
+    kind: broken
+    category: MON
+    severity: low
+    entity: scan
+    why: A rule that cannot run checks nothing; its findings stay unknown.
+    fix: keeper blind-spots lists each rule and its reason; grant the read permission it needs or disable the rule.
+    query:
+      protocol: store
+      text: >
+        SELECT r.instance || '/' || r.system AS id, r.instance, r.system, COUNT(*) AS failing
+        FROM latest_run r JOIN coverage c ON c.run_id = r.run_id
+        WHERE c.scope = 'rule' AND c.state = 'failed'
+        GROUP BY r.instance, r.system
+      key: id
+    each: { field: failing, op: gt, value: 0 }
+    evidence: "{system} via {instance}: {failing} rules could not run"
+
+  - id: KEEPER-SYSTEM-NEVER-SCANNED
+    title: Keeper has rules for a system type that has never been scanned
+    kind: missing
+    category: MON
+    severity: info
+    entity: system-type
+    why: If the organisation runs this system, none of its checks are being made.
+    fix: Add an integration for it (keeper integration add), or accept this finding if the system is not in use.
+    query:
+      protocol: store
+      text: >
+        SELECT system, COUNT(*) AS rules
+        FROM rule
+        WHERE system <> 'keeper' AND system NOT IN (SELECT DISTINCT system FROM run)
+        GROUP BY system
+      key: system
+    each: any
+    evidence: "{system}: {rules} rules, never scanned"
+
+  - id: KEEPER-UNMAPPED-ENTITIES
+    title: Scanned entities that belong to no system
+    kind: missing
+    category: HYG
+    severity: info
+    entity: integration
+    why: A finding on an unmapped entity has no owner and no route, so nobody is asked to fix it.
+    fix: keeper system map <map-id> <SYSTEM> --pattern <regex> claims them by name or attribute.
+    query:
+      protocol: store
+      text: >
+        SELECT instance, COUNT(*) AS unmapped
+        FROM entity
+        WHERE system_id = 'UNMAPPED' AND gone_since IS NULL
+        GROUP BY instance
+      key: instance
+    each: { field: unmapped, op: gt, value: 0 }
+    evidence: "{instance}: {unmapped} entities belong to no system"
+
+  - id: KEEPER-SYSTEM-NO-OWNER
+    title: A system has no owner or team
+    kind: missing
+    category: HYG
+    severity: low
+    entity: system
+    why: Its findings cannot be handed to anyone, so they wait on you.
+    fix: keeper system set <ID> --team <team> --owner-person <person>.
+    query:
+      protocol: store
+      text: >
+        SELECT system_id, name FROM system
+        WHERE active = 1 AND system_id NOT IN ('KEEPER', 'UNMAPPED')
+          AND COALESCE(team, '') = '' AND COALESCE(owner_person, '') = ''
+      key: system_id
+      name: name
+    each: any
+    evidence: "{system_id} ({name}) has no team or owner"
+
+  - id: KEEPER-ACCEPTED-RISK-OLD
+    title: An accepted exception or disabled rule has not been reviewed for a year
+    kind: misconfigured
+    lens: security
+    category: HYG
+    severity: low
+    entity: override
+    why: Accepting a risk was right when it was decided; the reasons may have changed since.
+    fix: Review it - keep it by recording it again with a fresh reason, or keeper decide undo <OVR-id>.
+    query:
+      protocol: store
+      text: >
+        SELECT override_id, check_id, decision, entity, at, why
+        FROM override
+        WHERE active = 1 AND decision IN ('exception', 'disable')
+      key: override_id
+    each: { field: at, op: age-gt, value: 365, threshold: keeper.override-review-days }
+    evidence: "{override_id}: {decision} of {check_id} {entity} since {at} - {why}"

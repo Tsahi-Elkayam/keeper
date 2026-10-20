@@ -1,0 +1,6 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <ItemGroup>
+    <ProjectReference Include="..\Keeper.Review\Keeper.Review.csproj" />
+    <ProjectReference Include="..\..\..\home\src\Keeper.Home\Keeper.Home.csproj" />
+  </ItemGroup>
+</Project>

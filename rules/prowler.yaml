@@ -1,0 +1,49 @@
+schema: keeper.rules/1
+system: prowler
+name: Prowler cloud security checks (imported)
+integration: files
+# Input: Prowler's OCSF JSON output (a JSON array of OCSF Detection Finding objects).
+#   pip install prowler
+#   prowler aws --output-formats json-ocsf        (also: azure, gcp, kubernetes, m365 ...)
+#   -> output/prowler-output-<account>-<timestamp>.ocsf.json
+#   (choose the folder and name with -o/--output-directory and -F/--output-filename)
+# Copy the .ocsf.json file into imports\prowler\. The newest matching file is read.
+# Fields used: status_code (PASS, FAIL, MANUAL), status (New, or Suppressed for muted findings),
+# severity (Critical, High, Medium, Low, Informational), metadata.event_code (the check id),
+# finding_info.uid and .title, status_detail, resources[].uid, cloud.account.uid, cloud.region.
+rules:
+  - id: PROWLER-FAILED
+    title: Prowler check failed
+    kind: misconfigured
+    lens: security
+    category: CFG
+    severity: medium
+    entity: cloud-resource
+    why: >-
+      A Prowler check compared a cloud resource or account setting with security best practice and
+      the compliance frameworks it maps to, and the resource does not meet it.
+    fix: >-
+      Follow the remediation in the Prowler report for this check, then run Prowler again and copy
+      the new .ocsf.json into imports\prowler\. A finding that is accepted should be muted in
+      Prowler's mutelist with a reason, so it arrives as Suppressed and is not reported.
+    refresh: 1d
+    query:
+      protocol: file
+      key: finding_info.uid
+      name: resources[].uid
+      path: "prowler/*.ocsf.json"
+      format: json
+    each:
+      all:
+        - { field: status_code, op: eq, value: FAIL }
+        - any:
+            - { field: status, op: absent }
+            - { field: status, op: ne, value: Suppressed }
+    emit:
+      check: "PROWLER-{metadata.event_code}"
+      title: "{finding_info.title}"
+      severity:
+        field: severity
+        map: { Critical: critical, High: high, Medium: medium, Low: low, Informational: info }
+        default: medium
+    evidence: "{metadata.event_code}: {status_detail} (resource {resources[].uid}, account {cloud.account.uid}, region {cloud.region}) [{_file}]"

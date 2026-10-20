@@ -62,8 +62,12 @@ public sealed class Tracker(SqliteConnection connection, TimeProvider? clock = n
                 (string)r["system_id"]!))
             .ToList();
 
+    /// <summary>Keeper's own rules (system 'keeper') are about Keeper; anything else no rule claims is unmapped.</summary>
+    private static (string SystemId, string MappedBy) Unclaimed(string ruleSystem) =>
+        ruleSystem.Equals("keeper", StringComparison.OrdinalIgnoreCase) ? ("KEEPER", "builtin") : ("UNMAPPED", "unmapped");
+
     private static (string SystemId, string MappedBy) MapSystem(IEnumerable<SystemRule> rules, string instance, string entityType,
-        string key, string? name, JsonObject? attrs)
+        string key, string? name, JsonObject? attrs, string ruleSystem)
     {
         foreach (var rule in rules)
         {
@@ -89,7 +93,7 @@ public sealed class Tracker(SqliteConnection connection, TimeProvider? clock = n
                 // A pathological pattern never maps anything; the entity stays unmapped.
             }
         }
-        return ("UNMAPPED", "unmapped");
+        return Unclaimed(ruleSystem);
     }
 
     private static string? Lookup(JsonObject attrs, string path)
@@ -125,7 +129,7 @@ public sealed class Tracker(SqliteConnection connection, TimeProvider? clock = n
                 seen.Add(key);
                 var attrs = JsonNode.Parse((string)row["attrs"]!) as JsonObject;
                 var name = row["entity_name"] as string;
-                var (systemId, mappedBy) = MapSystem(systemRules, instance, key.Item2, key.Item3, name, attrs);
+                var (systemId, mappedBy) = MapSystem(systemRules, instance, key.Item2, key.Item3, name, attrs, (string)run["system"]!);
                 existing.TryGetValue(key, out var before);
                 result[key] = new EntityRow
                 {
@@ -262,8 +266,8 @@ public sealed class Tracker(SqliteConnection connection, TimeProvider? clock = n
             events.Add(new EventRow(r.FindingKey, now, "severity-changed", runId, null, $"{oldSeverity} -> {r.Severity}"));
 
         var systemId = r.Target == "-"
-            ? MapSystem(systemRules, r.Instance, "instance", r.Instance, null, null).SystemId
-            : entities.TryGetValue((r.Instance, r.EntityType, r.Target), out var entity) ? entity.SystemId : "UNMAPPED";
+            ? MapSystem(systemRules, r.Instance, "instance", r.Instance, null, null, r.System).SystemId
+            : entities.TryGetValue((r.Instance, r.EntityType, r.Target), out var entity) ? entity.SystemId : Unclaimed(r.System).SystemId;
 
         return new FindingRow
         {

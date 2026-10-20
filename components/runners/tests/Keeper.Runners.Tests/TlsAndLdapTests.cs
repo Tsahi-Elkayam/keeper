@@ -68,6 +68,45 @@ public sealed class LdapTests
         Assert.Equal("9223372036854775807", LdapValues.Convert("accountExpires", ["9223372036854775807"])!.ToString());
         Assert.Equal("2024-01-02T03:04:05Z", LdapValues.Convert("whenCreated", ["20240102030405.0Z"])!.ToString());
         Assert.Equal("42", LdapValues.Convert("maxPwdAge", ["-36288000000000"])!.ToString());
+        Assert.Equal("never", LdapValues.Convert("maxPwdAge", ["-9223372036854775808"])!.ToString());
+        Assert.Equal("never", LdapValues.Convert("lockoutDuration", ["-9223372036854775808"])!.ToString());
+    }
+
+    [Fact]
+    public void A_delegation_descriptor_gives_the_allowed_sids()
+    {
+        byte[] sid = [1, 5, 0, 0, 0, 0, 0, 5, 21, 0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0, 0x51, 4, 0, 0];   // S-1-5-21-1-2-3-1105
+        var ace = new List<byte> { 0, 0 };                                 // ACCESS_ALLOWED_ACE, no flags
+        ace.AddRange(BitConverter.GetBytes((ushort)(8 + sid.Length)));
+        ace.AddRange(BitConverter.GetBytes(0x000F01FF));
+        ace.AddRange(sid);
+        var acl = new List<byte> { 2, 0 };
+        acl.AddRange(BitConverter.GetBytes((ushort)(8 + ace.Count)));
+        acl.AddRange(BitConverter.GetBytes((ushort)1));
+        acl.AddRange([0, 0]);
+        acl.AddRange(ace);
+        var descriptor = new List<byte> { 1, 0, 0x04, 0x80 };              // revision 1, DACL present, self-relative
+        descriptor.AddRange(BitConverter.GetBytes(0));                     // no owner
+        descriptor.AddRange(BitConverter.GetBytes(0));                     // no group
+        descriptor.AddRange(BitConverter.GetBytes(0));                     // no SACL
+        descriptor.AddRange(BitConverter.GetBytes(20));                    // DACL right after the header
+        descriptor.AddRange(acl);
+
+        var node = LdapValues.Convert("msDS-AllowedToActOnBehalfOfOtherIdentity", [descriptor.ToArray()]);
+
+        Assert.Equal("[\"S-1-5-21-1-2-3-1105\"]", node!.ToJsonString());
+        Assert.Null(LdapValues.AllowedTrustees([1, 0, 0, 0]));
+    }
+
+    [Theory]
+    [InlineData("member;range=0-1499", "member", 1499L)]
+    [InlineData("member;range=1500-*", "member", null)]
+    [InlineData("member", null, null)]
+    public void Ranged_attribute_names_parse(string name, string? attribute, long? high)
+    {
+        var range = LdapRunner.RangeOf(name);
+        Assert.Equal(attribute, range?.Attribute);
+        Assert.Equal(high, range?.High);
     }
 
     [Fact]

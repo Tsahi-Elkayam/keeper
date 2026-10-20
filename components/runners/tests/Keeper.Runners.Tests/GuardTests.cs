@@ -71,6 +71,17 @@ public sealed class GuardTests
         Assert.Equal(accepted, CimRunner.Problem(wql) is null);
     }
 
+    [Theory]
+    [InlineData("pc01.example.org", "SELECT * FROM Win32_GroupUser WHERE GroupComponent = \"Win32_Group.Domain='PC01',Name='Administrators'\"")]
+    [InlineData("PC-02", "SELECT * FROM Win32_GroupUser WHERE GroupComponent = \"Win32_Group.Domain='PC-02',Name='Administrators'\"")]
+    [InlineData("pc'01.example.org", null)]
+    [InlineData("pc01\" OR 1=1", null)]
+    public void Cim_host_macro_takes_only_a_clean_computer_name(string target, string? expected)
+    {
+        const string wql = "SELECT * FROM Win32_GroupUser WHERE GroupComponent = \"Win32_Group.Domain='{HOST}',Name='Administrators'\"";
+        Assert.Equal(expected, CimRunner.Expand(wql, target));
+    }
+
     [Fact]
     public void Secret_attributes_are_known()
     {

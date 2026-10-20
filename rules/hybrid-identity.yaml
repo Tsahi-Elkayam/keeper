@@ -1,0 +1,115 @@
+schema: keeper.rules/1
+system: hybrid-identity
+name: Hybrid identity (AD and Entra together)
+integration: keeper
+# Rules that need both directories. They read the newest Active Directory and Entra scans from the
+# store, joined on the account's SID (AD objectSid = Entra onPremisesSecurityIdentifier).
+# keeper run scans the store's systems after the others are loaded, so they see the same day's data.
+defaults:
+  lens: both
+  refresh: 1d
+rules:
+  - id: HYB-USER-STALE
+    title: Enabled account with no sign-in anywhere - no domain logon and no successful cloud sign-in
+    kind: misconfigured
+    category: IAM
+    severity: medium
+    entity: user
+    why: >
+      An enabled account nobody uses is a door nobody watches. Domain logons alone overstate this in a
+      hybrid estate: people who only use cloud services sign in to Entra and never reach a domain
+      controller, so this rule counts an account only when both directories show no activity.
+    fix: >
+      Confirm with the owner or HR, then disable it (and remove its licences). Accounts that must stay
+      enabled without signing in (break-glass, device accounts) are accepted one by one with keeper decide accept.
+    refs: [CIS-Controls-v8:5.3, NIST-800-53:AC-2(3)]
+    query:
+      protocol: store
+      text: >
+        WITH ad AS (
+          SELECT r.instance, s.entity_key AS account,
+                 MAX(json_extract(s.attrs, '$.userPrincipalName')) AS upn,
+                 MAX(json_extract(s.attrs, '$.objectSid')) AS sid,
+                 MAX(CAST(json_extract(s.attrs, '$.userAccountControl') AS INTEGER)) AS uac,
+                 MAX(json_extract(s.attrs, '$.lastLogonTimestamp')) AS dc_logon_raw,
+                 MAX(json_extract(s.attrs, '$.whenCreated')) AS created,
+                 MAX(json_extract(s.attrs, '$.accountExpires')) AS expires,
+                 MAX(CAST(json_extract(s.attrs, '$.msExchRecipientTypeDetails') AS INTEGER)) AS mailbox_type
+          FROM latest_run r JOIN row_seen s ON s.run_id = r.run_id
+          WHERE r.system = 'active-directory' AND s.entity_type = 'user'
+          GROUP BY r.instance, s.entity_key
+        ),
+        cloud AS (
+          SELECT json_extract(s.attrs, '$.onPremisesSecurityIdentifier') AS sid,
+                 MAX(json_extract(s.attrs, '$.signInActivity.lastSuccessfulSignInDateTime')) AS cloud_signin
+          FROM latest_run r JOIN row_seen s ON s.run_id = r.run_id
+          WHERE r.system = 'entra' AND s.entity_type = 'user'
+            AND json_extract(s.attrs, '$.onPremisesSecurityIdentifier') IS NOT NULL
+          GROUP BY json_extract(s.attrs, '$.onPremisesSecurityIdentifier')
+        ),
+        joined AS (
+          SELECT ad.*, c.cloud_signin, c.sid AS cloud_sid,
+                 CASE WHEN ad.dc_logon_raw GLOB '[0-9][0-9][0-9][0-9]-*' THEN ad.dc_logon_raw END AS dc_logon
+          FROM ad LEFT JOIN cloud c ON c.sid = ad.sid
+        )
+        SELECT instance || '/' || account AS id, account, upn, created, dc_logon, cloud_signin,
+               CASE WHEN cloud_sid IS NOT NULL THEN 'AD and Entra'
+                    WHEN EXISTS (SELECT 1 FROM latest_run WHERE system = 'entra' AND status <> 'failed') THEN 'AD only (not synced)'
+                    ELSE 'AD only - no Entra scan yet, cloud sign-ins unknown' END AS seen_in,
+               NULLIF(MAX(COALESCE(dc_logon, ''), COALESCE(cloud_signin, '')), '') AS last_activity
+        FROM joined
+        WHERE (COALESCE(uac, 0) & 2) = 0
+          AND COALESCE(mailbox_type, 0) NOT IN (4, 16, 32, 8589934592, 17179869184, 34359738368)
+          AND NOT (expires GLOB '[0-9][0-9][0-9][0-9]-*' AND expires < :now)
+      key: id
+      name: upn
+    each:
+      any:
+        - { field: last_activity, op: age-gt, value: 90, threshold: identity.stale-user-days }
+        - all:
+            - { field: last_activity, op: absent }
+            - { field: created, op: age-gt, value: 90, threshold: identity.stale-user-days }
+    evidence: "{account}: last domain logon {dc_logon}, last cloud sign-in {cloud_signin}, created {created} ({seen_in})"
+
+  - id: HYB-USER-CLOUD-ONLY-ACTIVITY
+    title: Accounts active only in the cloud - domain logons alone would call them stale
+    kind: missing
+    lens: maintenance
+    category: IAM
+    severity: info
+    entity: integration
+    why: >
+      These accounts have not logged on to a domain controller in the stale window but did sign in to
+      Entra. A report built on domain logons alone counts them as unused; this is the size of that error.
+    fix: Nothing to fix on the accounts. Use HYB-USER-STALE, not domain logons alone, for clean-up and licence decisions.
+    query:
+      protocol: store
+      text: >
+        WITH ad AS (
+          SELECT r.instance, s.entity_key AS account,
+                 MAX(json_extract(s.attrs, '$.objectSid')) AS sid,
+                 MAX(CAST(json_extract(s.attrs, '$.userAccountControl') AS INTEGER)) AS uac,
+                 MAX(json_extract(s.attrs, '$.lastLogonTimestamp')) AS dc_logon_raw
+          FROM latest_run r JOIN row_seen s ON s.run_id = r.run_id
+          WHERE r.system = 'active-directory' AND s.entity_type = 'user'
+          GROUP BY r.instance, s.entity_key
+        ),
+        cloud AS (
+          SELECT json_extract(s.attrs, '$.onPremisesSecurityIdentifier') AS sid,
+                 MAX(json_extract(s.attrs, '$.signInActivity.lastSuccessfulSignInDateTime')) AS cloud_signin
+          FROM latest_run r JOIN row_seen s ON s.run_id = r.run_id
+          WHERE r.system = 'entra' AND s.entity_type = 'user'
+            AND json_extract(s.attrs, '$.onPremisesSecurityIdentifier') IS NOT NULL
+          GROUP BY json_extract(s.attrs, '$.onPremisesSecurityIdentifier')
+        ),
+        stale_window AS (SELECT COALESCE((SELECT CAST(value AS INTEGER) FROM setting WHERE key = 'threshold.identity.stale-user-days'), 90) AS days)
+        SELECT ad.instance, COUNT(*) AS accounts
+        FROM ad JOIN cloud c ON c.sid = ad.sid, stale_window w
+        WHERE (COALESCE(ad.uac, 0) & 2) = 0
+          AND (ad.dc_logon_raw IS NULL OR ad.dc_logon_raw NOT GLOB '[0-9][0-9][0-9][0-9]-*'
+               OR julianday(:now) - julianday(ad.dc_logon_raw) > w.days)
+          AND julianday(:now) - julianday(c.cloud_signin) <= w.days
+        GROUP BY ad.instance
+      key: instance
+    each: { field: accounts, op: gt, value: 0 }
+    evidence: "{instance}: {accounts} enabled accounts look stale in AD but signed in to Entra"

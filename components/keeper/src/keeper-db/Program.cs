@@ -1,5 +1,6 @@
-using System.Globalization;
-using Keeper.Core;
+using Keeper.Common;
+using Keeper.Composition;
+using Keeper.Home;
 using Keeper.Store;
 using Microsoft.Data.Sqlite;
 
@@ -7,15 +8,14 @@ using Microsoft.Data.Sqlite;
 try
 {
     var cli = new CliArgs(args, flags: ["apply"]);
-    var command = cli.Positional.Count > 0 ? cli.Positional[0] : "status";
-    var (_, paths) = KeeperContext.Load(cli);
-    var db = new KeeperDb(paths.Database);
+    var command = cli.At(0) ?? "status";
+    var (paths, db) = Composition.Locate(cli);
+    var schemas = Composition.Schemas;
 
     return command switch
     {
-        "status" => Status(db),
-        "init" => Init(db, cli.Has("apply")),
-        "migrate" => Migrate(db, paths, cli.Has("apply")),
+        "status" => Status(db, schemas),
+        "init" or "migrate" => Migrate(db, paths, schemas, cli.Has("apply"), command == "init"),
         "backup" => Backup(db, paths),
         _ => Usage(),
     };
@@ -25,122 +25,80 @@ catch (Exception ex) when (ex is SettingsException or ArgumentException)
     Console.Error.WriteLine(ex.Message);
     return ExitCodes.Usage;
 }
-catch (Exception ex) when (ex is StoreException or SqliteException)
+catch (Exception ex) when (ex is StoreException or SqliteException or IOException)
 {
-    Console.Error.WriteLine(ex.Message);
+    Console.Error.WriteLine(Redactor.Clean(ex.Message));
     return ExitCodes.Failed;
 }
 
-static int Status(KeeperDb db)
+static int Status(Database db, IReadOnlyList<MigrationSet> schemas)
 {
-    Console.WriteLine($"Store:    {db.DbFile}");
+    Console.WriteLine($"Store: {db.DbFile}");
     if (!db.Exists)
     {
-        Console.WriteLine("State:    not created. Run 'keeper-db init --apply'.");
+        Console.WriteLine("Not created yet. Run 'keeper db init --apply' (or 'keeper setup --apply').");
         return ExitCodes.NoData;
     }
-
     using var connection = db.OpenReadOnly();
-    var version = KeeperDb.Version(connection);
-    Console.WriteLine($"Version:  {version} (this build: {Migrations.Latest})");
-    if (version != Migrations.Latest)
-    {
-        Console.WriteLine("Run 'keeper-db migrate' before using the store.");
-        return ExitCodes.Failed;
-    }
-
-    (string Label, string Sql)[] counts =
-    [
-        ("Systems", "SELECT COUNT(*) FROM system WHERE active = 1"),
-        ("Runs", "SELECT COUNT(*) FROM run"),
-        ("Active findings", "SELECT COUNT(*) FROM active_finding"),
-        ("Failed writes", "SELECT COUNT(*) FROM request WHERE state = 'failed'"),
-    ];
-    foreach (var (label, sql) in counts)
-        Console.WriteLine($"{label + ":",-17}{Sql.Scalar(connection, sql)}");
-    return ExitCodes.Ok;
+    var status = SchemaManager.Status(connection, schemas);
+    foreach (var s in status)
+        Console.WriteLine($"  {s.Component,-14} version {s.Current} of {s.Latest}{(s.UpToDate ? "" : "  <- run 'keeper db migrate --apply'")}");
+    return status.All(s => s.UpToDate) ? ExitCodes.Ok : ExitCodes.Failed;
 }
 
-static int Init(KeeperDb db, bool apply)
+static int Migrate(Database db, KeeperPaths paths, IReadOnlyList<MigrationSet> schemas, bool apply, bool init)
 {
-    if (db.Exists)
+    if (!init && !db.Exists)
+        throw new ArgumentException($"No store at {db.DbFile}. Run 'keeper db init --apply'.");
+    if (init && db.Exists)
     {
-        Console.WriteLine($"A store already exists at {db.DbFile}. See 'keeper-db status' or 'keeper-db migrate'.");
+        Console.WriteLine($"A store already exists at {db.DbFile}. 'keeper db migrate' brings it up to date.");
         return ExitCodes.Ok;
     }
 
-    Console.WriteLine($"Creates {db.DbFile} with {Migrations.Latest} migration(s):");
-    Print(Migrations.All);
+    IReadOnlyList<(MigrationSet Set, Migration Migration)> pending;
+    if (db.Exists)
+    {
+        using var read = db.OpenReadOnly();
+        pending = SchemaManager.Pending(read, schemas);
+    }
+    else
+    {
+        pending = SchemaManager.Ordered(schemas).SelectMany(s => s.Migrations.Select(m => (s, m))).ToList();
+    }
+
+    if (pending.Count == 0)
+    {
+        Console.WriteLine("Up to date.");
+        return ExitCodes.Ok;
+    }
+    Console.WriteLine($"{(init ? "Creates" : "Migrates")} {db.DbFile}:");
+    foreach (var (set, migration) in pending)
+        Console.WriteLine($"  {set.Component,-14} {migration.Version:D3} {migration.Name}");
     if (!apply)
     {
         Console.WriteLine("Dry run: nothing changed. Re-run with --apply.");
         return ExitCodes.Ok;
     }
 
+    if (db.Exists)
+    {
+        var backup = Path.Combine(paths.Backups, $"keeper-{Iso.Stamp(DateTimeOffset.UtcNow)}.db");
+        db.BackupTo(backup);
+        Console.WriteLine($"Backed up to {backup}");
+    }
     using var connection = db.OpenReadWrite(create: true);
-    Migrations.Apply(connection, Migrations.All);
-    Console.WriteLine($"Created. Store is at version {KeeperDb.Version(connection)}.");
+    var applied = SchemaManager.Apply(connection, schemas);
+    Console.WriteLine($"Applied {applied} migration(s).");
     return ExitCodes.Ok;
 }
 
-static int Migrate(KeeperDb db, KeeperPaths paths, bool apply)
+static int Backup(Database db, KeeperPaths paths)
 {
-    if (!db.Exists)
-    {
-        Console.Error.WriteLine($"No store at {db.DbFile}. Run 'keeper-db init --apply'.");
-        return ExitCodes.Usage;
-    }
-
-    int current;
-    using (var read = db.OpenReadOnly())
-        current = KeeperDb.Version(read);
-
-    if (current > Migrations.Latest)
-    {
-        Console.Error.WriteLine($"Store is at version {current}, newer than this build ({Migrations.Latest}). Use a newer build.");
-        return ExitCodes.Failed;
-    }
-
-    var pending = Migrations.Pending(current);
-    if (pending.Count == 0)
-    {
-        Console.WriteLine($"Up to date at version {current}.");
-        return ExitCodes.Ok;
-    }
-
-    Console.WriteLine($"Store is at version {current}; {pending.Count} migration(s) pending:");
-    Print(pending);
-    if (!apply)
-    {
-        Console.WriteLine("Dry run: nothing changed. Re-run with --apply (the store is backed up first).");
-        return ExitCodes.Ok;
-    }
-
-    var backup = BackupFile(paths);
-    db.BackupTo(backup);
-    Console.WriteLine($"Backed up to {backup}");
-
-    using var connection = db.OpenReadWrite();
-    Migrations.Apply(connection, pending);
-    Console.WriteLine($"Store is at version {KeeperDb.Version(connection)}.");
+    var file = Path.Combine(paths.Backups, $"keeper-{Iso.Stamp(DateTimeOffset.UtcNow)}.db");
+    db.BackupTo(file);
+    Console.WriteLine($"Backed up to {file}");
     return ExitCodes.Ok;
-}
-
-static int Backup(KeeperDb db, KeeperPaths paths)
-{
-    var backup = BackupFile(paths);
-    db.BackupTo(backup);
-    Console.WriteLine($"Backed up to {backup}");
-    return ExitCodes.Ok;
-}
-
-static string BackupFile(KeeperPaths paths) =>
-    Path.Combine(paths.Backups, $"keeper-{DateTime.UtcNow.ToString("yyyyMMdd-HHmmss", CultureInfo.InvariantCulture)}.db");
-
-static void Print(IEnumerable<Migration> migrations)
-{
-    foreach (var migration in migrations)
-        Console.WriteLine($"  {migration.Version.ToString("D3", CultureInfo.InvariantCulture)} {migration.Name}");
 }
 
 static int Usage()
@@ -148,12 +106,10 @@ static int Usage()
     Console.Error.WriteLine("""
         keeper-db - the store's lifecycle
 
-          keeper-db status               version, pending migrations, counts
+          keeper-db status               every component's schema version
           keeper-db init [--apply]       create the store (dry run without --apply)
           keeper-db migrate [--apply]    apply pending migrations, backing up first
           keeper-db backup               copy the store into data\backups\
-
-          --settings <file>              default: settings\settings.json in the Keeper home (KEEPER_HOME)
         """);
     return ExitCodes.Usage;
 }

@@ -1,0 +1,1676 @@
+schema: keeper.rules/1
+system: registers
+name: Licences, contracts, key dates and vendors
+integration: keeper
+# Rules over the registers people keep in Keeper's store (licence, contract, key_date, vendor).
+# Dates are yyyy-MM-dd. Each register row's own notice_days says how early it needs attention;
+# days_left and days_to_notice are computed in SQL against :today.
+# Rules with the same query text share one read: the licence rules read the licence table once,
+# the contract rules the contract table once, and so on. Keep the copies identical.
+rules:
+  # ---------------------------------------------------------------- licences
+  - id: REG-LIC-EXPIRING
+    title: Licence expires within its notice period
+    kind: broken
+    lens: both
+    category: CST
+    severity:
+      daysLeft: expires_on
+      ranges:
+        - { max: 7, value: critical }
+        - { max: 30, value: high }
+        - { max: 60, value: medium }
+      default: low
+    entity: licence
+    why: >-
+      The licence does not renew by itself and its expiry is inside the lead time recorded for it.
+      Quotes, approvals and orders take weeks; a renewal that was planned but never ordered looks
+      exactly like this until the product stops or runs unlicensed.
+    fix: >-
+      Start the renewal with the owner now (quote, budget, order) and confirm the order was placed,
+      or record the decision to let it lapse and plan the replacement. Update expires_on when the
+      new term is confirmed.
+    refs: [NIST-800-53:CM-10, NIST-800-53:SA-4]
+    refresh: 1d
+    query:
+      protocol: store
+      key: licence_id
+      name: product
+      text: |
+        SELECT l.licence_id,
+               l.product,
+               l.vendor_id,
+               v.name AS vendor,
+               l.system_id,
+               l.seats,
+               l.seats_used,
+               NULLIF(TRIM(l.expires_on), '') AS expires_on,
+               l.notice_days,
+               l.auto_renews,
+               l.cost,
+               l.currency,
+               NULLIF(TRIM(l.owner), '') AS owner,
+               COALESCE(NULLIF(TRIM(l.owner), ''), 'nobody') AS owner_shown,
+               NULLIF(TRIM(l.notes), '') AS notes,
+               CAST(julianday(NULLIF(TRIM(l.expires_on), '')) - julianday(:today) AS INTEGER) AS days_left,
+               CAST(julianday(:today) - julianday(NULLIF(TRIM(l.expires_on), '')) AS INTEGER) AS days_past,
+               CAST(julianday(NULLIF(TRIM(l.expires_on), '')) - julianday(:today) AS INTEGER) - l.notice_days AS days_to_notice,
+               date(NULLIF(TRIM(l.expires_on), ''), '-' || l.notice_days || ' days') AS renew_by,
+               CASE WHEN l.seats > 0 AND l.seats_used IS NOT NULL
+                    THEN ROUND(100.0 * l.seats_used / l.seats, 1) END AS used_pct,
+               CASE WHEN l.seats IS NOT NULL AND l.seats_used IS NOT NULL
+                    THEN l.seats - l.seats_used END AS seats_free,
+               CASE WHEN l.cost IS NULL OR l.cost > 0 THEN 1 ELSE 0 END AS paid,
+               (SELECT COUNT(*) FROM licence o
+                 WHERE LOWER(TRIM(o.product)) = LOWER(TRIM(l.product))
+                   AND o.licence_id <> l.licence_id
+                   AND COALESCE(NULLIF(TRIM(o.expires_on), ''), '9999-12-31') >= :today) AS same_product_current
+        FROM licence l
+        LEFT JOIN vendor v ON v.vendor_id = l.vendor_id
+    each:
+      all:
+        - { field: auto_renews, op: eq, value: 0 }
+        - { field: days_left, op: ge, value: 0 }
+        - { field: days_to_notice, op: le, value: 0 }
+    deadline: expires_on
+    evidence: "{product} ({licence_id}) expires {expires_on}, {days_left} days left; renewal was due to start {renew_by} ({notice_days}-day notice). Owner: {owner_shown}"
+
+  - id: REG-LIC-AUTORENEW-DUE
+    title: Auto-renewing licence renews within its notice period
+    kind: misconfigured
+    lens: maintenance
+    category: CST
+    severity: low
+    entity: licence
+    why: >-
+      An automatic renewal commits money and a unit count without anyone deciding, and some terms
+      fall back to list price if nobody renews on the negotiated offer. The notice period is the
+      last chance to cut unused seats, renegotiate or cancel.
+    fix: >-
+      Have the owner confirm the seat count and price before the renewal date, or cancel. After it
+      renews, set expires_on to the new end of term.
+    refs: [NIST-800-53:CM-10]
+    refresh: 1d
+    query:
+      protocol: store
+      key: licence_id
+      name: product
+      text: |
+        SELECT l.licence_id,
+               l.product,
+               l.vendor_id,
+               v.name AS vendor,
+               l.system_id,
+               l.seats,
+               l.seats_used,
+               NULLIF(TRIM(l.expires_on), '') AS expires_on,
+               l.notice_days,
+               l.auto_renews,
+               l.cost,
+               l.currency,
+               NULLIF(TRIM(l.owner), '') AS owner,
+               COALESCE(NULLIF(TRIM(l.owner), ''), 'nobody') AS owner_shown,
+               NULLIF(TRIM(l.notes), '') AS notes,
+               CAST(julianday(NULLIF(TRIM(l.expires_on), '')) - julianday(:today) AS INTEGER) AS days_left,
+               CAST(julianday(:today) - julianday(NULLIF(TRIM(l.expires_on), '')) AS INTEGER) AS days_past,
+               CAST(julianday(NULLIF(TRIM(l.expires_on), '')) - julianday(:today) AS INTEGER) - l.notice_days AS days_to_notice,
+               date(NULLIF(TRIM(l.expires_on), ''), '-' || l.notice_days || ' days') AS renew_by,
+               CASE WHEN l.seats > 0 AND l.seats_used IS NOT NULL
+                    THEN ROUND(100.0 * l.seats_used / l.seats, 1) END AS used_pct,
+               CASE WHEN l.seats IS NOT NULL AND l.seats_used IS NOT NULL
+                    THEN l.seats - l.seats_used END AS seats_free,
+               CASE WHEN l.cost IS NULL OR l.cost > 0 THEN 1 ELSE 0 END AS paid,
+               (SELECT COUNT(*) FROM licence o
+                 WHERE LOWER(TRIM(o.product)) = LOWER(TRIM(l.product))
+                   AND o.licence_id <> l.licence_id
+                   AND COALESCE(NULLIF(TRIM(o.expires_on), ''), '9999-12-31') >= :today) AS same_product_current
+        FROM licence l
+        LEFT JOIN vendor v ON v.vendor_id = l.vendor_id
+    each:
+      all:
+        - { field: auto_renews, op: eq, value: 1 }
+        - { field: days_left, op: ge, value: 0 }
+        - { field: days_to_notice, op: le, value: 0 }
+    deadline: expires_on
+    evidence: "{product} ({licence_id}) renews automatically on {expires_on}, {days_left} days left; confirm units and price before then. Owner: {owner_shown}"
+
+  - id: REG-LIC-EXPIRED
+    title: Licence has expired
+    kind: broken
+    lens: both
+    category: CST
+    severity:
+      field: auto_renews
+      map: { "0": critical, "1": medium }
+      default: critical
+    entity: licence
+    why: >-
+      The recorded expiry date has passed. Either the product now runs unlicensed or has stopped
+      (support, updates and protection signatures usually stop first), or it renewed and the
+      register is out of date - in which case every other date in it is suspect too.
+    fix: >-
+      Renew or retire the product today. If it already renewed, set expires_on to the new end of
+      term; if it was retired, delete the licence row.
+    refs: [NIST-800-53:CM-10]
+    refresh: 1d
+    query:
+      protocol: store
+      key: licence_id
+      name: product
+      text: |
+        SELECT l.licence_id,
+               l.product,
+               l.vendor_id,
+               v.name AS vendor,
+               l.system_id,
+               l.seats,
+               l.seats_used,
+               NULLIF(TRIM(l.expires_on), '') AS expires_on,
+               l.notice_days,
+               l.auto_renews,
+               l.cost,
+               l.currency,
+               NULLIF(TRIM(l.owner), '') AS owner,
+               COALESCE(NULLIF(TRIM(l.owner), ''), 'nobody') AS owner_shown,
+               NULLIF(TRIM(l.notes), '') AS notes,
+               CAST(julianday(NULLIF(TRIM(l.expires_on), '')) - julianday(:today) AS INTEGER) AS days_left,
+               CAST(julianday(:today) - julianday(NULLIF(TRIM(l.expires_on), '')) AS INTEGER) AS days_past,
+               CAST(julianday(NULLIF(TRIM(l.expires_on), '')) - julianday(:today) AS INTEGER) - l.notice_days AS days_to_notice,
+               date(NULLIF(TRIM(l.expires_on), ''), '-' || l.notice_days || ' days') AS renew_by,
+               CASE WHEN l.seats > 0 AND l.seats_used IS NOT NULL
+                    THEN ROUND(100.0 * l.seats_used / l.seats, 1) END AS used_pct,
+               CASE WHEN l.seats IS NOT NULL AND l.seats_used IS NOT NULL
+                    THEN l.seats - l.seats_used END AS seats_free,
+               CASE WHEN l.cost IS NULL OR l.cost > 0 THEN 1 ELSE 0 END AS paid,
+               (SELECT COUNT(*) FROM licence o
+                 WHERE LOWER(TRIM(o.product)) = LOWER(TRIM(l.product))
+                   AND o.licence_id <> l.licence_id
+                   AND COALESCE(NULLIF(TRIM(o.expires_on), ''), '9999-12-31') >= :today) AS same_product_current
+        FROM licence l
+        LEFT JOIN vendor v ON v.vendor_id = l.vendor_id
+    each: { field: days_left, op: lt, value: 0 }
+    deadline: expires_on
+    evidence: "{product} ({licence_id}) expired on {expires_on}, {days_past} days ago (auto-renews: {auto_renews}). Owner: {owner_shown}"
+
+  - id: REG-LIC-NO-EXPIRY
+    title: Licence has no expiry date recorded
+    kind: missing
+    lens: maintenance
+    category: CST
+    severity: low
+    entity: licence
+    why: >-
+      Without an expiry date no rule can warn before the licence lapses, which is exactly the
+      surprise the register exists to prevent. A term copied in incompletely ends up here too.
+    fix: >-
+      Record expires_on from the order or the vendor portal. For a genuinely perpetual licence,
+      write the word "perpetual" in its notes so it is not reported again.
+    refs: [NIST-800-53:CM-10]
+    refresh: 1d
+    query:
+      protocol: store
+      key: licence_id
+      name: product
+      text: |
+        SELECT l.licence_id,
+               l.product,
+               l.vendor_id,
+               v.name AS vendor,
+               l.system_id,
+               l.seats,
+               l.seats_used,
+               NULLIF(TRIM(l.expires_on), '') AS expires_on,
+               l.notice_days,
+               l.auto_renews,
+               l.cost,
+               l.currency,
+               NULLIF(TRIM(l.owner), '') AS owner,
+               COALESCE(NULLIF(TRIM(l.owner), ''), 'nobody') AS owner_shown,
+               NULLIF(TRIM(l.notes), '') AS notes,
+               CAST(julianday(NULLIF(TRIM(l.expires_on), '')) - julianday(:today) AS INTEGER) AS days_left,
+               CAST(julianday(:today) - julianday(NULLIF(TRIM(l.expires_on), '')) AS INTEGER) AS days_past,
+               CAST(julianday(NULLIF(TRIM(l.expires_on), '')) - julianday(:today) AS INTEGER) - l.notice_days AS days_to_notice,
+               date(NULLIF(TRIM(l.expires_on), ''), '-' || l.notice_days || ' days') AS renew_by,
+               CASE WHEN l.seats > 0 AND l.seats_used IS NOT NULL
+                    THEN ROUND(100.0 * l.seats_used / l.seats, 1) END AS used_pct,
+               CASE WHEN l.seats IS NOT NULL AND l.seats_used IS NOT NULL
+                    THEN l.seats - l.seats_used END AS seats_free,
+               CASE WHEN l.cost IS NULL OR l.cost > 0 THEN 1 ELSE 0 END AS paid,
+               (SELECT COUNT(*) FROM licence o
+                 WHERE LOWER(TRIM(o.product)) = LOWER(TRIM(l.product))
+                   AND o.licence_id <> l.licence_id
+                   AND COALESCE(NULLIF(TRIM(o.expires_on), ''), '9999-12-31') >= :today) AS same_product_current
+        FROM licence l
+        LEFT JOIN vendor v ON v.vendor_id = l.vendor_id
+    each:
+      all:
+        - { field: expires_on, op: absent }
+        - any:
+            - { field: notes, op: absent }
+            - { field: notes, op: notmatch, value: perpetual }
+    evidence: "{product} ({licence_id}) has no expiry date. Owner: {owner_shown}"
+
+  - id: REG-LIC-SEATS-AT-CAP
+    title: Licence seats used at or over the cap
+    kind: broken
+    lens: maintenance
+    category: CST
+    severity:
+      field: seats_free
+      ranges:
+        - { max: -1, value: high }
+      default: medium
+    entity: licence
+    why: >-
+      At the cap the next user, device or workload cannot be added - often discovered when a joiner
+      is blocked. Over the cap is a compliance exposure: an audit or true-up bills the difference,
+      often at list price and backdated. Free tiers have caps too, and usually no support to raise
+      them quickly.
+    fix: >-
+      Reclaim units from leavers and idle accounts, or order more (or request a cap increase)
+      before demand hits it; then verify the new cap in the vendor console and update seats.
+      Seats can be any unit the licence counts: users, devices, hosts, cores, GB or credits.
+    refs: [NIST-800-53:CM-10]
+    refresh: 1d
+    query:
+      protocol: store
+      key: licence_id
+      name: product
+      text: |
+        SELECT l.licence_id,
+               l.product,
+               l.vendor_id,
+               v.name AS vendor,
+               l.system_id,
+               l.seats,
+               l.seats_used,
+               NULLIF(TRIM(l.expires_on), '') AS expires_on,
+               l.notice_days,
+               l.auto_renews,
+               l.cost,
+               l.currency,
+               NULLIF(TRIM(l.owner), '') AS owner,
+               COALESCE(NULLIF(TRIM(l.owner), ''), 'nobody') AS owner_shown,
+               NULLIF(TRIM(l.notes), '') AS notes,
+               CAST(julianday(NULLIF(TRIM(l.expires_on), '')) - julianday(:today) AS INTEGER) AS days_left,
+               CAST(julianday(:today) - julianday(NULLIF(TRIM(l.expires_on), '')) AS INTEGER) AS days_past,
+               CAST(julianday(NULLIF(TRIM(l.expires_on), '')) - julianday(:today) AS INTEGER) - l.notice_days AS days_to_notice,
+               date(NULLIF(TRIM(l.expires_on), ''), '-' || l.notice_days || ' days') AS renew_by,
+               CASE WHEN l.seats > 0 AND l.seats_used IS NOT NULL
+                    THEN ROUND(100.0 * l.seats_used / l.seats, 1) END AS used_pct,
+               CASE WHEN l.seats IS NOT NULL AND l.seats_used IS NOT NULL
+                    THEN l.seats - l.seats_used END AS seats_free,
+               CASE WHEN l.cost IS NULL OR l.cost > 0 THEN 1 ELSE 0 END AS paid,
+               (SELECT COUNT(*) FROM licence o
+                 WHERE LOWER(TRIM(o.product)) = LOWER(TRIM(l.product))
+                   AND o.licence_id <> l.licence_id
+                   AND COALESCE(NULLIF(TRIM(o.expires_on), ''), '9999-12-31') >= :today) AS same_product_current
+        FROM licence l
+        LEFT JOIN vendor v ON v.vendor_id = l.vendor_id
+    each:
+      all:
+        - { field: seats, op: gt, value: 0 }
+        - { field: seats_free, op: le, value: 0 }
+    deadline: expires_on
+    evidence: "{product} ({licence_id}): {seats_used} units used of a cap of {seats} ({seats_free} free). Owner: {owner_shown}"
+
+  - id: REG-LIC-SEATS-NEARLY-FULL
+    title: Licence is nearly out of seats
+    kind: misconfigured
+    lens: maintenance
+    category: CST
+    severity: low
+    entity: licence
+    why: >-
+      With almost every unit taken, the next joiner or new server waits for a purchase, or someone
+      quietly reuses an account or goes over the count.
+    fix: Reclaim seats from leavers and idle accounts, or order more ahead of demand.
+    refs: [NIST-800-53:CM-10]
+    refresh: 1d
+    query:
+      protocol: store
+      key: licence_id
+      name: product
+      text: |
+        SELECT l.licence_id,
+               l.product,
+               l.vendor_id,
+               v.name AS vendor,
+               l.system_id,
+               l.seats,
+               l.seats_used,
+               NULLIF(TRIM(l.expires_on), '') AS expires_on,
+               l.notice_days,
+               l.auto_renews,
+               l.cost,
+               l.currency,
+               NULLIF(TRIM(l.owner), '') AS owner,
+               COALESCE(NULLIF(TRIM(l.owner), ''), 'nobody') AS owner_shown,
+               NULLIF(TRIM(l.notes), '') AS notes,
+               CAST(julianday(NULLIF(TRIM(l.expires_on), '')) - julianday(:today) AS INTEGER) AS days_left,
+               CAST(julianday(:today) - julianday(NULLIF(TRIM(l.expires_on), '')) AS INTEGER) AS days_past,
+               CAST(julianday(NULLIF(TRIM(l.expires_on), '')) - julianday(:today) AS INTEGER) - l.notice_days AS days_to_notice,
+               date(NULLIF(TRIM(l.expires_on), ''), '-' || l.notice_days || ' days') AS renew_by,
+               CASE WHEN l.seats > 0 AND l.seats_used IS NOT NULL
+                    THEN ROUND(100.0 * l.seats_used / l.seats, 1) END AS used_pct,
+               CASE WHEN l.seats IS NOT NULL AND l.seats_used IS NOT NULL
+                    THEN l.seats - l.seats_used END AS seats_free,
+               CASE WHEN l.cost IS NULL OR l.cost > 0 THEN 1 ELSE 0 END AS paid,
+               (SELECT COUNT(*) FROM licence o
+                 WHERE LOWER(TRIM(o.product)) = LOWER(TRIM(l.product))
+                   AND o.licence_id <> l.licence_id
+                   AND COALESCE(NULLIF(TRIM(o.expires_on), ''), '9999-12-31') >= :today) AS same_product_current
+        FROM licence l
+        LEFT JOIN vendor v ON v.vendor_id = l.vendor_id
+    each:
+      all:
+        - { field: seats_free, op: gt, value: 0 }
+        - { field: used_pct, op: ge, value: 95, threshold: registers.licence-full-pct }
+    evidence: "{product} ({licence_id}): {seats_used} of {seats} units used ({used_pct}%)"
+
+  - id: REG-LIC-UNUSED-SEATS
+    title: Paid licence seats mostly unused
+    kind: misconfigured
+    lens: maintenance
+    category: CST
+    severity: medium
+    entity: licence
+    why: >-
+      Units that are paid for and not used are money spent every term for nothing; the cheapest
+      moment to drop them is before the next renewal.
+    fix: >-
+      Agree the real need with the owner and reduce the count at the next renewal (or now, if the
+      contract allows). Correct seats_used if the register is behind.
+    refs: [NIST-800-53:CM-10]
+    refresh: 1d
+    query:
+      protocol: store
+      key: licence_id
+      name: product
+      text: |
+        SELECT l.licence_id,
+               l.product,
+               l.vendor_id,
+               v.name AS vendor,
+               l.system_id,
+               l.seats,
+               l.seats_used,
+               NULLIF(TRIM(l.expires_on), '') AS expires_on,
+               l.notice_days,
+               l.auto_renews,
+               l.cost,
+               l.currency,
+               NULLIF(TRIM(l.owner), '') AS owner,
+               COALESCE(NULLIF(TRIM(l.owner), ''), 'nobody') AS owner_shown,
+               NULLIF(TRIM(l.notes), '') AS notes,
+               CAST(julianday(NULLIF(TRIM(l.expires_on), '')) - julianday(:today) AS INTEGER) AS days_left,
+               CAST(julianday(:today) - julianday(NULLIF(TRIM(l.expires_on), '')) AS INTEGER) AS days_past,
+               CAST(julianday(NULLIF(TRIM(l.expires_on), '')) - julianday(:today) AS INTEGER) - l.notice_days AS days_to_notice,
+               date(NULLIF(TRIM(l.expires_on), ''), '-' || l.notice_days || ' days') AS renew_by,
+               CASE WHEN l.seats > 0 AND l.seats_used IS NOT NULL
+                    THEN ROUND(100.0 * l.seats_used / l.seats, 1) END AS used_pct,
+               CASE WHEN l.seats IS NOT NULL AND l.seats_used IS NOT NULL
+                    THEN l.seats - l.seats_used END AS seats_free,
+               CASE WHEN l.cost IS NULL OR l.cost > 0 THEN 1 ELSE 0 END AS paid,
+               (SELECT COUNT(*) FROM licence o
+                 WHERE LOWER(TRIM(o.product)) = LOWER(TRIM(l.product))
+                   AND o.licence_id <> l.licence_id
+                   AND COALESCE(NULLIF(TRIM(o.expires_on), ''), '9999-12-31') >= :today) AS same_product_current
+        FROM licence l
+        LEFT JOIN vendor v ON v.vendor_id = l.vendor_id
+    each:
+      all:
+        - { field: paid, op: eq, value: 1 }
+        - { field: used_pct, op: lt, value: 70, threshold: registers.licence-min-used-pct }
+        - { field: seats_free, op: ge, value: 5, threshold: registers.licence-min-idle-seats }
+    deadline: expires_on
+    evidence: "{product} ({licence_id}): {seats_used} of {seats} units used ({used_pct}%), {seats_free} idle; cost {cost} {currency}, term ends {expires_on}"
+
+  - id: REG-LIC-DUPLICATE-PRODUCT
+    title: Another current licence exists for the same product
+    kind: misconfigured
+    lens: maintenance
+    category: CST
+    severity: low
+    entity: licence
+    why: >-
+      Two current licences for the same product can mean paying twice - a new offer or order
+      accepted while an existing agreement for the same thing still runs.
+    fix: >-
+      Compare the terms of both. Merge or cancel one before its next charge, or rename the products
+      so the register shows why they are different (edition, department, environment).
+    refs: [NIST-800-53:CM-10]
+    refresh: 1d
+    query:
+      protocol: store
+      key: licence_id
+      name: product
+      text: |
+        SELECT l.licence_id,
+               l.product,
+               l.vendor_id,
+               v.name AS vendor,
+               l.system_id,
+               l.seats,
+               l.seats_used,
+               NULLIF(TRIM(l.expires_on), '') AS expires_on,
+               l.notice_days,
+               l.auto_renews,
+               l.cost,
+               l.currency,
+               NULLIF(TRIM(l.owner), '') AS owner,
+               COALESCE(NULLIF(TRIM(l.owner), ''), 'nobody') AS owner_shown,
+               NULLIF(TRIM(l.notes), '') AS notes,
+               CAST(julianday(NULLIF(TRIM(l.expires_on), '')) - julianday(:today) AS INTEGER) AS days_left,
+               CAST(julianday(:today) - julianday(NULLIF(TRIM(l.expires_on), '')) AS INTEGER) AS days_past,
+               CAST(julianday(NULLIF(TRIM(l.expires_on), '')) - julianday(:today) AS INTEGER) - l.notice_days AS days_to_notice,
+               date(NULLIF(TRIM(l.expires_on), ''), '-' || l.notice_days || ' days') AS renew_by,
+               CASE WHEN l.seats > 0 AND l.seats_used IS NOT NULL
+                    THEN ROUND(100.0 * l.seats_used / l.seats, 1) END AS used_pct,
+               CASE WHEN l.seats IS NOT NULL AND l.seats_used IS NOT NULL
+                    THEN l.seats - l.seats_used END AS seats_free,
+               CASE WHEN l.cost IS NULL OR l.cost > 0 THEN 1 ELSE 0 END AS paid,
+               (SELECT COUNT(*) FROM licence o
+                 WHERE LOWER(TRIM(o.product)) = LOWER(TRIM(l.product))
+                   AND o.licence_id <> l.licence_id
+                   AND COALESCE(NULLIF(TRIM(o.expires_on), ''), '9999-12-31') >= :today) AS same_product_current
+        FROM licence l
+        LEFT JOIN vendor v ON v.vendor_id = l.vendor_id
+    each:
+      all:
+        - { field: same_product_current, op: gt, value: 0 }
+        - any:
+            - { field: expires_on, op: absent }
+            - { field: days_left, op: ge, value: 0 }
+    deadline: expires_on
+    evidence: "{product} ({licence_id}, vendor {vendor}) has {same_product_current} other current licence(s) for the same product"
+
+  - id: REG-LIC-NO-OWNER
+    title: Licence has no owner
+    kind: missing
+    lens: maintenance
+    category: CST
+    severity: medium
+    entity: licence
+    why: >-
+      A licence nobody owns is renewed by nobody: the notice period passes unnoticed and the first
+      sign is the product stopping.
+    fix: >-
+      Name the person or team responsible for renewing and right-sizing it, and point the vendor's
+      renewal notices at a shared mailbox rather than one person.
+    refs: [NIST-800-53:CM-10]
+    refresh: 1d
+    query:
+      protocol: store
+      key: licence_id
+      name: product
+      text: |
+        SELECT l.licence_id,
+               l.product,
+               l.vendor_id,
+               v.name AS vendor,
+               l.system_id,
+               l.seats,
+               l.seats_used,
+               NULLIF(TRIM(l.expires_on), '') AS expires_on,
+               l.notice_days,
+               l.auto_renews,
+               l.cost,
+               l.currency,
+               NULLIF(TRIM(l.owner), '') AS owner,
+               COALESCE(NULLIF(TRIM(l.owner), ''), 'nobody') AS owner_shown,
+               NULLIF(TRIM(l.notes), '') AS notes,
+               CAST(julianday(NULLIF(TRIM(l.expires_on), '')) - julianday(:today) AS INTEGER) AS days_left,
+               CAST(julianday(:today) - julianday(NULLIF(TRIM(l.expires_on), '')) AS INTEGER) AS days_past,
+               CAST(julianday(NULLIF(TRIM(l.expires_on), '')) - julianday(:today) AS INTEGER) - l.notice_days AS days_to_notice,
+               date(NULLIF(TRIM(l.expires_on), ''), '-' || l.notice_days || ' days') AS renew_by,
+               CASE WHEN l.seats > 0 AND l.seats_used IS NOT NULL
+                    THEN ROUND(100.0 * l.seats_used / l.seats, 1) END AS used_pct,
+               CASE WHEN l.seats IS NOT NULL AND l.seats_used IS NOT NULL
+                    THEN l.seats - l.seats_used END AS seats_free,
+               CASE WHEN l.cost IS NULL OR l.cost > 0 THEN 1 ELSE 0 END AS paid,
+               (SELECT COUNT(*) FROM licence o
+                 WHERE LOWER(TRIM(o.product)) = LOWER(TRIM(l.product))
+                   AND o.licence_id <> l.licence_id
+                   AND COALESCE(NULLIF(TRIM(o.expires_on), ''), '9999-12-31') >= :today) AS same_product_current
+        FROM licence l
+        LEFT JOIN vendor v ON v.vendor_id = l.vendor_id
+    each: { field: owner, op: absent }
+    deadline: expires_on
+    evidence: "{product} ({licence_id}) has no owner; expires {expires_on}"
+
+  - id: REG-LIC-NO-SEAT-USAGE
+    title: Licence seat usage is not recorded
+    kind: missing
+    lens: maintenance
+    category: CST
+    severity: low
+    entity: licence
+    why: >-
+      The register knows how many units were bought but not how many are used, so neither waste
+      nor over-use (or a cap about to be hit) can be seen.
+    fix: Record seats_used from the vendor portal or the product's admin console, and keep it current.
+    refs: [NIST-800-53:CM-10]
+    refresh: 1d
+    query:
+      protocol: store
+      key: licence_id
+      name: product
+      text: |
+        SELECT l.licence_id,
+               l.product,
+               l.vendor_id,
+               v.name AS vendor,
+               l.system_id,
+               l.seats,
+               l.seats_used,
+               NULLIF(TRIM(l.expires_on), '') AS expires_on,
+               l.notice_days,
+               l.auto_renews,
+               l.cost,
+               l.currency,
+               NULLIF(TRIM(l.owner), '') AS owner,
+               COALESCE(NULLIF(TRIM(l.owner), ''), 'nobody') AS owner_shown,
+               NULLIF(TRIM(l.notes), '') AS notes,
+               CAST(julianday(NULLIF(TRIM(l.expires_on), '')) - julianday(:today) AS INTEGER) AS days_left,
+               CAST(julianday(:today) - julianday(NULLIF(TRIM(l.expires_on), '')) AS INTEGER) AS days_past,
+               CAST(julianday(NULLIF(TRIM(l.expires_on), '')) - julianday(:today) AS INTEGER) - l.notice_days AS days_to_notice,
+               date(NULLIF(TRIM(l.expires_on), ''), '-' || l.notice_days || ' days') AS renew_by,
+               CASE WHEN l.seats > 0 AND l.seats_used IS NOT NULL
+                    THEN ROUND(100.0 * l.seats_used / l.seats, 1) END AS used_pct,
+               CASE WHEN l.seats IS NOT NULL AND l.seats_used IS NOT NULL
+                    THEN l.seats - l.seats_used END AS seats_free,
+               CASE WHEN l.cost IS NULL OR l.cost > 0 THEN 1 ELSE 0 END AS paid,
+               (SELECT COUNT(*) FROM licence o
+                 WHERE LOWER(TRIM(o.product)) = LOWER(TRIM(l.product))
+                   AND o.licence_id <> l.licence_id
+                   AND COALESCE(NULLIF(TRIM(o.expires_on), ''), '9999-12-31') >= :today) AS same_product_current
+        FROM licence l
+        LEFT JOIN vendor v ON v.vendor_id = l.vendor_id
+    each:
+      all:
+        - { field: seats, op: gt, value: 0 }
+        - { field: seats_used, op: absent }
+    deadline: expires_on
+    evidence: "{product} ({licence_id}): {seats} units bought, usage unknown"
+
+  # --------------------------------------------------------------- contracts
+  - id: REG-CON-ENDING-UNDECIDED
+    title: Contract ends within its notice period with no decision
+    kind: missing
+    lens: maintenance
+    category: CST
+    severity:
+      daysLeft: end_on
+      ranges:
+        - { max: 14, value: critical }
+        - { max: 45, value: high }
+      default: medium
+    entity: contract
+    why: >-
+      The date by which the organisation had to decide (renew, replace or end) has passed and no
+      decision is recorded. Past that point the choice is made by default: an extension on the
+      vendor's terms, a fall-back to list price, or a service that stops.
+    fix: >-
+      Get a decision from the owner and record it (renew, replace or end). If it is renew or
+      replace, start the purchase now.
+    refs: [NIST-800-53:SA-4, NIST-800-53:SA-9]
+    refresh: 1d
+    query:
+      protocol: store
+      key: contract_id
+      name: title
+      text: |
+        SELECT c.contract_id,
+               c.title,
+               c.vendor_id,
+               v.name AS vendor,
+               c.system_id,
+               NULLIF(TRIM(c.start_on), '') AS start_on,
+               NULLIF(TRIM(c.end_on), '') AS end_on,
+               c.notice_days,
+               c.value,
+               c.currency,
+               COALESCE(c.decision, 'none') AS decision,
+               NULLIF(TRIM(c.owner), '') AS owner,
+               COALESCE(NULLIF(TRIM(c.owner), ''), 'nobody') AS owner_shown,
+               CAST(julianday(NULLIF(TRIM(c.end_on), '')) - julianday(:today) AS INTEGER) AS days_left,
+               CAST(julianday(:today) - julianday(NULLIF(TRIM(c.end_on), '')) AS INTEGER) AS days_past,
+               CAST(julianday(NULLIF(TRIM(c.end_on), '')) - julianday(:today) AS INTEGER) - c.notice_days AS days_to_notice,
+               date(NULLIF(TRIM(c.end_on), ''), '-' || c.notice_days || ' days') AS decide_by,
+               (SELECT COUNT(*) FROM system_dependency d WHERE d.depends_on = c.system_id) AS dependants
+        FROM contract c
+        LEFT JOIN vendor v ON v.vendor_id = c.vendor_id
+    each:
+      all:
+        - { field: decision, op: in, value: [none, undecided] }
+        - { field: days_left, op: ge, value: 0 }
+        - { field: days_to_notice, op: le, value: 0 }
+    deadline: end_on
+    evidence: "{title} ({contract_id}, {vendor}) ends {end_on}, {days_left} days left; decision was due {decide_by}, recorded: {decision}. Owner: {owner_shown}"
+
+  - id: REG-CON-ENDING-PLANNED
+    title: Contract ends by decision within its notice period
+    kind: missing
+    lens: both
+    category: CST
+    severity:
+      field: dependants
+      ranges:
+        - { min: 1, value: high }
+      default: medium
+    entity: contract
+    why: >-
+      The organisation decided to end this contract and the end is near. Ending is safe only if
+      whoever relies on the service has a working replacement and the data has been exported;
+      otherwise the dependants find out on the day it stops.
+    fix: >-
+      Confirm with every team that uses the service that the replacement covers what they need,
+      export the data, remove the vendor's access, and record the replacement contract. Systems
+      that depend on this contract's system are counted in the evidence.
+    refs: [NIST-800-53:SA-9, NIST-800-53:SR-2]
+    refresh: 1d
+    query:
+      protocol: store
+      key: contract_id
+      name: title
+      text: |
+        SELECT c.contract_id,
+               c.title,
+               c.vendor_id,
+               v.name AS vendor,
+               c.system_id,
+               NULLIF(TRIM(c.start_on), '') AS start_on,
+               NULLIF(TRIM(c.end_on), '') AS end_on,
+               c.notice_days,
+               c.value,
+               c.currency,
+               COALESCE(c.decision, 'none') AS decision,
+               NULLIF(TRIM(c.owner), '') AS owner,
+               COALESCE(NULLIF(TRIM(c.owner), ''), 'nobody') AS owner_shown,
+               CAST(julianday(NULLIF(TRIM(c.end_on), '')) - julianday(:today) AS INTEGER) AS days_left,
+               CAST(julianday(:today) - julianday(NULLIF(TRIM(c.end_on), '')) AS INTEGER) AS days_past,
+               CAST(julianday(NULLIF(TRIM(c.end_on), '')) - julianday(:today) AS INTEGER) - c.notice_days AS days_to_notice,
+               date(NULLIF(TRIM(c.end_on), ''), '-' || c.notice_days || ' days') AS decide_by,
+               (SELECT COUNT(*) FROM system_dependency d WHERE d.depends_on = c.system_id) AS dependants
+        FROM contract c
+        LEFT JOIN vendor v ON v.vendor_id = c.vendor_id
+    each:
+      all:
+        - { field: decision, op: eq, value: end }
+        - { field: days_left, op: ge, value: 0 }
+        - { field: days_to_notice, op: le, value: 0 }
+    deadline: end_on
+    evidence: "{title} ({contract_id}, {vendor}) ends by decision on {end_on}, {days_left} days left; {dependants} system(s) depend on system {system_id}. Owner: {owner_shown}"
+
+  - id: REG-CON-ENDED
+    title: Contract end date has passed but it is not recorded as ended
+    kind: broken
+    lens: maintenance
+    category: CST
+    severity: high
+    entity: contract
+    why: >-
+      The service is either running without a contract (no support, no agreed terms, no data
+      protection clauses, possibly list-price billing) or it was extended and the register still
+      shows the old date.
+    fix: >-
+      If it was extended, record the new end date. If it lapsed, decide now and either sign or set
+      the decision to end and plan the exit.
+    refs: [NIST-800-53:SA-4, NIST-800-53:SA-9]
+    refresh: 1d
+    query:
+      protocol: store
+      key: contract_id
+      name: title
+      text: |
+        SELECT c.contract_id,
+               c.title,
+               c.vendor_id,
+               v.name AS vendor,
+               c.system_id,
+               NULLIF(TRIM(c.start_on), '') AS start_on,
+               NULLIF(TRIM(c.end_on), '') AS end_on,
+               c.notice_days,
+               c.value,
+               c.currency,
+               COALESCE(c.decision, 'none') AS decision,
+               NULLIF(TRIM(c.owner), '') AS owner,
+               COALESCE(NULLIF(TRIM(c.owner), ''), 'nobody') AS owner_shown,
+               CAST(julianday(NULLIF(TRIM(c.end_on), '')) - julianday(:today) AS INTEGER) AS days_left,
+               CAST(julianday(:today) - julianday(NULLIF(TRIM(c.end_on), '')) AS INTEGER) AS days_past,
+               CAST(julianday(NULLIF(TRIM(c.end_on), '')) - julianday(:today) AS INTEGER) - c.notice_days AS days_to_notice,
+               date(NULLIF(TRIM(c.end_on), ''), '-' || c.notice_days || ' days') AS decide_by,
+               (SELECT COUNT(*) FROM system_dependency d WHERE d.depends_on = c.system_id) AS dependants
+        FROM contract c
+        LEFT JOIN vendor v ON v.vendor_id = c.vendor_id
+    each:
+      all:
+        - { field: days_left, op: lt, value: 0 }
+        - { field: decision, op: ne, value: end }
+    deadline: end_on
+    evidence: "{title} ({contract_id}, {vendor}) ended {end_on}, {days_past} days ago; decision recorded: {decision}. Owner: {owner_shown}"
+
+  - id: REG-CON-RENEWAL-NOT-RECORDED
+    title: Contract renewal decided but the new term is not recorded
+    kind: missing
+    lens: maintenance
+    category: CST
+    severity: medium
+    entity: contract
+    why: >-
+      The decision to renew or replace was taken, but the contract still ends soon. A decision
+      without a signed order is the classic way a service lapses with everyone believing it was
+      handled.
+    fix: >-
+      Check that the order or new contract is signed, then record the new end date (or the
+      replacement contract) in the register.
+    refs: [NIST-800-53:SA-4]
+    refresh: 1d
+    query:
+      protocol: store
+      key: contract_id
+      name: title
+      text: |
+        SELECT c.contract_id,
+               c.title,
+               c.vendor_id,
+               v.name AS vendor,
+               c.system_id,
+               NULLIF(TRIM(c.start_on), '') AS start_on,
+               NULLIF(TRIM(c.end_on), '') AS end_on,
+               c.notice_days,
+               c.value,
+               c.currency,
+               COALESCE(c.decision, 'none') AS decision,
+               NULLIF(TRIM(c.owner), '') AS owner,
+               COALESCE(NULLIF(TRIM(c.owner), ''), 'nobody') AS owner_shown,
+               CAST(julianday(NULLIF(TRIM(c.end_on), '')) - julianday(:today) AS INTEGER) AS days_left,
+               CAST(julianday(:today) - julianday(NULLIF(TRIM(c.end_on), '')) AS INTEGER) AS days_past,
+               CAST(julianday(NULLIF(TRIM(c.end_on), '')) - julianday(:today) AS INTEGER) - c.notice_days AS days_to_notice,
+               date(NULLIF(TRIM(c.end_on), ''), '-' || c.notice_days || ' days') AS decide_by,
+               (SELECT COUNT(*) FROM system_dependency d WHERE d.depends_on = c.system_id) AS dependants
+        FROM contract c
+        LEFT JOIN vendor v ON v.vendor_id = c.vendor_id
+    each:
+      all:
+        - { field: decision, op: in, value: [renew, replace] }
+        - { field: days_left, op: ge, value: 0 }
+        - { field: days_left, op: le, value: 30, threshold: registers.contract-execution-days }
+    deadline: end_on
+    evidence: "{title} ({contract_id}, {vendor}): decision {decision}, but the recorded term still ends {end_on} ({days_left} days). Owner: {owner_shown}"
+
+  - id: REG-CON-NO-OWNER
+    title: Contract has no owner
+    kind: missing
+    lens: maintenance
+    category: CST
+    severity: medium
+    entity: contract
+    why: >-
+      Nobody is responsible for the renewal decision, the vendor relationship or the exit, so the
+      notice period passes unnoticed.
+    fix: Name the person or team who owns the contract and its renewal decision.
+    refs: [NIST-800-53:SA-4]
+    refresh: 1d
+    query:
+      protocol: store
+      key: contract_id
+      name: title
+      text: |
+        SELECT c.contract_id,
+               c.title,
+               c.vendor_id,
+               v.name AS vendor,
+               c.system_id,
+               NULLIF(TRIM(c.start_on), '') AS start_on,
+               NULLIF(TRIM(c.end_on), '') AS end_on,
+               c.notice_days,
+               c.value,
+               c.currency,
+               COALESCE(c.decision, 'none') AS decision,
+               NULLIF(TRIM(c.owner), '') AS owner,
+               COALESCE(NULLIF(TRIM(c.owner), ''), 'nobody') AS owner_shown,
+               CAST(julianday(NULLIF(TRIM(c.end_on), '')) - julianday(:today) AS INTEGER) AS days_left,
+               CAST(julianday(:today) - julianday(NULLIF(TRIM(c.end_on), '')) AS INTEGER) AS days_past,
+               CAST(julianday(NULLIF(TRIM(c.end_on), '')) - julianday(:today) AS INTEGER) - c.notice_days AS days_to_notice,
+               date(NULLIF(TRIM(c.end_on), ''), '-' || c.notice_days || ' days') AS decide_by,
+               (SELECT COUNT(*) FROM system_dependency d WHERE d.depends_on = c.system_id) AS dependants
+        FROM contract c
+        LEFT JOIN vendor v ON v.vendor_id = c.vendor_id
+    each:
+      all:
+        - { field: owner, op: absent }
+        - { field: decision, op: ne, value: end }
+    deadline: end_on
+    evidence: "{title} ({contract_id}, {vendor}) has no owner; ends {end_on}"
+
+  - id: REG-CON-NO-END-DATE
+    title: Contract has no end date recorded
+    kind: missing
+    lens: maintenance
+    category: CST
+    severity: low
+    entity: contract
+    why: >-
+      Without an end date the register cannot warn before the notice period, and an automatic
+      extension, a price fall-back or a lapse comes as a surprise.
+    fix: >-
+      Record end_on from the signed contract. For an open-ended agreement, record the date of the
+      next review or termination window instead.
+    refs: [NIST-800-53:SA-4]
+    refresh: 1d
+    query:
+      protocol: store
+      key: contract_id
+      name: title
+      text: |
+        SELECT c.contract_id,
+               c.title,
+               c.vendor_id,
+               v.name AS vendor,
+               c.system_id,
+               NULLIF(TRIM(c.start_on), '') AS start_on,
+               NULLIF(TRIM(c.end_on), '') AS end_on,
+               c.notice_days,
+               c.value,
+               c.currency,
+               COALESCE(c.decision, 'none') AS decision,
+               NULLIF(TRIM(c.owner), '') AS owner,
+               COALESCE(NULLIF(TRIM(c.owner), ''), 'nobody') AS owner_shown,
+               CAST(julianday(NULLIF(TRIM(c.end_on), '')) - julianday(:today) AS INTEGER) AS days_left,
+               CAST(julianday(:today) - julianday(NULLIF(TRIM(c.end_on), '')) AS INTEGER) AS days_past,
+               CAST(julianday(NULLIF(TRIM(c.end_on), '')) - julianday(:today) AS INTEGER) - c.notice_days AS days_to_notice,
+               date(NULLIF(TRIM(c.end_on), ''), '-' || c.notice_days || ' days') AS decide_by,
+               (SELECT COUNT(*) FROM system_dependency d WHERE d.depends_on = c.system_id) AS dependants
+        FROM contract c
+        LEFT JOIN vendor v ON v.vendor_id = c.vendor_id
+    each:
+      all:
+        - { field: end_on, op: absent }
+        - { field: decision, op: ne, value: end }
+    evidence: "{title} ({contract_id}, {vendor}) has no end date. Owner: {owner_shown}"
+
+  # --------------------------------------------------------------- key dates
+  - id: REG-KEY-REPORT-DUE
+    title: Report due date is near
+    kind: missing
+    lens: maintenance
+    category: HYG
+    severity:
+      daysLeft: due_on
+      ranges:
+        - { max: 2, value: critical }
+        - { max: 7, value: high }
+      default: medium
+    entity: key-date
+    why: >-
+      A report someone outside IT expects (regulator, management, auditor, customer) is due within
+      its notice period. Late reports are noticed by the people who matter most.
+    fix: >-
+      Prepare and send the report, then move due_on to the next reporting date (or delete the row
+      if it was a one-off).
+    refresh: 1d
+    query:
+      protocol: store
+      key: key_date_id
+      name: title
+      text: |
+        SELECT k.key_date_id,
+               k.kind,
+               k.title,
+               k.due_on,
+               k.notice_days,
+               k.system_id,
+               NULLIF(TRIM(k.owner), '') AS owner,
+               COALESCE(NULLIF(TRIM(k.owner), ''), 'nobody') AS owner_shown,
+               CAST(julianday(k.due_on) - julianday(:today) AS INTEGER) AS days_left,
+               CAST(julianday(:today) - julianday(k.due_on) AS INTEGER) AS days_past,
+               CAST(julianday(k.due_on) - julianday(:today) AS INTEGER) - k.notice_days AS days_to_notice
+        FROM key_date k
+        WHERE k.kind = 'report'
+    each:
+      all:
+        - { field: days_left, op: ge, value: 0 }
+        - { field: days_to_notice, op: le, value: 0 }
+    deadline: due_on
+    evidence: "{title} ({key_date_id}) is due {due_on}, {days_left} days left. Owner: {owner_shown}"
+
+  - id: REG-KEY-RENEWAL-DUE
+    title: Renewal date is near
+    kind: missing
+    lens: maintenance
+    category: CST
+    severity:
+      daysLeft: due_on
+      ranges:
+        - { max: 7, value: critical }
+        - { max: 30, value: high }
+      default: medium
+    entity: key-date
+    why: >-
+      Something that has to be renewed - a subscription, a marketplace agreement, a domain name, a
+      support plan, a registration - is inside its notice period. Missing it is an outage, a lost
+      asset or billing at list price.
+    fix: >-
+      Renew it, then move due_on to the next renewal date. If it is a licence or contract, consider
+      recording it in that register instead so seats and decisions are tracked too.
+    refs: [NIST-800-53:SA-4]
+    refresh: 1d
+    query:
+      protocol: store
+      key: key_date_id
+      name: title
+      text: |
+        SELECT k.key_date_id,
+               k.kind,
+               k.title,
+               k.due_on,
+               k.notice_days,
+               k.system_id,
+               NULLIF(TRIM(k.owner), '') AS owner,
+               COALESCE(NULLIF(TRIM(k.owner), ''), 'nobody') AS owner_shown,
+               CAST(julianday(k.due_on) - julianday(:today) AS INTEGER) AS days_left,
+               CAST(julianday(:today) - julianday(k.due_on) AS INTEGER) AS days_past,
+               CAST(julianday(k.due_on) - julianday(:today) AS INTEGER) - k.notice_days AS days_to_notice
+        FROM key_date k
+        WHERE k.kind = 'renewal'
+    each:
+      all:
+        - { field: days_left, op: ge, value: 0 }
+        - { field: days_to_notice, op: le, value: 0 }
+    deadline: due_on
+    evidence: "{title} ({key_date_id}) renews {due_on}, {days_left} days left. Owner: {owner_shown}"
+
+  - id: REG-KEY-MAINTENANCE-DUE
+    title: Planned maintenance window is near
+    kind: missing
+    lens: maintenance
+    category: AVL
+    severity:
+      daysLeft: due_on
+      ranges:
+        - { max: 1, value: high }
+        - { max: 7, value: medium }
+      default: low
+    entity: key-date
+    why: >-
+      A maintenance window (vendor, provider or internal) is coming. Without preparation users are
+      surprised, changes collide with it and nobody watches the systems afterwards.
+    fix: >-
+      Tell the affected users, freeze conflicting changes, name who checks the systems afterwards,
+      then move due_on to the next window or delete the row.
+    refs: [NIST-800-53:MA-2]
+    refresh: 1d
+    query:
+      protocol: store
+      key: key_date_id
+      name: title
+      text: |
+        SELECT k.key_date_id,
+               k.kind,
+               k.title,
+               k.due_on,
+               k.notice_days,
+               k.system_id,
+               NULLIF(TRIM(k.owner), '') AS owner,
+               COALESCE(NULLIF(TRIM(k.owner), ''), 'nobody') AS owner_shown,
+               CAST(julianday(k.due_on) - julianday(:today) AS INTEGER) AS days_left,
+               CAST(julianday(:today) - julianday(k.due_on) AS INTEGER) AS days_past,
+               CAST(julianday(k.due_on) - julianday(:today) AS INTEGER) - k.notice_days AS days_to_notice
+        FROM key_date k
+        WHERE k.kind = 'maintenance'
+    each:
+      all:
+        - { field: days_left, op: ge, value: 0 }
+        - { field: days_to_notice, op: le, value: 0 }
+    deadline: due_on
+    evidence: "{title} ({key_date_id}) on {due_on}, {days_left} days left. Owner: {owner_shown}"
+
+  - id: REG-KEY-CERTIFICATE-DUE
+    title: Recorded certificate expires within its notice period
+    kind: broken
+    lens: security
+    category: PKI
+    severity:
+      daysLeft: due_on
+      ranges:
+        - { max: 7, value: critical }
+        - { max: 14, value: high }
+      default: medium
+    entity: key-date
+    why: >-
+      A certificate that no TLS scan can reach (signing certificates, CA and KDC certificates,
+      identity provider and federation certificates, device and client certificates) is about to
+      expire. These fail just as hard as web certificates and are usually forgotten.
+    fix: >-
+      Renew the certificate, distribute it to every party that trusts it (federation partners,
+      apps, devices), then move due_on to the new expiry date.
+    refs: [NIST-800-53:SC-17, NIST-SP-1800-16]
+    refresh: 1d
+    query:
+      protocol: store
+      key: key_date_id
+      name: title
+      text: |
+        SELECT k.key_date_id,
+               k.kind,
+               k.title,
+               k.due_on,
+               k.notice_days,
+               k.system_id,
+               NULLIF(TRIM(k.owner), '') AS owner,
+               COALESCE(NULLIF(TRIM(k.owner), ''), 'nobody') AS owner_shown,
+               CAST(julianday(k.due_on) - julianday(:today) AS INTEGER) AS days_left,
+               CAST(julianday(:today) - julianday(k.due_on) AS INTEGER) AS days_past,
+               CAST(julianday(k.due_on) - julianday(:today) AS INTEGER) - k.notice_days AS days_to_notice
+        FROM key_date k
+        WHERE k.kind = 'certificate'
+    each:
+      all:
+        - { field: days_left, op: ge, value: 0 }
+        - { field: days_to_notice, op: le, value: 0 }
+    deadline: due_on
+    evidence: "{title} ({key_date_id}) expires {due_on}, {days_left} days left. Owner: {owner_shown}"
+
+  - id: REG-KEY-LICENCE-DUE
+    title: Recorded licence date is near
+    kind: broken
+    lens: both
+    category: CST
+    severity:
+      daysLeft: due_on
+      ranges:
+        - { max: 7, value: critical }
+        - { max: 30, value: high }
+      default: medium
+    entity: key-date
+    why: >-
+      A licence date kept as a key date (for example a licence key or activation that has to be
+      replaced) is inside its notice period. When it passes, the product stops or runs unlicensed.
+    fix: >-
+      Renew or replace the licence, then move due_on to the new date. Consider moving it to the
+      licence register so seats and owner are tracked as well.
+    refs: [NIST-800-53:CM-10]
+    refresh: 1d
+    query:
+      protocol: store
+      key: key_date_id
+      name: title
+      text: |
+        SELECT k.key_date_id,
+               k.kind,
+               k.title,
+               k.due_on,
+               k.notice_days,
+               k.system_id,
+               NULLIF(TRIM(k.owner), '') AS owner,
+               COALESCE(NULLIF(TRIM(k.owner), ''), 'nobody') AS owner_shown,
+               CAST(julianday(k.due_on) - julianday(:today) AS INTEGER) AS days_left,
+               CAST(julianday(:today) - julianday(k.due_on) AS INTEGER) AS days_past,
+               CAST(julianday(k.due_on) - julianday(:today) AS INTEGER) - k.notice_days AS days_to_notice
+        FROM key_date k
+        WHERE k.kind = 'licence'
+    each:
+      all:
+        - { field: days_left, op: ge, value: 0 }
+        - { field: days_to_notice, op: le, value: 0 }
+    deadline: due_on
+    evidence: "{title} ({key_date_id}) on {due_on}, {days_left} days left. Owner: {owner_shown}"
+
+  - id: REG-KEY-PRICE-CHANGE-DUE
+    title: Announced price change takes effect soon
+    kind: missing
+    lens: maintenance
+    category: CST
+    severity:
+      daysLeft: due_on
+      ranges:
+        - { max: 7, value: high }
+        - { max: 30, value: medium }
+      default: low
+    entity: key-date
+    why: >-
+      A vendor or provider price change is about to apply - including an agreement that falls back
+      to list price when its offer ends. After the date the new price applies; before it there is
+      still room to commit, switch tier, renew on the offer or budget for it.
+    fix: >-
+      Decide with the owner whether to commit early, change plan or accept the increase, update the
+      budget, then delete the row or move it to the next announced change.
+    refresh: 1d
+    query:
+      protocol: store
+      key: key_date_id
+      name: title
+      text: |
+        SELECT k.key_date_id,
+               k.kind,
+               k.title,
+               k.due_on,
+               k.notice_days,
+               k.system_id,
+               NULLIF(TRIM(k.owner), '') AS owner,
+               COALESCE(NULLIF(TRIM(k.owner), ''), 'nobody') AS owner_shown,
+               CAST(julianday(k.due_on) - julianday(:today) AS INTEGER) AS days_left,
+               CAST(julianday(:today) - julianday(k.due_on) AS INTEGER) AS days_past,
+               CAST(julianday(k.due_on) - julianday(:today) AS INTEGER) - k.notice_days AS days_to_notice
+        FROM key_date k
+        WHERE k.kind = 'price-change'
+    each:
+      all:
+        - { field: days_left, op: ge, value: 0 }
+        - { field: days_to_notice, op: le, value: 0 }
+    deadline: due_on
+    evidence: "{title} ({key_date_id}) takes effect {due_on}, {days_left} days left. Owner: {owner_shown}"
+
+  - id: REG-KEY-CONTRACT-DUE
+    title: Recorded contract date is near
+    kind: missing
+    lens: maintenance
+    category: CST
+    severity:
+      daysLeft: due_on
+      ranges:
+        - { max: 14, value: critical }
+        - { max: 45, value: high }
+      default: medium
+    entity: key-date
+    why: >-
+      A contract milestone kept as a key date (a termination window, an option to extend, a price
+      review, an offer that expires) is inside its notice period. Once it passes, the option is gone
+      until the next term.
+    fix: >-
+      Take the decision the date calls for, then move due_on to the next milestone. Consider
+      recording the contract in the contract register so its decision and owner are tracked.
+    refs: [NIST-800-53:SA-4]
+    refresh: 1d
+    query:
+      protocol: store
+      key: key_date_id
+      name: title
+      text: |
+        SELECT k.key_date_id,
+               k.kind,
+               k.title,
+               k.due_on,
+               k.notice_days,
+               k.system_id,
+               NULLIF(TRIM(k.owner), '') AS owner,
+               COALESCE(NULLIF(TRIM(k.owner), ''), 'nobody') AS owner_shown,
+               CAST(julianday(k.due_on) - julianday(:today) AS INTEGER) AS days_left,
+               CAST(julianday(:today) - julianday(k.due_on) AS INTEGER) AS days_past,
+               CAST(julianday(k.due_on) - julianday(:today) AS INTEGER) - k.notice_days AS days_to_notice
+        FROM key_date k
+        WHERE k.kind = 'contract'
+    each:
+      all:
+        - { field: days_left, op: ge, value: 0 }
+        - { field: days_to_notice, op: le, value: 0 }
+    deadline: due_on
+    evidence: "{title} ({key_date_id}) on {due_on}, {days_left} days left. Owner: {owner_shown}"
+
+  # The key_date register has no "payment" kind yet: payments are kind "other" whose title matches
+  # the pattern in threshold registers.payment-title-pattern (a .NET regular expression, case-
+  # insensitive; add words in the tenant's own language there). The same pattern keeps payments
+  # out of REG-KEY-OTHER-DUE and REG-KEY-DATE-PASSED so each date is reported once.
+  - id: REG-KEY-PAYMENT-DUE
+    title: Payment due date is near
+    kind: missing
+    lens: both
+    category: CST
+    severity:
+      daysLeft: due_on
+      ranges:
+        - { max: 3, value: critical }
+        - { max: 10, value: high }
+      default: medium
+    entity: key-date
+    why: >-
+      An invoice, subscription charge or arrears settlement is due. Providers suspend accounts and
+      services for non-payment, and the people who pay are rarely the people who would notice the
+      outage - so IT needs to know the payment cleared before the date.
+    fix: >-
+      Confirm with whoever pays (finance, treasury, procurement) that the payment is approved and
+      will clear before the due date, and know which services stop if it does not. Then move due_on
+      to the next payment or delete the row.
+    refresh: 1d
+    query:
+      protocol: store
+      key: key_date_id
+      name: title
+      text: |
+        SELECT k.key_date_id,
+               k.kind,
+               k.title,
+               k.due_on,
+               k.notice_days,
+               k.system_id,
+               NULLIF(TRIM(k.owner), '') AS owner,
+               COALESCE(NULLIF(TRIM(k.owner), ''), 'nobody') AS owner_shown,
+               CAST(julianday(k.due_on) - julianday(:today) AS INTEGER) AS days_left,
+               CAST(julianday(:today) - julianday(k.due_on) AS INTEGER) AS days_past,
+               CAST(julianday(k.due_on) - julianday(:today) AS INTEGER) - k.notice_days AS days_to_notice
+        FROM key_date k
+        WHERE k.kind = 'other'
+    each:
+      all:
+        - { field: title, op: match, value: '\b(pay|payment|payments|invoice|invoices|bill|billing|arrears|overdue|suspension|suspend)', threshold: registers.payment-title-pattern }
+        - { field: days_left, op: ge, value: 0 }
+        - { field: days_to_notice, op: le, value: 0 }
+    deadline: due_on
+    evidence: "{title} ({key_date_id}) is due {due_on}, {days_left} days left. Owner: {owner_shown}"
+
+  - id: REG-KEY-PAYMENT-OVERDUE
+    title: Payment due date has passed
+    kind: broken
+    lens: both
+    category: CST
+    severity: critical
+    entity: key-date
+    why: >-
+      The payment date passed and the register was not moved on. Either the account is in arrears -
+      the step before collection and suspension of the service - or it was paid and the next due
+      date is not tracked.
+    fix: >-
+      Ask whoever pays for the payment status today. If it is unpaid, get a committed payment date
+      and warn the owners of the services that would be suspended; if it was paid, move due_on to
+      the next payment.
+    refresh: 1d
+    query:
+      protocol: store
+      key: key_date_id
+      name: title
+      text: |
+        SELECT k.key_date_id,
+               k.kind,
+               k.title,
+               k.due_on,
+               k.notice_days,
+               k.system_id,
+               NULLIF(TRIM(k.owner), '') AS owner,
+               COALESCE(NULLIF(TRIM(k.owner), ''), 'nobody') AS owner_shown,
+               CAST(julianday(k.due_on) - julianday(:today) AS INTEGER) AS days_left,
+               CAST(julianday(:today) - julianday(k.due_on) AS INTEGER) AS days_past,
+               CAST(julianday(k.due_on) - julianday(:today) AS INTEGER) - k.notice_days AS days_to_notice
+        FROM key_date k
+        WHERE k.kind = 'other'
+    each:
+      all:
+        - { field: title, op: match, value: '\b(pay|payment|payments|invoice|invoices|bill|billing|arrears|overdue|suspension|suspend)', threshold: registers.payment-title-pattern }
+        - { field: days_left, op: lt, value: 0 }
+    deadline: due_on
+    evidence: "{title} ({key_date_id}) was due {due_on}, {days_past} days ago. Owner: {owner_shown}"
+
+  - id: REG-KEY-OTHER-DUE
+    title: Other key date is near
+    kind: missing
+    lens: maintenance
+    category: HYG
+    severity:
+      daysLeft: due_on
+      ranges:
+        - { max: 3, value: high }
+        - { max: 14, value: medium }
+      default: low
+    entity: key-date
+    why: Someone recorded this date because missing it has a cost, and it is inside its notice period.
+    fix: Do what the date calls for, then move due_on to the next occurrence or delete the row.
+    refresh: 1d
+    query:
+      protocol: store
+      key: key_date_id
+      name: title
+      text: |
+        SELECT k.key_date_id,
+               k.kind,
+               k.title,
+               k.due_on,
+               k.notice_days,
+               k.system_id,
+               NULLIF(TRIM(k.owner), '') AS owner,
+               COALESCE(NULLIF(TRIM(k.owner), ''), 'nobody') AS owner_shown,
+               CAST(julianday(k.due_on) - julianday(:today) AS INTEGER) AS days_left,
+               CAST(julianday(:today) - julianday(k.due_on) AS INTEGER) AS days_past,
+               CAST(julianday(k.due_on) - julianday(:today) AS INTEGER) - k.notice_days AS days_to_notice
+        FROM key_date k
+        WHERE k.kind = 'other'
+    each:
+      all:
+        - { field: title, op: notmatch, value: '\b(pay|payment|payments|invoice|invoices|bill|billing|arrears|overdue|suspension|suspend)', threshold: registers.payment-title-pattern }
+        - { field: days_left, op: ge, value: 0 }
+        - { field: days_to_notice, op: le, value: 0 }
+    deadline: due_on
+    evidence: "{title} ({key_date_id}) on {due_on}, {days_left} days left. Owner: {owner_shown}"
+
+  - id: REG-KEY-DATE-PASSED
+    title: Key date has passed and was not moved on
+    kind: missing
+    lens: maintenance
+    category: HYG
+    severity:
+      field: kind
+      map:
+        certificate: critical
+        licence: critical
+        report: high
+        renewal: high
+        contract: high
+        price-change: medium
+        other: medium
+        maintenance: low
+      default: medium
+    entity: key-date
+    why: >-
+      The register has no "done" mark, so a date that passed is either overdue (the report was not
+      sent, the renewal did not happen) or handled but never rolled forward - and then the next
+      occurrence will not be warned about.
+    fix: >-
+      If it was handled, move due_on to the next occurrence or delete the row. If it was not, treat
+      it as overdue now. Payments are reported by REG-KEY-PAYMENT-OVERDUE instead.
+    refresh: 1d
+    query:
+      protocol: store
+      key: key_date_id
+      name: title
+      text: |
+        SELECT k.key_date_id,
+               k.kind,
+               k.title,
+               k.due_on,
+               k.notice_days,
+               k.system_id,
+               NULLIF(TRIM(k.owner), '') AS owner,
+               COALESCE(NULLIF(TRIM(k.owner), ''), 'nobody') AS owner_shown,
+               CAST(julianday(k.due_on) - julianday(:today) AS INTEGER) AS days_left,
+               CAST(julianday(:today) - julianday(k.due_on) AS INTEGER) AS days_past,
+               CAST(julianday(k.due_on) - julianday(:today) AS INTEGER) - k.notice_days AS days_to_notice
+        FROM key_date k
+    each:
+      all:
+        - { field: days_left, op: lt, value: 0 }
+        - not:
+            all:
+              - { field: kind, op: eq, value: other }
+              - { field: title, op: match, value: '\b(pay|payment|payments|invoice|invoices|bill|billing|arrears|overdue|suspension|suspend)', threshold: registers.payment-title-pattern }
+    deadline: due_on
+    evidence: "{kind} date {title} ({key_date_id}) was {due_on}, {days_past} days ago. Owner: {owner_shown}"
+
+  - id: REG-KEY-DATE-NO-OWNER
+    title: Upcoming key date has no owner
+    kind: missing
+    lens: maintenance
+    category: HYG
+    severity: low
+    entity: key-date
+    why: >-
+      A warning that reaches nobody in particular is acted on by nobody - the typical fate of a
+      reminder that lives in one person's calendar or a filed mail thread.
+    fix: Name the person or team who acts on this date.
+    refresh: 1d
+    query:
+      protocol: store
+      key: key_date_id
+      name: title
+      text: |
+        SELECT k.key_date_id,
+               k.kind,
+               k.title,
+               k.due_on,
+               k.notice_days,
+               k.system_id,
+               NULLIF(TRIM(k.owner), '') AS owner,
+               COALESCE(NULLIF(TRIM(k.owner), ''), 'nobody') AS owner_shown,
+               CAST(julianday(k.due_on) - julianday(:today) AS INTEGER) AS days_left,
+               CAST(julianday(:today) - julianday(k.due_on) AS INTEGER) AS days_past,
+               CAST(julianday(k.due_on) - julianday(:today) AS INTEGER) - k.notice_days AS days_to_notice
+        FROM key_date k
+    each:
+      all:
+        - { field: owner, op: absent }
+        - { field: days_left, op: ge, value: 0 }
+    deadline: due_on
+    evidence: "{kind} date {title} ({key_date_id}) on {due_on} has no owner"
+
+  # ----------------------------------------------------------------- vendors
+  - id: REG-VEN-SENSITIVE-NO-REVIEW
+    title: Vendor handling sensitive data has no security review in the last year
+    kind: missing
+    lens: security
+    category: HYG
+    severity: high
+    entity: vendor
+    why: >-
+      A vendor that handles sensitive data (personal, health, financial) or holds privileged access
+      is part of the organisation's attack surface. Moving such data to a vendor's service without a
+      review, or never reviewing again, leaves nobody knowing whether its controls, sub-processors,
+      retention and access still match what was agreed.
+    fix: >-
+      Run the security and privacy review (questionnaire, certifications, access and data held,
+      retention and export), record the date in security_review_on, and track the gaps it finds.
+    refs: [NIST-800-53:SA-9, NIST-800-53:SR-6, CIS-Controls-v8:15.5]
+    refresh: 1d
+    query:
+      protocol: store
+      key: vendor_id
+      name: name
+      text: |
+        SELECT v.vendor_id,
+               v.name,
+               v.sole_vendor,
+               v.sensitive,
+               NULLIF(TRIM(v.exit_plan), '') AS exit_plan,
+               NULLIF(TRIM(v.sla), '') AS sla,
+               NULLIF(TRIM(v.data_handled), '') AS data_handled,
+               COALESCE(NULLIF(TRIM(v.data_handled), ''), 'unrecorded data') AS data_shown,
+               NULLIF(TRIM(v.security_review_on), '') AS security_review_on,
+               COALESCE(NULLIF(TRIM(v.security_review_on), ''), 'never') AS reviewed_shown,
+               COALESCE(date(NULLIF(TRIM(v.security_review_on), ''), '+' ||
+                   COALESCE((SELECT st.value FROM setting st WHERE st.key = 'threshold.registers.vendor-review-days'), '365')
+                   || ' days'), :today) AS review_due,
+               (SELECT COUNT(*) FROM contract c
+                 WHERE c.vendor_id = v.vendor_id
+                   AND COALESCE(NULLIF(TRIM(c.end_on), ''), '9999-12-31') >= :today) AS current_contracts,
+               (SELECT COUNT(*) FROM licence l
+                 WHERE l.vendor_id = v.vendor_id
+                   AND COALESCE(NULLIF(TRIM(l.expires_on), ''), '9999-12-31') >= :today) AS current_licences
+        FROM vendor v
+        WHERE v.state = 'confirmed'
+    each:
+      all:
+        - { field: sensitive, op: eq, value: 1 }
+        - any:
+            - { field: security_review_on, op: absent }
+            - { field: security_review_on, op: age-gt, value: 365, threshold: registers.vendor-review-days }
+    deadline: review_due
+    evidence: "{name} ({vendor_id}) handles {data_shown}; last security review: {reviewed_shown}, next was due {review_due}"
+
+  - id: REG-VEN-SENSITIVE-NO-DATA-RECORD
+    title: Sensitive vendor has no record of the data it handles
+    kind: missing
+    lens: security
+    category: HYG
+    severity: low
+    entity: vendor
+    why: >-
+      The vendor is marked sensitive but the register does not say what data or access it has, so
+      a breach notice from them, or the end of the contract, cannot be acted on quickly.
+    fix: >-
+      Record in data_handled what data the vendor processes, what access it holds and any legal
+      retention period that applies to it.
+    refs: [NIST-800-53:SA-9]
+    refresh: 1d
+    query:
+      protocol: store
+      key: vendor_id
+      name: name
+      text: |
+        SELECT v.vendor_id,
+               v.name,
+               v.sole_vendor,
+               v.sensitive,
+               NULLIF(TRIM(v.exit_plan), '') AS exit_plan,
+               NULLIF(TRIM(v.sla), '') AS sla,
+               NULLIF(TRIM(v.data_handled), '') AS data_handled,
+               COALESCE(NULLIF(TRIM(v.data_handled), ''), 'unrecorded data') AS data_shown,
+               NULLIF(TRIM(v.security_review_on), '') AS security_review_on,
+               COALESCE(NULLIF(TRIM(v.security_review_on), ''), 'never') AS reviewed_shown,
+               COALESCE(date(NULLIF(TRIM(v.security_review_on), ''), '+' ||
+                   COALESCE((SELECT st.value FROM setting st WHERE st.key = 'threshold.registers.vendor-review-days'), '365')
+                   || ' days'), :today) AS review_due,
+               (SELECT COUNT(*) FROM contract c
+                 WHERE c.vendor_id = v.vendor_id
+                   AND COALESCE(NULLIF(TRIM(c.end_on), ''), '9999-12-31') >= :today) AS current_contracts,
+               (SELECT COUNT(*) FROM licence l
+                 WHERE l.vendor_id = v.vendor_id
+                   AND COALESCE(NULLIF(TRIM(l.expires_on), ''), '9999-12-31') >= :today) AS current_licences
+        FROM vendor v
+        WHERE v.state = 'confirmed'
+    each:
+      all:
+        - { field: sensitive, op: eq, value: 1 }
+        - { field: data_handled, op: absent }
+    evidence: "{name} ({vendor_id}) is marked sensitive but data_handled is empty"
+
+  - id: REG-VEN-SENSITIVE-NO-AGREEMENT
+    title: Sensitive vendor has no current contract or licence
+    kind: missing
+    lens: security
+    category: HYG
+    severity: medium
+    entity: vendor
+    why: >-
+      A vendor that handles sensitive data or holds access, with nothing current in the contract or
+      licence registers, either works without agreed terms or the relationship ended and its access
+      and copies of data may still exist.
+    fix: >-
+      Record the current agreement, or close the relationship properly: remove the vendor's
+      accounts and access, get the data returned or destroyed, and mark the vendor rejected.
+    refs: [NIST-800-53:SA-9, NIST-800-53:PS-7, CIS-Controls-v8:15.7]
+    refresh: 1d
+    query:
+      protocol: store
+      key: vendor_id
+      name: name
+      text: |
+        SELECT v.vendor_id,
+               v.name,
+               v.sole_vendor,
+               v.sensitive,
+               NULLIF(TRIM(v.exit_plan), '') AS exit_plan,
+               NULLIF(TRIM(v.sla), '') AS sla,
+               NULLIF(TRIM(v.data_handled), '') AS data_handled,
+               COALESCE(NULLIF(TRIM(v.data_handled), ''), 'unrecorded data') AS data_shown,
+               NULLIF(TRIM(v.security_review_on), '') AS security_review_on,
+               COALESCE(NULLIF(TRIM(v.security_review_on), ''), 'never') AS reviewed_shown,
+               COALESCE(date(NULLIF(TRIM(v.security_review_on), ''), '+' ||
+                   COALESCE((SELECT st.value FROM setting st WHERE st.key = 'threshold.registers.vendor-review-days'), '365')
+                   || ' days'), :today) AS review_due,
+               (SELECT COUNT(*) FROM contract c
+                 WHERE c.vendor_id = v.vendor_id
+                   AND COALESCE(NULLIF(TRIM(c.end_on), ''), '9999-12-31') >= :today) AS current_contracts,
+               (SELECT COUNT(*) FROM licence l
+                 WHERE l.vendor_id = v.vendor_id
+                   AND COALESCE(NULLIF(TRIM(l.expires_on), ''), '9999-12-31') >= :today) AS current_licences
+        FROM vendor v
+        WHERE v.state = 'confirmed'
+    each:
+      all:
+        - { field: sensitive, op: eq, value: 1 }
+        - { field: current_contracts, op: eq, value: 0 }
+        - { field: current_licences, op: eq, value: 0 }
+    evidence: "{name} ({vendor_id}) is marked sensitive and has no current contract or licence in the registers"
+
+  - id: REG-VEN-SOLE-NO-EXIT-PLAN
+    title: Sole vendor has no exit plan
+    kind: missing
+    lens: maintenance
+    category: AVL
+    severity: medium
+    entity: vendor
+    why: >-
+      When only one vendor can supply or support a system, its failure, a steep price rise or its
+      exit from the market leaves the organisation with no alternative ready - and short extensions
+      granted "while alternatives are checked" tend to repeat. The exit plan is what turns that
+      into a project instead of a crisis.
+    fix: >-
+      Write a short exit plan (alternatives, data export format and path, legal retention of the
+      data, time and cost to switch, who decides) and record where it lives in exit_plan.
+    refs: [NIST-800-53:SR-2, NIST-800-53:SA-9]
+    refresh: 1d
+    query:
+      protocol: store
+      key: vendor_id
+      name: name
+      text: |
+        SELECT v.vendor_id,
+               v.name,
+               v.sole_vendor,
+               v.sensitive,
+               NULLIF(TRIM(v.exit_plan), '') AS exit_plan,
+               NULLIF(TRIM(v.sla), '') AS sla,
+               NULLIF(TRIM(v.data_handled), '') AS data_handled,
+               COALESCE(NULLIF(TRIM(v.data_handled), ''), 'unrecorded data') AS data_shown,
+               NULLIF(TRIM(v.security_review_on), '') AS security_review_on,
+               COALESCE(NULLIF(TRIM(v.security_review_on), ''), 'never') AS reviewed_shown,
+               COALESCE(date(NULLIF(TRIM(v.security_review_on), ''), '+' ||
+                   COALESCE((SELECT st.value FROM setting st WHERE st.key = 'threshold.registers.vendor-review-days'), '365')
+                   || ' days'), :today) AS review_due,
+               (SELECT COUNT(*) FROM contract c
+                 WHERE c.vendor_id = v.vendor_id
+                   AND COALESCE(NULLIF(TRIM(c.end_on), ''), '9999-12-31') >= :today) AS current_contracts,
+               (SELECT COUNT(*) FROM licence l
+                 WHERE l.vendor_id = v.vendor_id
+                   AND COALESCE(NULLIF(TRIM(l.expires_on), ''), '9999-12-31') >= :today) AS current_licences
+        FROM vendor v
+        WHERE v.state = 'confirmed'
+    each:
+      all:
+        - { field: sole_vendor, op: eq, value: 1 }
+        - { field: exit_plan, op: absent }
+    evidence: "{name} ({vendor_id}) is a sole vendor with no exit plan recorded"
+
+  - id: REG-VEN-SOLE-NO-SLA
+    title: Sole vendor has no service level recorded
+    kind: missing
+    lens: maintenance
+    category: AVL
+    severity: low
+    entity: vendor
+    why: >-
+      With no alternative supplier, the agreed response and resolution times are the only
+      protection during an outage - and nobody can hold the vendor to terms that are not written
+      down. Free tiers often come with no support at all.
+    fix: Record the agreed SLA (response, resolution, support hours) in sla, or negotiate one at the next renewal.
+    refs: [NIST-800-53:SA-9]
+    refresh: 1d
+    query:
+      protocol: store
+      key: vendor_id
+      name: name
+      text: |
+        SELECT v.vendor_id,
+               v.name,
+               v.sole_vendor,
+               v.sensitive,
+               NULLIF(TRIM(v.exit_plan), '') AS exit_plan,
+               NULLIF(TRIM(v.sla), '') AS sla,
+               NULLIF(TRIM(v.data_handled), '') AS data_handled,
+               COALESCE(NULLIF(TRIM(v.data_handled), ''), 'unrecorded data') AS data_shown,
+               NULLIF(TRIM(v.security_review_on), '') AS security_review_on,
+               COALESCE(NULLIF(TRIM(v.security_review_on), ''), 'never') AS reviewed_shown,
+               COALESCE(date(NULLIF(TRIM(v.security_review_on), ''), '+' ||
+                   COALESCE((SELECT st.value FROM setting st WHERE st.key = 'threshold.registers.vendor-review-days'), '365')
+                   || ' days'), :today) AS review_due,
+               (SELECT COUNT(*) FROM contract c
+                 WHERE c.vendor_id = v.vendor_id
+                   AND COALESCE(NULLIF(TRIM(c.end_on), ''), '9999-12-31') >= :today) AS current_contracts,
+               (SELECT COUNT(*) FROM licence l
+                 WHERE l.vendor_id = v.vendor_id
+                   AND COALESCE(NULLIF(TRIM(l.expires_on), ''), '9999-12-31') >= :today) AS current_licences
+        FROM vendor v
+        WHERE v.state = 'confirmed'
+    each:
+      all:
+        - { field: sole_vendor, op: eq, value: 1 }
+        - { field: sla, op: absent }
+    evidence: "{name} ({vendor_id}) is a sole vendor with no SLA recorded"

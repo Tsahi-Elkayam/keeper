@@ -1,0 +1,11 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <AssemblyName>keeper-rank</AssemblyName>
+    <RootNamespace>Keeper.Cli.Rank</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\Keeper.Rank\Keeper.Rank.csproj" />
+    <ProjectReference Include="..\..\..\home\src\Keeper.Home\Keeper.Home.csproj" />
+  </ItemGroup>
+</Project>

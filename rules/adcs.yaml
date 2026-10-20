@@ -1,0 +1,312 @@
+schema: keeper.rules/1
+system: adcs
+name: Active Directory Certificate Services
+integration: ldap
+
+# AD CS as the configuration partition shows it (CN=Public Key Services,CN=Services,<configuration>).
+# LDAP cannot read enrollment permissions (security descriptors) or CA registry flags, and the
+# runner drops binary values (certificates, CRLs, validity periods); see docs/backlog/active-directory.md.
+# Template rules therefore judge the template itself: a hit is exploitable when a CA publishes the
+# template and low-privileged principals may enroll - confirm both before acting.
+# Default templates that ship with dangerous-looking flags but administrator-only enrollment are
+# left to the CA rules, which flag them only when they are published.
+
+defaults:
+  kind: misconfigured
+  lens: security
+  category: PKI
+  entity: policy
+  refresh: 1d
+
+rules:
+
+  # ---------------------------------------------------------------- certificate templates
+
+  - id: ADCS-TPL-ESC1
+    title: Template lets the requester name the subject of an authentication certificate
+    severity: high
+    why: With enrollee-supplied subject, an authentication EKU and no approval step, anyone allowed to enroll can request a certificate for any user, administrators included, and log on as them (ESC1).
+    fix: Build the subject from the directory instead, or require manager approval or an authorised signature; restrict enrollment to the accounts that need it.
+    refs: [MITRE-ATTACK:T1649, NIST-800-53:IA-5(2), ADCS:ESC1]
+    query:
+      protocol: ldap
+      base: 'CN=Certificate Templates,CN=Public Key Services,CN=Services,{CONFIGDN}'
+      scope: onelevel
+      filter: '(objectClass=pKICertificateTemplate)'
+      attributes: [cn, displayName, msPKI-Certificate-Name-Flag, msPKI-Enrollment-Flag, msPKI-RA-Signature, pKIExtendedKeyUsage, msPKI-Certificate-Application-Policy, msPKI-Template-Schema-Version, msPKI-Minimal-Key-Size, msPKI-Private-Key-Flag, msPKI-RA-Application-Policies]
+      key: cn
+      name: displayName
+    each:
+      all:
+        - { field: cn, op: notin, value: [CA, SubCA, CrossCA, OfflineRouter, CEPEncryption, EnrollmentAgent, EnrollmentAgentOffline, MachineEnrollmentAgent, IPSECIntermediateOffline, WebServer] }
+        - { field: msPKI-Certificate-Name-Flag, op: flag, value: 1 }
+        - any:
+            - { field: msPKI-Enrollment-Flag, op: absent }
+            - { field: msPKI-Enrollment-Flag, op: noflag, value: 2 }
+        - any:
+            - { field: msPKI-RA-Signature, op: absent }
+            - { field: msPKI-RA-Signature, op: eq, value: 0 }
+        - any:
+            - { field: pKIExtendedKeyUsage, op: match, value: '^(1\.3\.6\.1\.5\.5\.7\.3\.2|1\.3\.6\.1\.5\.2\.3\.4|1\.3\.6\.1\.4\.1\.311\.20\.2\.2|2\.5\.29\.37\.0)$' }
+            - { field: msPKI-Certificate-Application-Policy, op: match, value: '^(1\.3\.6\.1\.5\.5\.7\.3\.2|1\.3\.6\.1\.5\.2\.3\.4|1\.3\.6\.1\.4\.1\.311\.20\.2\.2|2\.5\.29\.37\.0)$' }
+    evidence: "{displayName} ({cn}) - name flag {msPKI-Certificate-Name-Flag}, EKU {pKIExtendedKeyUsage}"
+
+  - id: ADCS-TPL-ESC2
+    title: Template issues any-purpose or EKU-less certificates without approval
+    severity: high
+    why: A certificate with the Any Purpose EKU or no EKU at all can be used for client authentication and as an enrollment agent, so enrollees get far more than the template's stated use (ESC2).
+    fix: Set the specific EKUs the template is for, or require manager approval; restrict enrollment.
+    refs: [MITRE-ATTACK:T1649, NIST-800-53:IA-5(2), ADCS:ESC2]
+    query:
+      protocol: ldap
+      base: 'CN=Certificate Templates,CN=Public Key Services,CN=Services,{CONFIGDN}'
+      scope: onelevel
+      filter: '(objectClass=pKICertificateTemplate)'
+      attributes: [cn, displayName, msPKI-Certificate-Name-Flag, msPKI-Enrollment-Flag, msPKI-RA-Signature, pKIExtendedKeyUsage, msPKI-Certificate-Application-Policy, msPKI-Template-Schema-Version, msPKI-Minimal-Key-Size, msPKI-Private-Key-Flag, msPKI-RA-Application-Policies]
+      key: cn
+      name: displayName
+    each:
+      all:
+        - { field: cn, op: notin, value: [CA, SubCA, CrossCA, OfflineRouter, CEPEncryption, EnrollmentAgent, EnrollmentAgentOffline, MachineEnrollmentAgent, IPSECIntermediateOffline, WebServer] }
+        - any:
+            - { field: msPKI-Enrollment-Flag, op: absent }
+            - { field: msPKI-Enrollment-Flag, op: noflag, value: 2 }
+        - any:
+            - { field: msPKI-RA-Signature, op: absent }
+            - { field: msPKI-RA-Signature, op: eq, value: 0 }
+        - any:
+            - { field: pKIExtendedKeyUsage, op: match, value: '^2\.5\.29\.37\.0$' }
+            - { field: msPKI-Certificate-Application-Policy, op: match, value: '^2\.5\.29\.37\.0$' }
+            - all:
+                - { field: pKIExtendedKeyUsage, op: empty }
+                - { field: msPKI-Certificate-Application-Policy, op: empty }
+    evidence: "{displayName} ({cn}) - EKU '{pKIExtendedKeyUsage}'"
+
+  - id: ADCS-TPL-ESC3
+    title: Template issues enrollment-agent certificates without approval
+    severity: medium
+    why: A Certificate Request Agent certificate lets its holder request certificates on behalf of other users; without approval and CA agent restrictions, enrollees can act as anyone (ESC3).
+    fix: Require manager approval on the agent template, restrict enrollment to named agents, and configure enrollment-agent restrictions on the CA.
+    refs: [MITRE-ATTACK:T1649, NIST-800-53:IA-5(2), ADCS:ESC3]
+    query:
+      protocol: ldap
+      base: 'CN=Certificate Templates,CN=Public Key Services,CN=Services,{CONFIGDN}'
+      scope: onelevel
+      filter: '(objectClass=pKICertificateTemplate)'
+      attributes: [cn, displayName, msPKI-Certificate-Name-Flag, msPKI-Enrollment-Flag, msPKI-RA-Signature, pKIExtendedKeyUsage, msPKI-Certificate-Application-Policy, msPKI-Template-Schema-Version, msPKI-Minimal-Key-Size, msPKI-Private-Key-Flag, msPKI-RA-Application-Policies]
+      key: cn
+      name: displayName
+    each:
+      all:
+        - { field: cn, op: notin, value: [CA, SubCA, CrossCA, OfflineRouter, CEPEncryption, EnrollmentAgent, EnrollmentAgentOffline, MachineEnrollmentAgent, IPSECIntermediateOffline, WebServer] }
+        - any:
+            - { field: msPKI-Enrollment-Flag, op: absent }
+            - { field: msPKI-Enrollment-Flag, op: noflag, value: 2 }
+        - any:
+            - { field: msPKI-RA-Signature, op: absent }
+            - { field: msPKI-RA-Signature, op: eq, value: 0 }
+        - any:
+            - { field: pKIExtendedKeyUsage, op: match, value: '^1\.3\.6\.1\.4\.1\.311\.20\.2\.1$' }
+            - { field: msPKI-Certificate-Application-Policy, op: match, value: '^1\.3\.6\.1\.4\.1\.311\.20\.2\.1$' }
+    evidence: "{displayName} ({cn}) - EKU {pKIExtendedKeyUsage}"
+
+  - id: ADCS-TPL-ESC9
+    title: Authentication template issues certificates without the SID security extension
+    severity: medium
+    why: CT_FLAG_NO_SECURITY_EXTENSION leaves the requester's SID out of the certificate, so domain controllers fall back to weaker name-based mapping and certificates can be mapped to another account (ESC9).
+    fix: Clear CT_FLAG_NO_SECURITY_EXTENSION from msPKI-Enrollment-Flag and keep strong certificate mapping enforced on the domain controllers.
+    refs: [MITRE-ATTACK:T1649, MS-KB:5014754, ADCS:ESC9]
+    query:
+      protocol: ldap
+      base: 'CN=Certificate Templates,CN=Public Key Services,CN=Services,{CONFIGDN}'
+      scope: onelevel
+      filter: '(objectClass=pKICertificateTemplate)'
+      attributes: [cn, displayName, msPKI-Certificate-Name-Flag, msPKI-Enrollment-Flag, msPKI-RA-Signature, pKIExtendedKeyUsage, msPKI-Certificate-Application-Policy, msPKI-Template-Schema-Version, msPKI-Minimal-Key-Size, msPKI-Private-Key-Flag, msPKI-RA-Application-Policies]
+      key: cn
+      name: displayName
+    each:
+      all:
+        - { field: msPKI-Enrollment-Flag, op: flag, value: 524288 }
+        - any:
+            - { field: pKIExtendedKeyUsage, op: match, value: '^(1\.3\.6\.1\.5\.5\.7\.3\.2|1\.3\.6\.1\.5\.2\.3\.4|1\.3\.6\.1\.4\.1\.311\.20\.2\.2|2\.5\.29\.37\.0)$' }
+            - { field: msPKI-Certificate-Application-Policy, op: match, value: '^(1\.3\.6\.1\.5\.5\.7\.3\.2|1\.3\.6\.1\.5\.2\.3\.4|1\.3\.6\.1\.4\.1\.311\.20\.2\.2|2\.5\.29\.37\.0)$' }
+            - all:
+                - { field: pKIExtendedKeyUsage, op: empty }
+                - { field: msPKI-Certificate-Application-Policy, op: empty }
+    evidence: "{displayName} ({cn}) - enrollment flag {msPKI-Enrollment-Flag}"
+
+  - id: ADCS-TPL-WEAK-KEY
+    title: Template allows RSA keys shorter than the minimum
+    severity: medium
+    why: Short RSA keys can be factored with modest resources, and the certificate stays valid for its whole lifetime. ECC templates are excluded.
+    fix: Raise msPKI-Minimal-Key-Size to at least 2048 (3072 for long-lived certificates) and re-enroll the issued certificates.
+    refs: [NIST-800-53:SC-12, NIST-800-53:SC-13]
+    query:
+      protocol: ldap
+      base: 'CN=Certificate Templates,CN=Public Key Services,CN=Services,{CONFIGDN}'
+      scope: onelevel
+      filter: '(objectClass=pKICertificateTemplate)'
+      attributes: [cn, displayName, msPKI-Certificate-Name-Flag, msPKI-Enrollment-Flag, msPKI-RA-Signature, pKIExtendedKeyUsage, msPKI-Certificate-Application-Policy, msPKI-Template-Schema-Version, msPKI-Minimal-Key-Size, msPKI-Private-Key-Flag, msPKI-RA-Application-Policies]
+      key: cn
+      name: displayName
+    each:
+      all:
+        - { field: msPKI-Minimal-Key-Size, op: lt, value: 2048, threshold: adcs.min-rsa-key-size }
+        - any:
+            - { field: msPKI-RA-Application-Policies, op: absent }
+            - not: { field: msPKI-RA-Application-Policies, op: match, value: 'EC(DSA|DH)' }
+    evidence: "{displayName} ({cn}) - minimum key size {msPKI-Minimal-Key-Size}"
+
+  - id: ADCS-TPL-EXPORTABLE-AUTH-KEY
+    title: Authentication template allows the private key to be exported
+    severity: low
+    why: An exportable private key can be copied off the device together with the certificate, giving a portable credential that outlives a password reset.
+    fix: Clear "allow private key to be exported" unless a documented need exists; prefer TPM-backed keys for authentication certificates.
+    refs: [MITRE-ATTACK:T1649, NIST-800-53:SC-12]
+    query:
+      protocol: ldap
+      base: 'CN=Certificate Templates,CN=Public Key Services,CN=Services,{CONFIGDN}'
+      scope: onelevel
+      filter: '(objectClass=pKICertificateTemplate)'
+      attributes: [cn, displayName, msPKI-Certificate-Name-Flag, msPKI-Enrollment-Flag, msPKI-RA-Signature, pKIExtendedKeyUsage, msPKI-Certificate-Application-Policy, msPKI-Template-Schema-Version, msPKI-Minimal-Key-Size, msPKI-Private-Key-Flag, msPKI-RA-Application-Policies]
+      key: cn
+      name: displayName
+    each:
+      all:
+        - { field: msPKI-Private-Key-Flag, op: flag, value: 16 }
+        - any:
+            - { field: pKIExtendedKeyUsage, op: match, value: '^(1\.3\.6\.1\.5\.5\.7\.3\.2|1\.3\.6\.1\.5\.2\.3\.4|1\.3\.6\.1\.4\.1\.311\.20\.2\.2|2\.5\.29\.37\.0)$' }
+            - { field: msPKI-Certificate-Application-Policy, op: match, value: '^(1\.3\.6\.1\.5\.5\.7\.3\.2|1\.3\.6\.1\.5\.2\.3\.4|1\.3\.6\.1\.4\.1\.311\.20\.2\.2|2\.5\.29\.37\.0)$' }
+    evidence: "{displayName} ({cn}) - private key flag {msPKI-Private-Key-Flag}"
+
+  - id: ADCS-TPL-WEAK-HASH
+    title: Template signs requests with a weak hash algorithm
+    severity: low
+    why: SHA-1 and older hashes allow collisions; templates that still name them produce signatures that no longer meet current guidance.
+    fix: Change the template's hash algorithm to SHA-256 or stronger.
+    refs: [NIST-800-53:SC-13]
+    query:
+      protocol: ldap
+      base: 'CN=Certificate Templates,CN=Public Key Services,CN=Services,{CONFIGDN}'
+      scope: onelevel
+      filter: '(objectClass=pKICertificateTemplate)'
+      attributes: [cn, displayName, msPKI-Certificate-Name-Flag, msPKI-Enrollment-Flag, msPKI-RA-Signature, pKIExtendedKeyUsage, msPKI-Certificate-Application-Policy, msPKI-Template-Schema-Version, msPKI-Minimal-Key-Size, msPKI-Private-Key-Flag, msPKI-RA-Application-Policies]
+      key: cn
+      name: displayName
+    each: { field: msPKI-RA-Application-Policies, op: match, value: 'msPKI-Hash-Algorithm`PZPWSTR`(SHA1|MD5|MD4|MD2)`' }
+    evidence: "{displayName} ({cn}) - {msPKI-RA-Application-Policies}"
+
+  # ---------------------------------------------------------------- issuance policies
+
+  - id: ADCS-OID-GROUP-LINK
+    title: Issuance policy linked to a group
+    severity: medium
+    why: A certificate that carries a group-linked issuance policy adds the holder to that group at logon; if the group is privileged, enrolling is a path to its rights (ESC13).
+    fix: Confirm the linked group is meant to be granted by certificate, keep it unprivileged, and restrict enrollment on templates that carry the policy.
+    refs: [MITRE-ATTACK:T1649, NIST-800-53:AC-6, ADCS:ESC13]
+    refresh: 7d
+    query:
+      protocol: ldap
+      base: 'CN=OID,CN=Public Key Services,CN=Services,{CONFIGDN}'
+      scope: onelevel
+      filter: '(&(objectClass=msPKI-Enterprise-Oid)(msDS-OIDToGroupLink=*))'
+      attributes: [cn, displayName, msPKI-Cert-Template-OID, msDS-OIDToGroupLink]
+      key: cn
+      name: displayName
+    each: any
+    evidence: "{displayName} ({msPKI-Cert-Template-OID}) - linked to {msDS-OIDToGroupLink}"
+
+  # ---------------------------------------------------------------- enterprise CAs (enrollment services)
+
+  - id: ADCS-CA-PUBLISHES-CA-OR-AGENT-TEMPLATE
+    title: CA publishes a default CA or enrollment-agent template
+    severity: medium
+    entity: domain
+    why: SubCA, CA, CrossCA and the enrollment-agent templates issue certificates that can sign other certificates or request them on behalf of anyone; published, they are one permission change away from full compromise.
+    fix: Unpublish the template unless it is in use, and keep its enrollment rights limited to PKI administrators or named agents.
+    refs: [MITRE-ATTACK:T1649, NIST-800-53:CM-7, ADCS:ESC2, ADCS:ESC3]
+    query:
+      protocol: ldap
+      base: 'CN=Enrollment Services,CN=Public Key Services,CN=Services,{CONFIGDN}'
+      scope: onelevel
+      filter: '(objectClass=pKIEnrollmentService)'
+      attributes: [cn, dNSHostName, certificateTemplates, msPKI-Enrollment-Servers]
+      key: cn
+      name: dNSHostName
+    each: { field: certificateTemplates, op: match, value: '^(SubCA|CA|CrossCA|EnrollmentAgent|EnrollmentAgentOffline|MachineEnrollmentAgent|CEPEncryption)$' }
+    evidence: "{cn} on {dNSHostName} - publishes {certificateTemplates}"
+
+  - id: ADCS-CA-PUBLISHES-V1-SUPPLY-SUBJECT
+    title: CA publishes a version-1 template that accepts a requester-supplied subject
+    severity: low
+    entity: domain
+    why: On CAs without the November 2024 update, schema-version-1 templates with a requester-supplied subject accept extra application policies from the request, turning a server certificate into a logon certificate (ESC15).
+    fix: Patch the CA, replace the template with a duplicated version-2 or later template, and restrict who may enroll.
+    refs: [CVE-2024-49019, MITRE-ATTACK:T1649, ADCS:ESC15]
+    query:
+      protocol: ldap
+      base: 'CN=Enrollment Services,CN=Public Key Services,CN=Services,{CONFIGDN}'
+      scope: onelevel
+      filter: '(objectClass=pKIEnrollmentService)'
+      attributes: [cn, dNSHostName, certificateTemplates, msPKI-Enrollment-Servers]
+      key: cn
+      name: dNSHostName
+    each: { field: certificateTemplates, op: match, value: '^(WebServer|OfflineRouter|IPSECIntermediateOffline)$' }
+    evidence: "{cn} on {dNSHostName} - publishes {certificateTemplates}"
+
+  - id: ADCS-CA-DC-TEMPLATE-NO-KDC-EKU
+    title: CA issues domain controller certificates without the KDC Authentication EKU
+    severity: medium
+    entity: domain
+    why: The default DomainController and DomainControllerAuthentication templates lack the KDC Authentication EKU; domain controllers enrolled only from them fail strict KDC validation (smart card, certificate and Windows Hello logon) and log KDC certificate errors. The newer Kerberos Authentication template carries the EKU.
+    fix: Publish the Kerberos Authentication template (or a duplicate that keeps the KDC Authentication EKU), let it supersede the older domain controller templates, and re-enroll the domain controllers.
+    refs: [NIST-800-53:IA-5(2), NIST-800-53:SC-17]
+    query:
+      protocol: ldap
+      base: 'CN=Enrollment Services,CN=Public Key Services,CN=Services,{CONFIGDN}'
+      scope: onelevel
+      filter: '(objectClass=pKIEnrollmentService)'
+      attributes: [cn, dNSHostName, certificateTemplates, msPKI-Enrollment-Servers]
+      key: cn
+      name: dNSHostName
+    each:
+      all:
+        - { field: certificateTemplates, op: match, value: '^(DomainController|DomainControllerAuthentication)$' }
+        - not: { field: certificateTemplates, op: match, value: '^KerberosAuthentication$' }
+    evidence: "{cn} on {dNSHostName} - publishes {certificateTemplates}"
+
+  - id: ADCS-CA-ENROLLMENT-OVER-HTTP
+    title: Certificate enrollment web service advertised over plain HTTP
+    severity: high
+    entity: domain
+    why: An HTTP enrollment endpoint accepts relayed NTLM authentication, so a coerced domain controller can be made to request a certificate for itself (ESC8).
+    fix: Serve enrollment only over HTTPS with Extended Protection for Authentication, or remove the web enrollment roles.
+    refs: [MITRE-ATTACK:T1649, MITRE-ATTACK:T1187, NIST-800-53:SC-8, ADCS:ESC8]
+    query:
+      protocol: ldap
+      base: 'CN=Enrollment Services,CN=Public Key Services,CN=Services,{CONFIGDN}'
+      scope: onelevel
+      filter: '(objectClass=pKIEnrollmentService)'
+      attributes: [cn, dNSHostName, certificateTemplates, msPKI-Enrollment-Servers]
+      key: cn
+      name: dNSHostName
+    each: { field: msPKI-Enrollment-Servers, op: match, value: 'http://' }
+    evidence: "{cn} on {dNSHostName} - enrollment servers {msPKI-Enrollment-Servers}"
+
+  # ---------------------------------------------------------------- certificate mapping on accounts
+
+  - id: ADCS-ACCOUNT-WEAK-CERT-MAPPING
+    title: Account maps certificates by subject, issuer-and-subject or e-mail
+    severity: medium
+    entity: user
+    why: Explicit mappings by subject name or e-mail can be satisfied by a certificate an attacker obtains for a matching name, and they stop working when strong mapping is enforced (ESC14).
+    fix: Replace the mapping with a strong form (issuer and serial number, subject key identifier or public-key hash) and restrict who may write altSecurityIdentities.
+    refs: [MITRE-ATTACK:T1649, MS-KB:5014754, ADCS:ESC14]
+    query:
+      protocol: ldap
+      filter: '(&{USER}(altSecurityIdentities=*))'
+      attributes: [sAMAccountName, displayName, altSecurityIdentities]
+      key: sAMAccountName
+      name: displayName
+    each: { field: altSecurityIdentities, op: match, value: '^X509:(<I>.*<S>|<S>|<RFC822>)' }
+    evidence: "{sAMAccountName} - mapping {altSecurityIdentities}"

@@ -25,7 +25,13 @@ public static class LdapValues
 
     private static readonly IReadOnlySet<string> SidAttributes = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
     {
-        "objectSid", "sIDHistory", "securityIdentifier", "msDS-AllowedToActOnBehalfOfOtherIdentity",
+        "objectSid", "sIDHistory", "securityIdentifier",
+    };
+
+    /// <summary>Security descriptors whose allowed trustees are what a rule needs (who may delegate to this computer).</summary>
+    private static readonly IReadOnlySet<string> DescriptorAttributes = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+    {
+        "msDS-AllowedToActOnBehalfOfOtherIdentity",
     };
 
     private static readonly IReadOnlySet<string> DurationAttributes = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
@@ -53,6 +59,8 @@ public static class LdapValues
         {
             if (SidAttributes.Contains(attribute))
                 return Sid(bytes);
+            if (DescriptorAttributes.Contains(attribute))
+                return AllowedTrustees(bytes) is { } trustees ? new JsonArray([.. trustees.Select(t => (JsonNode)JsonValue.Create(t))]) : null;
             if (attribute.Equals("objectGUID", StringComparison.OrdinalIgnoreCase) && bytes.Length == 16)
                 return new Guid(bytes).ToString();
             // Text arrives as bytes from some servers.
@@ -65,7 +73,13 @@ public static class LdapValues
     private static string Text(string attribute, string value)
     {
         if (DurationAttributes.Contains(attribute) && long.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out var ticks))
+        {
+            // The most negative value means "never" (no maximum age, locked until an admin unlocks);
+            // Math.Abs of it overflows, so it is answered before any arithmetic.
+            if (ticks == long.MinValue)
+                return "never";
             return (Math.Abs(ticks) / TimeSpan.TicksPerDay).ToString(CultureInfo.InvariantCulture);   // days
+        }
         if (FileTimeAttributes.Contains(attribute) && long.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out var fileTime))
         {
             if (fileTime <= 0 || fileTime == long.MaxValue || fileTime >= DateTime.MaxValue.ToFileTimeUtc())
@@ -77,6 +91,39 @@ public static class LdapValues
                 DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal, out var generalized))
             return RowValues.Iso(new DateTimeOffset(generalized, TimeSpan.Zero));
         return value;
+    }
+
+    /// <summary>
+    /// The SIDs a self-relative security descriptor's DACL allows (ACCESS_ALLOWED_ACE, type 0), without
+    /// Windows-only APIs. Null when the bytes are not a well-formed descriptor; anything malformed is
+    /// refused rather than guessed at.
+    /// </summary>
+    public static IReadOnlyList<string>? AllowedTrustees(byte[] bytes)
+    {
+        if (bytes.Length < 20 || bytes[0] != 1)
+            return null;
+        var daclOffset = BitConverter.ToInt32(bytes, 16);
+        if (daclOffset == 0)
+            return [];
+        if (daclOffset < 20 || daclOffset + 8 > bytes.Length)
+            return null;
+
+        var aceCount = BitConverter.ToUInt16(bytes, daclOffset + 4);
+        var position = daclOffset + 8;
+        var trustees = new List<string>();
+        for (var i = 0; i < aceCount; i++)
+        {
+            if (position + 4 > bytes.Length)
+                return null;
+            var type = bytes[position];
+            var size = BitConverter.ToUInt16(bytes, position + 2);
+            if (size < 8 || position + size > bytes.Length)
+                return null;
+            if (type == 0 && Sid(bytes[(position + 8)..(position + size)]) is { } sid)
+                trustees.Add(sid);
+            position += size;
+        }
+        return trustees;
     }
 
     /// <summary>Binary SID to S-1-5-21-... text, without Windows-only APIs.</summary>

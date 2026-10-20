@@ -1,0 +1,1030 @@
+schema: keeper.rules/1
+system: obligations
+name: Recurring obligations people must prove
+integration: keeper
+# Duties no scan can see (a restore test, a DR drill, a password rotation) are proved by an
+# attestation: obligation id, target ('-' for the whole estate, or a domain, system or script),
+# state yes/no/na, done_on, evidence, expires_on.
+#
+# Each obligation rule returns one row per target that has ever been attested for it, plus one
+# row '-' when nothing was ever attested - so "never done" is a finding, not silence. A row fails
+# when the latest attestation is not 'na' and there is no 'yes' with a done_on inside the interval
+# (threshold obligations.<id>.interval-days). The due date (deadline) is computed in SQL from the
+# same threshold read from the setting table, falling back to the default interval.
+rules:
+  - id: OBL-AD-KRBTGT-ROTATION
+    title: krbtgt password not rotated within the interval
+    kind: missing
+    lens: security
+    category: AUT
+    severity: high
+    entity: obligation
+    why: >-
+      The krbtgt key signs every Kerberos ticket in the domain. As long as it stays the same, a
+      copy taken by an attacker keeps working: tickets can be forged for any account, and
+      resetting user passwords does not stop it.
+    fix: >-
+      Reset the krbtgt password twice per domain, letting replication complete between the two
+      resets, then attest obligation ad.krbtgt-rotation with the domain as target.
+    refs: [NIST-800-53:IA-5]
+    refresh: 1d
+    query:
+      protocol: store
+      key: item
+      name: title
+      text: |
+        WITH t AS (
+          SELECT DISTINCT a.target FROM attestation a WHERE a.obligation = 'ad.krbtgt-rotation'
+          UNION
+          SELECT '-' WHERE NOT EXISTS (SELECT 1 FROM attestation a WHERE a.obligation = 'ad.krbtgt-rotation')
+        ),
+        s AS (
+          SELECT t.target,
+                 (SELECT MAX(a.done_on) FROM attestation a
+                   WHERE a.obligation = 'ad.krbtgt-rotation' AND a.target = t.target AND a.state = 'yes'
+                     AND NULLIF(TRIM(a.done_on), '') IS NOT NULL) AS last_done,
+                 (SELECT la.state FROM latest_attestation la
+                   WHERE la.obligation = 'ad.krbtgt-rotation' AND la.target = t.target) AS latest_state
+          FROM t
+        )
+        SELECT 'ad.krbtgt-rotation' AS obligation,
+               'krbtgt password rotated twice' AS title,
+               s.target,
+               CASE WHEN s.target = '-' THEN 'ad.krbtgt-rotation' ELSE 'ad.krbtgt-rotation@' || s.target END AS item,
+               s.last_done,
+               COALESCE(s.latest_state, 'none') AS latest_state,
+               CASE WHEN s.last_done IS NULL THEN 'never attested as done'
+                    ELSE 'last done ' || s.last_done || ', ' || CAST(julianday(:today) - julianday(s.last_done) AS INTEGER) || ' days ago' END AS status_text,
+               CASE WHEN s.last_done IS NULL THEN :today
+                    ELSE date(s.last_done, '+' || COALESCE((SELECT st.value FROM setting st WHERE st.key = 'threshold.obligations.ad.krbtgt-rotation.interval-days'), '180') || ' days') END AS due_on
+        FROM s
+    each:
+      all:
+        - { field: latest_state, op: ne, value: na }
+        - any:
+            - { field: last_done, op: absent }
+            - { field: last_done, op: age-gt, value: 180, threshold: obligations.ad.krbtgt-rotation.interval-days }
+    deadline: due_on
+    evidence: "{title} ({item}): {status_text}; was due {due_on}. Latest attestation: {latest_state}"
+
+  - id: OBL-AD-DSRM-PASSWORD-ROTATION
+    title: DSRM administrator password not rotated within the interval
+    kind: missing
+    lens: security
+    category: IAM
+    severity: medium
+    entity: obligation
+    why: >-
+      The Directory Services Restore Mode account is a local administrator on every domain
+      controller. A password that never changes is a quiet way back in, and one nobody knows is a
+      problem on the day a DC has to be recovered.
+    fix: >-
+      Set a new DSRM password on every domain controller, store it in the privileged vault, then
+      attest obligation ad.dsrm-password-rotation with the domain as target.
+    refs: [NIST-800-53:IA-5]
+    refresh: 1d
+    query:
+      protocol: store
+      key: item
+      name: title
+      text: |
+        WITH t AS (
+          SELECT DISTINCT a.target FROM attestation a WHERE a.obligation = 'ad.dsrm-password-rotation'
+          UNION
+          SELECT '-' WHERE NOT EXISTS (SELECT 1 FROM attestation a WHERE a.obligation = 'ad.dsrm-password-rotation')
+        ),
+        s AS (
+          SELECT t.target,
+                 (SELECT MAX(a.done_on) FROM attestation a
+                   WHERE a.obligation = 'ad.dsrm-password-rotation' AND a.target = t.target AND a.state = 'yes'
+                     AND NULLIF(TRIM(a.done_on), '') IS NOT NULL) AS last_done,
+                 (SELECT la.state FROM latest_attestation la
+                   WHERE la.obligation = 'ad.dsrm-password-rotation' AND la.target = t.target) AS latest_state
+          FROM t
+        )
+        SELECT 'ad.dsrm-password-rotation' AS obligation,
+               'DSRM password rotated on every domain controller' AS title,
+               s.target,
+               CASE WHEN s.target = '-' THEN 'ad.dsrm-password-rotation' ELSE 'ad.dsrm-password-rotation@' || s.target END AS item,
+               s.last_done,
+               COALESCE(s.latest_state, 'none') AS latest_state,
+               CASE WHEN s.last_done IS NULL THEN 'never attested as done'
+                    ELSE 'last done ' || s.last_done || ', ' || CAST(julianday(:today) - julianday(s.last_done) AS INTEGER) || ' days ago' END AS status_text,
+               CASE WHEN s.last_done IS NULL THEN :today
+                    ELSE date(s.last_done, '+' || COALESCE((SELECT st.value FROM setting st WHERE st.key = 'threshold.obligations.ad.dsrm-password-rotation.interval-days'), '365') || ' days') END AS due_on
+        FROM s
+    each:
+      all:
+        - { field: latest_state, op: ne, value: na }
+        - any:
+            - { field: last_done, op: absent }
+            - { field: last_done, op: age-gt, value: 365, threshold: obligations.ad.dsrm-password-rotation.interval-days }
+    deadline: due_on
+    evidence: "{title} ({item}): {status_text}; was due {due_on}. Latest attestation: {latest_state}"
+
+  - id: OBL-AD-SYSTEM-STATE-BACKUP
+    title: No recent directory-aware system state backup
+    kind: missing
+    lens: both
+    category: BCK
+    severity: high
+    entity: obligation
+    why: >-
+      Only a backup the directory recognises (system state of a domain controller, covering every
+      partition) can restore it, and a backup older than the tombstone lifetime cannot be restored
+      at all. File-level or VM snapshots taken without directory awareness are not a substitute.
+    fix: >-
+      Schedule a directory-aware system state backup of at least one DC per domain, check that
+      the directory records it, then attest obligation ad.system-state-backup with the domain as
+      target (or let a backup integration prove it).
+    refs: [NIST-800-53:CP-9]
+    refresh: 1d
+    query:
+      protocol: store
+      key: item
+      name: title
+      text: |
+        WITH t AS (
+          SELECT DISTINCT a.target FROM attestation a WHERE a.obligation = 'ad.system-state-backup'
+          UNION
+          SELECT '-' WHERE NOT EXISTS (SELECT 1 FROM attestation a WHERE a.obligation = 'ad.system-state-backup')
+        ),
+        s AS (
+          SELECT t.target,
+                 (SELECT MAX(a.done_on) FROM attestation a
+                   WHERE a.obligation = 'ad.system-state-backup' AND a.target = t.target AND a.state = 'yes'
+                     AND NULLIF(TRIM(a.done_on), '') IS NOT NULL) AS last_done,
+                 (SELECT la.state FROM latest_attestation la
+                   WHERE la.obligation = 'ad.system-state-backup' AND la.target = t.target) AS latest_state
+          FROM t
+        )
+        SELECT 'ad.system-state-backup' AS obligation,
+               'Directory-aware system state backup' AS title,
+               s.target,
+               CASE WHEN s.target = '-' THEN 'ad.system-state-backup' ELSE 'ad.system-state-backup@' || s.target END AS item,
+               s.last_done,
+               COALESCE(s.latest_state, 'none') AS latest_state,
+               CASE WHEN s.last_done IS NULL THEN 'never attested as done'
+                    ELSE 'last done ' || s.last_done || ', ' || CAST(julianday(:today) - julianday(s.last_done) AS INTEGER) || ' days ago' END AS status_text,
+               CASE WHEN s.last_done IS NULL THEN :today
+                    ELSE date(s.last_done, '+' || COALESCE((SELECT st.value FROM setting st WHERE st.key = 'threshold.obligations.ad.system-state-backup.interval-days'), '7') || ' days') END AS due_on
+        FROM s
+    each:
+      all:
+        - { field: latest_state, op: ne, value: na }
+        - any:
+            - { field: last_done, op: absent }
+            - { field: last_done, op: age-gt, value: 7, threshold: obligations.ad.system-state-backup.interval-days }
+    deadline: due_on
+    evidence: "{title} ({item}): {status_text}; was due {due_on}. Latest attestation: {latest_state}"
+
+  - id: OBL-AD-FOREST-RECOVERY-TEST
+    title: Directory restore or forest recovery not tested within the interval
+    kind: missing
+    lens: both
+    category: BCK
+    severity: high
+    entity: obligation
+    why: >-
+      A directory recovery procedure that has never been rehearsed fails on the day it is needed:
+      missing steps, unknown passwords, backups that do not restore. When the directory is down,
+      almost everything else is too.
+    fix: >-
+      Restore a domain controller from backup into an isolated network and walk the recovery
+      procedure end to end, fix what broke, then attest obligation ad.forest-recovery-test.
+    refs: [NIST-800-53:CP-4, NIST-800-53:CP-10]
+    refresh: 1d
+    query:
+      protocol: store
+      key: item
+      name: title
+      text: |
+        WITH t AS (
+          SELECT DISTINCT a.target FROM attestation a WHERE a.obligation = 'ad.forest-recovery-test'
+          UNION
+          SELECT '-' WHERE NOT EXISTS (SELECT 1 FROM attestation a WHERE a.obligation = 'ad.forest-recovery-test')
+        ),
+        s AS (
+          SELECT t.target,
+                 (SELECT MAX(a.done_on) FROM attestation a
+                   WHERE a.obligation = 'ad.forest-recovery-test' AND a.target = t.target AND a.state = 'yes'
+                     AND NULLIF(TRIM(a.done_on), '') IS NOT NULL) AS last_done,
+                 (SELECT la.state FROM latest_attestation la
+                   WHERE la.obligation = 'ad.forest-recovery-test' AND la.target = t.target) AS latest_state
+          FROM t
+        )
+        SELECT 'ad.forest-recovery-test' AS obligation,
+               'Directory restore / forest recovery test' AS title,
+               s.target,
+               CASE WHEN s.target = '-' THEN 'ad.forest-recovery-test' ELSE 'ad.forest-recovery-test@' || s.target END AS item,
+               s.last_done,
+               COALESCE(s.latest_state, 'none') AS latest_state,
+               CASE WHEN s.last_done IS NULL THEN 'never attested as done'
+                    ELSE 'last done ' || s.last_done || ', ' || CAST(julianday(:today) - julianday(s.last_done) AS INTEGER) || ' days ago' END AS status_text,
+               CASE WHEN s.last_done IS NULL THEN :today
+                    ELSE date(s.last_done, '+' || COALESCE((SELECT st.value FROM setting st WHERE st.key = 'threshold.obligations.ad.forest-recovery-test.interval-days'), '365') || ' days') END AS due_on
+        FROM s
+    each:
+      all:
+        - { field: latest_state, op: ne, value: na }
+        - any:
+            - { field: last_done, op: absent }
+            - { field: last_done, op: age-gt, value: 365, threshold: obligations.ad.forest-recovery-test.interval-days }
+    deadline: due_on
+    evidence: "{title} ({item}): {status_text}; was due {due_on}. Latest attestation: {latest_state}"
+
+  - id: OBL-IAM-PRIVILEGED-ACCESS-RECERTIFICATION
+    title: Privileged group membership not recertified within the interval
+    kind: missing
+    lens: security
+    category: IAM
+    severity: medium
+    entity: obligation
+    why: >-
+      Privilege accumulates quietly: people change roles, projects end, emergency grants stay. Only
+      a periodic review by someone accountable removes what is no longer needed.
+    fix: >-
+      Have each privileged group's owner confirm every member (directory and cloud admin roles
+      alike), remove the rest, then attest obligation iam.privileged-access-recertification.
+    refs: [NIST-800-53:AC-2, NIST-800-53:AC-6(7)]
+    refresh: 1d
+    query:
+      protocol: store
+      key: item
+      name: title
+      text: |
+        WITH t AS (
+          SELECT DISTINCT a.target FROM attestation a WHERE a.obligation = 'iam.privileged-access-recertification'
+          UNION
+          SELECT '-' WHERE NOT EXISTS (SELECT 1 FROM attestation a WHERE a.obligation = 'iam.privileged-access-recertification')
+        ),
+        s AS (
+          SELECT t.target,
+                 (SELECT MAX(a.done_on) FROM attestation a
+                   WHERE a.obligation = 'iam.privileged-access-recertification' AND a.target = t.target AND a.state = 'yes'
+                     AND NULLIF(TRIM(a.done_on), '') IS NOT NULL) AS last_done,
+                 (SELECT la.state FROM latest_attestation la
+                   WHERE la.obligation = 'iam.privileged-access-recertification' AND la.target = t.target) AS latest_state
+          FROM t
+        )
+        SELECT 'iam.privileged-access-recertification' AS obligation,
+               'Privileged group membership recertified' AS title,
+               s.target,
+               CASE WHEN s.target = '-' THEN 'iam.privileged-access-recertification' ELSE 'iam.privileged-access-recertification@' || s.target END AS item,
+               s.last_done,
+               COALESCE(s.latest_state, 'none') AS latest_state,
+               CASE WHEN s.last_done IS NULL THEN 'never attested as done'
+                    ELSE 'last done ' || s.last_done || ', ' || CAST(julianday(:today) - julianday(s.last_done) AS INTEGER) || ' days ago' END AS status_text,
+               CASE WHEN s.last_done IS NULL THEN :today
+                    ELSE date(s.last_done, '+' || COALESCE((SELECT st.value FROM setting st WHERE st.key = 'threshold.obligations.iam.privileged-access-recertification.interval-days'), '90') || ' days') END AS due_on
+        FROM s
+    each:
+      all:
+        - { field: latest_state, op: ne, value: na }
+        - any:
+            - { field: last_done, op: absent }
+            - { field: last_done, op: age-gt, value: 90, threshold: obligations.iam.privileged-access-recertification.interval-days }
+    deadline: due_on
+    evidence: "{title} ({item}): {status_text}; was due {due_on}. Latest attestation: {latest_state}"
+
+  - id: OBL-AD-GPO-BACKUP
+    title: Group policy objects not backed up within the interval
+    kind: missing
+    lens: maintenance
+    category: BCK
+    severity: medium
+    entity: obligation
+    why: >-
+      A deleted or broken group policy without a backup has to be rebuilt from memory, and there is
+      no earlier version to compare against when a change goes wrong.
+    fix: >-
+      Back up every GPO (settings, links and permissions) to storage outside the domain controllers,
+      then attest obligation ad.gpo-backup with the domain as target.
+    refs: [NIST-800-53:CP-9, NIST-800-53:CM-2(3)]
+    refresh: 1d
+    query:
+      protocol: store
+      key: item
+      name: title
+      text: |
+        WITH t AS (
+          SELECT DISTINCT a.target FROM attestation a WHERE a.obligation = 'ad.gpo-backup'
+          UNION
+          SELECT '-' WHERE NOT EXISTS (SELECT 1 FROM attestation a WHERE a.obligation = 'ad.gpo-backup')
+        ),
+        s AS (
+          SELECT t.target,
+                 (SELECT MAX(a.done_on) FROM attestation a
+                   WHERE a.obligation = 'ad.gpo-backup' AND a.target = t.target AND a.state = 'yes'
+                     AND NULLIF(TRIM(a.done_on), '') IS NOT NULL) AS last_done,
+                 (SELECT la.state FROM latest_attestation la
+                   WHERE la.obligation = 'ad.gpo-backup' AND la.target = t.target) AS latest_state
+          FROM t
+        )
+        SELECT 'ad.gpo-backup' AS obligation,
+               'All group policy objects backed up' AS title,
+               s.target,
+               CASE WHEN s.target = '-' THEN 'ad.gpo-backup' ELSE 'ad.gpo-backup@' || s.target END AS item,
+               s.last_done,
+               COALESCE(s.latest_state, 'none') AS latest_state,
+               CASE WHEN s.last_done IS NULL THEN 'never attested as done'
+                    ELSE 'last done ' || s.last_done || ', ' || CAST(julianday(:today) - julianday(s.last_done) AS INTEGER) || ' days ago' END AS status_text,
+               CASE WHEN s.last_done IS NULL THEN :today
+                    ELSE date(s.last_done, '+' || COALESCE((SELECT st.value FROM setting st WHERE st.key = 'threshold.obligations.ad.gpo-backup.interval-days'), '30') || ' days') END AS due_on
+        FROM s
+    each:
+      all:
+        - { field: latest_state, op: ne, value: na }
+        - any:
+            - { field: last_done, op: absent }
+            - { field: last_done, op: age-gt, value: 30, threshold: obligations.ad.gpo-backup.interval-days }
+    deadline: due_on
+    evidence: "{title} ({item}): {status_text}; was due {due_on}. Latest attestation: {latest_state}"
+
+  - id: OBL-IAM-STALE-ACCOUNT-CLEANUP
+    title: Stale accounts not cleaned up within the interval
+    kind: missing
+    lens: both
+    category: HYG
+    severity: low
+    entity: obligation
+    why: >-
+      Accounts and computers nobody uses any more are free footholds: nobody notices when they are
+      used, and their passwords and certificates never change.
+    fix: >-
+      Disable, then after a grace period delete, users and computers inactive beyond the policy
+      limit (directory and cloud), then attest obligation iam.stale-account-cleanup.
+    refs: [NIST-800-53:AC-2(3), CIS-Controls-v8:5.3]
+    refresh: 1d
+    query:
+      protocol: store
+      key: item
+      name: title
+      text: |
+        WITH t AS (
+          SELECT DISTINCT a.target FROM attestation a WHERE a.obligation = 'iam.stale-account-cleanup'
+          UNION
+          SELECT '-' WHERE NOT EXISTS (SELECT 1 FROM attestation a WHERE a.obligation = 'iam.stale-account-cleanup')
+        ),
+        s AS (
+          SELECT t.target,
+                 (SELECT MAX(a.done_on) FROM attestation a
+                   WHERE a.obligation = 'iam.stale-account-cleanup' AND a.target = t.target AND a.state = 'yes'
+                     AND NULLIF(TRIM(a.done_on), '') IS NOT NULL) AS last_done,
+                 (SELECT la.state FROM latest_attestation la
+                   WHERE la.obligation = 'iam.stale-account-cleanup' AND la.target = t.target) AS latest_state
+          FROM t
+        )
+        SELECT 'iam.stale-account-cleanup' AS obligation,
+               'Stale users and computers disabled or removed' AS title,
+               s.target,
+               CASE WHEN s.target = '-' THEN 'iam.stale-account-cleanup' ELSE 'iam.stale-account-cleanup@' || s.target END AS item,
+               s.last_done,
+               COALESCE(s.latest_state, 'none') AS latest_state,
+               CASE WHEN s.last_done IS NULL THEN 'never attested as done'
+                    ELSE 'last done ' || s.last_done || ', ' || CAST(julianday(:today) - julianday(s.last_done) AS INTEGER) || ' days ago' END AS status_text,
+               CASE WHEN s.last_done IS NULL THEN :today
+                    ELSE date(s.last_done, '+' || COALESCE((SELECT st.value FROM setting st WHERE st.key = 'threshold.obligations.iam.stale-account-cleanup.interval-days'), '90') || ' days') END AS due_on
+        FROM s
+    each:
+      all:
+        - { field: latest_state, op: ne, value: na }
+        - any:
+            - { field: last_done, op: absent }
+            - { field: last_done, op: age-gt, value: 90, threshold: obligations.iam.stale-account-cleanup.interval-days }
+    deadline: due_on
+    evidence: "{title} ({item}): {status_text}; was due {due_on}. Latest attestation: {latest_state}"
+
+  - id: OBL-PKI-CERTIFICATE-INVENTORY-REVIEW
+    title: Certificate expiry list not reviewed within the interval
+    kind: missing
+    lens: security
+    category: PKI
+    severity: medium
+    entity: obligation
+    why: >-
+      Scans only see certificates on the endpoints they are pointed at. Signing, federation, CA,
+      device and appliance certificates are found only by someone going through the list - and an
+      expired one causes outages that look like network faults.
+    fix: >-
+      Go through the certificate inventory (TLS scan results plus certificate key dates), add the
+      ones that are missing, assign owners to upcoming renewals, then attest obligation
+      pki.certificate-inventory-review.
+    refs: [NIST-800-53:SC-17, NIST-SP-1800-16]
+    refresh: 1d
+    query:
+      protocol: store
+      key: item
+      name: title
+      text: |
+        WITH t AS (
+          SELECT DISTINCT a.target FROM attestation a WHERE a.obligation = 'pki.certificate-inventory-review'
+          UNION
+          SELECT '-' WHERE NOT EXISTS (SELECT 1 FROM attestation a WHERE a.obligation = 'pki.certificate-inventory-review')
+        ),
+        s AS (
+          SELECT t.target,
+                 (SELECT MAX(a.done_on) FROM attestation a
+                   WHERE a.obligation = 'pki.certificate-inventory-review' AND a.target = t.target AND a.state = 'yes'
+                     AND NULLIF(TRIM(a.done_on), '') IS NOT NULL) AS last_done,
+                 (SELECT la.state FROM latest_attestation la
+                   WHERE la.obligation = 'pki.certificate-inventory-review' AND la.target = t.target) AS latest_state
+          FROM t
+        )
+        SELECT 'pki.certificate-inventory-review' AS obligation,
+               'Certificate expiry list reviewed' AS title,
+               s.target,
+               CASE WHEN s.target = '-' THEN 'pki.certificate-inventory-review' ELSE 'pki.certificate-inventory-review@' || s.target END AS item,
+               s.last_done,
+               COALESCE(s.latest_state, 'none') AS latest_state,
+               CASE WHEN s.last_done IS NULL THEN 'never attested as done'
+                    ELSE 'last done ' || s.last_done || ', ' || CAST(julianday(:today) - julianday(s.last_done) AS INTEGER) || ' days ago' END AS status_text,
+               CASE WHEN s.last_done IS NULL THEN :today
+                    ELSE date(s.last_done, '+' || COALESCE((SELECT st.value FROM setting st WHERE st.key = 'threshold.obligations.pki.certificate-inventory-review.interval-days'), '30') || ' days') END AS due_on
+        FROM s
+    each:
+      all:
+        - { field: latest_state, op: ne, value: na }
+        - any:
+            - { field: last_done, op: absent }
+            - { field: last_done, op: age-gt, value: 30, threshold: obligations.pki.certificate-inventory-review.interval-days }
+    deadline: due_on
+    evidence: "{title} ({item}): {status_text}; was due {due_on}. Latest attestation: {latest_state}"
+
+  - id: OBL-BACKUP-RESTORE-TEST
+    title: Restore from backup not tested within the interval
+    kind: missing
+    lens: both
+    category: BCK
+    severity: high
+    entity: obligation
+    why: >-
+      A backup that has never been restored is a hope, not a backup: jobs succeed while the data is
+      incomplete, encrypted with a lost key, or too slow to bring back in time.
+    fix: >-
+      Restore a representative sample (files, a database, a whole server) to an isolated location,
+      check the data and record how long it took, then attest obligation backup.restore-test with
+      the backup system or protected system as target.
+    refs: [NIST-800-53:CP-4, NIST-800-53:CP-9(1), CIS-Controls-v8:11.5]
+    refresh: 1d
+    query:
+      protocol: store
+      key: item
+      name: title
+      text: |
+        WITH t AS (
+          SELECT DISTINCT a.target FROM attestation a WHERE a.obligation = 'backup.restore-test'
+          UNION
+          SELECT '-' WHERE NOT EXISTS (SELECT 1 FROM attestation a WHERE a.obligation = 'backup.restore-test')
+        ),
+        s AS (
+          SELECT t.target,
+                 (SELECT MAX(a.done_on) FROM attestation a
+                   WHERE a.obligation = 'backup.restore-test' AND a.target = t.target AND a.state = 'yes'
+                     AND NULLIF(TRIM(a.done_on), '') IS NOT NULL) AS last_done,
+                 (SELECT la.state FROM latest_attestation la
+                   WHERE la.obligation = 'backup.restore-test' AND la.target = t.target) AS latest_state
+          FROM t
+        )
+        SELECT 'backup.restore-test' AS obligation,
+               'Restore test from backup' AS title,
+               s.target,
+               CASE WHEN s.target = '-' THEN 'backup.restore-test' ELSE 'backup.restore-test@' || s.target END AS item,
+               s.last_done,
+               COALESCE(s.latest_state, 'none') AS latest_state,
+               CASE WHEN s.last_done IS NULL THEN 'never attested as done'
+                    ELSE 'last done ' || s.last_done || ', ' || CAST(julianday(:today) - julianday(s.last_done) AS INTEGER) || ' days ago' END AS status_text,
+               CASE WHEN s.last_done IS NULL THEN :today
+                    ELSE date(s.last_done, '+' || COALESCE((SELECT st.value FROM setting st WHERE st.key = 'threshold.obligations.backup.restore-test.interval-days'), '90') || ' days') END AS due_on
+        FROM s
+    each:
+      all:
+        - { field: latest_state, op: ne, value: na }
+        - any:
+            - { field: last_done, op: absent }
+            - { field: last_done, op: age-gt, value: 90, threshold: obligations.backup.restore-test.interval-days }
+    deadline: due_on
+    evidence: "{title} ({item}): {status_text}; was due {due_on}. Latest attestation: {latest_state}"
+
+  - id: OBL-DR-DRILL
+    title: Disaster recovery drill not run within the interval
+    kind: missing
+    lens: both
+    category: BCK
+    severity: high
+    entity: obligation
+    why: >-
+      Recovery plans rot: systems move, people leave, dependencies change. Only a drill shows
+      whether the most critical systems really come back within the time the organisation expects.
+    fix: >-
+      Run a recovery drill for the most critical systems (failover or restore at the recovery
+      site), measure recovery time against the target, fix the gaps, then attest obligation
+      dr.drill with the system as target.
+    refs: [NIST-800-53:CP-4]
+    refresh: 1d
+    query:
+      protocol: store
+      key: item
+      name: title
+      text: |
+        WITH t AS (
+          SELECT DISTINCT a.target FROM attestation a WHERE a.obligation = 'dr.drill'
+          UNION
+          SELECT '-' WHERE NOT EXISTS (SELECT 1 FROM attestation a WHERE a.obligation = 'dr.drill')
+        ),
+        s AS (
+          SELECT t.target,
+                 (SELECT MAX(a.done_on) FROM attestation a
+                   WHERE a.obligation = 'dr.drill' AND a.target = t.target AND a.state = 'yes'
+                     AND NULLIF(TRIM(a.done_on), '') IS NOT NULL) AS last_done,
+                 (SELECT la.state FROM latest_attestation la
+                   WHERE la.obligation = 'dr.drill' AND la.target = t.target) AS latest_state
+          FROM t
+        )
+        SELECT 'dr.drill' AS obligation,
+               'Disaster recovery drill for the most critical systems' AS title,
+               s.target,
+               CASE WHEN s.target = '-' THEN 'dr.drill' ELSE 'dr.drill@' || s.target END AS item,
+               s.last_done,
+               COALESCE(s.latest_state, 'none') AS latest_state,
+               CASE WHEN s.last_done IS NULL THEN 'never attested as done'
+                    ELSE 'last done ' || s.last_done || ', ' || CAST(julianday(:today) - julianday(s.last_done) AS INTEGER) || ' days ago' END AS status_text,
+               CASE WHEN s.last_done IS NULL THEN :today
+                    ELSE date(s.last_done, '+' || COALESCE((SELECT st.value FROM setting st WHERE st.key = 'threshold.obligations.dr.drill.interval-days'), '365') || ' days') END AS due_on
+        FROM s
+    each:
+      all:
+        - { field: latest_state, op: ne, value: na }
+        - any:
+            - { field: last_done, op: absent }
+            - { field: last_done, op: age-gt, value: 365, threshold: obligations.dr.drill.interval-days }
+    deadline: due_on
+    evidence: "{title} ({item}): {status_text}; was due {due_on}. Latest attestation: {latest_state}"
+
+  - id: OBL-LICENCE-REVIEW
+    title: Licence review not done within the interval
+    kind: missing
+    lens: maintenance
+    category: CST
+    severity: low
+    entity: obligation
+    why: >-
+      Paid licences assigned to accounts nobody uses are money every month and attack surface, and
+      the licence register drifts from reality unless someone compares it with the consoles.
+    fix: >-
+      Compare assigned licences with recent sign-in and usage, reclaim what is idle, update seats
+      and seats_used in the licence register, then attest obligation licence.review.
+    refs: [NIST-800-53:CM-10]
+    refresh: 1d
+    query:
+      protocol: store
+      key: item
+      name: title
+      text: |
+        WITH t AS (
+          SELECT DISTINCT a.target FROM attestation a WHERE a.obligation = 'licence.review'
+          UNION
+          SELECT '-' WHERE NOT EXISTS (SELECT 1 FROM attestation a WHERE a.obligation = 'licence.review')
+        ),
+        s AS (
+          SELECT t.target,
+                 (SELECT MAX(a.done_on) FROM attestation a
+                   WHERE a.obligation = 'licence.review' AND a.target = t.target AND a.state = 'yes'
+                     AND NULLIF(TRIM(a.done_on), '') IS NOT NULL) AS last_done,
+                 (SELECT la.state FROM latest_attestation la
+                   WHERE la.obligation = 'licence.review' AND la.target = t.target) AS latest_state
+          FROM t
+        )
+        SELECT 'licence.review' AS obligation,
+               'Licence review (unused and over-used paid licences)' AS title,
+               s.target,
+               CASE WHEN s.target = '-' THEN 'licence.review' ELSE 'licence.review@' || s.target END AS item,
+               s.last_done,
+               COALESCE(s.latest_state, 'none') AS latest_state,
+               CASE WHEN s.last_done IS NULL THEN 'never attested as done'
+                    ELSE 'last done ' || s.last_done || ', ' || CAST(julianday(:today) - julianday(s.last_done) AS INTEGER) || ' days ago' END AS status_text,
+               CASE WHEN s.last_done IS NULL THEN :today
+                    ELSE date(s.last_done, '+' || COALESCE((SELECT st.value FROM setting st WHERE st.key = 'threshold.obligations.licence.review.interval-days'), '90') || ' days') END AS due_on
+        FROM s
+    each:
+      all:
+        - { field: latest_state, op: ne, value: na }
+        - any:
+            - { field: last_done, op: absent }
+            - { field: last_done, op: age-gt, value: 90, threshold: obligations.licence.review.interval-days }
+    deadline: due_on
+    evidence: "{title} ({item}): {status_text}; was due {due_on}. Latest attestation: {latest_state}"
+
+  - id: OBL-IAM-VENDOR-ACCESS-REVIEW
+    title: Vendor and external accounts not reviewed within the interval
+    kind: missing
+    lens: security
+    category: IAM
+    severity: medium
+    entity: obligation
+    why: >-
+      Vendor and guest accounts outlive the contract or the project they were created for, and
+      nobody inside the organisation notices when they are used.
+    fix: >-
+      List every vendor, contractor and guest account (directory, cloud, remote access, product
+      consoles), confirm each with its sponsor and an active contract, remove the rest, then attest
+      obligation iam.vendor-access-review.
+    refs: [NIST-800-53:AC-2, NIST-800-53:PS-7]
+    refresh: 1d
+    query:
+      protocol: store
+      key: item
+      name: title
+      text: |
+        WITH t AS (
+          SELECT DISTINCT a.target FROM attestation a WHERE a.obligation = 'iam.vendor-access-review'
+          UNION
+          SELECT '-' WHERE NOT EXISTS (SELECT 1 FROM attestation a WHERE a.obligation = 'iam.vendor-access-review')
+        ),
+        s AS (
+          SELECT t.target,
+                 (SELECT MAX(a.done_on) FROM attestation a
+                   WHERE a.obligation = 'iam.vendor-access-review' AND a.target = t.target AND a.state = 'yes'
+                     AND NULLIF(TRIM(a.done_on), '') IS NOT NULL) AS last_done,
+                 (SELECT la.state FROM latest_attestation la
+                   WHERE la.obligation = 'iam.vendor-access-review' AND la.target = t.target) AS latest_state
+          FROM t
+        )
+        SELECT 'iam.vendor-access-review' AS obligation,
+               'Vendor and external accounts reviewed' AS title,
+               s.target,
+               CASE WHEN s.target = '-' THEN 'iam.vendor-access-review' ELSE 'iam.vendor-access-review@' || s.target END AS item,
+               s.last_done,
+               COALESCE(s.latest_state, 'none') AS latest_state,
+               CASE WHEN s.last_done IS NULL THEN 'never attested as done'
+                    ELSE 'last done ' || s.last_done || ', ' || CAST(julianday(:today) - julianday(s.last_done) AS INTEGER) || ' days ago' END AS status_text,
+               CASE WHEN s.last_done IS NULL THEN :today
+                    ELSE date(s.last_done, '+' || COALESCE((SELECT st.value FROM setting st WHERE st.key = 'threshold.obligations.iam.vendor-access-review.interval-days'), '90') || ' days') END AS due_on
+        FROM s
+    each:
+      all:
+        - { field: latest_state, op: ne, value: na }
+        - any:
+            - { field: last_done, op: absent }
+            - { field: last_done, op: age-gt, value: 90, threshold: obligations.iam.vendor-access-review.interval-days }
+    deadline: due_on
+    evidence: "{title} ({item}): {status_text}; was due {due_on}. Latest attestation: {latest_state}"
+
+  - id: OBL-SECURITY-PENETRATION-TEST
+    title: Independent penetration test not done within the interval
+    kind: missing
+    lens: security
+    category: MON
+    severity: medium
+    entity: obligation
+    why: >-
+      Self-review finds what its authors thought to look for. An independent test finds the paths
+      an attacker would actually take, before the attacker does.
+    fix: >-
+      Commission an external penetration test (or red-team exercise) with an agreed scope, track
+      its findings to closure, then attest obligation security.penetration-test.
+    refs: [NIST-800-53:CA-8, CIS-Controls-v8:18.2]
+    refresh: 1d
+    query:
+      protocol: store
+      key: item
+      name: title
+      text: |
+        WITH t AS (
+          SELECT DISTINCT a.target FROM attestation a WHERE a.obligation = 'security.penetration-test'
+          UNION
+          SELECT '-' WHERE NOT EXISTS (SELECT 1 FROM attestation a WHERE a.obligation = 'security.penetration-test')
+        ),
+        s AS (
+          SELECT t.target,
+                 (SELECT MAX(a.done_on) FROM attestation a
+                   WHERE a.obligation = 'security.penetration-test' AND a.target = t.target AND a.state = 'yes'
+                     AND NULLIF(TRIM(a.done_on), '') IS NOT NULL) AS last_done,
+                 (SELECT la.state FROM latest_attestation la
+                   WHERE la.obligation = 'security.penetration-test' AND la.target = t.target) AS latest_state
+          FROM t
+        )
+        SELECT 'security.penetration-test' AS obligation,
+               'External penetration test or red-team exercise' AS title,
+               s.target,
+               CASE WHEN s.target = '-' THEN 'security.penetration-test' ELSE 'security.penetration-test@' || s.target END AS item,
+               s.last_done,
+               COALESCE(s.latest_state, 'none') AS latest_state,
+               CASE WHEN s.last_done IS NULL THEN 'never attested as done'
+                    ELSE 'last done ' || s.last_done || ', ' || CAST(julianday(:today) - julianday(s.last_done) AS INTEGER) || ' days ago' END AS status_text,
+               CASE WHEN s.last_done IS NULL THEN :today
+                    ELSE date(s.last_done, '+' || COALESCE((SELECT st.value FROM setting st WHERE st.key = 'threshold.obligations.security.penetration-test.interval-days'), '365') || ' days') END AS due_on
+        FROM s
+    each:
+      all:
+        - { field: latest_state, op: ne, value: na }
+        - any:
+            - { field: last_done, op: absent }
+            - { field: last_done, op: age-gt, value: 365, threshold: obligations.security.penetration-test.interval-days }
+    deadline: due_on
+    evidence: "{title} ({item}): {status_text}; was due {due_on}. Latest attestation: {latest_state}"
+
+  - id: OBL-KEEPER-DEEP-REVIEW
+    title: Keeper deep review not run within the interval
+    kind: missing
+    lens: both
+    category: HYG
+    severity: medium
+    entity: obligation
+    why: >-
+      Daily scans cover the fast-changing checks; the slow, expensive ones (configuration
+      structure, rarely-changing settings, everything that needs a person to read it) only run in
+      the deep review. Skipping it lets slow drift go unseen.
+    fix: >-
+      Run the full deep review for each system type, triage what it found, then attest obligation
+      keeper.deep-review with the system as target.
+    refs: [NIST-800-53:CA-7]
+    refresh: 1d
+    query:
+      protocol: store
+      key: item
+      name: title
+      text: |
+        WITH t AS (
+          SELECT DISTINCT a.target FROM attestation a WHERE a.obligation = 'keeper.deep-review'
+          UNION
+          SELECT '-' WHERE NOT EXISTS (SELECT 1 FROM attestation a WHERE a.obligation = 'keeper.deep-review')
+        ),
+        s AS (
+          SELECT t.target,
+                 (SELECT MAX(a.done_on) FROM attestation a
+                   WHERE a.obligation = 'keeper.deep-review' AND a.target = t.target AND a.state = 'yes'
+                     AND NULLIF(TRIM(a.done_on), '') IS NOT NULL) AS last_done,
+                 (SELECT la.state FROM latest_attestation la
+                   WHERE la.obligation = 'keeper.deep-review' AND la.target = t.target) AS latest_state
+          FROM t
+        )
+        SELECT 'keeper.deep-review' AS obligation,
+               'Keeper deep review' AS title,
+               s.target,
+               CASE WHEN s.target = '-' THEN 'keeper.deep-review' ELSE 'keeper.deep-review@' || s.target END AS item,
+               s.last_done,
+               COALESCE(s.latest_state, 'none') AS latest_state,
+               CASE WHEN s.last_done IS NULL THEN 'never attested as done'
+                    ELSE 'last done ' || s.last_done || ', ' || CAST(julianday(:today) - julianday(s.last_done) AS INTEGER) || ' days ago' END AS status_text,
+               CASE WHEN s.last_done IS NULL THEN :today
+                    ELSE date(s.last_done, '+' || COALESCE((SELECT st.value FROM setting st WHERE st.key = 'threshold.obligations.keeper.deep-review.interval-days'), '183') || ' days') END AS due_on
+        FROM s
+    each:
+      all:
+        - { field: latest_state, op: ne, value: na }
+        - any:
+            - { field: last_done, op: absent }
+            - { field: last_done, op: age-gt, value: 183, threshold: obligations.keeper.deep-review.interval-days }
+    deadline: due_on
+    evidence: "{title} ({item}): {status_text}; was due {due_on}. Latest attestation: {latest_state}"
+
+  # Per change, not per calendar: target = the script, automation or pipeline. Attest 'yes' when it
+  # was reviewed (code and behaviour), checked for embedded secrets, run in staging and signed;
+  # attest 'no' for one that runs in production without that. The interval is the re-review period.
+  - id: OBL-CHANGE-CODE-REVIEW
+    title: Production script or automation not reviewed, staged and signed within the interval
+    kind: missing
+    lens: security
+    category: IAM
+    severity: high
+    entity: obligation
+    why: >-
+      Scripts and automations that create accounts, change permissions or reconfigure production
+      act with high privilege and at scale. Without review, a secrets check, a staging run and a
+      signature, one mistake reaches every object at once, embedded keys leak, and its alerts bury
+      real incidents in the SOC.
+    fix: >-
+      Before a script runs in production: review the code and what it does, check it holds no
+      secrets, run it in staging, sign the approved version, prefer an already-approved tool where
+      one exists - then attest obligation change.code-review with the script as target. Re-review
+      when it changes or when the interval passes.
+    refs: [NIST-800-53:CM-3, NIST-800-53:SA-11, NIST-800-53:CM-14]
+    refresh: 1d
+    query:
+      protocol: store
+      key: item
+      name: title
+      text: |
+        WITH t AS (
+          SELECT DISTINCT a.target FROM attestation a WHERE a.obligation = 'change.code-review'
+          UNION
+          SELECT '-' WHERE NOT EXISTS (SELECT 1 FROM attestation a WHERE a.obligation = 'change.code-review')
+        ),
+        s AS (
+          SELECT t.target,
+                 (SELECT MAX(a.done_on) FROM attestation a
+                   WHERE a.obligation = 'change.code-review' AND a.target = t.target AND a.state = 'yes'
+                     AND NULLIF(TRIM(a.done_on), '') IS NOT NULL) AS last_done,
+                 (SELECT la.state FROM latest_attestation la
+                   WHERE la.obligation = 'change.code-review' AND la.target = t.target) AS latest_state
+          FROM t
+        )
+        SELECT 'change.code-review' AS obligation,
+               'Script and automation review before production' AS title,
+               s.target,
+               CASE WHEN s.target = '-' THEN 'change.code-review' ELSE 'change.code-review@' || s.target END AS item,
+               s.last_done,
+               COALESCE(s.latest_state, 'none') AS latest_state,
+               CASE WHEN s.last_done IS NULL THEN 'never attested as done'
+                    ELSE 'last done ' || s.last_done || ', ' || CAST(julianday(:today) - julianday(s.last_done) AS INTEGER) || ' days ago' END AS status_text,
+               CASE WHEN s.last_done IS NULL THEN :today
+                    ELSE date(s.last_done, '+' || COALESCE((SELECT st.value FROM setting st WHERE st.key = 'threshold.obligations.change.code-review.interval-days'), '365') || ' days') END AS due_on
+        FROM s
+    each:
+      all:
+        - { field: latest_state, op: ne, value: na }
+        - any:
+            - { field: last_done, op: absent }
+            - { field: last_done, op: age-gt, value: 365, threshold: obligations.change.code-review.interval-days }
+    deadline: due_on
+    evidence: "{title} ({item}): {status_text}; was due {due_on}. Latest attestation: {latest_state}"
+
+  # ----------------------------------------------- every attestation, any obligation
+  - id: OBL-ATTESTATION-EXPIRED
+    title: Attestation has expired
+    kind: missing
+    lens: both
+    category: HYG
+    severity:
+      field: obligation
+      map:
+        ad.krbtgt-rotation: high
+        ad.system-state-backup: high
+        ad.forest-recovery-test: high
+        backup.restore-test: high
+        dr.drill: high
+        change.code-review: high
+        iam.stale-account-cleanup: low
+        licence.review: low
+      default: medium
+    entity: attestation
+    why: >-
+      Whoever attested this said how long it holds. Past that date it proves nothing - a 'na' may
+      no longer be true and a 'yes' may describe a system that has since changed.
+    fix: Do the obligation again (or re-confirm that it does not apply) and record a new attestation.
+    refresh: 1d
+    query:
+      protocol: store
+      key: item
+      name: obligation
+      text: |
+        SELECT la.attestation_id,
+               la.obligation,
+               la.target,
+               CASE WHEN la.target = '-' THEN la.obligation ELSE la.obligation || '@' || la.target END AS item,
+               la.state,
+               NULLIF(TRIM(la.done_on), '') AS done_on,
+               NULLIF(TRIM(la.expires_on), '') AS expires_on,
+               la.actor,
+               la.recorded_at
+        FROM latest_attestation la
+    each: { field: expires_on, op: until-lt, value: 0 }
+    deadline: expires_on
+    evidence: "{item}: attested {state} by {actor} on {recorded_at}, expired {expires_on}"
+
+  - id: OBL-ATTESTATION-EXPIRING
+    title: Attestation expires soon
+    kind: missing
+    lens: both
+    category: HYG
+    severity:
+      daysLeft: expires_on
+      ranges:
+        - { max: 7, value: high }
+        - { max: 14, value: medium }
+      default: low
+    entity: attestation
+    why: >-
+      An attestation that lapses turns a proven obligation into an open finding. Planning the
+      repeat (a drill, a restore test, a review) takes longer than the last few days.
+    fix: Schedule the obligation now so a new attestation is recorded before this one expires.
+    refresh: 1d
+    query:
+      protocol: store
+      key: item
+      name: obligation
+      text: |
+        SELECT la.attestation_id,
+               la.obligation,
+               la.target,
+               CASE WHEN la.target = '-' THEN la.obligation ELSE la.obligation || '@' || la.target END AS item,
+               la.state,
+               NULLIF(TRIM(la.done_on), '') AS done_on,
+               NULLIF(TRIM(la.expires_on), '') AS expires_on,
+               la.actor,
+               la.recorded_at
+        FROM latest_attestation la
+    each:
+      all:
+        - { field: expires_on, op: until-lt, value: 30, threshold: obligations.expiry-notice-days }
+        - not: { field: expires_on, op: until-lt, value: 0 }
+    deadline: expires_on
+    evidence: "{item}: attested {state} by {actor}, expires {expires_on}"
+
+  - id: OBL-ATTESTED-NO
+    title: Obligation attested as not done
+    kind: missing
+    lens: both
+    category: HYG
+    severity:
+      field: obligation
+      map:
+        ad.krbtgt-rotation: high
+        ad.system-state-backup: high
+        ad.forest-recovery-test: high
+        backup.restore-test: high
+        dr.drill: high
+        change.code-review: high
+        iam.stale-account-cleanup: low
+        licence.review: low
+      default: medium
+    entity: attestation
+    why: >-
+      Someone recorded that this obligation is not met - for example a script running in production
+      without review, or a restore test that failed. That is an open gap until it is redone.
+    fix: Close the gap the attestation describes, then record a new 'yes' attestation with evidence.
+    refresh: 1d
+    query:
+      protocol: store
+      key: item
+      name: obligation
+      text: |
+        SELECT la.attestation_id,
+               la.obligation,
+               la.target,
+               CASE WHEN la.target = '-' THEN la.obligation ELSE la.obligation || '@' || la.target END AS item,
+               la.state,
+               NULLIF(TRIM(la.done_on), '') AS done_on,
+               NULLIF(TRIM(la.expires_on), '') AS expires_on,
+               la.actor,
+               la.recorded_at
+        FROM latest_attestation la
+    each: { field: state, op: eq, value: "no" }
+    evidence: "{item}: attested 'no' by {actor} on {recorded_at}"
+
+  - id: OBL-ATTESTATION-NO-DATE
+    title: Attestation of a done obligation has no date
+    kind: missing
+    lens: both
+    category: HYG
+    severity: low
+    entity: attestation
+    why: >-
+      A 'yes' without the date it was done cannot show the obligation is within its interval, so the
+      obligation rules ignore it and keep reporting the obligation as due.
+    fix: Record a new attestation with done_on set to the day the work was done.
+    refresh: 1d
+    query:
+      protocol: store
+      key: item
+      name: obligation
+      text: |
+        SELECT la.attestation_id,
+               la.obligation,
+               la.target,
+               CASE WHEN la.target = '-' THEN la.obligation ELSE la.obligation || '@' || la.target END AS item,
+               la.state,
+               NULLIF(TRIM(la.done_on), '') AS done_on,
+               NULLIF(TRIM(la.expires_on), '') AS expires_on,
+               la.actor,
+               la.recorded_at
+        FROM latest_attestation la
+    each:
+      all:
+        - { field: state, op: eq, value: "yes" }
+        - { field: done_on, op: absent }
+    evidence: "{item}: attested 'yes' by {actor} on {recorded_at} without a done_on date"
+
+  - id: OBL-ATTESTATION-FUTURE-DATE
+    title: Attestation is dated in the future
+    kind: misconfigured
+    lens: both
+    category: HYG
+    severity: low
+    entity: attestation
+    why: >-
+      A done_on date in the future (usually a typo) makes the obligation look fresh for longer than
+      it is, hiding the moment it really falls due.
+    fix: Record a corrected attestation with the real done_on date.
+    refresh: 1d
+    query:
+      protocol: store
+      key: item
+      name: obligation
+      text: |
+        SELECT la.attestation_id,
+               la.obligation,
+               la.target,
+               CASE WHEN la.target = '-' THEN la.obligation ELSE la.obligation || '@' || la.target END AS item,
+               la.state,
+               NULLIF(TRIM(la.done_on), '') AS done_on,
+               NULLIF(TRIM(la.expires_on), '') AS expires_on,
+               la.actor,
+               la.recorded_at
+        FROM latest_attestation la
+    each:
+      all:
+        - { field: state, op: eq, value: "yes" }
+        - { field: done_on, op: age-lt, value: -1 }
+    evidence: "{item}: attested 'yes' by {actor} with done_on {done_on}, which is in the future"

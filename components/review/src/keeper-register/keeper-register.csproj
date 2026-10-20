@@ -1,0 +1,10 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <AssemblyName>keeper-register</AssemblyName>
+    <RootNamespace>Keeper.Cli.Register</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\Keeper.Review.Cli\Keeper.Review.Cli.csproj" />
+  </ItemGroup>
+</Project>

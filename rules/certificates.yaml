@@ -1,0 +1,393 @@
+schema: keeper.rules/1
+system: certificates
+name: Certificates on TLS endpoints
+integration: tls
+# Targets come from the tls integration's "targets" option (host or host:port, default port 443).
+# Every rule below uses the same query, so each endpoint gets one handshake per scan.
+# Bind lab and test endpoints as their own tls integration: rules that judge production
+# (self-signed, private CA) can then be disabled there with an override instead of everywhere.
+rules:
+  - id: TLS-CERT-EXPIRED
+    title: Certificate on a TLS endpoint has expired
+    kind: broken
+    lens: both
+    category: PKI
+    severity: critical
+    entity: endpoint
+    why: >-
+      Clients refuse an expired certificate, so the service is already failing for anyone who
+      validates it, and people learn to click through warnings.
+    fix: >-
+      Issue a new certificate, install it on the endpoint and on every load balancer or proxy in
+      front of it, then restart or reload the service. Record the next expiry as a key date if the
+      renewal is manual.
+    refs: [NIST-800-53:SC-17, NIST-SP-1800-16]
+    refresh: 1d
+    query: { protocol: tls, key: endpoint, name: subject }
+    each: { field: notAfter, op: until-lt, value: 0 }
+    deadline: notAfter
+    evidence: "{endpoint}: {subject} expired on {notAfter} (issuer {issuer})"
+
+  - id: TLS-CERT-EXPIRING
+    title: Certificate on a TLS endpoint expires soon
+    kind: broken
+    lens: both
+    category: PKI
+    severity:
+      daysLeft: notAfter
+      ranges:
+        - { max: 7, value: critical }
+        - { max: 14, value: high }
+        - { max: 30, value: medium }
+      default: low
+    entity: endpoint
+    why: >-
+      A certificate that lapses takes the service down at a time nobody chose. Renewal often needs
+      a purchase, an approval or a change window, which takes longer than the last week.
+    fix: >-
+      Renew now and install the new certificate everywhere the old one is used. Where the issuer
+      supports it, automate renewal (ACME or the CA's agent) so the date stops mattering.
+    refs: [NIST-800-53:SC-17, NIST-SP-1800-16]
+    refresh: 1d
+    query: { protocol: tls, key: endpoint, name: subject }
+    each:
+      all:
+        - { field: notAfter, op: until-lt, value: 60, threshold: tls.notice-days }
+        - not: { field: notAfter, op: until-lt, value: 0 }
+    deadline: notAfter
+    evidence: "{endpoint}: {subject} expires {notAfter} ({daysLeft} days left), issuer {issuer}"
+
+  - id: TLS-CERT-NOT-YET-VALID
+    title: Certificate on a TLS endpoint is not valid yet
+    kind: broken
+    lens: both
+    category: PKI
+    severity: high
+    entity: endpoint
+    why: >-
+      Clients reject a certificate whose start date is in the future. It usually means the
+      certificate was installed too early or a clock is wrong on the issuer or the server.
+    fix: >-
+      Check the server and CA clocks (time synchronisation), then reissue or reinstall a
+      certificate whose validity has started.
+    refs: [RFC-5280]
+    refresh: 1d
+    query: { protocol: tls, key: endpoint, name: subject }
+    each: { field: notBefore, op: age-lt, value: 0 }
+    evidence: "{endpoint}: {subject} is valid only from {notBefore}"
+
+  - id: TLS-SELF-SIGNED
+    title: Self-signed certificate on a TLS endpoint
+    kind: misconfigured
+    lens: security
+    category: PKI
+    severity: medium
+    entity: endpoint
+    why: >-
+      Nobody vouches for a self-signed certificate, so clients either fail or are configured to
+      trust anything, and an interception would look the same. It also escapes CA-side expiry
+      tracking and revocation.
+    fix: >-
+      Replace it with a certificate from the organisation's CA (internal services) or a public CA
+      (external ones). If this endpoint is a lab system, move it to a separate tls integration and
+      disable this rule there.
+    refs: [NIST-800-53:SC-17, NIST-SP-1800-16]
+    refresh: 1d
+    query: { protocol: tls, key: endpoint, name: subject }
+    each: { field: selfSigned, op: eq, value: true }
+    evidence: "{endpoint}: self-signed {subject}, valid until {notAfter}"
+
+  - id: TLS-CHAIN-UNTRUSTED-ROOT
+    title: Certificate chains to a root the scanning host does not trust
+    kind: misconfigured
+    lens: security
+    category: PKI
+    severity: high
+    entity: endpoint
+    why: >-
+      The certificate was issued by a CA that is not in the trust store of Keeper's host. Either
+      the private root is not deployed to clients either, or something other than the expected
+      CA issued it.
+    fix: >-
+      Confirm which CA issued it. If it is the organisation's own CA, deploy that root to the
+      clients (and to Keeper's host); if not, find out why the endpoint presents it and replace it.
+    refs: [NIST-800-53:SC-17, RFC-5280]
+    refresh: 1d
+    query: { protocol: tls, key: endpoint, name: subject }
+    each:
+      all:
+        - { field: selfSigned, op: eq, value: false }
+        - { field: chainErrors, op: contains, value: UntrustedRoot }
+    evidence: "{endpoint}: {subject} issued by {issuer}; chain: {chainErrors}"
+
+  - id: TLS-CHAIN-INCOMPLETE
+    title: Certificate chain cannot be completed
+    kind: misconfigured
+    lens: security
+    category: PKI
+    severity: high
+    entity: endpoint
+    why: >-
+      The server does not send an intermediate certificate and it could not be fetched. Clients
+      that do not download missing intermediates (many devices, libraries and appliances) fail.
+    fix: >-
+      Install the full chain (leaf plus intermediates, not the root) on the endpoint, and make sure
+      the issuer's AIA location is reachable.
+    refs: [NIST-800-53:SC-17, RFC-5280]
+    refresh: 1d
+    query: { protocol: tls, key: endpoint, name: subject }
+    each: { field: chainErrors, op: contains, value: PartialChain }
+    evidence: "{endpoint}: {subject} issued by {issuer}; chain: {chainErrors}"
+
+  - id: TLS-CHAIN-CA-EXPIRED
+    title: A CA certificate in the chain has expired
+    kind: broken
+    lens: both
+    category: PKI
+    severity: high
+    entity: endpoint
+    why: >-
+      The endpoint's own certificate is in date but an intermediate or root above it is not, so
+      validation fails anyway. This is easy to miss because the leaf's expiry date looks fine.
+    fix: >-
+      Install the current intermediate chain from the issuer. If the issuing CA itself has
+      expired, reissue the leaf from a valid CA.
+    refs: [NIST-800-53:SC-17, RFC-5280]
+    refresh: 1d
+    query: { protocol: tls, key: endpoint, name: subject }
+    each:
+      all:
+        - { field: chainErrors, op: contains, value: NotTimeValid }
+        - not: { field: notAfter, op: until-lt, value: 0 }
+        - not: { field: notBefore, op: age-lt, value: 0 }
+    evidence: "{endpoint}: leaf valid until {notAfter} but the chain reports {chainErrors} (issuer {issuer})"
+
+  - id: TLS-CHAIN-INVALID
+    title: Certificate chain fails validation for another reason
+    kind: broken
+    lens: security
+    category: PKI
+    severity: high
+    entity: endpoint
+    why: >-
+      Validation failed for a reason other than an untrusted root, a missing intermediate or an
+      expired certificate - for example a bad signature, a wrong key usage or a name constraint.
+      Clients that validate properly will refuse the connection.
+    fix: >-
+      Read the chain errors in the evidence, then reissue the certificate with the right usage and
+      install the issuer's current chain.
+    refs: [NIST-800-53:SC-17, RFC-5280]
+    refresh: 1d
+    query: { protocol: tls, key: endpoint, name: subject }
+    each:
+      all:
+        - { field: chainValid, op: eq, value: false }
+        - { field: selfSigned, op: eq, value: false }
+        - { field: chainErrors, op: notcontains, value: UntrustedRoot }
+        - { field: chainErrors, op: notcontains, value: PartialChain }
+        - { field: chainErrors, op: notcontains, value: NotTimeValid }
+    evidence: "{endpoint}: {subject}; chain errors: {chainErrors}"
+
+  - id: TLS-NAME-MISMATCH
+    title: Certificate does not match the endpoint's name
+    kind: misconfigured
+    lens: security
+    category: PKI
+    severity: medium
+    entity: endpoint
+    why: >-
+      Clients compare the name they connected to with the names in the certificate. A mismatch
+      fails strict clients and trains users and scripts to skip the check.
+    fix: >-
+      Reissue the certificate with every name clients use in the subject alternative names, or
+      point the target at the name the certificate was issued for.
+    refs: [RFC-9525, NIST-800-53:SC-17]
+    refresh: 1d
+    query: { protocol: tls, key: endpoint, name: subject }
+    each: { field: nameMatches, op: eq, value: false }
+    evidence: "{endpoint}: certificate names {sans} (subject {subject})"
+
+  - id: TLS-NO-SAN
+    title: Certificate has no DNS subject alternative names
+    kind: misconfigured
+    lens: security
+    category: PKI
+    severity: medium
+    entity: endpoint
+    why: >-
+      Current browsers and libraries ignore the subject common name and match only the subject
+      alternative names, so a certificate without them fails there even if older clients accept it.
+    fix: >-
+      Reissue the certificate with the DNS names in the subject alternative name extension (fix the
+      CA template if it does not add them). Certificates for IP addresses only also land here.
+    refs: [RFC-9525, CABF-BR]
+    refresh: 1d
+    query: { protocol: tls, key: endpoint, name: subject }
+    each: { field: sans, op: empty }
+    evidence: "{endpoint}: {subject} carries no DNS names"
+
+  - id: TLS-WILDCARD
+    title: Wildcard certificate on a TLS endpoint
+    kind: misconfigured
+    lens: security
+    category: PKI
+    severity: low
+    entity: endpoint
+    why: >-
+      A wildcard certificate's private key is usually copied to many servers, so one compromised
+      host can impersonate every name under the domain, and renewal has to reach every copy.
+    fix: >-
+      Prefer certificates per service with only the names it needs. Where a wildcard is kept,
+      list every host that holds the key and renew them together.
+    refs: [NIST-SP-1800-16]
+    refresh: 1d
+    query: { protocol: tls, key: endpoint, name: subject }
+    each: { field: sans, op: match, value: '^\*\.' }
+    evidence: "{endpoint}: names {sans}"
+
+  - id: TLS-WEAK-RSA-KEY
+    title: Certificate has a short RSA key
+    kind: misconfigured
+    lens: security
+    category: PKI
+    severity: high
+    entity: endpoint
+    why: >-
+      RSA keys below the current minimum size give less protection than the rest of the
+      connection assumes, and clients increasingly refuse them.
+    fix: >-
+      Generate a new key of at least the minimum size (or an EC key), request a new certificate
+      for it and replace the old one. Raise the minimum in the CA template too.
+    refs: [NIST-SP-800-131A, NIST-SP-800-57-1]
+    refresh: 1d
+    query: { protocol: tls, key: endpoint, name: subject }
+    each:
+      all:
+        - { field: keyAlgorithm, op: match, value: '^RSA' }
+        - { field: keySize, op: lt, value: 2048, threshold: tls.min-rsa-key-bits }
+    evidence: "{endpoint}: {keyAlgorithm} {keySize}-bit key"
+
+  - id: TLS-WEAK-EC-KEY
+    title: Certificate has a short elliptic-curve key
+    kind: misconfigured
+    lens: security
+    category: PKI
+    severity: high
+    entity: endpoint
+    why: Elliptic-curve keys on curves below 256 bits are below the current minimum strength.
+    fix: >-
+      Generate a new key on P-256 or larger, request a new certificate for it and replace the
+      old one.
+    refs: [NIST-SP-800-131A, NIST-SP-800-57-1]
+    refresh: 1d
+    query: { protocol: tls, key: endpoint, name: subject }
+    each:
+      all:
+        - { field: keyAlgorithm, op: match, value: '^EC' }
+        - { field: keySize, op: lt, value: 256, threshold: tls.min-ec-key-bits }
+    evidence: "{endpoint}: {keyAlgorithm} {keySize}-bit key"
+
+  - id: TLS-WEAK-SIGNATURE
+    title: Certificate is signed with SHA-1 or MD5
+    kind: misconfigured
+    lens: security
+    category: PKI
+    severity: high
+    entity: endpoint
+    why: >-
+      Collisions have been shown for SHA-1 and MD5, so a signature made with them no longer proves
+      the CA issued this exact certificate. Clients reject such certificates.
+    fix: >-
+      Reissue the certificate with a SHA-256 (or stronger) signature; if the CA still signs with
+      SHA-1, change the CA's hash setting first.
+    refs: [NIST-SP-800-131A]
+    refresh: 1d
+    query: { protocol: tls, key: endpoint, name: subject }
+    each: { field: signatureAlgorithm, op: match, value: '^(md2|md4|md5|sha1)' }
+    evidence: "{endpoint}: signature {signatureAlgorithm}, issuer {issuer}"
+
+  - id: TLS-LEGACY-PROTOCOL
+    title: Endpoint negotiates SSL, TLS 1.0 or TLS 1.1
+    kind: misconfigured
+    lens: security
+    category: PKI
+    severity: high
+    entity: endpoint
+    why: >-
+      The best protocol this endpoint offered was a deprecated one. These versions lack modern
+      protections and are disabled by current clients, so the service is both weaker and about to
+      break for some users.
+    fix: >-
+      Enable TLS 1.2 and TLS 1.3 on the service (OS, web server or appliance settings), then
+      disable the old versions. Older devices that still need them should be listed and replaced.
+    refs: [RFC-8996, NIST-SP-800-52r2]
+    refresh: 1d
+    query: { protocol: tls, key: endpoint, name: subject }
+    each: { field: protocol, op: in, value: [Ssl2, Ssl3, Tls, Tls11] }
+    evidence: "{endpoint}: negotiated {protocol} with {cipherSuite}"
+
+  - id: TLS-WEAK-CIPHER
+    title: Endpoint negotiates a broken cipher suite
+    kind: misconfigured
+    lens: security
+    category: PKI
+    severity: high
+    entity: endpoint
+    why: >-
+      The suite chosen for the connection uses RC4, DES or 3DES, no encryption, export-grade keys,
+      anonymous key exchange or MD5. Traffic protected by it can be read or altered.
+    fix: >-
+      Remove these suites from the server's cipher list and prefer AEAD suites (AES-GCM or
+      ChaCha20-Poly1305) with ECDHE key exchange.
+    refs: [NIST-SP-800-52r2, RFC-7465]
+    refresh: 1d
+    query: { protocol: tls, key: endpoint, name: subject }
+    each: { field: cipherSuite, op: match, value: '(_RC4_|_DES_|3DES|_NULL_|_EXPORT|_anon_|_MD5$)' }
+    evidence: "{endpoint}: {protocol} {cipherSuite}"
+
+  - id: TLS-NO-FORWARD-SECRECY
+    title: Endpoint negotiates a suite without forward secrecy
+    kind: misconfigured
+    lens: security
+    category: PKI
+    severity: medium
+    entity: endpoint
+    why: >-
+      With static RSA or static Diffie-Hellman key exchange, anyone who later obtains the server's
+      private key can decrypt recorded past traffic.
+    fix: >-
+      Prefer ECDHE (or DHE) suites and remove the static RSA and static DH suites from the
+      server's list; TLS 1.3 always provides forward secrecy.
+    refs: [NIST-SP-800-52r2]
+    refresh: 1d
+    query: { protocol: tls, key: endpoint, name: subject }
+    each: { field: cipherSuite, op: match, value: '^TLS_(RSA|DH|ECDH)_' }
+    evidence: "{endpoint}: {protocol} {cipherSuite}"
+
+  - id: TLS-VALIDITY-TOO-LONG
+    title: Certificate validity is longer than allowed
+    kind: misconfigured
+    lens: security
+    category: PKI
+    severity: low
+    entity: endpoint
+    why: >-
+      Long-lived certificates keep a key in service for years and hide broken renewal processes
+      until the day they are needed. Public CAs have cut the maximum validity in steps and keep
+      cutting it; internal certificates should follow the same discipline.
+    fix: >-
+      Reissue with a validity within the limit and automate renewal. Lower the limit
+      (threshold tls.max-validity-days) as the public maximum falls.
+    refs: [CABF-BR:6.3.2, NIST-SP-1800-16]
+    refresh: 1d
+    query: { protocol: tls, key: endpoint, name: subject }
+    # notAfter - notBefore cannot be computed in a condition. A certificate fails when more days
+    # remain than the limit allows, or when it is older than the limit and still in date: either
+    # way its validity exceeds the limit.
+    each:
+      any:
+        - { field: daysLeft, op: gt, value: 398, threshold: tls.max-validity-days }
+        - all:
+            - { field: notBefore, op: age-gt, value: 398, threshold: tls.max-validity-days }
+            - not: { field: notAfter, op: until-lt, value: 0 }
+    evidence: "{endpoint}: valid from {notBefore} to {notAfter} ({daysLeft} days left)"

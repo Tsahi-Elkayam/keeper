@@ -1,0 +1,243 @@
+schema: keeper.rules/1
+system: pingcastle
+name: PingCastle health check (imported)
+integration: files
+# Input: the XML health-check report PingCastle writes next to its HTML report.
+#   PingCastle.exe --healthcheck --server example.org      (run from a domain-joined host)
+#   -> ad_hc_example.org.html and ad_hc_example.org.xml in the working folder.
+# Copy ad_hc_<domain>.xml into imports\pingcastle\. The newest matching file is read.
+# Each triggered risk rule is /HealthcheckData/RiskRules/HealthcheckRiskRule with the child
+# elements RiskId, Category, Model, Points and Rationale. Findings carry PingCastle's own id
+# (PC-<RiskId>), its rationale as the title, and a severity from the rule's points.
+rules:
+  - id: PC-STALE-OBJECTS
+    title: PingCastle stale-object risk rule
+    kind: misconfigured
+    lens: both
+    category: HYG
+    severity: medium
+    entity: pingcastle-rule
+    why: >-
+      PingCastle found leftovers in the directory - inactive accounts, old operating systems,
+      obsolete settings or objects - that widen the attack surface and that nobody maintains.
+    fix: >-
+      Open the rule in the PingCastle HTML report, follow its remediation, then run PingCastle again
+      and replace the XML in imports\pingcastle\. Generate the report with: PingCastle.exe
+      --healthcheck --server <domain>.
+    refresh: 1d
+    query:
+      protocol: file
+      key: RiskId
+      name: Rationale
+      path: "pingcastle/ad_hc_*.xml"
+      format: xml
+      items: "/HealthcheckData/RiskRules/HealthcheckRiskRule[Category='StaleObjects']"
+    each: any
+    emit:
+      check: "PC-{RiskId}"
+      title: "{Rationale}"
+      severity:
+        field: Points
+        ranges:
+          - { min: 50, value: critical }
+          - { min: 20, value: high }
+          - { min: 5, value: medium }
+          - { min: 1, value: low }
+        default: info
+    evidence: "{RiskId} ({Points} points, model {Model}): {Rationale} [{_file}, {_modified}]"
+
+  - id: PC-PRIVILEGED-ACCOUNTS
+    title: PingCastle privileged-account risk rule
+    kind: misconfigured
+    lens: security
+    category: IAM
+    severity: medium
+    entity: pingcastle-rule
+    why: >-
+      PingCastle found a weakness in how administrative accounts, groups or delegations are set up -
+      the shortest paths to taking over the domain.
+    fix: >-
+      Open the rule in the PingCastle HTML report, follow its remediation, then run PingCastle again
+      and replace the XML in imports\pingcastle\. Generate the report with: PingCastle.exe
+      --healthcheck --server <domain>.
+    refresh: 1d
+    query:
+      protocol: file
+      key: RiskId
+      name: Rationale
+      path: "pingcastle/ad_hc_*.xml"
+      format: xml
+      items: "/HealthcheckData/RiskRules/HealthcheckRiskRule[Category='PrivilegedAccounts']"
+    each: any
+    emit:
+      check: "PC-{RiskId}"
+      title: "{Rationale}"
+      severity:
+        field: Points
+        ranges:
+          - { min: 50, value: critical }
+          - { min: 20, value: high }
+          - { min: 5, value: medium }
+          - { min: 1, value: low }
+        default: info
+    evidence: "{RiskId} ({Points} points, model {Model}): {Rationale} [{_file}, {_modified}]"
+
+  - id: PC-TRUSTS
+    title: PingCastle trust risk rule
+    kind: misconfigured
+    lens: security
+    category: IAM
+    severity: medium
+    entity: pingcastle-rule
+    why: >-
+      PingCastle found a weakness in the trusts between this domain and others, through which a
+      compromise elsewhere can reach this domain.
+    fix: >-
+      Open the rule in the PingCastle HTML report, follow its remediation (remove unused trusts,
+      enable SID filtering, tighten authentication), then run PingCastle again and replace the XML
+      in imports\pingcastle\.
+    refresh: 1d
+    query:
+      protocol: file
+      key: RiskId
+      name: Rationale
+      path: "pingcastle/ad_hc_*.xml"
+      format: xml
+      items: "/HealthcheckData/RiskRules/HealthcheckRiskRule[Category='Trusts']"
+    each: any
+    emit:
+      check: "PC-{RiskId}"
+      title: "{Rationale}"
+      severity:
+        field: Points
+        ranges:
+          - { min: 50, value: critical }
+          - { min: 20, value: high }
+          - { min: 5, value: medium }
+          - { min: 1, value: low }
+        default: info
+    evidence: "{RiskId} ({Points} points, model {Model}): {Rationale} [{_file}, {_modified}]"
+
+  - id: PC-ANOMALIES
+    title: PingCastle anomaly risk rule
+    kind: misconfigured
+    lens: security
+    category: AUT
+    severity: medium
+    entity: pingcastle-rule
+    why: >-
+      PingCastle found a hardening gap - authentication protocols, audit, certificate services,
+      local administrator management and similar settings that attackers rely on.
+    fix: >-
+      Open the rule in the PingCastle HTML report, follow its remediation, then run PingCastle again
+      and replace the XML in imports\pingcastle\.
+    refresh: 1d
+    query:
+      protocol: file
+      key: RiskId
+      name: Rationale
+      path: "pingcastle/ad_hc_*.xml"
+      format: xml
+      items: "/HealthcheckData/RiskRules/HealthcheckRiskRule[Category='Anomalies']"
+    each: any
+    emit:
+      check: "PC-{RiskId}"
+      title: "{Rationale}"
+      severity:
+        field: Points
+        ranges:
+          - { min: 50, value: critical }
+          - { min: 20, value: high }
+          - { min: 5, value: medium }
+          - { min: 1, value: low }
+        default: info
+    evidence: "{RiskId} ({Points} points, model {Model}): {Rationale} [{_file}, {_modified}]"
+
+  - id: PC-OTHER
+    title: PingCastle risk rule in another category
+    kind: misconfigured
+    lens: security
+    category: CFG
+    severity: medium
+    entity: pingcastle-rule
+    why: >-
+      PingCastle reported a risk rule in a category this pack does not map yet (a newer PingCastle
+      version may add categories). It is reported rather than dropped.
+    fix: >-
+      Open the rule in the PingCastle HTML report and follow its remediation. If the category is
+      new, map it to a Keeper category in this file.
+    refresh: 1d
+    query:
+      protocol: file
+      key: RiskId
+      name: Rationale
+      path: "pingcastle/ad_hc_*.xml"
+      format: xml
+      items: "/HealthcheckData/RiskRules/HealthcheckRiskRule[not(Category='StaleObjects' or Category='PrivilegedAccounts' or Category='Trusts' or Category='Anomalies')]"
+    each: any
+    emit:
+      check: "PC-{RiskId}"
+      title: "{Rationale}"
+      severity:
+        field: Points
+        ranges:
+          - { min: 50, value: critical }
+          - { min: 20, value: high }
+          - { min: 5, value: medium }
+          - { min: 1, value: low }
+        default: info
+    evidence: "{RiskId} ({Category}, {Points} points, model {Model}): {Rationale} [{_file}]"
+
+  - id: PC-GLOBAL-SCORE
+    title: PingCastle domain risk score above target
+    kind: misconfigured
+    lens: security
+    category: IAM
+    severity:
+      field: _text
+      ranges:
+        - { min: 76, value: critical }
+        - { min: 51, value: high }
+        - { min: 26, value: medium }
+      default: low
+    entity: domain
+    why: >-
+      PingCastle's overall score is the worst of its four category scores (0 is best, 100 worst).
+      A score above target means at least one area has risks that together make the domain easy
+      to take over.
+    fix: >-
+      Work down the highest-point rules first (they are findings of the PC- rules above), then run
+      PingCastle again and replace the XML in imports\pingcastle\. Lower the target with threshold
+      pingcastle.max-global-score as the domain improves.
+    refresh: 1d
+    query:
+      protocol: file
+      key: _file
+      path: "pingcastle/ad_hc_*.xml"
+      format: xml
+      items: "/HealthcheckData/GlobalScore"
+    each: { field: _text, op: gt, value: 25, threshold: pingcastle.max-global-score }
+    evidence: "{_file}: global score {_text} (report written {_modified})"
+
+  - id: PC-REPORT-STALE
+    title: PingCastle report is out of date
+    kind: missing
+    lens: both
+    category: MON
+    severity: medium
+    entity: domain
+    why: >-
+      The PingCastle findings are only as current as the report they came from. An old report hides
+      new risks and keeps reporting ones that were fixed.
+    fix: >-
+      Run PingCastle.exe --healthcheck --server <domain> again (schedule it), and copy the new
+      ad_hc_<domain>.xml into imports\pingcastle\.
+    refresh: 1d
+    query:
+      protocol: file
+      key: _file
+      path: "pingcastle/ad_hc_*.xml"
+      format: xml
+      items: "/HealthcheckData/GenerationDate"
+    each: { field: _text, op: age-gt, value: 35, threshold: pingcastle.max-report-age-days }
+    evidence: "{_file} was generated {_text}"

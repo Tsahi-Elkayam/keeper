@@ -105,10 +105,10 @@ Every query has `protocol:`, `key:` (the row field that identifies the entity) a
 | `http` | `path` (required, relative to the endpoint's own path), `params`: mapping, `items`: path to the array (default: OData value, or the root), `paging`: auto (default), odata, link, offset, none; `pageSize`, `offsetParam`, `limitParam` (offset paging, defaults sysparm_offset/sysparm_limit), `maxPages`, `headers` (never credentials). | One per item. |
 | `graphql` | `document` (required, a query), `path` (default /graphql), `variables`: mapping, `items`: path to the array, `paging`: { cursor, hasNext, variable }, `maxPages`. | One per item. |
 | `sql` | `text` (required, one SELECT/WITH), `database` (default master). Per target instance. | One per result row, plus `instance`. |
-| `cim` | `wql` (required, one SELECT), `namespace` (default root/cimv2). Per target host. | One per instance, plus `host`. Dates are ISO. |
+| `cim` | `wql` (required, one SELECT; `{HOST}` stands for the target's computer name, upper case - e.g. `Win32_Group.Domain='{HOST}',Name='Administrators'`), `namespace` (default root/cimv2). Per target host. Never `Win32_Product`: reading it makes Windows Installer re-check (and repair) every package. | One per instance, plus `host`. Dates are ISO. |
 | `tls` | `port` (default 443; a target may also be host:port). Per target. | endpoint, host, port, subject, issuer, notBefore, notAfter, daysLeft, serial, thumbprint, keyAlgorithm, keySize, signatureAlgorithm, protocol, cipherSuite, chainValid, nameMatches, chainErrors, selfSigned, sans. |
 | `file` | `path` (required, relative to imports\, wildcards in the file name), `format`: json (default), xml, csv; `items`: JSON path (json) or XPath (xml, required); `delimiter` (csv). | One per item, plus `_file` and `_modified`. XML elements become objects: attributes and child elements by name, repeated children as arrays. |
-| `store` | `text` (required, one SELECT; `:now` and `:today` are bound). | One per result row. Readable: the review and register tables (licence, contract, key_date, vendor, initiative, attestation, latest_attestation, system, entity, finding, active_finding). Never: integration_secret, vault_key, request. |
+| `store` | `text` (required, one SELECT or WITH; `:now` and `:today` are bound). | One per result row. Readable: the registers (licence, contract, key_date, vendor, initiative, attestation, latest_attestation), the review tables (system, entity, finding, active_finding, override, setting, rule, run, latest_run, coverage, row_seen) and integration_status / integration_test. Never: integration_secret, vault_key, request, schema_version. |
 
 LDAP filter macros (the earlier LDAP rules use them): `{USER}`, `{COMPUTER}`, `{ENABLED}`, `{UAC:n}`
 (bit n set), `{FT:n}` (FILETIME n days ago), `{GT:n}` (generalized time n days ago), `{DOMAINDN}`,
@@ -172,6 +172,25 @@ verdicts. `emit:` maps a row to the scanner's own check id, title and severity:
       title: "{Rationale}"
       severity: { field: Points, ranges: [ { min: 50, value: high }, { min: 10, value: medium }, { min: 0, value: low } ] }
 ```
+
+## Rules across systems
+
+A `store` rule can read what other scans saw: `row_seen` holds every row of the newest scans, with its
+attributes as JSON (`json_extract(attrs, '$.objectSid')`), and `latest_run` names the newest run of
+each system. `rules/hybrid-identity.yaml` joins Active Directory and Entra this way: an account is
+stale only when neither directory shows a sign-in, because people who use only cloud services never
+log on to a domain controller. `keeper run` scans the store's own systems after the others are
+loaded, so these rules see the same day's data.
+
+`keeper stale-users` shows the same join as counts per reason - disabled, mailbox objects, expired,
+active on-premises, active only in the cloud, new, stale - next to what domain logons alone would say.
+
+## Every problem found is checked everywhere
+
+A problem found on one machine, one account or one sample is written as a rule over every target of
+its kind, not as a note about that one: what was seen once is assumed to be widespread until a scan
+shows otherwise. Facts about the tenant (names, counts, which host) never go into a rule; the rule
+states the condition, the scan finds the instances.
 
 ## What a runner refuses
 
