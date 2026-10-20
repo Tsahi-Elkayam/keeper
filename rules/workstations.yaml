@@ -433,7 +433,7 @@ rules:
       op: gt
       value: 10
       threshold: workstations.piled-process-max
-      where: { field: Name, op: match, value: '^(schtasks|wmic|reg|sc|net|net1|netsh|gpupdate|cscript|wscript|msiexec)\.exe$', threshold: workstations.piled-process-pattern }
+      where: { field: Name, op: match, value: '^(schtasks|wmic|reg|sc|net|net1|netsh|gpupdate|cscript|wscript|msiexec|Photos)\.exe$', threshold: workstations.piled-process-pattern }
     evidence: "{host}: {count} copies of listed programs ({sample})"
 
   - id: WS-PROC-UNAPPROVED
@@ -1656,14 +1656,14 @@ rules:
     kind: misconfigured
     category: HLT
     severity: low
-    why: With today's browser and security stack, a PC under 8 GB pages constantly; it is slow whatever else is fixed. The threshold is in KB of visible memory.
+    why: With today's browser and security stack, a PC under 8 GB pages constantly; it is slow whatever else is fixed. The threshold is in KB of visible memory; a PC sold with 8 GB shows about 7.7 GB visible, so the default limit is 8 GiB (8388608 KB) and catches it.
     fix: Add memory where the board allows, otherwise plan the replacement.
     refs: [NIST-800-53:CP-2(2)]
     query:
       protocol: cim
       wql: SELECT Caption, Version, BuildNumber, OperatingSystemSKU, LastBootUpTime, FreePhysicalMemory, TotalVisibleMemorySize FROM Win32_OperatingSystem
       key: host
-    each: { field: TotalVisibleMemorySize, op: lt, value: 7864320, threshold: workstations.min-memory-kb }
+    each: { field: TotalVisibleMemorySize, op: lt, value: 8388608, threshold: workstations.min-memory-kb }
     evidence: "{host}: {TotalVisibleMemorySize} KB visible memory"
 
   - id: WS-PAGEFILE-NONE
