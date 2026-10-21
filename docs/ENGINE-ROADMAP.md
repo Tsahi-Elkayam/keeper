@@ -1,0 +1,47 @@
+# Engine roadmap
+
+What the engine still needs so that rules can be written for every product in the catalogue
+(`docs/proposals/catalog-*.md`, `docs/backlog/*.md`). Rows = old-catalogue checks each gap blocks.
+Everything runs in-process: no external program is ever started (no aws.exe, snmpwalk or PowerShell
+modules). Each stage is built, reviewed independently and fixed until a review finds nothing serious.
+
+## Build order
+
+1. **HTTP read core** (~260 rows; most later stages build on it)
+   - Read-only POST/PUT: the integration type carries an allow-list of verb + path pattern and of body
+     command names; anything else is refused, the way GraphQL mutations are. Paging inside the body.
+   - XML response bodies (the file runner's XML-to-object code).
+   - Paging styles: ARM `nextLink`, `nextPageKey`, cursors. Response shapes: a map as rows, string arrays
+     kept. Response headers as fields. Quoted path segments (`@odata.type`). Graph `Prefer` header.
+   - http targets (a list of URLs), `for_each` from a list or threshold, `for_each` placeholders in
+     params, 404 as empty, an environment label on the integration.
+   - Thresholds in requests (`{DAYS_AGO:threshold.x|90}`), macros in GraphQL documents.
+2. **Condition language**: count per group / distinct / share (`pct`); same-element array conditions
+   and min/max over arrays; operators `version-lt/ge`, ISO 8601 durations, epoch-ms and custom date
+   formats, `in-cidr`, hour-of-day; rule plumbing (constant deadline, thresholds on severity ranges,
+   RID/SID macros, value masking, expiring exceptions); then two-level `for_each` and run-to-run
+   comparison in the store.
+3. **Microsoft APIs on other token audiences** (~330): Entra tokens per resource for Power Platform,
+   Dataverse, Defender for Endpoint, Cloud Apps, Key Vault (metadata only); then Exchange Online and
+   Purview through the REST endpoint the modules call, with a `Get-*` cmdlet allow-list.
+4. **AWS** (~377): SigV4 signed by hand (no SDK) with AWS's test vectors, STS AssumeRole / Roles Anywhere,
+   JSON, Query/XML and REST-JSON, accounts x regions; only Describe/List/Get/Search/Lookup, with an
+   explicit deny list (GetObject, GetSecretValue, GetParameter, Decrypt, StartQuery); billed APIs daily.
+5. **Windows reads** (~200): security descriptors (LDAP with the SD-flags control, NTFS and share ACLs);
+   SMB/SYSVOL file reads and a GPO parser (registry.pol, GptTmpl.inf, audit.csv, GPP with cpassword
+   masked); LDAP binary attributes and per-DC reads; registry binary values and the machine certificate
+   store; SQL per-database loop and allow-listed read procedures; cim/eventlog extensions.
+6. **Network** (~230): probes (tcp, http, ssh banner, ntp) and config text first; then dns (DnsClient),
+   snmp v3 GET/GETNEXT/GETBULK only (Lextm.SharpSnmpLib), tls extensions (BouncyCastle).
+7. **Other auth kinds and types** (~330): jwt-bearer service accounts (GCP, Google Admin), HMAC-signed
+   requests (Duo, AnyDesk), and named vendor types with allowed hosts (each checked against the vendor).
+8. **SOAP** (134): vSphere and unified communications, allow-listed read methods only.
+
+## Not built
+- Hosting PowerShell in the process (EDR flags it as unmanaged PowerShell): REST, CIM, registry, SMB or
+  an attestation instead.
+- SharePoint admin REST (needs Sites.FullControl.All) and the Teams module endpoint: the ScubaGear import.
+- CA API / CA database over DCOM: the CA's registry and event log through the existing runners.
+- Performance sampling, DHCP discover probes, user RSoP: other tools, or low value.
+- Graph export jobs and CloudWatch `StartQuery`: they create server-side jobs, so they count as writes.
+- Vendor config exports and offline rulebase analysis: imported through the file runner.

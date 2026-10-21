@@ -64,6 +64,12 @@ public sealed record AnyCondition(IReadOnlyList<Condition> Items) : Condition;
 
 public sealed record NotCondition(Condition Item) : Condition;
 
+/// <summary>
+/// The condition held by one element of an array - assignments[] where target and intent are of the same
+/// assignment, not one each. Any (default) fires when some element fires; All when every element does.
+/// </summary>
+public sealed record ElementCondition(string Of, bool All, Condition Where) : Condition;
+
 /// <summary>"each: any": every row is a problem.</summary>
 public sealed record AlwaysCondition : Condition
 {
@@ -74,7 +80,17 @@ public sealed record AlwaysCondition : Condition
 /// <param name="Where">Counts only the rows this holds for: "at least one enforced policy must exist" is
 /// count lt 1 where enforced. A row the condition cannot judge (n/a) is not counted, so an unreadable
 /// policy never satisfies a must-exist rule.</param>
-public sealed record CountCondition(string Mode, string? Op, double Value, string? Threshold, Condition? Where = null);
+public sealed record CountCondition(string Mode, string? Op, double Value, string? Threshold, Condition? Where = null)
+{
+    /// <summary>Counts per value of this field: one result (and finding) per group - "more than one admin per site".</summary>
+    public string? By { get; init; }
+
+    /// <summary>Counts the distinct values of this field among the rows counted, not the rows.</summary>
+    public string? Distinct { get; init; }
+
+    /// <summary>The count is the share of the judged rows that match, in percent - "more than 20% of devices".</summary>
+    public bool Percent { get; init; }
+}
 
 public sealed record SeverityRange(double? Min, double? Max, string Value);
 
@@ -130,6 +146,7 @@ public sealed record Rule
         AllCondition all => all.Items.SelectMany(Leaves),
         AnyCondition any => any.Items.SelectMany(Leaves),
         NotCondition not => Leaves(not.Item),
+        ElementCondition element => Leaves(element.Where),
         _ => [],
     };
 }

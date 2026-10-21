@@ -223,6 +223,170 @@ public sealed class ScannerTests : IDisposable
         Assert.Equal("fail", counts["pc01.example.org"]);
     }
 
+    private async Task<ScanReport> ScanUsers(string countYaml, string? deadline = null)
+    {
+        Drop("users/d.json", """
+            { "users": [ { "name": "a", "site": "north", "managed": false, "os": "10" }, { "name": "b", "site": "north", "managed": false, "os": "10" },
+                         { "name": "c", "site": "north", "managed": true, "os": "11" }, { "name": "d", "site": "south", "managed": true, "os": "11" } ] }
+            """);
+        var path = Path.Combine(_dir, "count.yaml");
+        File.WriteAllText(path, $$"""
+            schema: keeper.rules/1
+            system: example
+            integration: files
+            defaults: { lens: both, refresh: 1d, category: HYG, kind: misconfigured, severity: medium, entity: device }
+            rules:
+              - id: EX-COUNT
+                title: Count
+                query: { protocol: file, path: "users/d.json", items: users, key: name }
+                count: {{countYaml}}
+            {{(deadline is null ? "" : $"    deadline: {deadline}")}}
+            """);
+        return await Scan(file: RuleLoader.LoadFile(path, "test", Runners.Registry().Validators));
+    }
+
+    [Fact]
+    public async Task A_count_by_group_judges_each_group_on_its_own()
+    {
+        var report = await ScanUsers("{ op: gt, value: 1, by: site, where: { field: managed, op: eq, value: false } }");
+
+        var results = Read<ResultRecord>(report, RunFolder.Results).ToDictionary(r => r.EntityKey, r => r.State);
+        Assert.Equal("fail", results["north"]);   // two unmanaged in the north
+        Assert.Equal("pass", results["south"]);
+        Assert.Equal("north", Assert.Single(Read<FindingRecord>(report, RunFolder.Findings)).Target);
+    }
+
+    [Fact]
+    public async Task A_share_count_compares_the_percentage_of_judged_rows()
+    {
+        var report = await ScanUsers("{ op: ge, value: 50, percent: true, where: { field: managed, op: eq, value: false } }", deadline: "2026-12-31");
+
+        var finding = Assert.Single(Read<FindingRecord>(report, RunFolder.Findings));   // 2 of 4 = 50%
+        Assert.Contains("50% of 4 rows", finding.Evidence, StringComparison.Ordinal);
+        Assert.Equal("2026-12-31", finding.Deadline);   // a deadline of its own, on a count finding too
+    }
+
+    [Fact]
+    public async Task Rows_that_cannot_be_judged_never_turn_a_count_into_a_pass()
+    {
+        // Two devices unmanaged, two whose state is unreadable: "more than 3" is not known to pass.
+        Drop("users/d.json", """
+            { "users": [ { "name": "a", "managed": false }, { "name": "b", "managed": false }, { "name": "c" }, { "name": "d" } ] }
+            """);
+        var path = Path.Combine(_dir, "floor.yaml");
+        File.WriteAllText(path, """
+            schema: keeper.rules/1
+            system: example
+            integration: files
+            defaults: { lens: both, refresh: 1d, category: HYG, kind: misconfigured, severity: medium, entity: device }
+            rules:
+              - id: EX-TOO-MANY
+                title: Too many unmanaged
+                query: { protocol: file, path: "users/d.json", items: users, key: name }
+                count: { op: gt, value: 3, where: { field: managed, op: eq, value: false } }
+              - id: EX-SOME
+                title: Some unmanaged
+                query: { protocol: file, path: "users/d.json", items: users, key: name }
+                count: { op: gt, value: 1, where: { field: managed, op: eq, value: false } }
+            """);
+
+        var report = await Scan(file: RuleLoader.LoadFile(path, "test", Runners.Registry().Validators));
+
+        var results = Read<ResultRecord>(report, RunFolder.Results).ToDictionary(r => r.RuleId, r => r.State);
+        Assert.Equal("n-a", results["EX-TOO-MANY"]);   // 2, but up to 4
+        Assert.Equal("fail", results["EX-SOME"]);      // 2 > 1 whatever the other two are
+    }
+
+    [Theory]
+    [InlineData("{ op: eq, value: 3, where: { field: managed, op: eq, value: false } }", "n-a")]   // 2 to 4: may be exactly 3
+    [InlineData("{ op: ne, value: 3, where: { field: managed, op: eq, value: false } }", "n-a")]   // fails at 2, passes at 3
+    [InlineData("{ op: eq, value: 7, where: { field: managed, op: eq, value: false } }", "pass")]  // 2 to 4 is never 7
+    [InlineData("{ op: gt, value: 60, percent: true, where: { field: managed, op: eq, value: false } }", "n-a")]    // 50% to 100%: may be above 60
+    [InlineData("{ op: gt, value: 40, percent: true, where: { field: managed, op: eq, value: false } }", "fail")]   // 50% to 100%: above 40 either way
+    public async Task Eq_ne_and_shares_are_unknown_when_unjudged_rows_reach_the_limit(string countYaml, string state)
+    {
+        Drop("users/d.json", """{ "users": [ { "name": "a", "managed": false }, { "name": "b", "managed": false }, { "name": "c" }, { "name": "d" } ] }""");
+        var path = Path.Combine(_dir, "eq.yaml");
+        File.WriteAllText(path, $$"""
+            schema: keeper.rules/1
+            system: example
+            integration: files
+            defaults: { lens: both, refresh: 1d, category: HYG, kind: misconfigured, severity: medium, entity: device }
+            rules:
+              - id: EX-EQ
+                title: Count
+                query: { protocol: file, path: "users/d.json", items: users, key: name }
+                count: {{countYaml}}
+            """);
+
+        var report = await Scan(file: RuleLoader.LoadFile(path, "test", Runners.Registry().Validators));
+
+        Assert.Equal(state, Assert.Single(Read<ResultRecord>(report, RunFolder.Results)).State);
+    }
+
+    [Fact]
+    public async Task Rows_without_the_group_field_are_not_a_group_that_could_pass()
+    {
+        Drop("users/d.json", """{ "users": [ { "name": "a", "managed": false, "site": "north" }, { "name": "b", "managed": false } ] }""");
+        var path = Path.Combine(_dir, "nogroup.yaml");
+        File.WriteAllText(path, """
+            schema: keeper.rules/1
+            system: example
+            integration: files
+            defaults: { lens: both, refresh: 1d, category: HYG, kind: misconfigured, severity: medium, entity: device }
+            rules:
+              - id: EX-BY-SITE
+                title: Unmanaged per site
+                query: { protocol: file, path: "users/d.json", items: users, key: name }
+                count: { op: gt, value: 0, by: site, where: { field: managed, op: eq, value: false } }
+            """);
+
+        var report = await Scan(file: RuleLoader.LoadFile(path, "test", Runners.Registry().Validators));
+
+        var results = Read<ResultRecord>(report, RunFolder.Results).ToDictionary(r => r.EntityKey, r => r.State);
+        Assert.Equal("fail", results["north"]);
+        Assert.Equal("n-a", results["(no site)"]);
+    }
+
+    [Fact]
+    public async Task Rows_without_the_group_field_dilute_a_share_even_when_they_cannot_match()
+    {
+        // b is managed and has no site: it adds nothing to a count, but may belong to the north and halve its share.
+        Drop("users/d.json", """{ "users": [ { "name": "a", "managed": false, "site": "north" }, { "name": "b", "managed": true } ] }""");
+        var path = Path.Combine(_dir, "dilute.yaml");
+        File.WriteAllText(path, """
+            schema: keeper.rules/1
+            system: example
+            integration: files
+            defaults: { lens: both, refresh: 1d, category: HYG, kind: misconfigured, severity: medium, entity: device }
+            rules:
+              - id: EX-SHARE
+                title: Unmanaged share per site
+                query: { protocol: file, path: "users/d.json", items: users, key: name }
+                count: { op: gt, value: 50, by: site, percent: true, where: { field: managed, op: eq, value: false } }
+              - id: EX-COUNT
+                title: Unmanaged per site
+                query: { protocol: file, path: "users/d.json", items: users, key: name }
+                count: { op: gt, value: 0, by: site, where: { field: managed, op: eq, value: false } }
+            """);
+
+        var report = await Scan(file: RuleLoader.LoadFile(path, "test", Runners.Registry().Validators));
+
+        var results = Read<ResultRecord>(report, RunFolder.Results).ToDictionary(r => (r.RuleId, r.EntityKey), r => r.State);
+        Assert.Equal("n-a", results[("EX-SHARE", "north")]);       // 100%, or 50% with b
+        Assert.Equal("n-a", results[("EX-SHARE", "(no site)")]);
+        Assert.Equal("fail", results[("EX-COUNT", "north")]);
+        Assert.False(results.ContainsKey(("EX-COUNT", "(no site)")));   // b could not change the count
+    }
+
+    [Fact]
+    public async Task A_distinct_count_counts_values_not_rows()
+    {
+        var report = await ScanUsers("{ op: gt, value: 1, distinct: os }");
+
+        Assert.Contains("2 distinct", Assert.Single(Read<FindingRecord>(report, RunFolder.Findings)).Evidence, StringComparison.Ordinal);
+    }
+
     [Fact]
     public async Task A_per_host_key_always_names_its_host_so_two_machines_never_share_an_entity()
     {

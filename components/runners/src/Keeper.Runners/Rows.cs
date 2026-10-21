@@ -48,6 +48,18 @@ public static class RowValues
         };
     }
 
+    /// <summary>
+    /// A map as rows: each property of the object at <paramref name="items"/> becomes { key, value } - a settings
+    /// object keyed by name ({ "smtp": {...}, "imap": {...} }) gives one row per setting.
+    /// </summary>
+    public static IReadOnlyList<JsonObject> EntriesOf(JsonNode? body, string? items)
+    {
+        var node = string.IsNullOrEmpty(items) ? body : Keeper.Rules.FieldPath.First(body, items);
+        if (node is not JsonObject map)
+            return ItemsOf(body, items);
+        return [.. map.Select(p => Detach(new JsonObject { ["key"] = p.Key, ["value"] = p.Value?.DeepClone() }))];
+    }
+
     /// <summary>A row of its own, with every secret property masked (<see cref="SecretProperties"/>).</summary>
     public static JsonObject Detach(JsonObject node)
     {

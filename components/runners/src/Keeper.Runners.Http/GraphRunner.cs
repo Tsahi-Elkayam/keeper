@@ -27,6 +27,12 @@ public sealed class GraphRunner : IRunner
             yield return "consistency can only be eventual";
         if (query.Text("search") is not null && query.Text("consistency") is null)
             yield return "search needs consistency: eventual";
+        if (query.Text("prefer") is { } prefer && prefer.Contains("respond-async", StringComparison.OrdinalIgnoreCase))
+            yield return "prefer: respond-async starts a job on the server; Keeper only reads";
+        if (query.Text("missing") is not (null or "empty" or "fail"))
+            yield return "missing must be empty (a 404 is an answer with no rows) or fail (the default)";
+        else if (query.Text("missing") == "empty" && query.Fields["for_each"] is null)
+            yield return "missing: empty is for per-object reads (for_each), where an object may lack the child; a list that answers 404 has a wrong path";
         foreach (var perObject in PerObject.Validate(query))
             yield return perObject;
     }
@@ -47,12 +53,14 @@ public sealed class GraphRunner : IRunner
 
             var select = query.List("select");
             Add("$select", select.Count > 0 ? string.Join(",", select) : null);
-            Add("$filter", query.Text("filter") is { } filter ? RequestMacros.Expand(filter, context.Now) : null);
+            Add("$filter", query.Text("filter") is { } filter ? RequestMacros.Expand(filter, context) : null);
             Add("$expand", query.Text("expand"));
             // Only when the rule asks: some Graph endpoints refuse $top outright.
             Add("$top", query.Int("top")?.ToString(CultureInfo.InvariantCulture));
             Add("$search", query.Text("search"));
             var headers = new Dictionary<string, string>();
+            if (query.Text("prefer") is { } prefer)
+                headers["Prefer"] = prefer;   // include-unknown-enum-members, odata.maxpagesize=999
             if (query.Text("consistency") == "eventual")
             {
                 headers["ConsistencyLevel"] = "eventual";
@@ -69,6 +77,7 @@ public sealed class GraphRunner : IRunner
                     // Forcing "value" made those answers empty - and an empty answer looks like a pass.
                     ["items"] = query.Text("items"),
                     ["maxPages"] = query.Text("maxPages"),
+                    ["missing"] = query.Text("missing"),
                 },
                 query.Key, query.Name);
             return await HttpRunner.Fetch(engine, versioned, context, cancellationToken, headers, parameters).ConfigureAwait(false);

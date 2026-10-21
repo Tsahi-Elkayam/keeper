@@ -3,18 +3,58 @@ using System.Text.Json.Nodes;
 namespace Keeper.Rules;
 
 /// <summary>
-/// Row field paths: "a.b.c", and "a[].b" to take b from every element of the array a. A path that is
-/// missing anywhere gives no values. Property names match case-insensitively.
+/// Row field paths: "a.b.c", and "a[].b" to take b from every element of the array a. A name with dots in it
+/// is quoted: ["@odata.type"], value[].["user.company"]. A path that is missing anywhere gives no values.
+/// Property names match case-insensitively.
 /// </summary>
 public static class FieldPath
 {
+    /// <summary>The path's names, each with whether to take every element of its array ("[]").</summary>
+    public static IEnumerable<(string Name, bool Flatten)> Parts(string path)
+    {
+        if (!path.Contains("[\"", StringComparison.Ordinal))
+        {
+            foreach (var part in path.Split('.'))
+                yield return part.EndsWith("[]", StringComparison.Ordinal) ? (part[..^2], true) : (part, false);
+            yield break;
+        }
+        for (var i = 0; i < path.Length;)
+        {
+            string name;
+            if (string.CompareOrdinal(path, i, "[\"", 0, 2) == 0 && path.IndexOf("\"]", i + 2, StringComparison.Ordinal) is var close and >= 0)
+            {
+                name = path[(i + 2)..close];
+                i = close + 2;
+            }
+            else
+            {
+                var end = path.IndexOf('.', i);
+                var stop = end < 0 ? path.Length : end;
+                name = path[i..stop];
+                i = stop;
+            }
+            var flatten = false;
+            if (string.CompareOrdinal(path, i, "[]", 0, 2) == 0)
+            {
+                flatten = true;
+                i += 2;
+            }
+            else if (name.EndsWith("[]", StringComparison.Ordinal))
+            {
+                flatten = true;
+                name = name[..^2];
+            }
+            yield return (name, flatten);
+            if (i < path.Length && path[i] == '.')
+                i++;
+        }
+    }
+
     public static IReadOnlyList<JsonNode?> Resolve(JsonNode? root, string path)
     {
         IEnumerable<JsonNode?> current = [root];
-        foreach (var part in path.Split('.'))
+        foreach (var (name, flatten) in Parts(path))
         {
-            var flatten = part.EndsWith("[]", StringComparison.Ordinal);
-            var name = flatten ? part[..^2] : part;
             current = current.SelectMany(node =>
             {
                 var next = Child(node, name);

@@ -20,10 +20,12 @@ internal sealed class StubHandler(Func<HttpRequestMessage, HttpResponseMessage> 
         new(status) { Content = new StringContent(json, Encoding.UTF8, "application/json") };
 }
 
-internal sealed class FakeConnection(string endpoint, HttpMessageHandler? handler = null, JsonObject? options = null) : IConnection
+internal sealed class FakeConnection(string endpoint, HttpMessageHandler? handler = null, JsonObject? options = null,
+    IReadOnlyList<string>? readPosts = null) : IConnection
 {
     public string Instance => "test";
     public string Type => "test";
+    public IReadOnlyList<string> ReadPosts => readPosts ?? [];
     public string Endpoint => endpoint;
     public string AuthKind => "bearer";
     public string? Identity => "reader@example.org";
@@ -50,7 +52,7 @@ internal static class Context
     {
         var json = new JsonObject();
         foreach (var (name, value) in fields)
-            json[name] = value;
+            json[name] = value?.Parent is null ? value : value.DeepClone();
         return new QuerySpec(protocol, json, key, null);
     }
 }

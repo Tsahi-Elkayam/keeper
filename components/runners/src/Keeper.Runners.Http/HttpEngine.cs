@@ -46,6 +46,7 @@ public sealed class HttpEngine : IDisposable
         };
         client.DefaultRequestHeaders.UserAgent.Add(new ProductInfoHeaderValue("Keeper", "1"));
         client.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+        client.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/xml", 0.5));
         return new HttpEngine(endpoint, context, client);
     }
 
@@ -69,17 +70,54 @@ public sealed class HttpEngine : IDisposable
         && uri.Host.Equals(Endpoint.Host, StringComparison.OrdinalIgnoreCase)
         && uri.Port == Endpoint.Port;
 
-    public Task<(JsonNode? Body, HttpResponseHeaders Headers)> GetAsync(Uri uri, IReadOnlyDictionary<string, string>? headers, CancellationToken cancellationToken) =>
-        SendAsync(() => new HttpRequestMessage(HttpMethod.Get, uri), headers, cancellationToken);
+    public Task<(JsonNode? Body, IReadOnlyDictionary<string, string> Headers)> GetAsync(Uri uri, IReadOnlyDictionary<string, string>? headers, CancellationToken cancellationToken) =>
+        JsonAsync(() => new HttpRequestMessage(HttpMethod.Get, uri), headers, cancellationToken);
 
     /// <summary>POST is only for protocols whose reads are POSTs (GraphQL queries).</summary>
-    public Task<(JsonNode? Body, HttpResponseHeaders Headers)> PostJsonAsync(Uri uri, JsonObject body, CancellationToken cancellationToken) =>
-        SendAsync(() => new HttpRequestMessage(HttpMethod.Post, uri)
+    public Task<(JsonNode? Body, IReadOnlyDictionary<string, string> Headers)> PostJsonAsync(Uri uri, JsonObject body, CancellationToken cancellationToken) =>
+        JsonAsync(() => new HttpRequestMessage(HttpMethod.Post, uri)
         {
             Content = new StringContent(body.ToJsonString(), Encoding.UTF8, "application/json"),
         }, null, cancellationToken);
 
-    private async Task<(JsonNode? Body, HttpResponseHeaders Headers)> SendAsync(Func<HttpRequestMessage> create,
+    /// <summary>
+    /// The answer as text, with every header it carried (the content's too): a GET, or a POST with a JSON body.
+    /// The caller has checked that the POST is a read its integration type allows (<see cref="IConnection.ReadPosts"/>).
+    /// </summary>
+    public Task<(string Text, IReadOnlyDictionary<string, string> Headers)> SendTextAsync(HttpMethod method, Uri uri, JsonObject? body,
+        IReadOnlyDictionary<string, string>? headers, CancellationToken cancellationToken) =>
+        SendAsync(() => new HttpRequestMessage(method, uri)
+        {
+            Content = body is null ? null : new StringContent(body.ToJsonString(), Encoding.UTF8, "application/json"),
+        }, headers, cancellationToken);
+
+    /// <summary>
+    /// A URL's path relative to the endpoint's own path - what a rule names and an allow-list matches - or null
+    /// when the URL is outside the endpoint's path altogether (https://host/mgmt has nothing at /web_api).
+    /// </summary>
+    public string? Relative(Uri uri)
+    {
+        var basePath = Endpoint.AbsolutePath.TrimEnd('/');
+        if (basePath.Length == 0)
+            return uri.AbsolutePath;
+        return uri.AbsolutePath.StartsWith(basePath + "/", StringComparison.Ordinal) ? uri.AbsolutePath[basePath.Length..] : null;
+    }
+
+    /// <summary>A next-page URL as an answer gives it: absolute, or relative to the endpoint. Null when it is neither.</summary>
+    public Uri? Resolve(string? link) =>
+        string.IsNullOrWhiteSpace(link) ? null
+        : Uri.TryCreate(link, UriKind.Absolute, out var absolute) && absolute.Scheme is "https" or "http" ? absolute
+        : Uri.TryCreate(Endpoint, link, out var relative) ? relative
+        : null;
+
+    private async Task<(JsonNode? Body, IReadOnlyDictionary<string, string> Headers)> JsonAsync(Func<HttpRequestMessage> create,
+        IReadOnlyDictionary<string, string>? headers, CancellationToken cancellationToken)
+    {
+        var (text, responseHeaders) = await SendAsync(create, headers, cancellationToken).ConfigureAwait(false);
+        return (text.Length == 0 ? null : RowValues.Parse(text) ?? throw new HttpRequestException($"{Endpoint.Host} did not answer with JSON."), responseHeaders);
+    }
+
+    private async Task<(string Text, IReadOnlyDictionary<string, string> Headers)> SendAsync(Func<HttpRequestMessage> create,
         IReadOnlyDictionary<string, string>? headers, CancellationToken cancellationToken)
     {
         for (var attempt = 1; ; attempt++)
@@ -111,21 +149,44 @@ public sealed class HttpEngine : IDisposable
                     null, response.StatusCode);
             }
 
-            var text = await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false);
-            return (text.Length == 0 ? null : RowValues.Parse(text) ?? throw new HttpRequestException($"{Endpoint.Host} did not answer with JSON."), response.Headers);
+            var all = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var (name, values) in response.Headers.Concat(response.Content.Headers))
+                all[name] = string.Join(", ", values);
+            return (await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false), all);
         }
     }
 
-    public static Uri? NextLink(HttpResponseHeaders headers)
+    /// <summary>
+    /// The rel="next" target of a Link header (RFC 8288), as written: &lt;url&gt;; rel="next", ... - the URL is
+    /// read between its angle brackets, so a comma inside it does not split it. Null when there is no next link.
+    /// </summary>
+    public static string? NextLink(string? link) => NextLink(link, out _);
+
+    /// <param name="malformed">The header could not be read (an unclosed &lt;): the caller cannot tell whether a next page exists.</param>
+    public static string? NextLink(string? link, out bool malformed)
     {
-        if (!headers.TryGetValues("Link", out var values))
+        malformed = false;
+        if (string.IsNullOrEmpty(link))
             return null;
-        foreach (var part in values.SelectMany(v => v.Split(',')))
+        for (var start = link.IndexOf('<', StringComparison.Ordinal); start >= 0;)
         {
-            var pieces = part.Split(';', StringSplitOptions.TrimEntries);
-            if (pieces.Length > 1 && pieces.Skip(1).Any(p => p.Replace(" ", "", StringComparison.Ordinal).Equals("rel=\"next\"", StringComparison.OrdinalIgnoreCase))
-                && Uri.TryCreate(pieces[0].Trim('<', '>'), UriKind.Absolute, out var next))
-                return next;
+            var end = link.IndexOf('>', start + 1);
+            if (end < 0)
+            {
+                malformed = true;
+                return null;
+            }
+            var target = link[(start + 1)..end];
+            var next = link.IndexOf('<', end + 1);
+            var parameters = next < 0 ? link[(end + 1)..] : link[(end + 1)..next];
+            // rel is a list of tokens: rel="next last" names the next page too.
+            if (parameters.Split(';', StringSplitOptions.TrimEntries)
+                .Select(p => p.Trim(',', ' '))
+                .Where(p => p.Contains('=', StringComparison.Ordinal) && p[..p.IndexOf('=', StringComparison.Ordinal)].Trim().Equals("rel", StringComparison.OrdinalIgnoreCase))
+                .Select(p => p[(p.IndexOf('=', StringComparison.Ordinal) + 1)..].Trim().Trim('"'))
+                .Any(value => value.Split(' ', StringSplitOptions.RemoveEmptyEntries).Contains("next", StringComparer.OrdinalIgnoreCase)))
+                return target;
+            start = next;
         }
         return null;
     }

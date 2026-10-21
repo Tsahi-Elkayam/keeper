@@ -12,6 +12,9 @@ public sealed record RunnerResult(IReadOnlyList<JsonObject> Rows, string State, 
     public static RunnerResult Partial(IReadOnlyList<JsonObject> rows, string reason) => new(rows, "partial", reason);
 
     public static RunnerResult Failed(string reason) => new([], "failed", reason);
+
+    /// <summary>The note on an ok answer that was a 404 under missing: empty; for_each counts them.</summary>
+    public const string NotFound = "not found (404)";
 }
 
 /// <summary>
@@ -40,6 +43,12 @@ public interface IConnection
     /// </summary>
     string? SignedInAs => null;
 
+    /// <summary>
+    /// Paths (relative to the endpoint, '*' within one segment) where this integration's type answers a POST
+    /// as a read - Check Point's show- commands, Azure Resource Graph queries. Nowhere else does a rule POST.
+    /// </summary>
+    IReadOnlyList<string> ReadPosts => [];
+
     /// <summary>Non-secret options (scopes, header names, TLS mode, targets).</summary>
     JsonObject Options { get; }
 
@@ -63,7 +72,11 @@ public sealed record RunnerContext(
     string? StoreFile,
     DateTimeOffset Now,
     TimeSpan Timeout,
-    Action<string> Log);
+    Action<string> Log)
+{
+    /// <summary>A tenant threshold by name (setting threshold.&lt;name&gt;), for requests that name one: {DAYS_AGO:threshold.x|90}.</summary>
+    public Func<string, string?> Threshold { get; init; } = _ => null;
+}
 
 /// <summary>A read-only way to get rows from one kind of system. Runners never write.</summary>
 public interface IRunner

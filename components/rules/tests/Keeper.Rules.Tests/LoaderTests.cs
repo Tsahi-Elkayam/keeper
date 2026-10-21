@@ -70,6 +70,53 @@ public sealed class LoaderTests : IDisposable
     }
 
     [Fact]
+    public void Element_conditions_and_grouped_counts_load()
+    {
+        var file = RuleLoader.LoadFile(Write("ok.yaml", """
+            schema: keeper.rules/1
+            system: example
+            integration: ldap
+            defaults: { lens: security, category: IAM, refresh: 1d, entity: policy, kind: misconfigured, severity: medium }
+            rules:
+              - id: EX-ASSIGNED-TO-ALL
+                title: Required for everyone
+                query: { protocol: ldap, filter: "(x=1)", key: id }
+                each:
+                  element:
+                    of: assignments
+                    match: all
+                    where: { all: [ { field: group, op: eq, value: All }, { field: intent, op: eq, value: required } ] }
+              - id: EX-SITE-SHARE
+                title: Too many unmanaged devices per site
+                query: { protocol: ldap, filter: "(x=2)", key: id }
+                count: { op: gt, value: 20, by: site, percent: true, where: { field: managed, op: eq, value: false } }
+                deadline: 2026-12-31
+            """), "builtin", Protocols);
+
+        var element = Assert.IsType<ElementCondition>(file.Rules[0].Each);
+        Assert.True(element.All);
+        Assert.Equal("assignments", element.Of);
+        Assert.Equal(("site", true), (file.Rules[1].Count!.By, file.Rules[1].Count!.Percent));
+        Assert.Equal("2026-12-31", file.Rules[1].Deadline);
+    }
+
+    [Theory]
+    [InlineData("op: flag, value: 65536", "op: version-lt, value: soon", "needs a version")]
+    [InlineData("op: flag, value: 65536", "op: in-cidr, value: \"192.0.2.0/24,not-a-net\"", "'not-a-net' is not a network")]
+    [InlineData("op: flag, value: 65536", "op: duration-gt, value: P30D", "needs a number")]
+    [InlineData("count: { op: gt, value: 5, threshold: ad.max-domain-admins }", "count: { op: gt, value: 5, percent: true, distinct: site }", "cannot be combined with distinct")]
+    [InlineData("count: { op: gt, value: 5, threshold: ad.max-domain-admins }", "count: { op: gt, value: 5, percent: maybe }", "percent must be true or false")]
+    [InlineData("evidence: \"{sAMAccountName}\"", "evidence: \"{sAMAccountName}\"\n    deadline: 2026-02-30", "not a real date")]
+    public void New_operators_and_count_options_are_checked_at_load(string from, string to, string expected)
+    {
+        var path = Write("bad.yaml", Valid.Replace(from, to, StringComparison.Ordinal));
+
+        var ex = Assert.Throws<RuleException>(() => RuleLoader.LoadFile(path, "builtin", Protocols));
+
+        Assert.Contains(expected, ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void Rules_with_the_same_query_share_its_id()
     {
         var a = new QuerySpec("ldap", new System.Text.Json.Nodes.JsonObject { ["filter"] = "(x=1)", ["base"] = "domain" }, "cn", null);

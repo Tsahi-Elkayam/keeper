@@ -99,42 +99,8 @@ public sealed class FileRunner : IRunner
 
     private static List<JsonObject> Xml(string path, string xpath)
     {
-        var settings = new XmlReaderSettings
-        {
-            DtdProcessing = DtdProcessing.Prohibit,
-            XmlResolver = null,
-            MaxCharactersFromEntities = 0,
-            MaxCharactersInDocument = MaxBytes,
-        };
-        using var reader = XmlReader.Create(path, settings);
-        var document = new XmlDocument { XmlResolver = null };
-        document.Load(reader);
-
-        var rows = new List<JsonObject>();
-        foreach (var element in document.SelectNodes(xpath)?.OfType<XmlElement>() ?? [])
-            rows.Add(ElementToJson(element, 0));
-        return rows;
-    }
-
-    private static JsonObject ElementToJson(XmlElement element, int depth)
-    {
-        var row = new JsonObject();
-        foreach (XmlAttribute attribute in element.Attributes)
-            row[attribute.LocalName] = attribute.Value;
-
-        foreach (var group in element.ChildNodes.OfType<XmlElement>().GroupBy(e => e.LocalName))
-        {
-            var values = group.Select(child =>
-                    child.HasChildNodes && child.ChildNodes.OfType<XmlElement>().Any() && depth < MaxDepth
-                        ? (JsonNode)ElementToJson(child, depth + 1)
-                        : JsonValue.Create(child.InnerText.Trim()))
-                .ToList();
-            row[group.Key] = values.Count == 1 ? values[0] : new JsonArray(values.ToArray());
-        }
-
-        if (!element.ChildNodes.OfType<XmlElement>().Any() && element.InnerText.Trim() is { Length: > 0 } text)
-            row["_text"] = text;
-        return row;
+        using var reader = new StreamReader(path, Encoding.UTF8, detectEncodingFromByteOrderMarks: true);
+        return XmlRows.Select(XmlRows.Load(reader, MaxBytes), xpath, MaxDepth);
     }
 
     /// <summary>RFC 4180: a header row, quoted fields, doubled quotes, line breaks inside quotes.</summary>

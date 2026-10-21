@@ -51,7 +51,9 @@ public sealed partial class GraphQlRunner : IRunner
         {
             using var engine = HttpEngine.Open(context);
             var uri = engine.Build(query.Text("path") ?? "/graphql");
-            var variables = query.Fields["variables"] is JsonObject v ? (JsonObject)JsonNode.Parse(v.ToJsonString())! : new JsonObject();
+            // Dates in the document and the variables ({DAYS_AGO:30}); a macro only ever becomes a date, never syntax.
+            var document = RequestMacros.Expand(query.Text("document")!, context);
+            var variables = query.Fields["variables"] is JsonObject v ? (JsonObject)RequestMacros.ExpandAll(v.DeepClone(), context)! : new JsonObject();
             var paging = query.Fields["paging"] as JsonObject;
             var maxPages = query.Int("maxPages") ?? DefaultMaxPages;
             var rows = new List<JsonObject>();
@@ -60,7 +62,7 @@ public sealed partial class GraphQlRunner : IRunner
             {
                 var (body, _) = await engine.PostJsonAsync(uri, new JsonObject
                 {
-                    ["query"] = query.Text("document"),
+                    ["query"] = document,
                     ["variables"] = (JsonObject)JsonNode.Parse(variables.ToJsonString())!,
                 }, cancellationToken).ConfigureAwait(false);
 

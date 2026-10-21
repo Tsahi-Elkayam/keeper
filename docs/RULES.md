@@ -66,7 +66,17 @@ about that host: "no update installed in 45 days" is `count: { op: lt, value: 1,
 InstalledOn, op: age-lt, value: 45 } }` over the host's hotfixes. A host whose query failed is
 *unknown* for the rule, never a pass. In `where`, a row the condition cannot judge (a missing field)
 is not counted, so an unreadable policy never satisfies a must-exist rule; the evidence says how many
-rows could not be judged.
+rows could not be judged. And a pass those rows could overturn - "more than 3" with 2 counted and 5
+unreadable - is unknown, never a pass.
+
+A count can also be `by: <field>` (one result and finding per value: "more than one admin per site"),
+`distinct: <field>` (distinct values, not rows: "more than one OS version") or `percent: true` (the
+share of the judged rows that match: "more than 20% of devices unmanaged"; with no row to judge it is
+n/a). A partial read can fail a count (it is a floor) but never pass it, and a share of a partial read
+is unknown either way.
+
+`deadline:` is a date field of the row, or a date of its own (`deadline: 2026-12-31`, a product's end
+of support) given to every finding of the rule.
 
 `key:` is a field, or a template when one field is not unique per entity: `key: "{host}|{PartComponent}"`
 makes each member of a host's Administrators group its own finding.
@@ -82,6 +92,17 @@ each:
 ```
 
 `threshold:` names a tenant setting (`threshold.<name>`) that replaces `value` when it is set.
+
+Two conditions on **one element** of an array take `element`: "an assignment that is both to everyone
+and required" is not one assignment to everyone and another that is required.
+
+```yaml
+each:
+  element:
+    of: assignments          # the array
+    match: any               # any (default): some element fires; all: every element fires
+    where: { all: [ { field: target.groupId, op: eq, value: all-users }, { field: intent, op: eq, value: required } ] }
+```
 
 `value: { field: <other> }` compares with another field of the same row, optionally scaled with
 `times` and `plus` - "more than 90% of the seats used" is
@@ -102,9 +123,13 @@ the other field is n/a.
 | `flag` `noflag` | Integer has / lacks the bit (e.g. `userAccountControl`) |
 | `size-gt` `size-lt` `size-eq` | Array length |
 | `status` | Verdict words: fail, failed, false, noncompliant fire; pass, ok, true, compliant pass; anything else is unknown |
+| `version-lt` `version-le` `version-gt` `version-ge` | Dotted version comparison: 10.0.19045 < 10.0.22621; v and a -suffix are ignored; not a version is n/a |
+| `in-cidr` `notin-cidr` | An IPv4/IPv6 address is in / not in one of the networks (a list or comma-separated) |
+| `duration-gt` `duration-lt` | A length of time (ISO 8601 such as P90D, or d.hh:mm:ss) longer / shorter than N days |
 
 Fields are paths: `signInActivity.lastSignInDateTime`, and `passwordCredentials[].endDateTime` (any
-element). Dates may be ISO 8601, Windows FILETIME or LDAP generalized time.
+element). Dates may be ISO 8601, Windows FILETIME, LDAP generalized time, or Unix time (10 digits in
+seconds, 13 in milliseconds, `/Date(ms)/`).
 
 A missing field gives **n/a** for comparisons and is never a pass by default. A query that fails gives
 **unknown** with the reason, never a pass.
@@ -145,8 +170,8 @@ is *not configured* (n/a, with the setting to make), never a pass that compared 
 | Protocol | Fields | Rows |
 |---|---|---|
 | `ldap` | `base`: domain (default), config, schema, root, or a DN (macros allowed). `scope`: subtree (default), onelevel, base. `filter` (required, macros below). `attributes`: list. `pageSize`. | One per entry, plus `distinguishedName`. FILETIME attributes (pwdLastSet, lastLogonTimestamp, accountExpires, LAPS expiry...) become ISO dates; 0 and never-expires stay as they are. whenCreated/whenChanged become ISO. maxPwdAge-style durations become days. objectSid/objectGUID become text. Multi-valued attributes are arrays. |
-| `graph` | `path` (required, e.g. /users), `version`: v1.0 (default) or beta, `select`: list, `filter`, `expand`, `top`, `search`, `consistency`: eventual, `items` (default value), `maxPages`. | One per item. |
-| `http` | `path` (required, relative to the endpoint's own path), `params`: mapping, `items`: path to the array (default: OData value, or the root), `paging`: auto (default), odata, link, offset, none; `pageSize`, `offsetParam`, `limitParam` (offset paging, defaults sysparm_offset/sysparm_limit), `maxPages`, `headers` (never credentials). | One per item. |
+| `graph` | `path` (required, e.g. /users), `version`: v1.0 (default) or beta, `select`: list, `filter`, `expand`, `top`, `search`, `consistency`: eventual, `items` (default value), `maxPages`, `prefer` (a Prefer header; never respond-async), `missing`: empty (a 404 is an answer with no rows). | One per item. |
+| `http` | `path` (required, relative to the endpoint's own path), `params`: mapping, `items`: path to the array (default: OData value, or the root), `format`: json (default) or xml (`items` is then an XPath; namespaces are ignored), `method`: get (default) or post with a `body` mapping - post only on the paths the integration type answers as reads (Check Point `/web_api/show-*`, Azure Resource Graph); `paging`: auto (default: @odata.nextLink or ARM nextLink), odata, link, offset, cursor (`cursorField` in the answer, `cursorParam` in the next request), body-offset (`offsetField`/`limitField` in the body), body-cursor (`cursorField` -> `cursorBody`), none; `pageSize`, `offsetParam`, `limitParam` (offset paging, defaults sysparm_offset/sysparm_limit), `maxPages`, `headers` (never credentials), `missing`: empty, `capture_headers`: list (response headers as `_headers.<name>`), `map`: true (an object's keys as rows of `key` and `value`). | One per item. |
 | `graphql` | `document` (required, a query), `path` (default /graphql), `variables`: mapping, `items`: path to the array, `paging`: { cursor, hasNext, variable }, `maxPages`. | One per item. |
 | `sql` | `text` (required, one SELECT/WITH), `database` (default master). Per target instance. | One per result row, plus `instance`. |
 | `cim` | `wql` (required, one SELECT; `{HOST}` stands for the target's computer name, upper case - e.g. `Win32_Group.Domain='{HOST}',Name='Administrators'`), `namespace` (default root/cimv2). Per target host. Never `Win32_Product`: reading it makes Windows Installer re-check (and repair) every package. | One per instance, plus `host`. Dates are ISO. |
@@ -168,11 +193,15 @@ carries its object as `parent`:
       key: "{parent.id}|{id}"
 ```
 
-Only plain ids (letters, digits, `. _ : -`) are put into a path; a failed object makes the result
-partial, never a pass. One level only; `max` defaults to 200 (at most 2000).
+Only plain ids (letters, digits, `. _ : -`) are put into a path or a param; a failed object makes the
+result partial, never a pass. One level only; `max` defaults to 200 (at most 2000). Instead of a list
+query, `values: [a, b]` or `threshold: <name>` (the tenant's comma-separated setting) gives the objects.
 
-**Dates relative to the scan** in `http` and `graph` paths, params and filters: `{NOW}`, `{TODAY}`,
-`{DAYS_AGO:n}`, `{DAYS_AHEAD:n}` - e.g. `filter: "activityDateTime ge {DAYS_AGO:7}"`.
+**Dates relative to the scan** in `http` and `graph` paths, params, bodies and filters, and in `graphql`
+documents and variables: `{NOW}`, `{TODAY}`, `{DAYS_AGO:n}`, `{DAYS_AHEAD:n}` - e.g.
+`filter: "activityDateTime ge {DAYS_AGO:7}"`. The days can be the tenant's: `{DAYS_AGO:threshold.ad.stale-days|90}`.
+
+**Names with dots** in a field path are quoted: `["@odata.type"]`, `value[].["user.company"]`.
 
 LDAP filter macros (the earlier LDAP rules use them): `{USER}`, `{COMPUTER}`, `{ENABLED}`, `{UAC:n}`
 (bit n set), `{FT:n}` (FILETIME n days ago), `{GT:n}` (generalized time n days ago), `{DOMAINDN}`,

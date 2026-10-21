@@ -14,6 +14,9 @@ public sealed record IntegrationType(
     IReadOnlyList<string> AllowedHosts,
     string? DefaultEndpoint = null)
 {
+    /// <summary>Paths (relative to the endpoint, '*' within a segment) where this type's API answers a POST as a read.</summary>
+    public IReadOnlyList<string> ReadPosts { get; init; } = [];
+
     public bool AllowsHost(string host) =>
         AllowedHosts.Count == 0 || AllowedHosts.Any(pattern =>
             pattern.StartsWith("*.", StringComparison.Ordinal)
@@ -50,7 +53,15 @@ public static partial class IntegrationTypes
         new("graph", "Microsoft Graph: Entra ID, Intune, Microsoft 365", ["graph"], Entra,
             ["graph.microsoft.com", "graph.microsoft.us", "dod-graph.microsoft.us", "microsoftgraph.chinacloudapi.cn"], "https://graph.microsoft.com"),
         new("azure", "Azure Resource Manager", ["http"], Entra,
-            ["management.azure.com", "management.usgovcloudapi.net", "management.chinacloudapi.cn"], "https://management.azure.com"),
+            ["management.azure.com", "management.usgovcloudapi.net", "management.chinacloudapi.cn"], "https://management.azure.com")
+        {
+            // Resource Graph takes its KQL as a POST; the query is the rule's own text, and Resource Graph only reads.
+            ReadPosts = ["/providers/Microsoft.ResourceGraph/resources"],
+        },
+        new("checkpoint", "Check Point management API (show- commands only, on a read-only session)", ["http"], ["session-login"], [])
+        {
+            ReadPosts = ["/web_api/show-*", "/web_api/v*/show-*"],
+        },
         new("sccm", "SCCM AdminService (or the site database)", ["http", "sql"], [.. Windows, "basic"], []),
         new("cim", "Windows hosts: WMI over WinRM, the registry (read-only) and event logs", ["cim", "registry", "eventlog"], Windows, []),
         new("sql", "SQL Server instances", ["sql"], ["negotiate", "basic"], []),

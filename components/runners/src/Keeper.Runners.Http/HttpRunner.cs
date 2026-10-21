@@ -5,14 +5,19 @@ using Keeper.Rules;
 namespace Keeper.Runners.Http;
 
 /// <summary>
-/// http: GET a JSON API relative to the integration's endpoint - SCCM AdminService, ServiceNow, vCenter,
-/// Veeam, PRTG, Dynatrace, Azure Resource Manager. Paging: odata (@odata.nextLink), link (Link header),
-/// offset (offsetParam/limitParam, e.g. ServiceNow's sysparm_offset/sysparm_limit), or none.
+/// http: read a JSON or XML API relative to the integration's endpoint - SCCM AdminService, ServiceNow, vCenter,
+/// Veeam, PRTG, Dynatrace, Azure Resource Manager, Check Point. GET, or POST where the integration's type
+/// answers a POST as a read (<see cref="IConnection.ReadPosts"/>). Paging: odata (@odata.nextLink or ARM's
+/// nextLink), link (Link header), offset (offsetParam/limitParam), cursor (cursorField in the answer ->
+/// cursorParam), body-offset (offsetField/limitField in a POST body), body-cursor (cursorField -> cursorBody),
+/// or none.
 /// </summary>
 public sealed class HttpRunner : IRunner
 {
     private const int DefaultMaxPages = 200;
     private const int MaxRows = 500_000;
+
+    private static readonly string[] Pagings = ["auto", "odata", "link", "offset", "cursor", "body-offset", "body-cursor", "none"];
 
     public string Protocol => "http";
 
@@ -22,8 +27,39 @@ public sealed class HttpRunner : IRunner
     {
         if (HttpPaths.Problem(query.Text("path")) is { } problem)
             yield return problem;
-        if (query.Text("paging") is { } paging && paging is not ("auto" or "odata" or "link" or "offset" or "none"))
-            yield return "paging must be auto, odata, link, offset or none";
+        var method = query.Text("method") ?? "get";
+        if (method is not ("get" or "post"))
+            yield return "method must be get or post (post only where the integration type answers it as a read)";
+        if (query.Fields["body"] is not (null or JsonObject))
+            yield return "body must be a mapping (it is sent as JSON)";
+        else if (query.Fields["body"] is not null && method != "post")
+            yield return "body needs method: post";
+        var paging = query.Text("paging") ?? "auto";
+        if (!Pagings.Contains(paging))
+            yield return $"paging must be {string.Join(", ", Pagings)}";
+        if (paging is "body-offset" or "body-cursor" && method != "post")
+            yield return $"paging {paging} needs method: post";
+        if (paging is "cursor" or "body-cursor" && query.Text("cursorField") is null)
+            yield return $"paging {paging} needs cursorField: where the answer gives the next cursor";
+        if (paging == "cursor" && query.Text("cursorParam") is null)
+            yield return "paging cursor needs cursorParam: the parameter the next request passes it in";
+        if (paging == "body-cursor" && query.Text("cursorBody") is null)
+            yield return "paging body-cursor needs cursorBody: where in the body the next request passes it";
+        var format = query.Text("format") ?? "json";
+        if (format is not ("json" or "xml"))
+            yield return "format must be json or xml";
+        else if (format == "xml" && string.IsNullOrWhiteSpace(query.Text("items")))
+            yield return "format xml needs items: the XPath of the elements that are rows";
+        if (query.Text("missing") is not (null or "empty" or "fail"))
+            yield return "missing must be empty (a 404 is an answer with no rows) or fail (the default)";
+        else if (query.Text("missing") == "empty" && query.Fields["for_each"] is null)
+            yield return "missing: empty is for per-object reads (for_each), where an object may lack the child; a list that answers 404 has a wrong path";
+        if (query.Fields["capture_headers"] is not (null or JsonArray))
+            yield return "capture_headers must be a list of response header names";
+        if (query.Text("map") is not (null or "true" or "false"))
+            yield return "map must be true or false";
+        else if (query.Text("map") == "true" && format == "xml")
+            yield return "map works on JSON answers only";
         if (query.Fields["params"] is not (null or JsonObject))
             yield return "params must be a mapping";
         if (query.Fields["headers"] is JsonObject headers && headers.Any(h => h.Key.Contains("auth", StringComparison.OrdinalIgnoreCase) || h.Key.Contains("cookie", StringComparison.OrdinalIgnoreCase)))
@@ -52,20 +88,33 @@ public sealed class HttpRunner : IRunner
     {
         var paging = query.Text("paging") ?? "auto";
         var items = query.Text("items");
+        var xml = query.Text("format") == "xml";
         var maxPages = query.Int("maxPages") ?? DefaultMaxPages;
         var headers = (query.Fields["headers"] as JsonObject)?.ToDictionary(h => h.Key, h => Values.Text(h.Value) ?? "") ?? [];
         foreach (var (name, value) in extraHeaders ?? new Dictionary<string, string>())
             headers[name] = value;
         var parameters = HttpEngine.Parameters(query.Fields["params"]).Concat(extraParams ?? [])
-            .Select(p => KeyValuePair.Create(p.Key, RequestMacros.Expand(p.Value, context.Now)))
+            .Select(p => KeyValuePair.Create(p.Key, RequestMacros.Expand(p.Value, context)))
             .ToList();
-        var path = RequestMacros.Expand(query.Text("path")!, context.Now);
+        var path = RequestMacros.Expand(query.Text("path")!, context);
+
+        var method = query.Text("method") == "post" ? HttpMethod.Post : HttpMethod.Get;
+        if (method == HttpMethod.Post && !ReadPost.Allow(context.Connection.ReadPosts, path))
+            return RunnerResult.Failed($"POST {path.Split('?')[0]} is not a read the {context.Connection.Type} integration type allows; nothing was sent");
+        var body = query.Fields["body"] is JsonObject template ? (JsonObject)RequestMacros.ExpandAll(template.DeepClone(), context)! : null;
 
         var offsetParam = query.Text("offsetParam") ?? "sysparm_offset";
         var limitParam = query.Text("limitParam") ?? "sysparm_limit";
         var pageSize = query.Int("pageSize") ?? 1000;
         if (paging == "offset")
             parameters.Add(KeyValuePair.Create(limitParam, pageSize.ToString(CultureInfo.InvariantCulture)));
+        if (paging == "body-offset")
+        {
+            body ??= [];
+            ReadPost.Set(body, query.Text("limitField") ?? "limit", pageSize);
+            ReadPost.Set(body, query.Text("offsetField") ?? "offset", 0);
+        }
+        var cursorField = query.Text("cursorField");
 
         var rows = new List<JsonObject>();
         Uri? next = engine.Build(path, paging == "offset"
@@ -77,20 +126,82 @@ public sealed class HttpRunner : IRunner
                 return RunnerResult.Partial(rows, $"stopped after {maxPages} pages");
             if (!engine.IsOwn(next))
                 return RunnerResult.Partial(rows, $"the next page is on another host ({next.Host}); refused");
+            // A next page the server names is checked like the rule's own path: a read POST never follows a link
+            // to a path its integration type does not read.
+            if (method == HttpMethod.Post && (engine.Relative(next) is not { } relative || !ReadPost.Allow(context.Connection.ReadPosts, relative)))
+                return RunnerResult.Partial(rows, $"the next page POST {next.AbsolutePath} is not a read the {context.Connection.Type} integration type allows; refused");
 
-            var (body, responseHeaders) = await engine.GetAsync(next, headers, cancellationToken).ConfigureAwait(false);
-            var pageRows = RowValues.ItemsOf(body, items);
+            string text;
+            IReadOnlyDictionary<string, string> responseHeaders;
+            try
+            {
+                (text, responseHeaders) = await engine.SendTextAsync(method, next, body, headers, cancellationToken).ConfigureAwait(false);
+            }
+            catch (HttpRequestException ex) when (ex.StatusCode == System.Net.HttpStatusCode.NotFound && query.Text("missing") == "empty")
+            {
+                // The object has no such child (no manager, no policy): an answer with no rows - on the first page
+                // only. A later page that vanishes is a cut-short read.
+                return page == 1 ? new RunnerResult([], "ok", RunnerResult.NotFound) : RunnerResult.Partial(rows, $"page {page} answered 404");
+            }
+            JsonNode? json = null;
+            System.Xml.Linq.XDocument? document = null;
+            List<JsonObject> pageRows;
+            if (xml)
+            {
+                document = text.Length == 0 ? null : XmlRows.Load(new StringReader(text), HttpEngine.MaxResponseBytes);
+                pageRows = document is null ? [] : XmlRows.Select(document, items!);
+                pageRows.ForEach(SecretProperties.Mask);
+            }
+            else
+            {
+                json = text.Length == 0 ? null : RowValues.Parse(text) ?? throw new HttpRequestException($"{engine.Endpoint.Host} did not answer with JSON.");
+                pageRows = query.Text("map") == "true" ? [.. RowValues.EntriesOf(json, items)] : [.. RowValues.ItemsOf(json, items)];
+            }
+            if (query.Fields["capture_headers"] is JsonArray wanted)
+            {
+                // Response headers as fields (Strict-Transport-Security, Server): on every row, or one row of their own.
+                var captured = new JsonObject();
+                foreach (var name in wanted.Select(Values.Text).OfType<string>())
+                    captured[name] = responseHeaders.GetValueOrDefault(name);
+                if (pageRows.Count == 0 && page == 1)
+                    pageRows.Add([]);
+                foreach (var row in pageRows)
+                    row["_headers"] = captured.DeepClone();
+            }
             rows.AddRange(pageRows);
             if (rows.Count > MaxRows)
                 return RunnerResult.Partial(rows, $"stopped at {MaxRows} rows");
 
+            string? Cursor() => cursorField is null ? null
+                : xml ? (document is null ? null : XmlRows.Value(document, cursorField))
+                : Values.Text(FieldPath.First(json, cursorField)) is { Length: > 0 } c ? c : null;
+            // A next link the answer names but that cannot be used is a cut-short read, never the last page.
+            var malformed = false;
+            var named = paging switch
+            {
+                "link" => HttpEngine.NextLink(responseHeaders.GetValueOrDefault("Link"), out malformed),
+                "auto" or "odata" => json is JsonObject linked
+                    ? (Values.Text(linked["@odata.nextLink"]) is { } odataLink && !string.IsNullOrWhiteSpace(odataLink) ? odataLink : Values.Text(linked["nextLink"]))
+                    : null,
+                _ => null,
+            };
+            if (malformed)
+                return RunnerResult.Partial(rows, "the answer's Link header could not be read, so whether more pages follow is unknown");
+            if (string.IsNullOrWhiteSpace(named))
+                named = null;   // an empty next link is no next link
+            if (named is not null && engine.Resolve(named) is null)
+                return RunnerResult.Partial(rows, $"the answer's next page link could not be used: {HttpEngine.Truncate(named, 120)}");
             next = paging switch
             {
                 "none" => null,
-                "link" => HttpEngine.NextLink(responseHeaders),
+                "link" or "auto" or "odata" => engine.Resolve(named),
                 "offset" => pageRows.Count < pageSize ? null : engine.Build(path,
                     parameters.Append(KeyValuePair.Create(offsetParam, (page * pageSize).ToString(CultureInfo.InvariantCulture)))),
-                _ => body is JsonObject o && Values.Text(o["@odata.nextLink"]) is { } link && Uri.TryCreate(link, UriKind.Absolute, out var u) ? u : null,
+                "cursor" => Cursor() is { } cursor ? engine.Build(path, parameters.Append(KeyValuePair.Create(query.Text("cursorParam")!, cursor))) : null,
+                // A body page is the same request with the next offset or cursor in its body.
+                "body-offset" => pageRows.Count < pageSize ? null : ReadPost.Set(body!, query.Text("offsetField") ?? "offset", page * pageSize, next),
+                "body-cursor" => Cursor() is { } cursor ? ReadPost.Set(body ??= [], query.Text("cursorBody")!, cursor, next) : null,
+                _ => null,
             };
         }
         return RunnerResult.Ok(rows);

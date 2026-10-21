@@ -222,6 +222,8 @@ public static partial class RuleLoader
 
         var evidence = reader.Text(fields, "evidence", what);
         var deadline = reader.Text(fields, "deadline", what);
+        if (deadline is { Length: 10 } && char.IsAsciiDigit(deadline[0]) && deadline[4] == '-' && !Values.IsLiteralDate(deadline))
+            reader.Error($"{what}: deadline '{deadline}' is not a real date (yyyy-MM-dd).");
         Emit? emit = null;
         if (fields.TryGetValue("emit", out var emitNode) && reader.Fields(emitNode, $"{what}.emit", EmitFields) is { } e)
         {
@@ -303,6 +305,24 @@ public static partial class RuleLoader
 
     private static Condition? ReadCondition(YamlReader reader, YamlNode node, string what)
     {
+        // element: { of: assignments, match: any|all, where: <condition> } - both conditions on the same element.
+        if (node is YamlMappingNode single && single.Children.Count == 1 && single.Children.First().Key is YamlScalarNode { Value: "element" })
+        {
+            var elementFields = reader.Fields(single.Children.First().Value, $"{what}.element", ["of", "match", "where"]);
+            if (elementFields is null)
+                return null;
+            var of = reader.Text(elementFields, "of", $"{what}.element", required: true);
+            var match = reader.Text(elementFields, "match", $"{what}.element") ?? "any";
+            if (match is not ("any" or "all"))
+                reader.Error(single, $"{what}.element.match must be any or all.");
+            if (!elementFields.TryGetValue("where", out var whereNode))
+            {
+                reader.Error(single, $"{what}.element needs where: the condition each element is judged by.");
+                return null;
+            }
+            var where = ReadCondition(reader, whereNode, $"{what}.element.where");
+            return of is null || where is null ? null : new ElementCondition(of, match == "all", where);
+        }
         if (node is YamlMappingNode map && map.Children.Count == 1 && map.Children.First().Key is YamlScalarNode { Value: "all" or "any" or "not" } combinator)
         {
             var inner = map.Children.First().Value;
@@ -364,8 +384,20 @@ public static partial class RuleLoader
             }
         }
         if (op is "gt" or "ge" or "lt" or "le" or "age-gt" or "age-lt" or "until-lt" or "flag" or "noflag" or "size-gt" or "size-lt" or "size-eq"
+                or "duration-gt" or "duration-lt"
             && !Values.TryNumber(Values.Text(value), out _))
             reader.Error(node, $"{what}: op '{op}' needs a number.");
+        if (op.StartsWith("version-", StringComparison.Ordinal) && !Values.TryVersion(Values.Text(value), out _))
+            reader.Error(node, $"{what}: op '{op}' needs a version such as 10.0.19045.");
+        if (op is "in-cidr" or "notin-cidr")
+        {
+            var ranges = value is JsonArray list ? list.Select(Values.Text) : (Values.Text(value) ?? "").Split(',', StringSplitOptions.TrimEntries);
+            foreach (var range in ranges)
+            {
+                if (!System.Net.IPNetwork.TryParse(range, out _))
+                    reader.Error(node, $"{what}: '{range}' is not a network such as 192.0.2.0/24.");
+            }
+        }
 
         var threshold = reader.Text(fields, "threshold", what);
         if (threshold is not null && !ThresholdName().IsMatch(threshold))
@@ -392,9 +424,19 @@ public static partial class RuleLoader
         if (node is YamlScalarNode { Value: "none" or "some" } mode)
             return new CountCondition(mode.Value!, null, 0, null);
 
-        var fields = reader.Fields(node, $"{what}.count", ["op", "value", "threshold", "where"]);
+        var fields = reader.Fields(node, $"{what}.count", ["op", "value", "threshold", "where", "by", "distinct", "percent"]);
         if (fields is null)
             return null;
+        var by = reader.Text(fields, "by", $"{what}.count");
+        var distinct = reader.Text(fields, "distinct", $"{what}.count");
+        var percent = reader.Text(fields, "percent", $"{what}.count") switch
+        {
+            null or "false" => false,
+            "true" => true,
+            _ => Refuse(reader, node, $"{what}.count.percent must be true or false."),
+        };
+        if (percent && distinct is not null)
+            reader.Error(node, $"{what}.count: percent counts rows; it cannot be combined with distinct.");
         var where = fields.TryGetValue("where", out var whereNode) ? ReadCondition(reader, whereNode, $"{what}.count.where") : null;
         var op = reader.Text(fields, "op", $"{what}.count", required: true) ?? "";
         if (op is not ("gt" or "ge" or "lt" or "le" or "eq" or "ne"))
@@ -405,7 +447,13 @@ public static partial class RuleLoader
         var threshold = reader.Text(fields, "threshold", $"{what}.count");
         if (threshold is not null && !ThresholdName().IsMatch(threshold))
             reader.Error(node, $"{what}.count: threshold '{threshold}' must be lower-case letters, digits, dots and dashes.");
-        return new CountCondition("compare", op, value, threshold, where);
+        return new CountCondition("compare", op, value, threshold, where) { By = by, Distinct = distinct, Percent = percent };
+    }
+
+    private static bool Refuse(YamlReader reader, YamlNode node, string message)
+    {
+        reader.Error(node, message);
+        return false;
     }
 
     private static SeverityMap? ReadSeverityMap(YamlReader reader, YamlNode node, string what)

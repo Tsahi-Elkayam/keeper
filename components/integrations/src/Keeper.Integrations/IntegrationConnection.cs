@@ -40,6 +40,8 @@ public sealed partial class IntegrationConnection : IConnection, IDisposable
     /// <summary>The account an Entra token was issued to; for negotiate, the Windows user this process runs as.</summary>
     public string? SignedInAs => _signedInAs ?? (_record.AuthKind == "negotiate" ? $"{Environment.UserDomainName}\\{Environment.UserName}" : null);
 
+    public IReadOnlyList<string> ReadPosts => IntegrationTypes.Find(_record.Type)?.ReadPosts ?? [];
+
     /// <summary>Sign in to Entra again even when a cached token is valid: right after a PIM activation, so the new role is in it.</summary>
     public bool FreshSignIn { get; init; }
 
@@ -264,16 +266,23 @@ public sealed partial class IntegrationConnection : IConnection, IDisposable
             [_record.Options["userField"]?.ToString() ?? "user"] = user,
             [_record.Options["passwordField"]?.ToString() ?? "password"] = RequiredSecret("password"),
         };
+        var extras = new HashSet<string>(StringComparer.Ordinal);
         foreach (var (name, value) in _record.Options.Where(o => o.Key.StartsWith("loginFields.", StringComparison.Ordinal)))
+        {
             fields[name["loginFields.".Length..]] = value?.ToString() ?? "";
+            extras.Add(name["loginFields.".Length..]);
+        }
 
         using var client = new HttpClient(new SocketsHttpHandler { AllowAutoRedirect = false }) { Timeout = TimeSpan.FromSeconds(30) };
         using var request = new HttpRequestMessage(HttpMethod.Post, uri)
         {
             Content = _record.Options["body"]?.ToString() == "form"
                 ? new FormUrlEncodedContent(fields)
-                : new StringContent(new JsonObject(fields.Select(f => KeyValuePair.Create(f.Key, (JsonNode?)JsonValue.Create(f.Value)))).ToJsonString(),
-                    Encoding.UTF8, "application/json"),
+                // A configured login field of true / false goes as a JSON boolean: Check Point's login takes
+                // "read-only": true for a session that cannot change anything. The user and password never do.
+                : new StringContent(new JsonObject(fields.Select(f => KeyValuePair.Create(f.Key, extras.Contains(f.Key) && f.Value is "true" or "false"
+                    ? (JsonNode?)JsonValue.Create(f.Value == "true")
+                    : JsonValue.Create(f.Value)))).ToJsonString(), Encoding.UTF8, "application/json"),
         };
         using var response = await client.SendAsync(request, cancellationToken).ConfigureAwait(false);
         if (!response.IsSuccessStatusCode)

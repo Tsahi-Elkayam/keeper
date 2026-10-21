@@ -12,6 +12,76 @@ public sealed class EvaluatorTests
     private static LeafCondition Leaf(string field, string op, string? value = null, string? threshold = null) =>
         new(field, op, value is null ? null : JsonValue.Create(value), threshold);
 
+    [Theory]
+    [InlineData("10.0.19045.3803", "version-lt", "10.0.22621", true)]
+    [InlineData("10.0.22631", "version-lt", "10.0.22621", false)]
+    [InlineData("8.1", "version-ge", "8.1.0", true)]              // missing parts are 0
+    [InlineData("v2.4.1-beta", "version-gt", "2.4", true)]
+    [InlineData("unknown", "version-lt", "1.0", null)]           // not a version: n/a, never a pass
+    [InlineData("192.0.2.15", "in-cidr", "192.0.2.0/24,198.51.100.0/24", true)]
+    [InlineData("203.0.113.7", "in-cidr", "192.0.2.0/24", false)]
+    [InlineData("203.0.113.7", "notin-cidr", "192.0.2.0/24", true)]
+    [InlineData("2001:db8::1", "in-cidr", "2001:db8::/32", true)]
+    [InlineData("not-an-ip", "in-cidr", "192.0.2.0/24", null)]
+    [InlineData("P90D", "duration-gt", "60", true)]
+    [InlineData("PT12H", "duration-gt", "1", false)]
+    [InlineData("30.00:00:00", "duration-lt", "31", true)]
+    [InlineData("ninety days", "duration-gt", "60", null)]
+    [InlineData("2.4.1-beta", "version-lt", "2.4.1", true)]      // a pre-release is below its release
+    [InlineData("2.4.1-beta", "version-lt", "2.4.1-rc", null)]   // two pre-releases of one version cannot be ordered
+    [InlineData("1.0-beta", "version-lt", "1.0.0-alpha", null)]  // the same version, written shorter
+    [InlineData("2026-10-21", "version-lt", "3000", null)]       // a date is not a version
+    [InlineData("5", "notin-cidr", "192.0.2.0/24", null)]          // parses as 0.0.0.5, but is not an address
+    [InlineData("3232235777", "notin-cidr", "192.0.2.0/24", null)]
+    [InlineData("192.168.1", "notin-cidr", "192.0.2.0/24", null)]
+    [InlineData("P1M", "duration-gt", "20", null)]                // a month has no fixed length
+    [InlineData("P1Y", "duration-gt", "300", null)]
+    [InlineData("-P5D", "duration-lt", "1", null)]                // a negative length means nothing here
+    [InlineData("P2W", "duration-gt", "13", true)]
+    [InlineData("PT1M", "duration-lt", "1", true)]                // a minute, not a month
+    public void Versions_networks_and_durations_compare_as_what_they_are(string value, string op, string operand, bool? fails)
+    {
+        var verdict = Engine().Each(Leaf("v", op, operand), new JsonObject { ["v"] = value });
+
+        Assert.Equal(fails, verdict.Fails);
+    }
+
+    [Theory]
+    [InlineData("1760918400000", true)]   // milliseconds: 2025-10-20
+    [InlineData("1760918400", true)]      // seconds
+    [InlineData("/Date(1760918400000)/", true)]
+    [InlineData("1792454400000", false)]  // 2026-10-20: today, not older than 30 days
+    [InlineData("9999999999", null)]      // 2286: an id, not a date
+    [InlineData("0000000042", null)]
+    [InlineData("123456789012345", null)] // a 15-digit id read as FILETIME would be 1601
+    public void Unix_times_are_dates(string value, bool? olderThan30Days)
+    {
+        Assert.Equal(olderThan30Days, Engine().Each(Leaf("at", "age-gt", "30"), new JsonObject { ["at"] = value }).Fails);
+    }
+
+    private static readonly JsonObject Policy = new()
+    {
+        ["assignments"] = new JsonArray(
+            new JsonObject { ["group"] = "All users", ["intent"] = "available" },
+            new JsonObject { ["group"] = "Pilot", ["intent"] = "required" }),
+    };
+
+    [Fact]
+    public void Two_conditions_on_one_element_are_judged_on_the_same_element()
+    {
+        var both = new AllCondition([Leaf("group", "eq", "All users"), Leaf("intent", "eq", "required")]);
+
+        // Flattened, each condition finds an element of its own: a false alarm.
+        Assert.True(Engine().Each(new AllCondition([Leaf("assignments[].group", "eq", "All users"), Leaf("assignments[].intent", "eq", "required")]), Policy).Fails);
+        // On one element at a time, no assignment is both.
+        Assert.False(Engine().Each(new ElementCondition("assignments", false, both), Policy).Fails);
+        Assert.True(Engine().Each(new ElementCondition("assignments", false, new AllCondition([Leaf("group", "eq", "Pilot"), Leaf("intent", "eq", "required")])), Policy).Fails);
+        Assert.False(Engine().Each(new ElementCondition("assignments", true, Leaf("intent", "eq", "required")), Policy).Fails);
+        Assert.Null(Engine().Each(new ElementCondition("missing", false, both), Policy).Fails);    // no array at all: cannot be judged
+        Assert.False(Engine().Each(new ElementCondition("none", false, both), new JsonObject { ["none"] = new JsonArray() }).Fails);   // an empty one fires nothing
+        Assert.Null(Engine().Each(new ElementCondition("gaps", false, both), new JsonObject { ["gaps"] = new JsonArray(null, new JsonObject()) }).Fails);
+    }
+
     private static readonly JsonObject User = new()
     {
         ["sAMAccountName"] = "svc-backup",

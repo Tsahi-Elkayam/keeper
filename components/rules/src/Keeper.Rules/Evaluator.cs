@@ -22,6 +22,7 @@ public sealed class Evaluator(Func<string, string?> threshold, DateTimeOffset no
         "eq", "ne", "gt", "ge", "lt", "le", "in", "notin", "contains", "notcontains", "match", "notmatch",
         "exists", "absent", "empty", "notempty", "age-gt", "age-lt", "until-lt", "flag", "noflag",
         "size-gt", "size-lt", "size-eq", "status",
+        "version-lt", "version-le", "version-gt", "version-ge", "in-cidr", "notin-cidr", "duration-gt", "duration-lt",
     };
 
     public static readonly IReadOnlySet<string> OpsWithoutValue = new HashSet<string>(StringComparer.Ordinal)
@@ -41,16 +42,46 @@ public sealed class Evaluator(Func<string, string?> threshold, DateTimeOffset no
         AllCondition all => Combine(all.Items.Select(c => Each(c, row)).ToList(), any: false),
         AnyCondition any => Combine(any.Items.Select(c => Each(c, row)).ToList(), any: true),
         NotCondition not => Invert(Each(not.Item, row)),
+        ElementCondition element => Element(element, row),
         _ => throw new InvalidOperationException($"Unknown condition {condition.GetType().Name}."),
     };
 
-    public Verdict Count(CountCondition condition, int count)
+    /// <summary>
+    /// One element at a time: any - fires when some element fires (n/a when none fires and one cannot be
+    /// judged); all - fires when every element fires. An empty array fires neither; a missing one, or a null
+    /// element, cannot be judged.
+    /// </summary>
+    private Verdict Element(ElementCondition element, JsonNode? row)
     {
-        var value = count.ToString(CultureInfo.InvariantCulture);
+        var found = FieldPath.Resolve(row, element.Of);
+        if (found.Count == 0 || found.All(n => n is null))
+            return new Verdict(null, null, null, $"{element.Of} not present");
+        var elements = found.SelectMany(n => n is JsonArray a ? a.ToList() : [n]).ToList();
+        if (elements.Count == 0)
+            return new Verdict(false, "0 elements", null, null);
+        var verdicts = elements.Select(e => e is null ? new Verdict(null, null, null, $"an element of {element.Of} is null") : Each(element.Where, e)).ToList();
+        if (element.All)
+        {
+            if (verdicts.FirstOrDefault(v => v.Fails == false) is { } miss)
+                return miss;
+            if (verdicts.FirstOrDefault(v => v.Fails is null) is { } unknown)
+                return new Verdict(null, null, null, unknown.Why);
+            return new Verdict(true, $"all {verdicts.Count} elements", null, null);
+        }
+        if (verdicts.FirstOrDefault(v => v.Fails == true) is { } hit)
+            return hit;
+        return verdicts.FirstOrDefault(v => v.Fails is null) is { } open
+            ? new Verdict(null, null, null, open.Why)
+            : new Verdict(false, null, null, null);
+    }
+
+    public Verdict Count(CountCondition condition, double count)
+    {
+        var value = Math.Round(count, 2).ToString(CultureInfo.InvariantCulture);
         switch (condition.Mode)
         {
             case "none":
-                return new Verdict(count == 0, value, "none", count == 0 ? "no rows: something that should exist was not found" : null);
+                return new Verdict(count == 0, value, "none", count == 0 ? "nothing matched: something that should exist was not found" : null);
             case "some":
                 return new Verdict(count > 0, value, "some", null);
         }
@@ -242,6 +273,42 @@ public sealed class Evaluator(Func<string, string?> threshold, DateTimeOffset no
                     return new Verdict(null, value, operand, $"{leaf.Field} is not an integer");
                 fails = leaf.Op == "flag" ? (bits & flag) == flag : (bits & flag) == 0;
                 break;
+            case "version-lt":
+            case "version-le":
+            case "version-gt":
+            case "version-ge":
+                if (!Values.TryVersion(value, out var have))
+                    return new Verdict(null, value, operand, $"{leaf.Field} is not a version");
+                if (!Values.TryVersion(operand, out var limitVersion))
+                    return new Verdict(null, value, operand, "operand is not a version");
+                if (have.PreRelease && limitVersion.PreRelease
+                    && Values.CompareVersions(have with { PreRelease = false }, limitVersion with { PreRelease = false }) == 0)
+                    return new Verdict(null, value, operand, "two pre-releases of one version cannot be ordered");
+                var order = Values.CompareVersions(have, limitVersion);   // a pre-release is below its release
+                fails = leaf.Op switch { "version-lt" => order < 0, "version-le" => order <= 0, "version-gt" => order > 0, _ => order >= 0 };
+                break;
+            case "in-cidr":
+            case "notin-cidr":
+                // Only an address written as one: 5, 192.168.1 or 3232235777 also parse, as 0.0.0.5 and the like.
+                if (!IsAddress(value.Trim(), out var address))
+                    return new Verdict(null, value, operand, $"{leaf.Field} is not an IP address");
+                var inside = false;
+                foreach (var range in ListOf(leaf.Value, operand))
+                {
+                    if (!System.Net.IPNetwork.TryParse(range, out var network))
+                        return new Verdict(null, value, operand, $"'{range}' is not a network (CIDR)");
+                    inside |= network.Contains(address.IsIPv4MappedToIPv6 ? address.MapToIPv4() : address);
+                }
+                fails = leaf.Op == "in-cidr" ? inside : !inside;
+                break;
+            case "duration-gt":
+            case "duration-lt":
+                if (!Values.TryDays(value, out var length))
+                    return new Verdict(null, value, operand, $"{leaf.Field} is not a duration");
+                if (!Values.TryNumber(operand, out var limitDays))
+                    return new Verdict(null, value, operand, "operand is not a number of days");
+                fails = leaf.Op == "duration-gt" ? length > limitDays : length < limitDays;
+                break;
             case "status":
                 var word = value.Trim().ToLowerInvariant();
                 var failWords = operand is { Length: > 0 } ? operand.Split(',', StringSplitOptions.TrimEntries) : FailWords;
@@ -256,6 +323,16 @@ public sealed class Evaluator(Func<string, string?> threshold, DateTimeOffset no
                 throw new InvalidOperationException($"Unknown op {leaf.Op}.");
         }
         return new Verdict(fails, value, operand, null);
+    }
+
+    /// <summary>An IPv4 address in its four dotted parts, or an IPv6 address.</summary>
+    private static bool IsAddress(string text, out System.Net.IPAddress address)
+    {
+        address = System.Net.IPAddress.None;
+        if (text.Contains(':', StringComparison.Ordinal))
+            return System.Net.IPAddress.TryParse(text, out address!) && address.AddressFamily == System.Net.Sockets.AddressFamily.InterNetworkV6;
+        return text.Split('.') is { Length: 4 } parts && parts.All(p => p.Length is > 0 and <= 3 && p.All(char.IsAsciiDigit))
+               && System.Net.IPAddress.TryParse(text, out address!);
     }
 
     private static IReadOnlyList<string> ListOf(JsonNode? literal, string? operand) =>

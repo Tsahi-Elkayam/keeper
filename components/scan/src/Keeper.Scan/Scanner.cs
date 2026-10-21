@@ -238,7 +238,10 @@ public sealed class Scanner(RunnerRegistry registry, TimeProvider? clock = null)
 
     private RunnerContext Context(ScanRequest request, string? target) =>
         new(request.Connection, target, request.ImportsDir, request.StoreFile, _clock.GetUtcNow(), request.Timeout,
-            message => request.Log(target is null ? message : $"{target}: {message}"));
+            message => request.Log(target is null ? message : $"{target}: {message}"))
+        {
+            Threshold = request.Threshold,
+        };
 
     /// <summary>A runner that throws is a failed query, never a crashed scan.</summary>
     private static async Task<RunnerResult> Safe(IRunner runner, QuerySpec query, RunnerContext context, CancellationToken cancellationToken)
@@ -339,12 +342,12 @@ public sealed class Scanner(RunnerRegistry registry, TimeProvider? clock = null)
                         });
                         continue;
                     }
-                    findings += CountOne(byTarget[target.Target].ToList(), rule.EntityType, target.Target!, target.State == "partial" ? target.Reason : null);
+                    findings += CountRows(byTarget[target.Target].ToList(), rule.EntityType, target.Target!, target.State == "partial" ? target.Reason : null);
                 }
             }
             else
             {
-                findings += CountOne(outcome.Rows, "instance", "-", outcome.State == "partial" ? outcome.Reason : null);
+                findings += CountRows(outcome.Rows, "instance", "-", outcome.State == "partial" ? outcome.Reason : null);
             }
         }
         else
@@ -370,8 +373,46 @@ public sealed class Scanner(RunnerRegistry registry, TimeProvider? clock = null)
         Coverage(outcome.State, outcome.State == "ok" ? null : outcome.Reason, outcome.Rows.Count);
         return findings;
 
-        // partial: why the read is incomplete. Its count is a floor - enough to fail, never to pass.
-        int CountOne(List<(JsonObject Row, string? Target)> rows, string entityType, string target, string? partial)
+        // by: one count per value of a field - "more than one admin per site" - each its own result and finding.
+        int CountRows(List<(JsonObject Row, string? Target)> rows, string entityType, string target, string? partial)
+        {
+            if (rule.Count!.By is not { } by)
+                return CountOne(rows, entityType, target, partial, null, 0, 0);
+            if (rows.Count == 0)
+            {
+                Result(entityType, target, new Verdict(null, "0", null, $"no rows, so no {by} to count by"));
+                return 0;
+            }
+            var groups = rows.GroupBy(r => Values.Text(FieldPath.First(r.Row, by)), StringComparer.OrdinalIgnoreCase).ToList();
+            // Rows whose group cannot be read could belong to any group: not a group that could pass, and they could
+            // add to every other group's count.
+            var orphans = groups.FirstOrDefault(g => g.Key is null)?.ToList() ?? [];
+            var evaluator = new Evaluator(name => request.OverrideThreshold(rule.Id, target) ?? request.Threshold(name), now);
+            var mayCount = rule.Count.Where is null ? orphans.Count : orphans.Count(o => evaluator.Each(rule.Count.Where, o.Row).Fails != false);
+            var total = 0;
+            foreach (var group in groups)
+            {
+                if (group.Key is null)
+                {
+                    // Said only when those rows could change something: they could count, or dilute a share.
+                    if (mayCount > 0 || rule.Count.Percent)
+                    {
+                        var none = target == "-" ? "(no " + by + ")" : $"{target}|(no {by})";
+                        Result(entityType, none, new Verdict(null, group.Count().ToString(System.Globalization.CultureInfo.InvariantCulture), null, $"{group.Count()} rows have no {by}"));
+                    }
+                    continue;
+                }
+                total += CountOne([.. group], entityType, target == "-" ? group.Key : $"{target}|{group.Key}", partial, group.Key, orphans.Count, mayCount);
+            }
+            return total;
+        }
+
+        // partial: why the read is incomplete. Its count is a floor - enough to fail, never to pass; a share
+        // of a partial read says nothing either way.
+        // Rows outside this count that could still belong to it (rows with no group, for a count by group): all of
+        // them (they could join a share and dilute it), and those that could also match (they could add to it).
+        int CountOne(List<(JsonObject Row, string? Target)> rows, string entityType, string target, string? partial, string? group,
+            double mayJoin, double extraUnknown)
         {
             var count = rule.Count!;
             var evaluator = new Evaluator(name => request.OverrideThreshold(rule.Id, target) ?? request.Threshold(name), now);
@@ -380,8 +421,52 @@ public sealed class Scanner(RunnerRegistry registry, TimeProvider? clock = null)
                 : rows.Select(r => (r.Row, r.Target, evaluator.Each(count.Where, r.Row).Fails)).ToList();
             var matching = judged.Where(j => j.Fails == true).ToList();
             var unjudged = judged.Count(j => j.Fails is null);
-            var verdict = evaluator.Count(count, matching.Count);
-            if (verdict.Fails != true && partial is not null)
+            if (count.Percent && judged.Count == 0)
+            {
+                Result(entityType, target, new Verdict(null, null, null, "no rows, so there is no share to compare"));
+                return 0;
+            }
+            // Rows that could not be judged might all match or none might: judge both ends. A pass that the
+            // unjudged rows could overturn is unknown, never a pass. A failure stands, as before: an unreadable
+            // policy never satisfies a must-exist rule.
+            double low, high, shown;
+            if (count.Percent)
+            {
+                // Rows that may belong here may join and not match (all of them: the share falls), or join and match
+                // (those that could: the share rises).
+                var (m, t) = ((double)matching.Count, (double)judged.Count);
+                shown = 100 * m / t;
+                low = Math.Min(shown, 100 * m / (t + mayJoin));
+                high = Math.Max(100 * (m + unjudged) / t, 100 * (m + unjudged + extraUnknown) / (t + extraUnknown));
+            }
+            else if (count.Distinct is { } field)
+            {
+                var values = matching.Select(m => Values.Text(FieldPath.First(m.Row, field))).ToList();
+                low = shown = values.OfType<string>().Distinct(StringComparer.OrdinalIgnoreCase).Count();
+                high = low + unjudged + values.Count(v => v is null) + extraUnknown;
+            }
+            else
+            {
+                low = shown = matching.Count;
+                high = matching.Count + unjudged + extraUnknown;
+            }
+            var verdict = evaluator.Count(count, shown);
+            // The far end, and the limit itself when it lies between: "eq 3" passes at 2 and at 4, not at 3. For
+            // eq and ne a failure is no floor either - "ne 2" fails at 1 and passes at 2 - so a limit within reach
+            // of the unjudged rows makes either verdict unknown.
+            // A share has no floor: rows that may join can tip it either way.
+            var limitInRange = Values.TryNumber(verdict.Operand, out var limit) && limit >= low && limit <= high;
+            bool Differs(double v) => evaluator.Count(count, v).Fails != verdict.Fails;
+            var uncertain = high != low && (count.Op is "eq" or "ne" ? limitInRange
+                : count.Percent ? Differs(low) || Differs(high)
+                : verdict.Fails == false && (Differs(high) || Differs(low)));
+            if (uncertain)
+            {
+                Result(entityType, target, new Verdict(null, verdict.Value, verdict.Operand,
+                    $"{unjudged + (int)extraUnknown} rows could not be judged, and they could change the outcome"));
+                return 0;
+            }
+            if (partial is not null && (verdict.Fails != true || count.Percent))
             {
                 run.Result(new ResultRecord
                 {
@@ -398,12 +483,14 @@ public sealed class Scanner(RunnerRegistry registry, TimeProvider? clock = null)
             var sample = string.Join(", ", matching.Take(10).Select(r => KeyOf(rule.Query, r.Row, r.Target)));
             var note = unjudged > 0 ? $" ({unjudged} of {judged.Count} rows could not be judged)" : "";
             var where = target == "-" ? "" : $"{target}: ";
+            var counting = count.Percent ? $"{verdict.Value}% of {judged.Count} rows" : count.Distinct is not null ? $"{verdict.Value} distinct" : $"{verdict.Value}";
             run.Finding(BuildFinding(rule, instance, system, entityType, target, target == "-" ? null : target, null, evaluator, observedAt,
                 rule.Evidence is null
-                    ? $"{where}{verdict.Value} found (limit {verdict.Operand}){(sample.Length > 0 ? ": " + sample : "")}{note}"
+                    ? $"{where}{counting} found (limit {verdict.Operand}){(sample.Length > 0 ? ": " + sample : "")}{note}"
                     : Templates.Render(rule.Evidence, new JsonObject
                     {
-                        ["host"] = target, ["count"] = matching.Count, ["rows"] = judged.Count, ["unjudged"] = unjudged, ["sample"] = sample,
+                        ["host"] = target, ["group"] = group, ["count"] = matching.Count, ["value"] = verdict.Value, ["rows"] = judged.Count,
+                        ["unjudged"] = unjudged, ["sample"] = sample,
                     }) + note));
             return 1;
         }
@@ -443,7 +530,10 @@ public sealed class Scanner(RunnerRegistry registry, TimeProvider? clock = null)
             Why = rule.Why,
             Fix = rule.Fix,
             Refs = rule.Refs,
-            Deadline = rule.Deadline is { } field && row is not null ? Values.IsoDate(Values.Text(FieldPath.First(row, field))) : null,
+            // deadline: a field of the row, or a date of its own (a product's end of support) for every finding of the rule.
+            Deadline = rule.Deadline is not { } deadline ? null
+                : Values.IsLiteralDate(deadline) ? deadline
+                : row is not null ? Values.IsoDate(Values.Text(FieldPath.First(row, deadline))) : null,
             ObservedAt = observedAt,
         };
     }
