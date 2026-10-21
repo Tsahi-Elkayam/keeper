@@ -99,7 +99,9 @@ public static partial class PerObject
     [GeneratedRegex(@"^(?!\.{1,2}$)[A-Za-z0-9._:\-]{1,200}$", RegexOptions.CultureInvariant)]
     private static partial Regex PlainId();
 
-    public static IEnumerable<string> Validate(QuerySpec query)
+    /// <param name="validateList">How the runner checks the list query itself, when it is not an HTTP path (an
+    /// AWS action); null: the list's path is checked as an HTTP path.</param>
+    public static IEnumerable<string> Validate(QuerySpec query, Func<QuerySpec, IEnumerable<string>>? validateList = null)
     {
         if (query.Fields["for_each"] is null)
             yield break;
@@ -129,7 +131,15 @@ public static partial class PerObject
             yield return "for_each.values must be a list";
         if (each["threshold"] is { } name && Values.Text(name) is not { Length: > 0 })
             yield return "for_each.threshold must name a setting (threshold.<name>) that holds a comma-separated list";
-        if (!given && HttpPaths.Problem(Values.Text(each["path"])) is { } problem)
+        if (!given && validateList is not null)
+        {
+            var listFields = (JsonObject)each.DeepClone();
+            listFields.Remove("field");
+            listFields.Remove("max");
+            foreach (var listProblem in validateList(new QuerySpec(query.Protocol, listFields, "-", null)))
+                yield return $"for_each.{listProblem}";
+        }
+        else if (!given && HttpPaths.Problem(Values.Text(each["path"])) is { } problem)
             yield return $"for_each.{problem}";
         if (Values.Text(each["max"]) is { } max && (!int.TryParse(max, NumberStyles.None, CultureInfo.InvariantCulture, out var n) || n is < 1 or > 2000))
             yield return "for_each.max must be 1 to 2000";

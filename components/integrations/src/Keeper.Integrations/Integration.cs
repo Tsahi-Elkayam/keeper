@@ -6,7 +6,11 @@ using Microsoft.Data.Sqlite;
 
 namespace Keeper.Integrations;
 
-public sealed class IntegrationException(string message) : Exception(message);
+public sealed class IntegrationException(string message) : Exception(message)
+{
+    /// <summary>The service was busy or unreachable, not refusing: worth asking again, never kept as a refusal.</summary>
+    public bool Transient { get; init; }
+}
 
 public sealed record IntegrationRecord(
     string Id,

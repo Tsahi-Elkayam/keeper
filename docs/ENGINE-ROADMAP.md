@@ -25,9 +25,11 @@ modules). Each stage is built, reviewed independently and fixed until a review f
    type per API with its own token resource and hosts - Power Platform (admin, Apps, Automate, API),
    Dataverse, Power BI, Defender for Endpoint, Cloud Apps, Key Vault (a path allow-list: metadata only);
    Exchange Online and Purview through the REST endpoint the modules call, `Get-*` cmdlets only.
-4. **AWS** (~377): SigV4 signed by hand (no SDK) with AWS's test vectors, STS AssumeRole / Roles Anywhere,
-   JSON, Query/XML and REST-JSON, accounts x regions; only Describe/List/Get/Search/Lookup, with an
-   explicit deny list (GetObject, GetSecretValue, GetParameter, Decrypt, StartQuery); billed APIs daily.
+4. **AWS** (~377; built, never run against an account): SigV4 signed by hand (no SDK), checked against
+   AWS's signing test suite; an access key, STS AssumeRole into each account's read-only role; Query/XML,
+   JSON, REST-JSON and REST-XML (S3 bucket settings, never objects); accounts x regions; only reads, with
+   an explicit deny list (GetObject, GetSecretValue, GetParameter(s), GetPasswordData, token issuers);
+   billed APIs daily. Not yet: IAM Roles Anywhere (X.509 sign-in), S3 buckets in other regions than asked.
 5. **Windows reads** (~200): security descriptors (LDAP with the SD-flags control, NTFS and share ACLs);
    SMB/SYSVOL file reads and a GPO parser (registry.pol, GptTmpl.inf, audit.csv, GPP with cpassword
    masked); LDAP binary attributes and per-DC reads; registry binary values and the machine certificate

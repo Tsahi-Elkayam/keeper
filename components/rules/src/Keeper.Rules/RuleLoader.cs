@@ -208,6 +208,9 @@ public static partial class RuleLoader
         }
 
         var query = ReadQuery(reader, fields, what, protocols);
+        // A query that bills each call (Cost Explorer) says so, and runs at most once a day.
+        if (query?.Text("billed") == "daily" && refresh < TimeSpan.FromDays(1))
+            reader.Error(node, $"{what}: its query is billed per call (billed: daily), so refresh must be 1d or longer, not {refreshText}.");
 
         Condition? each = null;
         CountCondition? count = null;

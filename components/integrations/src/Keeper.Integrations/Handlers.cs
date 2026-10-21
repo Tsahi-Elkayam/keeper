@@ -9,7 +9,7 @@ namespace Keeper.Integrations;
 /// Validates the type, the auth kind it allows, the endpoint's scheme and allowed hosts, and refuses options
 /// that look like secrets. Changing the endpoint drops the stored secrets - they were bound to the old one.
 /// </summary>
-public sealed class UpsertHandler : IRequestHandler
+public sealed partial class UpsertHandler : IRequestHandler
 {
     private static readonly string[] SecretLike = ["password", "secret", "token", "apikey", "api-key", "credential", "key"];
 
@@ -78,6 +78,52 @@ public sealed class UpsertHandler : IRequestHandler
             context.Execute("DELETE FROM integration_secret WHERE integration_id = :id;", (":id", id));
     }
 
+    /// <summary>
+    /// aws: the endpoint is the home region; the identity an access key id; accounts are 12-digit ids read
+    /// through roleName in each; aws-assume-role names the role the key assumes first (roleArn).
+    /// </summary>
+    private static void CheckAws(string endpoint, JsonElement payload)
+    {
+        if (!AwsRegion().IsMatch(endpoint))
+            throw new RequestException("aws endpoints are the home region, such as eu-central-1.");
+        if (Payload.Text(payload, "identity") is not { } key || !AccessKeyId().IsMatch(key))
+            throw new RequestException("aws needs a long-term access key id as the identity (AKIA...); its secret is set with set-secret secretAccessKey.");
+        if (!payload.TryGetProperty("options", out var options) || options.ValueKind != JsonValueKind.Object)
+            options = default;
+        string? Option(string name) => options.ValueKind == JsonValueKind.Object && options.TryGetProperty(name, out var v) ? v.ToString() : null;
+        List<string> Options(string name) => options.ValueKind == JsonValueKind.Object && options.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.Array
+            ? [.. v.EnumerateArray().Select(e => e.ToString())]
+            : Option(name) is { } text ? [.. text.Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries)] : [];
+        if (Options("accounts") is { Count: > 0 } accounts)
+        {
+            if (accounts.FirstOrDefault(a => !AccountId().IsMatch(a)) is { } bad)
+                throw new RequestException($"Option accounts: '{bad}' is not a 12-digit account id.");
+            if (Option("roleName") is not { } role || !RoleName().IsMatch(role))
+                throw new RequestException("Option accounts needs roleName: the read-only role each account has for Keeper (SecurityAudit, ReadOnlyAccess).");
+        }
+        if (Options("regions").FirstOrDefault(r => !AwsRegion().IsMatch(r)) is { } region)
+            throw new RequestException($"Option regions: '{region}' is not a region id.");
+        if (Payload.Text(payload, "authKind") == "aws-assume-role" && (Option("roleArn") is not { } arn || !RoleArn().IsMatch(arn)))
+            throw new RequestException("aws-assume-role needs the option roleArn (arn:aws:iam::<account>:role/<name>).");
+    }
+
+    // \z, never $: "$" would let a trailing newline through into a host name.
+    [System.Text.RegularExpressions.GeneratedRegex(@"\A[a-z]{2}(-[a-z]+)+-[0-9]{1,2}\z")]
+    private static partial System.Text.RegularExpressions.Regex AwsRegion();
+
+    // A long-term key: a temporary one (ASIA...) needs its session token, which Keeper does not take.
+    [System.Text.RegularExpressions.GeneratedRegex(@"\AAKIA[A-Z0-9]{16}\z")]
+    private static partial System.Text.RegularExpressions.Regex AccessKeyId();
+
+    [System.Text.RegularExpressions.GeneratedRegex(@"\A[0-9]{12}\z")]
+    private static partial System.Text.RegularExpressions.Regex AccountId();
+
+    [System.Text.RegularExpressions.GeneratedRegex(@"\A[\w+=,.@-]{1,64}\z")]
+    private static partial System.Text.RegularExpressions.Regex RoleName();
+
+    [System.Text.RegularExpressions.GeneratedRegex(@"\Aarn:aws:iam::[0-9]{12}:role/[\w+=,.@/-]{1,128}\z")]
+    private static partial System.Text.RegularExpressions.Regex RoleArn();
+
     private static void CheckEndpoint(IntegrationType type, string endpoint, JsonElement payload)
     {
         if (type.Protocols.Any(p => p is "http" or "graph" or "graphql"))
@@ -96,6 +142,10 @@ public sealed class UpsertHandler : IRequestHandler
                 throw new RequestException(type.EndpointPath is null
                     ? $"{type.Id} endpoints have no path: https://<host> (what it reads is checked against the host's own paths)."
                     : $"{type.Id} endpoints have the path {type.EndpointPath}, and no query.");
+        }
+        else if (type.Id == "aws")
+        {
+            CheckAws(endpoint, payload);
         }
         else if (type.Id == "ldap" && endpoint.Length > 0 && endpoint.Contains("://", StringComparison.Ordinal)
                  && !endpoint.StartsWith("ldap://", StringComparison.OrdinalIgnoreCase) && !endpoint.StartsWith("ldaps://", StringComparison.OrdinalIgnoreCase))

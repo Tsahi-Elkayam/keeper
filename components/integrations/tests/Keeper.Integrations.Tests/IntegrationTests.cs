@@ -108,6 +108,44 @@ public sealed class IntegrationTests : IDisposable
         Assert.Empty(unknown.Protocols!);   // a type Keeper no longer knows offers nothing
     }
 
+    [Theory]
+    [InlineData("eu-central-1", "AKIAIOSFODNN7EXAMPLE", "111111111111", "keeper-read", true)]
+    [InlineData("eu-central-1", "AKIAIOSFODNN7EXAMPLE", null, null, true)]                        // its own account only
+    [InlineData("https://ec2.amazonaws.com", "AKIAIOSFODNN7EXAMPLE", null, null, false)]          // a region, never a host
+    [InlineData("eu-central-1", "keeper-user", null, null, false)]                                 // not an access key id
+    [InlineData("eu-central-1", "AKIAIOSFODNN7EXAMPLE", "111111111111", null, false)]             // accounts without the role to assume
+    [InlineData("eu-central-1", "AKIAIOSFODNN7EXAMPLE", "1111", "keeper-read", false)]
+    public void An_aws_integration_is_a_home_region_an_access_key_id_and_accounts_with_their_role(string endpoint, string identity,
+        string? account, string? role, bool accepted)
+    {
+        Submit("integrations.upsert", new
+        {
+            integrationId = "aws", type = "aws", endpoint, authKind = "aws-access-key", identity,
+            options = account is null ? (object)new { } : new { accounts = new[] { account }, roleName = role, regions = new[] { "eu-west-1" } },
+        });
+
+        Assert.Equal(accepted ? 1 : 0, Drain().Done);
+    }
+
+    [Fact]
+    public async Task An_aws_connection_reads_its_home_region_first_and_only_the_accounts_it_names()
+    {
+        var record = new IntegrationRecord("aws", "aws", "eu-central-1", "aws-access-key", "AKIAIOSFODNN7EXAMPLE",
+            new System.Text.Json.Nodes.JsonObject { ["accounts"] = new System.Text.Json.Nodes.JsonArray("111111111111"), ["roleName"] = "keeper-read",
+                ["regions"] = new System.Text.Json.Nodes.JsonArray("eu-west-1", "eu-central-1") },
+            true, new Dictionary<string, StoredSecret>());
+        using var connection = new IntegrationConnection(record, null);
+
+        Assert.Equal(["eu-central-1", "eu-west-1"], connection.AwsRegions);
+        Assert.Equal(["111111111111"], connection.AwsAccounts);
+        // No secret is set: refused, and refused the same way again rather than retried.
+        var first = await Assert.ThrowsAsync<IntegrationException>(() => connection.AwsCredentialsAsync(null, CancellationToken.None));
+        var again = await Assert.ThrowsAsync<IntegrationException>(() => connection.AwsCredentialsAsync(null, CancellationToken.None));
+        Assert.Contains("secretAccessKey", first.Message, StringComparison.Ordinal);
+        Assert.Same(first, again);
+        await Assert.ThrowsAsync<IntegrationException>(() => connection.AwsCredentialsAsync("222222222222", CancellationToken.None));
+    }
+
     [Fact]
     public void Key_vault_never_reads_a_secrets_value_and_exchange_runs_get_cmdlets_only()
     {

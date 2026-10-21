@@ -8,5 +8,6 @@
     <ProjectReference Include="..\..\..\runners\src\Keeper.Runners.Sql\Keeper.Runners.Sql.csproj" />
     <ProjectReference Include="..\..\..\runners\src\Keeper.Runners.Cim\Keeper.Runners.Cim.csproj" />
     <ProjectReference Include="..\..\..\runners\src\Keeper.Runners.Tls\Keeper.Runners.Tls.csproj" />
+    <ProjectReference Include="..\..\..\runners\src\Keeper.Runners.Aws\Keeper.Runners.Aws.csproj" />
   </ItemGroup>
 </Project>

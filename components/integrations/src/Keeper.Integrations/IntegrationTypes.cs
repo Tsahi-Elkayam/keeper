@@ -72,6 +72,8 @@ public static partial class IntegrationTypes
         ["session-login"] = ["password"],
         ["entra-interactive"] = [],
         ["entra-certificate"] = [],
+        ["aws-access-key"] = ["secretAccessKey"],
+        ["aws-assume-role"] = ["secretAccessKey"],
     };
 
     private static readonly string[] Windows = ["negotiate", "windows-credential"];
@@ -158,6 +160,9 @@ public static partial class IntegrationTypes
             ReadPosts = ["/InvokeCommand"],
             ReadCommand = GetCmdlets,
         },
+        // The endpoint is the home region. Hosts are never configured: the runner builds them under amazonaws.com.
+        new("aws", "Amazon Web Services: read-only actions, signed in-process; every account through its read-only role", ["aws"],
+            ["aws-access-key", "aws-assume-role"], []),
         new("checkpoint", "Check Point management API (show- commands only, on a read-only session)", ["http"], ["session-login"], [])
         {
             ReadPosts = ["/web_api/show-*", "/web_api/v*/show-*"],

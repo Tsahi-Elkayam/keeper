@@ -14,11 +14,14 @@ namespace Keeper.Integrations;
 /// The connection a runner gets: one integration's endpoint and credentials. Secrets are opened from the
 /// vault only when used, and only this integration's. Tokens are cached for the life of the process.
 /// </summary>
-public sealed partial class IntegrationConnection : IConnection, IDisposable
+public sealed partial class IntegrationConnection : IConnection, IAwsConnection, IDisposable
 {
     private readonly IntegrationRecord _record;
     private readonly Keeper.Vault.Vault? _vault;
     private readonly SemaphoreSlim _tokenLock = new(1, 1);
+    private readonly SemaphoreSlim _awsLock = new(1, 1);
+    private readonly Dictionary<string, AwsCredentials> _aws = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, IntegrationException> _awsErrors = new(StringComparer.Ordinal);
     private string? _token;
     private DateTimeOffset _tokenExpires;
     private string? _signedInAs;
@@ -435,8 +438,153 @@ public sealed partial class IntegrationConnection : IConnection, IDisposable
         }
     }
 
+    // ---- AWS: an access key from the vault, then each account's read-only role through STS ----
+
+    private const string OwnKey = "";
+
+    public IReadOnlyList<string> AwsAccounts => OptionList("accounts");
+
+    /// <summary>The home region (the endpoint) first, then the option regions.</summary>
+    public IReadOnlyList<string> AwsRegions => [.. new[] { _record.Endpoint }.Concat(OptionList("regions")).Where(r => r.Length > 0).Distinct(StringComparer.Ordinal)];
+
+    private IReadOnlyList<string> OptionList(string name) => _record.Options[name] switch
+    {
+        JsonArray list => [.. list.Select(v => v?.ToString() ?? "").Where(v => v.Length > 0)],
+        JsonValue text => text.ToString().Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries),
+        _ => [],
+    };
+
+    /// <summary>
+    /// Credentials for one account (its read-only role, assumed from the integration's own), or the
+    /// integration's own (account null). Cached until five minutes before they expire; a refusal is kept for
+    /// the whole scan, so a wrong key is not tried again per region and per query.
+    /// </summary>
+    public async Task<AwsCredentials> AwsCredentialsAsync(string? account, CancellationToken cancellationToken)
+    {
+        if (_record.AuthKind is not ("aws-access-key" or "aws-assume-role"))
+            throw new IntegrationException($"Integration {_record.Id} does not sign AWS requests (auth {_record.AuthKind}).");
+        await _awsLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            var own = await CachedAsync(OwnKey, async () =>
+            {
+                var key = new AwsCredentials(_record.Identity ?? throw new IntegrationException($"Integration {_record.Id} needs the access key id as its identity."),
+                    RequiredSecret("secretAccessKey"), null);
+                var credentials = _record.AuthKind == "aws-assume-role"
+                    ? await AssumeRoleAsync(key, _record.Options["roleArn"]?.ToString()
+                        ?? throw new IntegrationException($"Integration {_record.Id} needs the option roleArn."), cancellationToken).ConfigureAwait(false)
+                    : key;
+                // Who they are, for the record of the scan. A refusal here is a wrong key: refused once, for the
+                // scan, rather than in every account and region. A busy STS only leaves the name unknown.
+                try
+                {
+                    _signedInAs = await CallerAsync(credentials, cancellationToken).ConfigureAwait(false);
+                }
+                catch (IntegrationException ex) when (ex.Transient)
+                {
+                    _signedInAs = null;
+                }
+                return credentials;
+            }).ConfigureAwait(false);
+            if (account is null)
+                return own;
+            if (!AwsAccounts.Contains(account, StringComparer.Ordinal))
+                throw new IntegrationException($"Integration {_record.Id} does not read account {account}.");
+            var role = _record.Options["roleName"]?.ToString() ?? throw new IntegrationException($"Integration {_record.Id} needs the option roleName.");
+            return await CachedAsync(account, () => AssumeRoleAsync(own, $"arn:aws:iam::{account}:role/{role}", cancellationToken)).ConfigureAwait(false);
+        }
+        finally
+        {
+            _awsLock.Release();
+        }
+    }
+
+    private async Task<AwsCredentials> CachedAsync(string key, Func<Task<AwsCredentials>> get)
+    {
+        if (_awsErrors.TryGetValue(key, out var refused))
+            throw refused;
+        if (_aws.TryGetValue(key, out var cached) && (cached.Expires is null || cached.Expires > DateTimeOffset.UtcNow.AddMinutes(5)))
+            return cached;
+        try
+        {
+            return _aws[key] = await get().ConfigureAwait(false);
+        }
+        catch (IntegrationException ex) when (!ex.Transient)
+        {
+            // A refusal (wrong key, no permission to assume the role) stays refused for the scan. A busy or
+            // unreachable STS is asked again by the next read.
+            _awsErrors[key] = ex;
+            throw;
+        }
+    }
+
+    /// <summary>STS AssumeRole for an hour, as "keeper-scan": the role's own permissions, which must only read.</summary>
+    private async Task<AwsCredentials> AssumeRoleAsync(AwsCredentials from, string roleArn, CancellationToken cancellationToken)
+    {
+        var form = new List<string>
+        {
+            "Action=AssumeRole", "Version=2011-06-15", $"RoleArn={SigV4.Encode(roleArn)}", "RoleSessionName=keeper-scan", "DurationSeconds=3600",
+        };
+        if (_record.Options["externalId"]?.ToString() is { Length: > 0 } externalId)
+            form.Add($"ExternalId={SigV4.Encode(externalId)}");
+        var document = await StsAsync(from, string.Join("&", form), cancellationToken).ConfigureAwait(false);
+        var expires = Keeper.Runners.XmlRows.Value(document, "//Credentials/Expiration") is { } text
+                      && DateTimeOffset.TryParse(text, System.Globalization.CultureInfo.InvariantCulture, System.Globalization.DateTimeStyles.AssumeUniversal, out var at)
+            ? at : DateTimeOffset.UtcNow.AddMinutes(55);
+        return new AwsCredentials(
+            Keeper.Runners.XmlRows.Value(document, "//Credentials/AccessKeyId") ?? throw new IntegrationException($"STS gave no credentials for {roleArn}."),
+            Keeper.Runners.XmlRows.Value(document, "//Credentials/SecretAccessKey") ?? throw new IntegrationException($"STS gave no credentials for {roleArn}."),
+            Keeper.Runners.XmlRows.Value(document, "//Credentials/SessionToken"),
+            expires);
+    }
+
+    /// <summary>Who the credentials are (GetCallerIdentity): the ARN the scan records as read by.</summary>
+    private async Task<string?> CallerAsync(AwsCredentials credentials, CancellationToken cancellationToken) =>
+        Keeper.Runners.XmlRows.Value(await StsAsync(credentials, "Action=GetCallerIdentity&Version=2011-06-15", cancellationToken).ConfigureAwait(false), "//Arn");
+
+    private async Task<System.Xml.Linq.XDocument> StsAsync(AwsCredentials credentials, string form, CancellationToken cancellationToken)
+    {
+        var region = AwsRegions.FirstOrDefault() ?? throw new IntegrationException($"Integration {_record.Id} needs its home region as the endpoint.");
+        if (!System.Text.RegularExpressions.Regex.IsMatch(region, @"\A[a-z]{2}(-[a-z]+)+-[0-9]{1,2}\z"))
+            throw new IntegrationException($"Integration {_record.Id}: '{region}' is not a region.");
+        var body = Encoding.UTF8.GetBytes(form);
+        // Short: every read waits for credentials while STS is asked.
+        using var client = new HttpClient(CreateHttpHandler()) { Timeout = TimeSpan.FromSeconds(15) };
+        for (var attempt = 1; ; attempt++)
+        {
+            using var request = new HttpRequestMessage(HttpMethod.Post, $"https://sts.{region}.amazonaws.com/") { Content = new ByteArrayContent(body) };
+            request.Content.Headers.ContentType = MediaTypeHeaderValue.Parse("application/x-www-form-urlencoded; charset=utf-8");
+            SigV4.Sign(request, body, credentials, region, "sts", DateTimeOffset.UtcNow);
+            IntegrationException failure;
+            try
+            {
+                using var response = await client.SendAsync(request, cancellationToken).ConfigureAwait(false);
+                var text = await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false);
+                var document = Keeper.Runners.XmlRows.Load(new StringReader(text), 1_000_000);
+                if (response.IsSuccessStatusCode)
+                    return document;
+                var code = Keeper.Runners.XmlRows.Value(document, "//Code") ?? "";
+                // A busy STS is not a refusal: asked again, and never kept as one.
+                var busy = (int)response.StatusCode >= 500 || code is "Throttling" or "ThrottlingException" or "RequestLimitExceeded";
+                failure = new IntegrationException($"STS {(busy ? "was busy" : "refused")} ({(int)response.StatusCode} {code}): " +
+                    Keeper.Common.Redactor.Clean(Keeper.Runners.XmlRows.Value(document, "//Message") ?? "")) { Transient = busy };
+            }
+            catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException or System.Xml.XmlException && !cancellationToken.IsCancellationRequested)
+            {
+                failure = new IntegrationException($"STS could not be read: {ex.Message}") { Transient = true };
+            }
+            if (!failure.Transient || attempt >= 3)
+                throw failure;
+            await Task.Delay(TimeSpan.FromSeconds(2 * attempt), cancellationToken).ConfigureAwait(false);
+        }
+    }
+
     [LibraryImport("kernel32.dll")]
     private static partial IntPtr GetConsoleWindow();
 
-    public void Dispose() => _tokenLock.Dispose();
+    public void Dispose()
+    {
+        _tokenLock.Dispose();
+        _awsLock.Dispose();
+    }
 }

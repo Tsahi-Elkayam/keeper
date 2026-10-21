@@ -1,4 +1,5 @@
 using Keeper.Runners;
+using Keeper.Runners.Aws;
 using Keeper.Runners.Cim;
 using Keeper.Runners.Files;
 using Keeper.Runners.Http;
@@ -22,6 +23,7 @@ public static class Runners
         new EventLogRunner(),
         new RegistryRunner(),
         new TlsRunner(),
+        new AwsRunner(),
         new FileRunner(),
         new StoreRunner(),
     ]);
