@@ -164,6 +164,30 @@ public sealed class LdapTests
         Assert.Equal((server, port, ssl), LdapRunner.Endpoint(endpoint));
     }
 
+    [Theory]
+    [InlineData(@"u:EXAMPLE\reader", @"EXAMPLE\reader")]
+    [InlineData("dn:CN=reader,DC=example,DC=org", "CN=reader,DC=example,DC=org")]
+    [InlineData("reader", "reader")]
+    public void Who_am_i_answers_become_plain_names(string answer, string expected)
+    {
+        Assert.Equal(expected, LdapRunner.AuthzId(answer));
+    }
+
+    [Fact]
+    public void A_complete_answer_says_who_read_it_and_which_requested_attributes_no_entry_returned()
+    {
+        var rows = new List<System.Text.Json.Nodes.JsonObject>
+        {
+            new() { ["distinguishedName"] = "CN=u1,DC=example,DC=org", ["sAMAccountName"] = "u1" },
+            new() { ["distinguishedName"] = "CN=u2,DC=example,DC=org", ["samaccountname"] = "u2", ["pwdLastSet"] = "2026-01-01" },
+        };
+
+        var notes = LdapRunner.Notes(@"EXAMPLE\reader", ["sAMAccountName", "pwdLastSet", "msDS-AllowedToDelegateTo", "ms-Mcs-AdmPwd"], rows);
+
+        Assert.Equal(@"bound as EXAMPLE\reader; no entry returned msDS-AllowedToDelegateTo (unset everywhere, or hidden from this account)", notes);
+        Assert.Null(LdapRunner.Notes(null, ["sAMAccountName"], []));   // no rows: nothing to say about attributes
+    }
+
     [Fact]
     public void Secret_attributes_are_refused_at_load_time()
     {

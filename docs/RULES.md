@@ -112,7 +112,35 @@ A missing field gives **n/a** for comparisons and is never a pass by default. A 
 ## Queries by protocol
 
 Every query has `protocol:`, `key:` (the row field that identifies the entity) and optionally `name:`
-(a display name field). The other fields depend on the protocol:
+(a display name field) and `min_rows:`. The other fields depend on the protocol.
+
+**Too few rows is not a clean answer.** A read that succeeds but returns little looks exactly like a
+lost permission, an admin role not activated yet, or a wrong base. So the read is *partial*, which
+can neither mark entities gone nor resolve findings, when:
+- it returns fewer rows than `min_rows` (per host for per-host protocols). Set it on queries that
+  always return something: every user, the domain object, the instance's configuration.
+- a read returns less than half of what its last clean read returned (`threshold.scan.row-drop-ratio`,
+  default 0.5) - judged per host for per-host protocols. It stays partial, and shows in today's blind
+  spots, until three scans in a row over at least two days read as low (`threshold.scan.drop-confirm-scans`,
+  `threshold.scan.drop-confirm-days`); a partial for another reason, such as a row cap, starts the count
+  again. Then the lower count is accepted, so a real clean-up resolves a few days later. `store` and `file` reads are not
+  compared: Keeper's own store and another tool's report cannot lose sight of rows.
+
+A partial read of a `count` rule can still fail (its count is a floor), but never pass. An entity is
+gone only when every read that ever returned it - each rule system, query and host - read cleanly
+without it in that system's newest scan, so one failed read hides only its own entities. A host the
+newest scan no longer reads at all, while it read the query's other hosts, is retired. A per-host key
+always names its host (`host|key` when the key does not), so two machines never share an entity.
+Rules sharing one query share its strictest `min_rows`. Scans compare with the scans the store has
+*loaded* (`keeper run` loads every scan); a slow decline over many scans is not caught.
+
+**A tenant's own list.** A condition whose threshold has no meaningful default - names of the
+organisation's agents, its admin groups - takes `required: true`: until the tenant sets it, the rule
+is *not configured* (n/a, with the setting to make), never a pass that compared with nothing.
+
+```yaml
+- { field: Name, op: match, value: '^$', threshold: workstations.watch-agent-pattern, required: true }
+```
 
 | Protocol | Fields | Rows |
 |---|---|---|

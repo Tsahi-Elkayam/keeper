@@ -34,6 +34,12 @@ public interface IConnection
     /// <summary>The account or application the integration reads as. Not a secret.</summary>
     string? Identity { get; }
 
+    /// <summary>
+    /// Who the system actually saw, once known: the account a token was issued to, or the Windows user a
+    /// negotiate sign-in runs as. Null until known, or when it is simply <see cref="Identity"/>.
+    /// </summary>
+    string? SignedInAs => null;
+
     /// <summary>Non-secret options (scopes, header names, TLS mode, targets).</summary>
     JsonObject Options { get; }
 

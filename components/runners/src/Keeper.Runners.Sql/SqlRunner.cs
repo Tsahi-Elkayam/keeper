@@ -42,6 +42,15 @@ public sealed class SqlRunner : IRunner
             await using var transaction = (SqlTransaction)await connection.BeginTransactionAsync(IsolationLevel.ReadCommitted, cancellationToken).ConfigureAwait(false);
             try
             {
+                string? missing;
+                await using (var probe = new SqlCommand(SqlPermissions.Probe, connection, transaction) { CommandTimeout = 15 })
+                await using (var answer = await probe.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false))
+                {
+                    await answer.ReadAsync(cancellationToken).ConfigureAwait(false);
+                    missing = SqlPermissions.Missing(query.Text("text")!, answer.IsDBNull(0) ? "the login" : answer.GetString(0),
+                        !answer.IsDBNull(1) && answer.GetInt32(1) == 1, !answer.IsDBNull(2) && answer.GetInt32(2) == 1);
+                }
+
                 await using var command = new SqlCommand(query.Text("text"), connection, transaction)
                 {
                     CommandTimeout = (int)Math.Max(5, context.Timeout.TotalSeconds),
@@ -55,9 +64,10 @@ public sealed class SqlRunner : IRunner
                         row[reader.GetName(i)] = RowValues.From(reader.IsDBNull(i) ? null : reader.GetValue(i));
                     rows.Add(row);
                     if (rows.Count >= MaxRows)
-                        return RunnerResult.Partial(rows, $"stopped at {MaxRows} rows");
+                        return RunnerResult.Partial(rows, missing is null ? $"stopped at {MaxRows} rows" : $"stopped at {MaxRows} rows; {missing}");
                 }
-                return RunnerResult.Ok(rows);
+                // Missing a view permission is not an error to SQL Server: the views just show less.
+                return missing is null ? RunnerResult.Ok(rows) : RunnerResult.Partial(rows, missing);
             }
             finally
             {

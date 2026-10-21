@@ -1,4 +1,5 @@
 using System.Text;
+using System.Text.Json.Nodes;
 using System.Text.RegularExpressions;
 
 namespace Keeper.Runners;
@@ -19,6 +20,51 @@ public static class SecretAttributes
     public static bool IsSecret(string attribute) => Names.Contains(attribute);
 
     public static IEnumerable<string> In(IEnumerable<string> attributes) => attributes.Where(IsSecret);
+}
+
+/// <summary>
+/// Properties of a JSON answer (Graph, REST and GraphQL APIs, imported reports) that hold a secret: a
+/// Wi-Fi or VPN key in a device profile, a script that may embed a credential, a token. Exact names only -
+/// passwordPolicies and lastPasswordChangeDateTime are facts, not secrets. A secret that is there comes
+/// back as "set", so a rule can still say whether one exists; its value never reaches a row.
+/// </summary>
+public static class SecretProperties
+{
+    private static readonly HashSet<string> Names = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "password", "passwd", "pwd", "user_password", "passphrase", "secret", "secretText", "clientSecret", "sharedSecret",
+        "preSharedKey", "wpaPreSharedKey", "privateKey", "apiKey", "api_key", "token", "accessToken", "access_token",
+        "refreshToken", "refresh_token", "connectionString", "scriptContent", "detectionScriptContent",
+        "remediationScriptContent", "recoveryKey", "bitLockerRecoveryKey",
+    };
+
+    public static bool IsSecret(string property) => Names.Contains(property);
+
+    /// <summary>Replaces every secret value in <paramref name="node"/>, at any depth, with "set". Changes the node in place.</summary>
+    public static void Mask(JsonNode? node)
+    {
+        switch (node)
+        {
+            case JsonObject o:
+                foreach (var name in o.Select(p => p.Key).ToList())
+                {
+                    if (IsSecret(name))
+                    {
+                        if (o[name] is not null && !(o[name] is JsonValue v && v.TryGetValue<string>(out var s) && s.Length == 0))
+                            o[name] = "set";
+                    }
+                    else
+                    {
+                        Mask(o[name]);
+                    }
+                }
+                break;
+            case JsonArray a:
+                foreach (var item in a)
+                    Mask(item);
+                break;
+        }
+    }
 }
 
 /// <summary>

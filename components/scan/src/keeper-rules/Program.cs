@@ -114,7 +114,7 @@ static int Load(RuleSet set, CliArgs cli)
     var file = Path.Combine(paths.Builds, buildId, "rules.json");
     Directory.CreateDirectory(Path.GetDirectoryName(file)!);
     var rows = set.Rules.Select(r => new RulesLoadHandler.RuleRow(r.Id, r.System, r.Title, r.Kind, r.Lens, r.Category, r.Severity,
-        r.EntityType, r.Query.Protocol, (int)r.Refresh.TotalMinutes, r.Why, r.Fix, r.Refs, r.Source)).ToList();
+        r.EntityType, r.Query.Protocol, (int)r.Refresh.TotalMinutes, r.Why, r.Fix, r.Refs, r.Source) { QueryId = r.Query.Id }).ToList();
     File.WriteAllText(file, JsonSerializer.Serialize(rows, JsonLines.Options));
 
     new RequestWriter(paths.Spool).Submit("review.rules-load", $"Rule catalogue: {rows.Count} rules", new

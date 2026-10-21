@@ -277,11 +277,19 @@ public static partial class RuleLoader
         var protocol = reader.Text(map, "protocol", $"{what}.query", required: true) ?? "";
         var key = reader.Text(map, "key", $"{what}.query", required: true) ?? "";
         var name = reader.Text(map, "name", $"{what}.query");
+        int? minRows = null;
+        if (reader.Text(map, "min_rows", $"{what}.query") is { } minText)
+        {
+            if (int.TryParse(minText, System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out var n) && n >= 1)
+                minRows = n;
+            else
+                reader.Error(map["min_rows"], $"{what}.query.min_rows must be a whole number of at least 1.");
+        }
         var json = new JsonObject();
-        foreach (var (field, value) in map.Where(f => f.Key is not ("protocol" or "key" or "name")))
+        foreach (var (field, value) in map.Where(f => f.Key is not ("protocol" or "key" or "name" or "min_rows")))
             json[field] = YamlReader.ToJson(value);
 
-        var query = new QuerySpec(protocol, json, key, name);
+        var query = new QuerySpec(protocol, json, key, name) { MinRows = minRows };
         if (protocols is not null)
         {
             if (!protocols.TryGetValue(protocol, out var validate))
@@ -311,7 +319,7 @@ public static partial class RuleLoader
             return combinator.Value == "all" ? new AllCondition(items!) : new AnyCondition(items!);
         }
 
-        var fields = reader.Fields(node, what, ["field", "op", "value", "threshold"]);
+        var fields = reader.Fields(node, what, ["field", "op", "value", "threshold", "required"]);
         if (fields is null)
             return null;
         var field = reader.Text(fields, "field", what, required: true);
@@ -340,6 +348,8 @@ public static partial class RuleLoader
                 if (reference[key] is { } n && !Values.TryNumber(Values.Text(n), out _))
                     reader.Error(node, $"{what}: value.{key} must be a number.");
             }
+            if (fields.ContainsKey("required"))
+                reader.Error(node, $"{what}: required applies to a threshold, not to a field reference.");
             return new LeafCondition(field, op, value, reader.Text(fields, "threshold", what));
         }
         if (op is "match" or "notmatch" && Values.Text(value) is { } pattern)
@@ -360,7 +370,21 @@ public static partial class RuleLoader
         var threshold = reader.Text(fields, "threshold", what);
         if (threshold is not null && !ThresholdName().IsMatch(threshold))
             reader.Error(node, $"{what}: threshold '{threshold}' must be lower-case letters, digits, dots and dashes.");
-        return new LeafCondition(field, op, value, threshold);
+        var required = reader.Text(fields, "required", what) switch
+        {
+            null or "false" => false,
+            "true" => true,
+            var other => Invalid(other),
+        };
+        if (required && threshold is null)
+            reader.Error(node, $"{what}: required: true needs the threshold the tenant must set.");
+        return new LeafCondition(field, op, value, threshold) { Required = required };
+
+        bool Invalid(string text)
+        {
+            reader.Error(node, $"{what}: required must be true or false, not '{text}'.");
+            return false;
+        }
     }
 
     private static CountCondition? ReadCount(YamlReader reader, YamlNode node, string what)

@@ -30,6 +30,9 @@ public sealed class UpsertHandler : IRequestHandler
         var authKind = Payload.Required(payload, "authKind");
         if (!type.AuthKinds.Contains(authKind))
             throw new RequestException($"{type.Id} allows auth: {string.Join(", ", type.AuthKinds)}.");
+        // A scan refuses a token issued to anyone but this account, and Entra names the account by its sign-in name.
+        if (authKind == "entra-interactive" && Payload.Text(payload, "identity") is { } account && !account.Contains('@', StringComparison.Ordinal))
+            throw new RequestException("payload.identity for entra-interactive must be the account's sign-in name (user@domain), or empty for whoever signs in.");
 
         var endpoint = Payload.Text(payload, "endpoint") ?? type.DefaultEndpoint ?? "";
         CheckEndpoint(type, endpoint, payload);

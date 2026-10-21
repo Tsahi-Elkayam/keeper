@@ -19,6 +19,12 @@ public static class RunFolder
     public const string Findings = "findings.jsonl";
     public const string Coverage = "coverage.jsonl";
 
+    /// <summary>
+    /// The coverage item of one read: the query id (scope query), or query@host for one host of a per-host
+    /// query (scope target) - the same host as the rows' target.
+    /// </summary>
+    public static string CoverageItem(string queryId, string? target) => target is null ? queryId : $"{queryId}@{target}";
+
     public static readonly IReadOnlyDictionary<string, string> FileSchemas = new Dictionary<string, string>
     {
         [Rows] = Schemas.Row,

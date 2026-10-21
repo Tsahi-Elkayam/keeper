@@ -21,6 +21,8 @@ public sealed partial class IntegrationConnection : IConnection, IDisposable
     private readonly SemaphoreSlim _tokenLock = new(1, 1);
     private string? _token;
     private DateTimeOffset _tokenExpires;
+    private string? _signedInAs;
+    private IntegrationException? _tokenError;
 
     public IntegrationConnection(IntegrationRecord record, Keeper.Vault.Vault? vault)
     {
@@ -34,6 +36,12 @@ public sealed partial class IntegrationConnection : IConnection, IDisposable
     public string AuthKind => _record.AuthKind;
     public string? Identity => _record.Identity;
     public JsonObject Options => _record.Options;
+
+    /// <summary>The account an Entra token was issued to; for negotiate, the Windows user this process runs as.</summary>
+    public string? SignedInAs => _signedInAs ?? (_record.AuthKind == "negotiate" ? $"{Environment.UserDomainName}\\{Environment.UserName}" : null);
+
+    /// <summary>Sign in to Entra again even when a cached token is valid: right after a PIM activation, so the new role is in it.</summary>
+    public bool FreshSignIn { get; init; }
 
     public string? Secret(string name)
     {
@@ -132,17 +140,29 @@ public sealed partial class IntegrationConnection : IConnection, IDisposable
         await _tokenLock.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
+            // A refused sign-in is refused for the whole scan: asking again for every query would open a
+            // sign-in window per query, or repeat a wrong password until the account locks.
+            if (_tokenError is not null)
+                throw _tokenError;
             if (_token is not null && DateTimeOffset.UtcNow < _tokenExpires.AddMinutes(-2))
                 return _token;
-            (_token, _tokenExpires) = _record.AuthKind switch
+            try
             {
-                "oauth-client-credentials" => await OAuthAsync(ClientCredentialsForm(), TokenUrl(), cancellationToken).ConfigureAwait(false),
-                "oauth-password" => await OAuthAsync(PasswordForm(), TokenUrl("/api/oauth2/token"), cancellationToken).ConfigureAwait(false),
-                "vcenter-session" => await VCenterSessionAsync(cancellationToken).ConfigureAwait(false),
-                "session-login" => await SessionLoginAsync(cancellationToken).ConfigureAwait(false),
-                "entra-interactive" => await EntraInteractiveAsync(cancellationToken).ConfigureAwait(false),
-                _ => await EntraCertificateAsync(cancellationToken).ConfigureAwait(false),
-            };
+                (_token, _tokenExpires) = _record.AuthKind switch
+                {
+                    "oauth-client-credentials" => await OAuthAsync(ClientCredentialsForm(), TokenUrl(), cancellationToken).ConfigureAwait(false),
+                    "oauth-password" => await OAuthAsync(PasswordForm(), TokenUrl("/api/oauth2/token"), cancellationToken).ConfigureAwait(false),
+                    "vcenter-session" => await VCenterSessionAsync(cancellationToken).ConfigureAwait(false),
+                    "session-login" => await SessionLoginAsync(cancellationToken).ConfigureAwait(false),
+                    "entra-interactive" => await EntraInteractiveAsync(cancellationToken).ConfigureAwait(false),
+                    _ => await EntraCertificateAsync(cancellationToken).ConfigureAwait(false),
+                };
+            }
+            catch (IntegrationException ex)
+            {
+                _tokenError = ex;
+                throw;
+            }
             return _token;
         }
         finally
@@ -297,27 +317,67 @@ public sealed partial class IntegrationConnection : IConnection, IDisposable
         }
         var app = builder.Build();
         var scopes = Scopes();
+        // The account this integration reads as, typically an admin account. Null: whoever is signed in.
+        var wanted = _record.Identity;
 
         try
         {
-            var account = (await app.GetAccountsAsync().ConfigureAwait(false)).FirstOrDefault();
-            var silent = account is null
-                ? app.AcquireTokenSilent(scopes, PublicClientApplication.OperatingSystemAccount)
-                : app.AcquireTokenSilent(scopes, account);
-            var result = await silent.ExecuteAsync(cancellationToken).ConfigureAwait(false);
-            return (result.AccessToken, result.ExpiresOn);
-        }
-        catch (MsalUiRequiredException)
-        {
-            if (!Environment.UserInteractive || Console.IsInputRedirected)
-                throw new IntegrationException($"Integration {_record.Id} needs an interactive sign-in, and this run has no desktop. Run the scan from your own window once, or use entra-certificate.");
-            var result = await app.AcquireTokenInteractive(scopes).ExecuteAsync(cancellationToken).ConfigureAwait(false);
+            var accounts = await app.GetAccountsAsync().ConfigureAwait(false);
+            var account = wanted is null
+                ? accounts.FirstOrDefault()
+                : accounts.FirstOrDefault(a => string.Equals(a.Username, wanted, StringComparison.OrdinalIgnoreCase));
+
+            AuthenticationResult? result = null;
+            // With an identity, never the Windows account: it is usually not the admin account, and a scan
+            // through it reads less while looking complete. A fresh sign-in skips the cache altogether: a
+            // token minted before a PIM activation does not carry the new role.
+            if ((account is not null || wanted is null) && !FreshSignIn)
+            {
+                try
+                {
+                    var silent = account is null
+                        ? app.AcquireTokenSilent(scopes, PublicClientApplication.OperatingSystemAccount)
+                        : app.AcquireTokenSilent(scopes, account);
+                    result = await silent.ExecuteAsync(cancellationToken).ConfigureAwait(false);
+                }
+                catch (MsalUiRequiredException)
+                {
+                    // Falls through to the interactive sign-in.
+                }
+            }
+            if (result is null)
+            {
+                if (!Environment.UserInteractive || Console.IsInputRedirected)
+                    throw new IntegrationException($"Integration {_record.Id} needs an interactive sign-in{(wanted is null ? "" : $" as {wanted}")}, and this run has no desktop. Run the scan from your own window once, or use entra-certificate.");
+                var interactive = app.AcquireTokenInteractive(scopes);
+                if (wanted is not null)
+                    interactive = interactive.WithLoginHint(wanted);
+                result = await interactive.ExecuteAsync(cancellationToken).ConfigureAwait(false);
+            }
+
+            _signedInAs = SignedInAccount(_record.Id, wanted, result.Account?.Username);
             return (result.AccessToken, result.ExpiresOn);
         }
         catch (MsalException ex)
         {
             throw new IntegrationException($"Entra sign-in failed: {ex.ErrorCode}: {ex.Message}");
         }
+    }
+
+    /// <summary>
+    /// The account a token was issued to, when it is the one the integration reads as. A token for anyone
+    /// else - picked in the account chooser, or the Windows account - would make a scan that reads less and
+    /// still looks complete, so it is refused.
+    /// </summary>
+    public static string? SignedInAccount(string integration, string? wanted, string? issuedTo)
+    {
+        if (wanted is not null && !string.Equals(issuedTo, wanted, StringComparison.OrdinalIgnoreCase))
+            throw new IntegrationException(
+                $"Integration {integration} reads as {wanted}, but the sign-in returned {issuedTo ?? "an unknown account"}. " +
+                (wanted.Contains('@', StringComparison.Ordinal)
+                    ? $"Sign in as {wanted} (activate its PIM role first if it needs one)."
+                    : $"The identity must be the account's sign-in name (user@domain): keeper integration set {integration} --identity <user@domain> --reason \"...\"."));
+        return issuedTo;
     }
 
     private async Task<(string, DateTimeOffset)> EntraCertificateAsync(CancellationToken cancellationToken)

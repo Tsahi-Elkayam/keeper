@@ -100,15 +100,233 @@ public sealed class ScannerTests : IDisposable
         File.WriteAllText(path, json);
     }
 
-    private async Task<ScanReport> Scan(Func<string, string?>? threshold = null) =>
+    private async Task<ScanReport> Scan(Func<string, string?>? threshold = null, Func<string, PreviousRead?>? previousRows = null, RuleFile? file = null) =>
         await new Scanner(Runners.Registry(), new Clock(Now)).RunAsync(new ScanRequest
         {
-            Files = [Load()],
+            Files = [file ?? Load()],
             Connection = new FilesConnection(),
             RunsDir = Runs,
             ImportsDir = Imports,
             Threshold = threshold ?? (_ => null),
+            PreviousRows = previousRows ?? (_ => null),
         }, CancellationToken.None);
+
+    private string UsersQuery => Load().Rules.Single(r => r.Id == "EX-USER-STALE").Query.Id;
+
+    /// <summary>A directory-like runner: returns the rows it is given, per host when per-target. Never fails.</summary>
+    private sealed class FakeRunner(bool perTarget, Dictionary<string, int> rowsPerHost) : IRunner
+    {
+        public string Protocol => "fake";
+        public bool PerTarget => perTarget;
+        public IEnumerable<string> Validate(QuerySpec query) => [];
+
+        public Task<RunnerResult> RunAsync(QuerySpec query, RunnerContext context, CancellationToken cancellationToken)
+        {
+            var host = context.Target ?? "-";
+            var rows = Enumerable.Range(1, rowsPerHost.GetValueOrDefault(host))
+                .Select(i => new JsonObject { ["name"] = $"{host}|admin{i}", ["id"] = $"admin{i}", ["host"] = host }).ToList();
+            return Task.FromResult(RunnerResult.Ok(rows));
+        }
+    }
+
+    private const string FakeRules = """
+        schema: keeper.rules/1
+        system: example
+        integration: files
+        defaults: { lens: both, refresh: 1d, category: IAM, kind: misconfigured, severity: high, entity: member }
+        TARGETS
+        rules:
+          - id: EX-ADMIN-UNEXPECTED
+            title: Unexpected administrator
+            query: { protocol: fake, key: name }
+            each: { field: name, op: match, value: "admin9" }
+          - id: EX-ADMINS-TOO-MANY
+            title: Too many administrators
+            query: { protocol: fake, key: name }
+            count: { op: gt, value: 2 }
+        """;
+
+    private static Func<string, PreviousRead?> Clean(int? rows, params PartialRead[] since) => _ => rows is int n ? new PreviousRead(n, since) : null;
+
+    /// <summary>A read the drop guard held back, <paramref name="daysAgo"/> before the scan.</summary>
+    private static PartialRead Low(int count, double daysAgo) => new(count, Now.AddDays(-daysAgo), Low: true);
+
+    /// <summary>A partial read for another reason (a row cap).</summary>
+    private static PartialRead Other(int count, double daysAgo) => new(count, Now.AddDays(-daysAgo), Low: false);
+
+    private async Task<ScanReport> ScanFake(Dictionary<string, int> rowsPerHost, Func<string, PreviousRead?> previousRows, bool perTarget = false)
+    {
+        var path = Path.Combine(_dir, "fake.yaml");
+        File.WriteAllText(path, FakeRules.Replace("TARGETS", perTarget ? "targets: { list: [pc01.example.org, pc02.example.org] }" : "", StringComparison.Ordinal));
+        var registry = new RunnerRegistry([new FakeRunner(perTarget, rowsPerHost)]);
+        var file = RuleLoader.LoadFile(path, "test", registry.Validators);
+        return await new Scanner(registry, new Clock(Now)).RunAsync(new ScanRequest
+        {
+            Files = [file], Connection = new FilesConnection(), RunsDir = Runs, ImportsDir = Imports, PreviousRows = previousRows,
+        }, CancellationToken.None);
+    }
+
+    [Theory]
+    [InlineData(null, "ok")]     // never read before
+    [InlineData(3, "ok")]
+    [InlineData(5, "ok")]        // 3 of 5 is more than half
+    [InlineData(7, "partial")]   // 3 of 7 is less than half: a lost permission looks like this
+    public async Task A_read_that_suddenly_returns_much_less_than_its_last_clean_read_is_partial(int? previous, string state)
+    {
+        var report = await ScanFake(new() { ["-"] = 3 }, Clean(previous));
+
+        var query = Assert.Single(Read<CoverageRecord>(report, RunFolder.Coverage), c => c.Scope == "query");
+        Assert.Equal(state, query.State);
+        Assert.Equal(3, query.Count);
+        // Its rules are not clean either, so the tracker can resolve nothing through them.
+        Assert.Equal(state, Read<CoverageRecord>(report, RunFolder.Coverage).Single(c => c.Scope == "rule" && c.Item == "EX-ADMIN-UNEXPECTED").State);
+        if (state == "partial")
+        {
+            Assert.Equal("partial", report.Manifest.Status);
+            Assert.Contains("the last clean scan 7", query.Reason, StringComparison.Ordinal);
+        }
+    }
+
+    [Fact]
+    public async Task An_empty_answer_after_rows_stays_partial_until_three_scans_over_two_days_read_as_low()
+    {
+        CoverageRecord QueryOf(ScanReport report) => Assert.Single(Read<CoverageRecord>(report, RunFolder.Coverage), c => c.Scope == "query");
+
+        // The last clean read had 900 rows; then nothing, again and again. A role not activated looks the same.
+        var first = QueryOf(await ScanFake(new() { ["-"] = 0 }, Clean(900)));
+        var second = QueryOf(await ScanFake(new() { ["-"] = 0 }, Clean(900, Low(0, 1))));
+        var third = QueryOf(await ScanFake(new() { ["-"] = 0 }, Clean(900, Low(0, 1), Low(0, 2))));
+        // Three scans within the hour are not three days of evidence.
+        var hasty = QueryOf(await ScanFake(new() { ["-"] = 0 }, Clean(900, Low(0, 0.02), Low(0, 0.04))));
+        // A partial for another reason (a row cap) breaks the streak.
+        var broken = QueryOf(await ScanFake(new() { ["-"] = 0 }, Clean(900, Low(0, 1), Other(850, 2))));
+
+        Assert.Equal(new[] { "partial", "partial", "ok", "partial", "partial" }, new[] { first.State, second.State, third.State, hasty.State, broken.State });
+        Assert.StartsWith(Scanner.LowReadMarker, first.Reason, StringComparison.Ordinal);
+        Assert.Contains("accepted after 3 scans", third.Reason, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Each_host_of_a_per_host_query_is_judged_against_its_own_previous_read()
+    {
+        // pc01 reads as before; pc02 suddenly returns nothing (a broken WMI repository looks like this).
+        var report = await ScanFake(new() { ["pc01.example.org"] = 3, ["pc02.example.org"] = 0 },
+            item => new PreviousRead(item.EndsWith("@pc01.example.org", StringComparison.Ordinal) ? 3 : 4, []), perTarget: true);
+
+        var hosts = Read<CoverageRecord>(report, RunFolder.Coverage).Where(c => c.Scope == "target").ToDictionary(c => c.Item.Split('@')[1], c => c.State);
+        Assert.Equal("ok", hosts["pc01.example.org"]);
+        Assert.Equal("partial", hosts["pc02.example.org"]);
+
+        // pc02's count of administrators (0) is only a floor: not a pass. pc01's (3 > 2) fails as usual.
+        var counts = Read<ResultRecord>(report, RunFolder.Results).Where(r => r.RuleId == "EX-ADMINS-TOO-MANY").ToDictionary(r => r.EntityKey, r => r.State);
+        Assert.Equal("unknown", counts["pc02.example.org"]);
+        Assert.Equal("fail", counts["pc01.example.org"]);
+    }
+
+    [Fact]
+    public async Task A_per_host_key_always_names_its_host_so_two_machines_never_share_an_entity()
+    {
+        var registry = new RunnerRegistry([new FakeRunner(true, new() { ["pc01.example.org"] = 1, ["pc02.example.org"] = 1 })]);
+        var path = Path.Combine(_dir, "keys.yaml");
+        // The key is a field that is the same on both machines (an event id, a service name).
+        File.WriteAllText(path, """
+            schema: keeper.rules/1
+            system: example
+            integration: files
+            targets: { list: [pc01.example.org, pc02.example.org] }
+            rules:
+              - id: EX-MEMBER
+                title: Member
+                kind: misconfigured
+                lens: both
+                category: IAM
+                severity: low
+                entity: member
+                query: { protocol: fake, key: id }
+                each: any
+            """);
+        var file = RuleLoader.LoadFile(path, "test", registry.Validators);
+
+        var report = await new Scanner(registry, new Clock(Now)).RunAsync(new ScanRequest
+        {
+            Files = [file], Connection = new FilesConnection(), RunsDir = Runs, ImportsDir = Imports,
+        }, CancellationToken.None);
+
+        var keys = Read<RowRecord>(report, RunFolder.Rows).Select(r => r.EntityKey).ToList();
+        Assert.Equal(2, keys.Distinct().Count());
+        Assert.All(keys, k => Assert.Matches("^pc0[12]\\.example\\.org\\|", k));
+    }
+
+    [Fact]
+    public async Task A_short_host_name_inside_a_key_is_not_mistaken_for_the_host()
+    {
+        // Hosts named "admin1" and "db": their row ids are admin1 (the host itself - kept) and admin1 (not "db" - prefixed).
+        var registry = new RunnerRegistry([new FakeRunner(true, new() { ["admin1"] = 1, ["db"] = 1 })]);
+        var path = Path.Combine(_dir, "short.yaml");
+        File.WriteAllText(path, """
+            schema: keeper.rules/1
+            system: example
+            integration: files
+            targets: { list: [admin1, db] }
+            rules:
+              - id: EX-MEMBER
+                title: Member
+                kind: misconfigured
+                lens: both
+                category: IAM
+                severity: low
+                entity: member
+                query: { protocol: fake, key: id }
+                each: any
+            """);
+
+        var report = await new Scanner(registry, new Clock(Now)).RunAsync(new ScanRequest
+        {
+            Files = [RuleLoader.LoadFile(path, "test", registry.Validators)], Connection = new FilesConnection(), RunsDir = Runs, ImportsDir = Imports,
+        }, CancellationToken.None);
+
+        Assert.Equal(new[] { "admin1", "db|admin1" }, Read<RowRecord>(report, RunFolder.Rows).Select(r => r.EntityKey).Order(StringComparer.Ordinal));
+    }
+
+    [Fact]
+    public async Task Imported_files_are_not_drop_checked_because_they_cannot_lose_sight_of_rows()
+    {
+        DropAll();   // three users, where the previous scan read seven
+
+        var report = await Scan(previousRows: q => q == UsersQuery ? new PreviousRead(7, []) : null);
+
+        Assert.Equal("ok", Read<CoverageRecord>(report, RunFolder.Coverage).Single(c => c.Scope == "query" && c.Item == UsersQuery).State);
+    }
+
+    [Fact]
+    public async Task Fewer_rows_than_min_rows_is_partial_whatever_the_previous_scan_said()
+    {
+        DropAll();
+        var path = Path.Combine(_dir, "min.yaml");
+        File.WriteAllText(path, Rules.Replace("query: { protocol: file, path: \"users/*.json\", items: users, key: name, name: display }",
+            "query: { protocol: file, path: \"users/*.json\", items: users, key: name, name: display, min_rows: 5 }", StringComparison.Ordinal));
+        var file = RuleLoader.LoadFile(path, "test", Runners.Registry().Validators);
+        var queryId = file.Rules.Single(r => r.Id == "EX-USER-STALE").Query.Id;
+
+        var report = await Scan(file: file);
+
+        var query = Read<CoverageRecord>(report, RunFolder.Coverage).Single(c => c.Scope == "query" && c.Item == queryId);
+        Assert.Equal("partial", query.State);
+        Assert.Contains("at least 5", query.Reason, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData("0")]
+    [InlineData("-1")]
+    [InlineData("many")]
+    public void Min_rows_must_be_a_whole_number_of_at_least_one(string value)
+    {
+        var path = Path.Combine(_dir, "bad.yaml");
+        File.WriteAllText(path, Rules.Replace("items: admins, key: name }", $"items: admins, key: name, min_rows: {value} }}", StringComparison.Ordinal));
+
+        var ex = Assert.Throws<RuleException>(() => RuleLoader.LoadFile(path, "test", Runners.Registry().Validators));
+        Assert.Contains("min_rows", ex.Message, StringComparison.Ordinal);
+    }
 
     private void DropAll()
     {

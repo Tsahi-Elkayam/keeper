@@ -78,6 +78,7 @@ public sealed class FileRunner : IRunner
             };
             foreach (var row in rows)
             {
+                SecretProperties.Mask(row);   // JSON rows are masked already; XML and CSV columns too
                 row["_file"] = file.Name;
                 row["_modified"] = RowValues.Iso(file.LastWriteTimeUtc);
             }

@@ -48,7 +48,13 @@ public static class RowValues
         };
     }
 
-    public static JsonObject Detach(JsonObject node) => (JsonObject)JsonNode.Parse(node.ToJsonString())!;
+    /// <summary>A row of its own, with every secret property masked (<see cref="SecretProperties"/>).</summary>
+    public static JsonObject Detach(JsonObject node)
+    {
+        var row = (JsonObject)JsonNode.Parse(node.ToJsonString())!;
+        SecretProperties.Mask(row);
+        return row;
+    }
 
     public static JsonNode? Parse(string text)
     {

@@ -14,7 +14,7 @@ using Microsoft.Data.Sqlite;
 // Read-only towards the system; the only thing it writes is the run folder in the Keeper home.
 try
 {
-    var cli = new CliArgs(args, flags: ["test", "list"]);
+    var cli = new CliArgs(args, flags: ["test", "list", "fresh-sign-in"]);
     if (cli.Help)
         return CliUsage.Print("""
             keeper-scan - run one system's rules through its integration and write a run folder (read-only towards the system)
@@ -24,6 +24,7 @@ try
               keeper scan <system> --test           connection test: the first rule only, no run kept; the result is
                                                     recorded on the integration ('keeper integrations' shows it)
                 --integration <id>   which one, when there are several of the type
+                --fresh-sign-in      take a new token (Entra): right after activating a PIM role, so the role is in it
                 --timeout 60         seconds per request     --parallel 8   requests at once
             """, asked: true);
     var (_, paths) = KeeperContext.Load(cli);
@@ -59,10 +60,11 @@ try
         if (record.Secrets.Count > 0)
             vault = Vault.Load(connection, KeyProtectors.Default());
         inputs = new StoreInputs(connection);
+        var previous = inputs.PreviousRows(record.Id, systemName);
 
         var test = cli.Has("test");
         var runsDir = test ? Path.Combine(paths.DataDir, "tmp", "test-" + Iso.Stamp(DateTimeOffset.UtcNow)) : paths.Runs;
-        using var link = new IntegrationConnection(record, vault);
+        using var link = new IntegrationConnection(record, vault) { FreshSignIn = cli.Has("fresh-sign-in") };
         var scanner = new Scanner(Keeper.Scan.Runners.Registry());
         var started = DateTimeOffset.UtcNow;
         var request = new ScanRequest
@@ -75,6 +77,9 @@ try
             Threshold = inputs.Threshold,
             OverrideThreshold = inputs.OverrideThreshold,
             ResolveTargets = spec => inputs.Targets(spec, started),
+            TargetsIncomplete = inputs.TargetsIncomplete,
+            // A connection test reads one rule once; comparing it with a full scan would only confuse the result.
+            PreviousRows = test ? _ => null : item => previous.GetValueOrDefault(item),
             Timeout = TimeSpan.FromSeconds(int.TryParse(cli.Get("timeout"), NumberStyles.None, CultureInfo.InvariantCulture, out var t) ? t : 60),
             Parallelism = int.TryParse(cli.Get("parallel"), NumberStyles.None, CultureInfo.InvariantCulture, out var p) ? p : 8,
             Log = message => Console.Error.WriteLine($"  {Redactor.Clean(message)}"),
@@ -85,7 +90,8 @@ try
         var report = await scanner.RunAsync(request, CancellationToken.None);
 
         Console.WriteLine($"{report.Manifest.Status}: {report.Rules} rules, {report.Queries} queries, {report.Rows} rows, " +
-                          $"{report.Findings} findings, {report.FailedQueries} failed queries.");
+                          $"{report.Findings} findings, {report.FailedQueries} failed queries." +
+                          (report.Manifest.Identity is { } readAs ? $" Read as {readAs}." : ""));
         foreach (var note in report.Manifest.Notes)
             Console.WriteLine($"  {note}");
 

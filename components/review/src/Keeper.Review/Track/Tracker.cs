@@ -160,32 +160,134 @@ public sealed class Tracker(SqliteConnection connection, TimeProvider? clock = n
             }
         }
 
-        foreach (var run in runs)
+        // Entities none of the newest scans returned. One is gone only when every read that ever returned it - each
+        // rule system, query and host - read cleanly without it in that system's newest scan. A failed or
+        // partial read says nothing about its entities, and no longer hides every other read's.
+        // Two runs of one system started in the same second: the later id (…-2) is the later run.
+        var newest = runs.GroupBy(r => ((string)r["instance"]!, (string)r["system"]!))
+            .ToDictionary(g => g.Key, g => g.MaxBy(r => (string)r["run_id"]!, StringComparer.Ordinal)!);
+        var instances = runs.Select(r => (string)r["instance"]!).ToHashSet(StringComparer.Ordinal);
+        foreach (var (key, before) in existing.Where(e => instances.Contains(e.Key.Item1) && !result.ContainsKey(e.Key)))
         {
-            // Only a complete scan can say an entity is gone, and only of entities its own rule system returned.
-            if ((string)run["status"]! != "ok")
+            if (before["gone_since"] is null && !ReadCleanlyWithout(key, before["seen_by"] as string, newest))
                 continue;
-            var instance = (string)run["instance"]!;
-            var system = (string)run["system"]!;
-            foreach (var (key, before) in existing.Where(e => e.Key.Item1 == instance && !result.ContainsKey(e.Key)
-                         && (e.Value["seen_by"] as string ?? system) == system))
+            result[key] = new EntityRow
             {
-                result[key] = new EntityRow
-                {
-                    Instance = key.Item1,
-                    EntityType = key.Item2,
-                    EntityKey = key.Item3,
-                    EntityName = before["entity_name"] as string,
-                    SystemId = (string)before["system_id"]!,
-                    MappedBy = (string)before["mapped_by"]!,
-                    FirstSeen = (string)before["first_seen"]!,
-                    LastSeen = (string)before["last_seen"]!,
-                    GoneSince = before["gone_since"] as string ?? now,
-                    SeenBy = system,
-                };
-            }
+                Instance = key.Item1,
+                EntityType = key.Item2,
+                EntityKey = key.Item3,
+                EntityName = before["entity_name"] as string,
+                SystemId = (string)before["system_id"]!,
+                MappedBy = (string)before["mapped_by"]!,
+                FirstSeen = (string)before["first_seen"]!,
+                LastSeen = (string)before["last_seen"]!,
+                GoneSince = before["gone_since"] as string ?? now,
+                SeenBy = before["seen_by"] as string,
+            };
         }
         return result.Values.ToList();
+    }
+
+    /// <summary>
+    /// What one run read: the reads that came back clean, every read it made (query-wide records included), and
+    /// the per-host queries that read at least one host cleanly.
+    /// </summary>
+    private sealed record RunReads(HashSet<string> Clean, HashSet<string> Attempted, HashSet<string> CleanPerHostQueries, bool WholeRunClean);
+
+    private readonly Dictionary<string, RunReads> _reads = new(StringComparer.Ordinal);
+
+    private RunReads ReadsOf(Dictionary<string, object?> run)
+    {
+        var runId = (string)run["run_id"]!;
+        if (_reads.TryGetValue(runId, out var known))
+            return known;
+        var rows = Sql.Rows(connection, "SELECT scope, item, state FROM coverage WHERE run_id = :r AND scope IN ('query', 'target');", null, (":r", runId));
+        var reads = new RunReads(
+            rows.Where(r => (string)r["state"]! == "ok").Select(r => (string)r["item"]!).ToHashSet(StringComparer.OrdinalIgnoreCase),
+            rows.Select(r => (string)r["item"]!).ToHashSet(StringComparer.OrdinalIgnoreCase),
+            rows.Where(r => (string)r["scope"]! == "target" && (string)r["state"]! == "ok" && ((string)r["item"]!).Contains('@', StringComparison.Ordinal))
+                .Select(r => ((string)r["item"]!).Split('@', 2)[0]).ToHashSet(StringComparer.Ordinal),
+            (string)run["status"]! == "ok");
+        _reads[runId] = reads;
+        return reads;
+    }
+
+    /// <summary>
+    /// A host is retired from a per-host query when the newest scan read that query - at least one host cleanly,
+    /// from a host list nothing casts doubt on (no query-wide record beside the hosts') - but no longer tried the
+    /// host at all (a decommissioned PC, a server that left the workstation list).
+    /// </summary>
+    private static bool Retired(RunReads reads, string query, string host) =>
+        reads.CleanPerHostQueries.Contains(query) && !reads.Attempted.Contains(query) && !reads.Attempted.Contains(RunFolder.CoverageItem(query, host));
+
+    private readonly Dictionary<(string, string, string), HashSet<string>> _knownHosts = [];
+
+    /// <summary>Every host this system's retained scans through this integration ever read with this query.</summary>
+    private HashSet<string> KnownHosts(string instance, string system, string query)
+    {
+        if (_knownHosts.TryGetValue((instance, system, query), out var hosts))
+            return hosts;
+        hosts = Sql.Rows(connection,
+                """
+                SELECT DISTINCT substr(c.item, length(:q) + 2) AS host FROM coverage c JOIN run r ON r.run_id = c.run_id
+                WHERE r.instance = :i AND r.system = :s AND c.scope = 'target' AND substr(c.item, 1, length(:q) + 1) = :q || '@';
+                """,
+                null, (":i", instance), (":s", system), (":q", query))
+            .Select(r => (string)r["host"]!).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        _knownHosts[(instance, system, query)] = hosts;
+        return hosts;
+    }
+
+    private Dictionary<string, string>? _ruleQueries;
+
+    /// <summary>The query a rule reads, from the catalogue (null for a catalogue loaded before review 7).</summary>
+    private string? QueryOf(string ruleId)
+    {
+        _ruleQueries ??= Sql.Rows(connection, "SELECT rule_id, query_id FROM rule WHERE query_id IS NOT NULL;")
+            .ToDictionary(r => (string)r["rule_id"]!, r => (string)r["query_id"]!, StringComparer.Ordinal);
+        return _ruleQueries.GetValueOrDefault(ruleId);
+    }
+
+    /// <summary>
+    /// Every read that returned this entity (rule system, query, host) read cleanly without it in that system's
+    /// newest scan. A host the scan no longer reads at all, while it read the query's other hosts, is retired
+    /// (a decommissioned PC). A query the newest scan did not run at all (removed from the rules) counts only
+    /// when that whole scan was clean. With no read on record (its runs were pruned), the entity's own system's
+    /// newest scan must have been clean throughout.
+    /// </summary>
+    private bool ReadCleanlyWithout((string Instance, string Type, string Key) entity, string? seenBy,
+        Dictionary<(string, string), Dictionary<string, object?>> newest)
+    {
+        var sources = Sql.Rows(connection,
+            """
+            SELECT DISTINCT r.system, rs.query, rs.target FROM row_seen rs JOIN run r ON r.run_id = rs.run_id
+            WHERE r.instance = :i AND rs.entity_type = :t AND rs.entity_key = :k;
+            """,
+            null, (":i", entity.Instance), (":t", entity.Type), (":k", entity.Key));
+        // The system that last returned it, even when its rows of the entity were pruned: its newest scan must
+        // have been clean throughout.
+        if (seenBy is not null && !sources.Any(s => (string)s["system"]! == seenBy)
+            && !(newest.TryGetValue((entity.Instance, seenBy), out var own) && ReadsOf(own).WholeRunClean))
+            return false;
+        if (sources.Count == 0)
+            return seenBy is not null;
+
+        foreach (var source in sources)
+        {
+            if (!newest.TryGetValue((entity.Instance, (string)source["system"]!), out var run))
+                return false;   // that system's newest scan failed: it says nothing
+            var reads = ReadsOf(run);
+            var query = (string)source["query"]!;
+            var target = source["target"] as string;
+            var item = RunFolder.CoverageItem(query, target);
+            if (reads.Clean.Contains(item))
+                continue;
+            if (reads.Attempted.Contains(item))
+                return false;   // read, but not cleanly
+            if (!(target is not null && Retired(reads, query, target)) && !reads.WholeRunClean)
+                return false;
+        }
+        return true;
     }
 
     // ---- findings ------------------------------------------------------------
@@ -343,16 +445,23 @@ public sealed class Tracker(SqliteConnection connection, TimeProvider? clock = n
             "SELECT 1 FROM result WHERE instance = :i AND rule_id = :r AND entity_type = :t AND entity_key = :k AND state = 'pass' AND at >= :seen;",
             null, (":i", instance), (":r", ruleId), (":t", entityType), (":k", target), (":seen", (string)before["last_seen"]!)) is not null;
 
-        // 2. The rule ran cleanly and the entity is gone (or, for an imported tool's row, the tool no longer reports it).
+        // 2. The entity is gone: every read that returned it read cleanly without it (MapEntities).
+        // 3. The rule ran cleanly and an imported tool no longer reports the row, or an instance-wide result is gone.
         var ruleRanCleanly = Sql.Scalar(connection,
             "SELECT 1 FROM coverage WHERE run_id = :run AND scope = 'rule' AND item = :r AND state = 'ok';",
             null, (":run", runId), (":r", ruleId)) is not null;
         var entityGone = entities.TryGetValue((instance, entityType, target), out var entity) && entity.GoneSince is not null;
         var imported = (string)before["check_id"]! != ruleId;
+        // 4. A finding about one host (a per-host count) of a rule whose own query read that host before, and no
+        //    longer tries it at all: retired. Never an imported tool's row: only the tool can say it is gone.
+        var query = QueryOf(ruleId);
+        var hostRetired = !imported && target != "-" && query is not null && Retired(ReadsOf(run), query, target)
+                          && KnownHosts(instance, (string)run["system"]!, query).Contains(target);
 
-        if (passed || (ruleRanCleanly && (entityGone || imported || target == "-")))
+        if (passed || entityGone || hostRetired || (ruleRanCleanly && (imported || target == "-")))
         {
-            var note = passed ? "the check passed" : entityGone ? "the entity no longer exists" : "no longer reported";
+            var note = passed ? "the check passed" : entityGone ? "the entity no longer exists"
+                : hostRetired ? "the host is no longer scanned (no longer in the host list)" : "no longer reported";
             events.Add(new EventRow(key, now, "resolved", runId, null, note));
             return Copy(before) with { Status = "resolved", Lifecycle = "resolved", ResolvedAt = now, RunId = runId };
         }

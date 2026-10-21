@@ -37,6 +37,48 @@ public sealed class IntegrationTests : IDisposable
             Assert.Equal(expected, IntegrationConnection.LoginUri(endpoint, path).ToString());
     }
 
+    [Theory]
+    [InlineData("admin@example.org", "admin@example.org", true)]
+    [InlineData("admin@example.org", "ADMIN@Example.org", true)]    // case only
+    [InlineData("admin@example.org", "someone@example.org", false)] // the Windows account, or another pick in the chooser
+    [InlineData("admin@example.org", null, false)]
+    [InlineData(null, "someone@example.org", true)]                 // no identity set: whoever signed in, recorded as such
+    public void An_entra_token_is_accepted_only_for_the_account_the_integration_reads_as(string? wanted, string? issuedTo, bool accepted)
+    {
+        if (accepted)
+            Assert.Equal(issuedTo, IntegrationConnection.SignedInAccount("entra", wanted, issuedTo));
+        else
+            Assert.Contains("reads as admin@example.org", Assert.Throws<IntegrationException>(() => IntegrationConnection.SignedInAccount("entra", wanted, issuedTo)).Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task A_refused_sign_in_is_refused_once_for_the_whole_scan_not_retried_per_query()
+    {
+        // No identity: the sign-in fails before anything is sent. The same must hold for a refused password.
+        var record = new IntegrationRecord("app", "http", "https://app.example.org", "session-login", null, [], true, new Dictionary<string, StoredSecret>());
+        using var connection = new IntegrationConnection(record, null);
+        using var first = new HttpRequestMessage(HttpMethod.Get, "https://app.example.org/api/a");
+        using var second = new HttpRequestMessage(HttpMethod.Get, "https://app.example.org/api/b");
+
+        var a = await Assert.ThrowsAsync<IntegrationException>(() => connection.AuthorizeAsync(first, CancellationToken.None));
+        var b = await Assert.ThrowsAsync<IntegrationException>(() => connection.AuthorizeAsync(second, CancellationToken.None));
+
+        Assert.Same(a, b);
+    }
+
+    [Fact]
+    public void A_negotiate_connection_says_which_windows_user_it_reads_as()
+    {
+        var negotiate = new IntegrationRecord("ad", "ldap", "example.org", "negotiate", null, [], true, new Dictionary<string, StoredSecret>());
+        var basic = negotiate with { AuthKind = "basic", Identity = "reader" };
+
+        using var a = new IntegrationConnection(negotiate, null);
+        using var b = new IntegrationConnection(basic, null);
+
+        Assert.Equal($"{Environment.UserDomainName}\\{Environment.UserName}", a.SignedInAs);
+        Assert.Null(b.SignedInAs);   // the manifest falls back to the identity, reader
+    }
+
     private QueueReport Drain() =>
         new QueueManager(_db, Path.Combine(DataDir, "spool"), DataDir, Schemas, IntegrationHandlers.All()).DrainOnce();
 
@@ -163,6 +205,20 @@ public sealed class IntegrationTests : IDisposable
 
         Assert.Equal(1, Drain().Failed);
         Assert.Null(Find("x"));
+    }
+
+    [Theory]
+    [InlineData(@"EXAMPLE\admin", false)]   // a Windows name is not what Entra returns
+    [InlineData("Admin Example", false)]
+    [InlineData("admin@example.org", true)]
+    public void An_entra_interactive_identity_must_be_a_sign_in_name(string identity, bool accepted)
+    {
+        Submit("integrations.upsert", new { integrationId = "entra", type = "graph", authKind = "entra-interactive", identity });
+
+        var report = Drain();
+
+        Assert.Equal(accepted ? 1 : 0, report.Done);
+        Assert.Equal(accepted, Find("entra") is not null);
     }
 
     [Fact]

@@ -109,4 +109,24 @@ public sealed class EvidenceTests : IDisposable
         Assert.Matches(@"NIST-800-53\s+AC-2\s+2\s+2\s+1\s+1\s+0\s+0\s+\S+\s+failing, risk accepted", text);
         Assert.Matches(@"NIST-800-53\s+IA-5\s+1\s+0\s+0\s+0\s+0\s+1\s+.*not tested", text);
     }
+
+    [Fact]
+    public void A_control_whose_only_rule_is_not_configured_is_not_tested_never_passing()
+    {
+        using (var connection = Db.OpenReadWrite())
+            Sql.Execute(connection,
+                $$"""
+                INSERT INTO rule (rule_id, system, title, kind, lens, category, severity, entity_type, protocol, refresh_min, refs, source_file, loaded_at)
+                    VALUES ('R4', 'workstations', 'Watched agents', 'misconfigured', 'both', 'MON', 'info', 'service', 'cim', 1440, '["NIST-800-53:SI-4"]', 'builtin:w.yaml', '{{Now}}');
+                INSERT INTO result (instance, rule_id, entity_type, entity_key, state, why, ttl_minutes, at, run_id)
+                    VALUES ('ad-1', 'R4', 'service', '-', 'n-a', 'not configured: set threshold.workstations.watch-agent-pattern', 1440, '{{Now}}', '20261020-060000-ad');
+                """);
+        var query = ReviewComponent.Questions.Load().Single(q => q.Name == "controls");
+        var output = new StringWriter();
+
+        using (var connection = Db.OpenReadOnly())
+            Query.QueryRunner.Run(connection, query, new Dictionary<string, string?> { ["framework"] = "NIST-800-53" }, new Query.TableWriter(output));
+
+        Assert.Matches(@"NIST-800-53\s+SI-4\s+1\s+0\s+0\s+0\s+0\s+1\s+.*not tested", output.ToString());
+    }
 }

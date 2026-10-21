@@ -13,6 +13,12 @@ public sealed record QuerySpec(string Protocol, JsonObject Fields, string Key, s
     /// <summary>Stable short id: the same protocol, fields and key always give the same id.</summary>
     public string Id { get; } = Fingerprint(Protocol, Fields, Key);
 
+    /// <summary>
+    /// Fewer rows than this (per target, for per-host protocols) makes the read partial, never a clean
+    /// empty answer: for queries that always return something, such as every user or the domain object.
+    /// </summary>
+    public int? MinRows { get; init; }
+
     public string? Text(string field) => Fields[field] is JsonValue v && v.TryGetValue<string>(out var s) ? s : null;
 
     public IReadOnlyList<string> List(string field) =>
@@ -43,7 +49,14 @@ public sealed record QuerySpec(string Protocol, JsonObject Fields, string Key, s
 public abstract record Condition;
 
 /// <summary>A row fails when <see cref="Op"/> holds for the value at <see cref="Field"/>.</summary>
-public sealed record LeafCondition(string Field, string Op, JsonNode? Value, string? Threshold) : Condition;
+public sealed record LeafCondition(string Field, string Op, JsonNode? Value, string? Threshold) : Condition
+{
+    /// <summary>
+    /// The threshold has no meaningful default (a tenant's own list of names): until the tenant sets it the
+    /// rule is not configured - never a pass that nothing was compared with.
+    /// </summary>
+    public bool Required { get; init; }
+}
 
 public sealed record AllCondition(IReadOnlyList<Condition> Items) : Condition;
 
@@ -106,6 +119,19 @@ public sealed record Rule
 
     /// <summary>A result older than three refresh periods is stale.</summary>
     public int TtlMinutes => (int)Math.Max(1, Refresh.TotalMinutes * 3);
+
+    /// <summary>The thresholds this rule cannot be judged without (conditions marked required).</summary>
+    public IReadOnlyList<string> RequiredSettings => [.. Leaves(Each).Concat(Leaves(Count?.Where)).Where(l => l.Required && l.Threshold is not null)
+        .Select(l => l.Threshold!).Distinct(StringComparer.Ordinal)];
+
+    private static IEnumerable<LeafCondition> Leaves(Condition? condition) => condition switch
+    {
+        LeafCondition leaf => [leaf],
+        AllCondition all => all.Items.SelectMany(Leaves),
+        AnyCondition any => any.Items.SelectMany(Leaves),
+        NotCondition not => Leaves(not.Item),
+        _ => [],
+    };
 }
 
 public sealed record RuleFile(string System, string Name, string Integration, TargetSpec? Targets, IReadOnlyList<Rule> Rules,

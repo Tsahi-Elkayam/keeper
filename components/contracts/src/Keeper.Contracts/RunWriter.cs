@@ -73,9 +73,29 @@ public sealed class RunWriter : IDisposable
             Notes = notes.Select(Redactor.Clean).ToList(),
         };
         File.WriteAllText(Path.Combine(_tmp, RunFolder.Manifest), JsonSerializer.Serialize(manifest, JsonLines.Options));
-        Directory.Move(_tmp, _final);
+        MoveWhenFree(_tmp, _final);
         _completed = true;
         return manifest;
+    }
+
+    /// <summary>
+    /// Renames the finished folder. An antivirus or EDR that is still reading the files it just saw written
+    /// holds them for a moment; the rename waits for it rather than losing the run.
+    /// </summary>
+    private static void MoveWhenFree(string from, string to)
+    {
+        for (var attempt = 1; ; attempt++)
+        {
+            try
+            {
+                Directory.Move(from, to);
+                return;
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException && attempt < 10 && Directory.Exists(from) && !Directory.Exists(to))
+            {
+                Thread.Sleep(100 * attempt);
+            }
+        }
     }
 
     public void Dispose()

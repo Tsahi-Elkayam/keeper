@@ -1,5 +1,6 @@
 using Keeper.Runners.Cim;
 using Keeper.Runners.Http;
+using Keeper.Runners.Sql;
 
 namespace Keeper.Runners.Tests;
 
@@ -36,6 +37,28 @@ public sealed class GuardTests
     public void Secret_tables_are_refused_however_they_are_quoted(string text)
     {
         Assert.NotNull(SqlGuard.Problem(text, ["integration_secret", "vault_key"]));
+    }
+
+    [Theory]
+    [InlineData("SELECT session_id FROM sys.dm_exec_sessions", false, true, "VIEW SERVER STATE")]
+    [InlineData("SELECT name FROM sys . dm_os_volume_stats(1, 1)", false, true, "VIEW SERVER STATE")]
+    [InlineData("SELECT name, is_disabled FROM sys.server_principals", true, false, "VIEW ANY DEFINITION")]
+    [InlineData("SELECT * FROM sys.dm_exec_sessions s JOIN sys.sql_logins l ON 1 = 1", false, false, "VIEW SERVER STATE|VIEW ANY DEFINITION")]
+    [InlineData("SELECT name FROM sys.tables WHERE is_ms_shipped = 0", true, false, "VIEW ANY DEFINITION")]
+    [InlineData("SELECT name FROM sys.server_principals", true, true, null)]          // held: a full answer
+    [InlineData("SELECT name, state_desc FROM sys.databases", false, false, null)]    // every login sees every row
+    public void A_sql_read_that_the_login_cannot_fully_see_is_partial_with_the_reason(string text, bool serverState, bool anyDefinition, string? lacks)
+    {
+        var missing = SqlPermissions.Missing(text, @"EXAMPLE\reader", serverState, anyDefinition);
+
+        if (lacks is null)
+        {
+            Assert.Null(missing);
+            return;
+        }
+        Assert.StartsWith(@"read as EXAMPLE\reader, which lacks ", missing, StringComparison.Ordinal);
+        foreach (var permission in new[] { "VIEW SERVER STATE", "VIEW ANY DEFINITION" })
+            Assert.Equal(lacks.Split('|').Contains(permission), missing!.Contains(permission, StringComparison.Ordinal));
     }
 
     [Theory]
@@ -137,6 +160,30 @@ public sealed class GuardTests
         Assert.Equal("GREEN", Assert.Single(single)["value"]!.ToString());
         Assert.True(Keeper.Runners.Ldap.LdapValues.IsBinary("objectSid"));
         Assert.False(Keeper.Runners.Ldap.LdapValues.IsBinary("sAMAccountName"));
+    }
+
+    [Fact]
+    public void Secrets_in_a_json_answer_come_back_as_set_at_any_depth_and_facts_about_them_stay()
+    {
+        var body = System.Text.Json.Nodes.JsonNode.Parse("""
+            { "value": [ {
+                "displayName": "Office Wi-Fi", "preSharedKey": "hunter2-not-real", "passwordPolicies": "DisablePasswordExpiration",
+                "lastPasswordChangeDateTime": "2026-01-01T00:00:00Z", "password": "",
+                "settings": [ { "name": "vpn", "sharedSecret": "s3cret-not-real" } ],
+                "detectionScriptContent": "JHBhc3N3b3JkID0gJ3gn"
+            } ] }
+            """);
+
+        var row = Assert.Single(RowValues.ItemsOf(body, null));
+        var text = row.ToJsonString();
+
+        Assert.DoesNotContain("not-real", text, StringComparison.Ordinal);
+        Assert.DoesNotContain("JHBhc3N3b3Jk", text, StringComparison.Ordinal);
+        Assert.Equal("set", row["preSharedKey"]!.ToString());
+        Assert.Equal("set", row["settings"]![0]!["sharedSecret"]!.ToString());
+        Assert.Equal("", row["password"]!.ToString());   // not set is still visible as not set
+        Assert.Equal("DisablePasswordExpiration", row["passwordPolicies"]!.ToString());
+        Assert.Equal("2026-01-01T00:00:00Z", row["lastPasswordChangeDateTime"]!.ToString());
     }
 
     [Fact]

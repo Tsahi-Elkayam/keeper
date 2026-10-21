@@ -93,7 +93,11 @@ public sealed class RulesLoadHandler : IRequestHandler
 
     public sealed record RuleRow(string RuleId, string System, string Title, string Kind, string Lens, string Category,
         string Severity, string EntityType, string Protocol, int RefreshMinutes, string? Why, string? Fix,
-        IReadOnlyList<string> Refs, string SourceFile);
+        IReadOnlyList<string> Refs, string SourceFile)
+    {
+        /// <summary>The id of the query the rule reads (QuerySpec.Id), as coverage and row_seen name it.</summary>
+        public string? QueryId { get; init; }
+    }
 
     public void Apply(RequestContext context)
     {
@@ -114,11 +118,11 @@ public sealed class RulesLoadHandler : IRequestHandler
         {
             context.Execute(
                 """
-                INSERT INTO rule (rule_id, system, title, kind, lens, category, severity, entity_type, protocol, refresh_min, why, fix, refs, source_file, loaded_at)
-                VALUES (:id, :system, :title, :kind, :lens, :category, :severity, :type, :protocol, :refresh, :why, :fix, :refs, :source, :at);
+                INSERT INTO rule (rule_id, system, title, kind, lens, category, severity, entity_type, protocol, query_id, refresh_min, why, fix, refs, source_file, loaded_at)
+                VALUES (:id, :system, :title, :kind, :lens, :category, :severity, :type, :protocol, :query, :refresh, :why, :fix, :refs, :source, :at);
                 """,
                 (":id", r.RuleId), (":system", r.System), (":title", r.Title), (":kind", r.Kind), (":lens", r.Lens),
-                (":category", r.Category), (":severity", r.Severity), (":type", r.EntityType), (":protocol", r.Protocol),
+                (":category", r.Category), (":severity", r.Severity), (":type", r.EntityType), (":protocol", r.Protocol), (":query", r.QueryId),
                 (":refresh", r.RefreshMinutes), (":why", r.Why), (":fix", r.Fix),
                 (":refs", JsonSerializer.Serialize(r.Refs, JsonLines.Options)), (":source", r.SourceFile), (":at", context.NowText));
         }

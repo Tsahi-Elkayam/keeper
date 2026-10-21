@@ -12,7 +12,7 @@ using Microsoft.Data.Sqlite;
 //            -> track -> qm run -> rank -> qm run -> today.
 try
 {
-    var cli = new CliArgs(args, flags: ["scan-all", "no-scan", "dry-run"]);
+    var cli = new CliArgs(args, flags: ["scan-all", "no-scan", "dry-run", "fresh-sign-in"]);
     if (cli.Help)
         return CliUsage.Print("""
             keeper-run - the daily pipeline: load rules, scan, load, track, rank, then today's list
@@ -21,9 +21,11 @@ try
               keeper run --scan entra,intune  only these systems; each needs an enabled integration
               keeper run --no-scan            no scans: load, track and rank what is already there
               keeper run --dry-run            show which scans would run, and run nothing
+              keeper run --fresh-sign-in      new Entra tokens for every scan: right after activating a PIM role
             """, asked: true);
     var (_, paths) = KeeperContext.Load(cli);
     var passSettings = cli.Get("settings") is { } s ? new[] { "--settings", Path.GetFullPath(s) } : [];
+    string[] scanFlags = cli.Has("fresh-sign-in") ? ["--fresh-sign-in"] : [];
     var build = Iso.Stamp(DateTimeOffset.UtcNow);
 
     var scans = cli.Has("no-scan") ? [] : Plan(paths, cli);
@@ -49,7 +51,7 @@ try
     // Rules over the store (Keeper's own health, cross-system checks) read what the other scans
     // found, so those scans are loaded first. A failed scan does not stop the run - the rest still count;
     // a stage the next one depends on does.
-    Scan(external, passSettings, problems);
+    Scan(external, [.. passSettings, .. scanFlags], problems);
     Console.WriteLine();
     if (!Stage("keeper-load", [.. passSettings], problems, tolerateNoData: true)
         || !Stage("keeper-qm", ["run", .. passSettings], problems))
@@ -95,12 +97,12 @@ catch (Exception ex) when (ex is StoreException or SqliteException or IOExceptio
     return ExitCodes.Failed;
 }
 
-static void Scan(List<(string System, string? Integration, string Type)> scans, string[] passSettings, List<string> problems)
+static void Scan(List<(string System, string? Integration, string Type)> scans, string[] passOn, List<string> problems)
 {
     foreach (var (system, integration, _) in scans)
     {
         Console.WriteLine();
-        string[] scanArgs = integration is null ? [system, .. passSettings] : [system, "--integration", integration, .. passSettings];
+        string[] scanArgs = integration is null ? [system, .. passOn] : [system, "--integration", integration, .. passOn];
         var code = Siblings.Run("keeper-scan", scanArgs);
         if (code == ExitCodes.NoData)
             problems.Add($"{system}: partial scan (see its blind spots)");

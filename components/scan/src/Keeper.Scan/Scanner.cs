@@ -24,6 +24,15 @@ public sealed record ScanRequest
     /// <summary>Hosts for per-target rules, from what earlier scans saw.</summary>
     public Func<TargetSpec, IReadOnlyList<string>> ResolveTargets { get; init; } = _ => [];
 
+    /// <summary>Why the resolved host list may be missing hosts (its source read was not clean), or null.</summary>
+    public Func<TargetSpec, string?> TargetsIncomplete { get; init; } = _ => null;
+
+    /// <summary>
+    /// A read's history in this system's earlier scans, by coverage item (the query id, or query@host for a
+    /// per-host query), or null when it never read cleanly.
+    /// </summary>
+    public Func<string, PreviousRead?> PreviousRows { get; init; } = _ => null;
+
     public TimeSpan Timeout { get; init; } = TimeSpan.FromSeconds(60);
     public int Parallelism { get; init; } = 8;
     public Action<string> Log { get; init; } = _ => { };
@@ -55,10 +64,20 @@ public sealed class Scanner(RunnerRegistry registry, TimeProvider? clock = null)
         var queries = rules.GroupBy(r => r.Rule.Query.Id).ToList();
         var outcomes = new Dictionary<string, QueryOutcome>(StringComparer.Ordinal);
 
+        var dropRatio = double.TryParse(request.Threshold("scan.row-drop-ratio"), System.Globalization.NumberStyles.Float,
+            System.Globalization.CultureInfo.InvariantCulture, out var r) && r is > 0 and <= 1 ? r : DefaultDropRatio;
+        var confirmScans = int.TryParse(request.Threshold("scan.drop-confirm-scans"), System.Globalization.NumberStyles.None,
+            System.Globalization.CultureInfo.InvariantCulture, out var confirm) && confirm >= 1 ? confirm : DefaultDropConfirmScans;
+        var confirmAge = TimeSpan.FromDays(double.TryParse(request.Threshold("scan.drop-confirm-days"), System.Globalization.NumberStyles.Float,
+            System.Globalization.CultureInfo.InvariantCulture, out var days) && days >= 0 ? days : DefaultDropConfirmDays);
         foreach (var group in queries)
         {
             var (rule, file) = group.First();
             var outcome = await RunQuery(rule.Query, file, request, cancellationToken).ConfigureAwait(false);
+            // Keeper's own store and other tools' files cannot lose sight of rows, so only their min_rows applies.
+            var dropCheck = rule.Query.Protocol is not ("store" or "file");
+            Distrust(outcome, group.Key, group.Max(g => g.Rule.Query.MinRows), dropCheck ? request.PreviousRows : _ => null, dropRatio,
+                confirmScans, confirmAge, started);
             outcomes[group.Key] = outcome;
 
             foreach (var (row, target) in outcome.Rows)
@@ -80,7 +99,7 @@ public sealed class Scanner(RunnerRegistry registry, TimeProvider? clock = null)
                     Instance = instance,
                     System = system,
                     Scope = target.Target is null ? "query" : "target",
-                    Item = target.Target is null ? group.Key : $"{group.Key}@{target.Target}",
+                    Item = RunFolder.CoverageItem(group.Key, target.Target),
                     State = target.State,
                     Reason = target.Reason is null ? null : Redactor.Clean(target.Reason),
                     Count = target.Count,
@@ -96,9 +115,58 @@ public sealed class Scanner(RunnerRegistry registry, TimeProvider? clock = null)
 
         var states = outcomes.Values.Select(o => o.State).ToList();
         var status = states.All(s => s == "ok") ? "ok" : states.Any(s => s is "ok" or "partial") ? "partial" : "failed";
-        var manifest = run.Complete(status, _clock.GetUtcNow(), request.Connection.Identity, notes);
+        var manifest = run.Complete(status, _clock.GetUtcNow(), request.Connection.SignedInAs ?? request.Connection.Identity, notes);
         return new ScanReport(manifest, rules.Count, queries.Count, outcomes.Values.Sum(o => o.Rows.Count), findings,
             states.Count(s => s == "failed"));
+    }
+
+    /// <summary>A read that returns less than this share of its last clean read's rows is not trusted yet.</summary>
+    public const double DefaultDropRatio = 0.5;
+
+    /// <summary>How many scans in a row must read that low before the lower count is accepted.</summary>
+    public const int DefaultDropConfirmScans = 3;
+
+    /// <summary>...and over how many days at least: frequent scans must not accept a lost permission within hours.</summary>
+    public const double DefaultDropConfirmDays = 2;
+
+    /// <summary>How a read the drop guard made partial begins its reason: the next scan counts it as a low read.</summary>
+    public const string LowReadMarker = "low read: ";
+
+    /// <summary>
+    /// A read that succeeded but returned too little is partial, so it can neither mark its entities gone nor
+    /// resolve their findings: fewer rows than the query's min_rows, or less than half of what its last clean
+    /// read returned - judged per host for a per-host query. A lost permission, an admin role not activated
+    /// yet, a wrong base or a broken WMI repository looks exactly like that, and stays a blind spot until
+    /// several scans in a row read as low: then the lower count is accepted as the truth (a real clean-up).
+    /// </summary>
+    private static void Distrust(QueryOutcome outcome, string queryId, int? minRows, Func<string, PreviousRead?> previousRows, double ratio,
+        int confirmScans, TimeSpan confirmAge, DateTimeOffset now)
+    {
+        for (var i = 0; i < outcome.Targets.Count; i++)
+        {
+            var target = outcome.Targets[i];
+            if (target.State != "ok")
+                continue;
+            if (minRows is { } min && target.Count < min)
+            {
+                outcome.Targets[i] = target with { State = "partial", Reason = $"returned {target.Count} row(s); this query always returns at least {min}" };
+                continue;
+            }
+            if (previousRows(RunFolder.CoverageItem(queryId, target.Target)) is not { Clean: > 0 } previous || target.Count >= previous.Clean * ratio)
+                continue;
+            // Only reads the guard itself held back count: a partial for another reason (a row cap) breaks the streak.
+            var streak = previous.PartialSince.TakeWhile(p => p.Low).ToList();
+            var lowInARow = streak.Count + 1;
+            var since = streak.Count > 0 ? streak[^1].At : now;
+            outcome.Targets[i] = lowInARow >= confirmScans && now - since >= confirmAge
+                ? target with { Reason = $"returned {target.Count} row(s), down from {previous.Clean}: accepted after {lowInARow} scans in a row read as low since {Iso.Utc(since)}" }
+                : target with
+                {
+                    State = "partial",
+                    Reason = $"{LowReadMarker}returned {target.Count} row(s), the last clean scan {previous.Clean}: not trusted until {confirmScans} scans " +
+                             $"over {confirmAge.TotalDays:0.#} days read as low ({lowInARow} so far) - a lost permission or a wrong base looks the same",
+                };
+        }
     }
 
     private sealed record TargetOutcome(string? Target, string State, string? Reason, int Count);
@@ -132,6 +200,10 @@ public sealed class Scanner(RunnerRegistry registry, TimeProvider? clock = null)
             outcome.Targets.Add(new TargetOutcome(null, "failed", "no targets: set the file's targets or the integration's targets option", 0));
             return outcome;
         }
+        // A query-wide record beside the hosts' own: it tells the tracker that a host missing from this read may
+        // simply be missing from the list, not retired.
+        if (file.Targets is { List.Count: 0 } spec && request.TargetsIncomplete(spec) is { } incomplete)
+            outcome.Targets.Add(new TargetOutcome(null, "partial", incomplete, 0));
 
         using var gate = new SemaphoreSlim(Math.Max(1, request.Parallelism));
         var tasks = targets.Select(async target =>
@@ -193,10 +265,19 @@ public sealed class Scanner(RunnerRegistry registry, TimeProvider? clock = null)
     /// </summary>
     private static string KeyOf(QuerySpec query, JsonObject row, string? target)
     {
-        if (query.Key.Contains('{', StringComparison.Ordinal))
-            return Templates.Render(query.Key, row) is { Length: > 0 } rendered ? rendered : target ?? "-";
-        return Values.Text(FieldPath.First(row, query.Key)) is { Length: > 0 } key ? key : target ?? "-";
+        var key = query.Key.Contains('{', StringComparison.Ordinal)
+            ? Templates.Render(query.Key, row)
+            : Values.Text(FieldPath.First(row, query.Key));
+        if (string.IsNullOrEmpty(key))
+            return target ?? "-";
+        // Per host, a key must name its host: the same service, event id or package on two machines are two
+        // entities, and one machine's failed read must never speak for the other's. The host must be a whole
+        // part of the key ("db" is not in "dbo.users").
+        return target is null || NamesHost(key, target) ? key : $"{target}|{key}";
     }
+
+    private static bool NamesHost(string key, string target) =>
+        key.Split('|').Any(part => part.Equals(target, StringComparison.OrdinalIgnoreCase));
 
     private int Evaluate(Rule rule, QueryOutcome outcome, ScanRequest request, RunWriter run, string instance, string system, string observedAt)
     {
@@ -212,6 +293,21 @@ public sealed class Scanner(RunnerRegistry registry, TimeProvider? clock = null)
             State = verdict.State, Value = Truncate(verdict.Value), Operand = verdict.Operand, Why = why ?? verdict.Why,
             TtlMinutes = rule.TtlMinutes, At = observedAt,
         });
+
+        // A rule that compares with the tenant's own list (names of its agents, its admin groups) says nothing
+        // until the list is set: not configured, never a pass.
+        var unset = rule.RequiredSettings.Where(name => (request.OverrideThreshold(rule.Id, "-") ?? request.Threshold(name)) is not { Length: > 0 }).ToList();
+        if (unset.Count > 0)
+        {
+            var reason = $"not configured: set {string.Join(", ", unset.Select(n => "threshold." + n))} ('keeper decide setting threshold.{unset[0]} <value>')";
+            run.Result(new ResultRecord
+            {
+                Instance = instance, System = system, RuleId = rule.Id, EntityType = rule.EntityType, EntityKey = "-",
+                State = "n-a", Why = reason, TtlMinutes = rule.TtlMinutes, At = observedAt,
+            });
+            Coverage("not-applicable", reason, 0);
+            return 0;
+        }
 
         if (outcome.State == "failed")
         {
@@ -243,12 +339,12 @@ public sealed class Scanner(RunnerRegistry registry, TimeProvider? clock = null)
                         });
                         continue;
                     }
-                    findings += CountOne(byTarget[target.Target].ToList(), rule.EntityType, target.Target!);
+                    findings += CountOne(byTarget[target.Target].ToList(), rule.EntityType, target.Target!, target.State == "partial" ? target.Reason : null);
                 }
             }
             else
             {
-                findings += CountOne(outcome.Rows, "instance", "-");
+                findings += CountOne(outcome.Rows, "instance", "-", outcome.State == "partial" ? outcome.Reason : null);
             }
         }
         else
@@ -274,7 +370,8 @@ public sealed class Scanner(RunnerRegistry registry, TimeProvider? clock = null)
         Coverage(outcome.State, outcome.State == "ok" ? null : outcome.Reason, outcome.Rows.Count);
         return findings;
 
-        int CountOne(List<(JsonObject Row, string? Target)> rows, string entityType, string target)
+        // partial: why the read is incomplete. Its count is a floor - enough to fail, never to pass.
+        int CountOne(List<(JsonObject Row, string? Target)> rows, string entityType, string target, string? partial)
         {
             var count = rule.Count!;
             var evaluator = new Evaluator(name => request.OverrideThreshold(rule.Id, target) ?? request.Threshold(name), now);
@@ -284,6 +381,16 @@ public sealed class Scanner(RunnerRegistry registry, TimeProvider? clock = null)
             var matching = judged.Where(j => j.Fails == true).ToList();
             var unjudged = judged.Count(j => j.Fails is null);
             var verdict = evaluator.Count(count, matching.Count);
+            if (verdict.Fails != true && partial is not null)
+            {
+                run.Result(new ResultRecord
+                {
+                    Instance = instance, System = system, RuleId = rule.Id, EntityType = entityType, EntityKey = target, State = "unknown",
+                    Value = verdict.Value, Operand = verdict.Operand, TtlMinutes = rule.TtlMinutes, At = observedAt,
+                    Why = Redactor.Clean($"the read was partial, so {verdict.Value} is only a floor: {partial}"),
+                });
+                return 0;
+            }
             Result(entityType, target, verdict);
             if (verdict.Fails != true)
                 return 0;

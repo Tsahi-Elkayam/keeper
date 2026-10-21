@@ -83,7 +83,7 @@ public sealed class LdapRunner : IRunner
                 paging.Cookie = cookie;
             }
             context.Log($"{rows.Count} entries");
-            return RunnerResult.Ok(rows);
+            return new RunnerResult(rows, "ok", Notes(WhoAmI(connection, context.Timeout), query.List("attributes"), rows));
         }
         catch (Exception ex) when (ex is LdapException or DirectoryOperationException or FormatException or TimeoutException)
         {
@@ -118,6 +118,47 @@ public sealed class LdapRunner : IRunner
         else
             connection.Bind(credential);
         return connection;
+    }
+
+    /// <summary>Who the directory says this connection is bound as (the LDAP "Who am I?" operation), or null.</summary>
+    private static string? WhoAmI(LdapConnection connection, TimeSpan timeout)
+    {
+        try
+        {
+            var response = (ExtendedResponse)connection.SendRequest(new ExtendedRequest("1.3.6.1.4.1.4203.1.11.3"), timeout);
+            // An empty answer is the anonymous identity: the directory showed only what anyone may see.
+            return response.ResponseValue is { Length: > 0 } value ? AuthzId(System.Text.Encoding.UTF8.GetString(value)) : "anonymous";
+        }
+        catch (Exception ex) when (ex is LdapException or DirectoryOperationException)
+        {
+            return null;   // a directory without the operation still answered the search
+        }
+    }
+
+    /// <summary>"u:EXAMPLE\reader" -> EXAMPLE\reader; "dn:CN=..." -> CN=...</summary>
+    public static string AuthzId(string value) =>
+        value.StartsWith("u:", StringComparison.Ordinal) ? value[2..] : value.StartsWith("dn:", StringComparison.Ordinal) ? value[3..] : value;
+
+    /// <summary>
+    /// What to know about an answer that is still complete: who read it, and attributes no entry returned.
+    /// A directory leaves out an attribute nobody has set and one this account may not read alike, so a
+    /// rule on such an attribute deserves a look before its pass is trusted.
+    /// </summary>
+    public static string? Notes(string? boundAs, IReadOnlyList<string> requested, IReadOnlyList<JsonObject> rows)
+    {
+        var notes = new List<string>();
+        if (boundAs is not null)
+            notes.Add($"bound as {boundAs}");
+        if (rows.Count > 0)
+        {
+            var absent = requested
+                .Where(a => !a.Equals("distinguishedName", StringComparison.OrdinalIgnoreCase) && !SecretAttributes.IsSecret(a))
+                .Where(a => !rows.Any(r => r.Any(p => p.Key.Equals(a, StringComparison.OrdinalIgnoreCase))))
+                .ToList();
+            if (absent.Count > 0)
+                notes.Add($"no entry returned {string.Join(", ", absent)} (unset everywhere, or hidden from this account)");
+        }
+        return notes.Count == 0 ? null : string.Join("; ", notes);
     }
 
     /// <summary>ldap://host:389, ldaps://host:636, or a bare domain/host name (DC locator, port 389).</summary>
