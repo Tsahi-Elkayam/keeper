@@ -232,4 +232,5 @@ static int Usage(bool asked = false) =>
 
           Options: targets=a,b,c  scopes=x,y  clientId=..  tenantId=..  tokenUrl=https://..  header=..  prefix=..
                    param=..  headers.<name>=..  tls=trust (sql)  allowHttp=true (only if you accept cleartext)
+                   cimProtocol=auto|wsman|dcom (cim: WinRM, then DCOM for hosts WinRM cannot reach)
         """, asked);

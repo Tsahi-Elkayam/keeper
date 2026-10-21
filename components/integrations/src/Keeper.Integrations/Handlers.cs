@@ -52,6 +52,8 @@ public sealed class UpsertHandler : IRequestHandler
         if (options["tokenUrl"] is JsonValue tokenUrl
             && (!Uri.TryCreate(tokenUrl.ToString(), UriKind.Absolute, out var tu) || tu.Scheme != "https"))
             throw new RequestException("Option tokenUrl must be an https URL.");
+        if (options["cimProtocol"] is { } cimProtocol && cimProtocol.ToString() is not ("auto" or "wsman" or "dcom"))
+            throw new RequestException("Option cimProtocol must be auto (WinRM, then DCOM), wsman or dcom.");
 
         var existing = context.Scalar("SELECT endpoint FROM integration WHERE integration_id = :id;", (":id", id)) as string;
         context.Execute(

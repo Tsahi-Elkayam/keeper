@@ -221,6 +221,17 @@ public sealed class IntegrationTests : IDisposable
         Assert.Equal(accepted, Find("entra") is not null);
     }
 
+    [Theory]
+    [InlineData("auto", true)]
+    [InlineData("dcom", true)]
+    [InlineData("telnet", false)]
+    public void Cim_protocol_is_winrm_dcom_or_auto(string protocol, bool accepted)
+    {
+        Submit("integrations.upsert", new { integrationId = "pcs", type = "cim", endpoint = "pc01.example.org", authKind = "negotiate", options = new { cimProtocol = protocol } });
+
+        Assert.Equal(accepted ? 1 : 0, Drain().Done);
+    }
+
     [Fact]
     public void An_option_that_looks_like_a_secret_is_refused()
     {
