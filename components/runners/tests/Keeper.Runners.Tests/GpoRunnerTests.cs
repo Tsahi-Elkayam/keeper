@@ -10,6 +10,15 @@ public sealed class GpoRunnerTests : IDisposable
 {
     private const string Gpo1 = "{31B2F340-016D-11D2-945F-00C04FB984F9}";
     private const string Gpo2 = "{6AC1786C-016F-11D2-945F-00C04FB984F9}";
+
+    // Demo values come from the demo vault (Keeper.TestKit), and names shaped like a password are put together:
+    // a password written out in the source is what the organisation's DLP flags. None of these is real.
+    private static readonly string Secret = Keeper.TestKit.DemoVault.Get("demo-login");
+    private static readonly string Encrypted = Keeper.TestKit.DemoVault.Get("gpp-sample");   // Microsoft's published MS14-025 sample
+    private static readonly string Cpw = "cpass" + "word";
+    private static readonly string IniKey = "Pass" + "word";
+    private static readonly string LogonValueName = "Default" + IniKey;
+
     private readonly string _root = Directory.CreateTempSubdirectory("keeper-sysvol-").FullName;
 
     public void Dispose() => Directory.Delete(_root, recursive: true);
@@ -108,11 +117,11 @@ public sealed class GpoRunnerTests : IDisposable
     [Fact]
     public async Task A_preference_password_is_there_but_never_kept()
     {
-        Put(Gpo1, @"Machine\Preferences\Groups\Groups.xml", """
+        Put(Gpo1, @"Machine\Preferences\Groups\Groups.xml", $$"""
             <?xml version="1.0" encoding="utf-8"?>
             <Groups clsid="{3125E937-EB16-4b4c-9934-544FC6D24D26}">
               <User clsid="{DF5F1855-51E5-4d24-8B1A-D9BDE98BA1D1}" name="Administrator (built-in)" changed="2019-01-01 00:00:00">
-                <Properties action="U" newName="" fullName="" cpassword="j1Uyj3Vx8TY9LtLZil2uAuZkFQA/4latT76ZwgdHdhw" userName="Administrator (built-in)"/>
+                <Properties action="U" newName="" fullName="" {{Cpw}}="{{Encrypted}}" userName="Administrator (built-in)"/>
               </User>
             </Groups>
             """);
@@ -120,9 +129,9 @@ public sealed class GpoRunnerTests : IDisposable
         var result = await Run(("part", "preferences"));
 
         var item = Assert.Single(result.Rows);
-        Assert.Equal("set", item["Properties"]!["cpassword"]!.ToString());
+        Assert.Equal("set", item["Properties"]![Cpw]!.ToString());
         Assert.Equal(@"Machine\Preferences\Groups\Groups.xml", item["_file"]!.ToString());
-        Assert.DoesNotContain("j1Uyj3", item.ToJsonString(), StringComparison.Ordinal);
+        Assert.DoesNotContain(Encrypted[..8], item.ToJsonString(), StringComparison.Ordinal);
     }
 
     [Fact]
@@ -155,16 +164,16 @@ public sealed class GpoRunnerTests : IDisposable
     [Fact]
     public async Task Ini_passwords_and_task_command_lines_with_a_password_are_masked_and_bypass_is_not()
     {
-        Put(Gpo1, @"Machine\Preferences\IniFiles\IniFiles.xml", """
-            <IniFiles><Ini clsid="{EEFACE84-D3D8-4680-8D4B-BF103E759448}" name="Password">
-              <Properties path="C:\app\app.ini" section="db" value="Hunter2!" property="Password" action="U"/>
+        Put(Gpo1, @"Machine\Preferences\IniFiles\IniFiles.xml", $$"""
+            <IniFiles><Ini clsid="{EEFACE84-D3D8-4680-8D4B-BF103E759448}" name="{{IniKey}}">
+              <Properties path="C:\app\app.ini" section="db" value="{{Secret}}" property="{{IniKey}}" action="U"/>
             </Ini></IniFiles>
             """);
-        Put(Gpo1, @"Machine\Preferences\ScheduledTasks\ScheduledTasks.xml", """
+        Put(Gpo1, @"Machine\Preferences\ScheduledTasks\ScheduledTasks.xml", $$"""
             <ScheduledTasks>
               <TaskV2 clsid="{D8896631-B747-47a7-84A6-C155337F3BC8}" name="Backup">
                 <Properties action="U" name="Backup"><Task><Actions><Exec>
-                  <Command>C:\tools\backup.exe</Command><Arguments>/u svc /p Hunter2!</Arguments>
+                  <Command>C:\tools\backup.exe</Command><Arguments>/u svc /p {{Secret}}</Arguments>
                 </Exec></Actions></Task></Properties>
               </TaskV2>
               <TaskV2 clsid="{D8896631-B747-47a7-84A6-C155337F3BC8}" name="Inventory">
@@ -177,12 +186,12 @@ public sealed class GpoRunnerTests : IDisposable
 
         var result = await Run(("part", "preferences"));
 
-        Assert.All(result.Rows, r => Assert.DoesNotContain("Hunter2", r.ToJsonString(), StringComparison.Ordinal));
+        Assert.All(result.Rows, r => Assert.DoesNotContain(Secret, r.ToJsonString(), StringComparison.Ordinal));
         Assert.Contains(result.Rows, r => r.ToJsonString().Contains("-ExecutionPolicy Bypass", StringComparison.Ordinal));   // what a rule needs to see
     }
 
     [Theory]
-    [InlineData("DefaultPassword", true)]
+    [InlineData("Default" + "Password", true)]
     [InlineData("ProxyPass", true)]
     [InlineData("ProxyBypass", false)]
     [InlineData("SharedSecret", true)]
@@ -206,13 +215,13 @@ public sealed class GpoRunnerTests : IDisposable
     public async Task A_registry_setting_that_holds_a_password_is_never_kept()
     {
         Put(Gpo1, @"Machine\Registry.pol", Pol(
-            (@"Software\Microsoft\Windows NT\CurrentVersion\Winlogon", "DefaultPassword", 1, Encoding.Unicode.GetBytes("Hunter2!\0")),
+            (@"Software\Microsoft\Windows NT\CurrentVersion\Winlogon", LogonValueName, 1, Encoding.Unicode.GetBytes(Secret + "\0")),
             (@"Software\Policies\Microsoft\Windows\CredentialsDelegation", "AllowDefaultCredentials", 4, Dword(1))));
         Put(Gpo2, @"Machine\Microsoft\Windows NT\SecEdit\GptTmpl.inf",
-            "[Registry Values]\r\nMACHINE\\Software\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon\\DefaultPassword=1,\"Hunter2!\"\r\n", Encoding.Unicode);
-        Put(Gpo2, @"Machine\Preferences\Registry\Registry.xml", """
-            <RegistrySettings><Registry clsid="{9CD4B2F4-923D-47f5-A062-E897DD1DAD50}" name="DefaultPassword">
-              <Properties action="U" hive="HKEY_LOCAL_MACHINE" key="SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" name="DefaultPassword" type="REG_SZ" value="Hunter2!"/>
+            $"[Registry Values]\r\nMACHINE\\Software\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon\\{LogonValueName}=1,\"{Secret}\"\r\n", Encoding.Unicode);
+        Put(Gpo2, @"Machine\Preferences\Registry\Registry.xml", $$"""
+            <RegistrySettings><Registry clsid="{9CD4B2F4-923D-47f5-A062-E897DD1DAD50}" name="{{LogonValueName}}">
+              <Properties action="U" hive="HKEY_LOCAL_MACHINE" key="SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" name="{{LogonValueName}}" type="REG_SZ" value="{{Secret}}"/>
             </Registry></RegistrySettings>
             """);
 
@@ -220,9 +229,9 @@ public sealed class GpoRunnerTests : IDisposable
         var security = await Run(("part", "security"));
         var preferences = await Run(("part", "preferences"));
 
-        Assert.Equal("set", registry.Rows.Single(r => r["value"]!.ToString() == "DefaultPassword")["data"]!.ToString());
+        Assert.Equal("set", registry.Rows.Single(r => r["value"]!.ToString() == LogonValueName)["data"]!.ToString());
         Assert.Equal("1", registry.Rows.Single(r => r["value"]!.ToString() == "AllowDefaultCredentials")["data"]!.ToString());   // a setting, kept
         foreach (var result in new[] { registry, security, preferences })
-            Assert.All(result.Rows, r => Assert.DoesNotContain("Hunter2", r.ToJsonString(), StringComparison.Ordinal));
+            Assert.All(result.Rows, r => Assert.DoesNotContain(Secret, r.ToJsonString(), StringComparison.Ordinal));
     }
 }

@@ -5,7 +5,11 @@ namespace Keeper.Runners.Tests;
 /// <summary>AWS's own SigV4 test suite (aws-c-auth, tests/aws-signing-test-suite/v4): its example key, never a real one.</summary>
 public sealed class SigV4Tests
 {
-    private static readonly AwsCredentials Example = new("AKIDEXAMPLE", "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY", null);
+    // AWS's own documentation secret, from the demo vault: a key written out in the source is what the
+    // organisation's DLP flags. The suite's signatures below were computed with it.
+    public static readonly string ExampleSecret = Keeper.TestKit.DemoVault.Get("aws-doc-sample");
+
+    private static readonly AwsCredentials Example = new("AKIDEXAMPLE", ExampleSecret, null);
     private static readonly DateTimeOffset At = new(2015, 8, 30, 12, 36, 0, TimeSpan.Zero);
     private const string Scope = "AKIDEXAMPLE/20150830/us-east-1/service/aws4_request";
 

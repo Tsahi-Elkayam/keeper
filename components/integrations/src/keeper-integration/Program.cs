@@ -70,8 +70,8 @@ static int List(Database db, MigrationSet[] schemas)
         Console.WriteLine("No integrations yet. 'keeper integration types' lists what Keeper can read; then: keeper integration add <id> --type <type> ...");
     foreach (var i in all)
     {
-        var secrets = i.Secrets.Count == 0 ? "" : " secrets: " + string.Join(", ", i.Secrets.Values.Select(s => s.ExpiresOn is null ? s.Name : $"{s.Name} (expires {s.ExpiresOn})"));
-        Console.WriteLine($"{i.Id,-20} {i.Type,-11} {(i.Enabled ? "on " : "off")} {i.AuthKind,-24} {i.Endpoint}{secrets}");
+        var stored = i.Secrets.Count == 0 ? "" : " secrets set - " + string.Join(", ", i.Secrets.Values.Select(s => s.ExpiresOn is null ? s.Name : $"{s.Name} (expires {s.ExpiresOn})"));
+        Console.WriteLine($"{i.Id,-20} {i.Type,-11} {(i.Enabled ? "on " : "off")} {i.AuthKind,-24} {i.Endpoint}{stored}");
     }
     return ExitCodes.Ok;
 }

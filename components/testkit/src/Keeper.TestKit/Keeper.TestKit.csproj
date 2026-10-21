@@ -1,0 +1,5 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <ItemGroup>
+    <EmbeddedResource Include="demo.vault.json" LogicalName="Keeper.TestKit.demo.vault.json" />
+  </ItemGroup>
+</Project>

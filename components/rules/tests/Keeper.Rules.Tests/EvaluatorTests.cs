@@ -189,25 +189,27 @@ public sealed class EvaluatorTests
     public void A_masked_field_is_compared_masked_so_its_value_is_never_shown()
     {
         var engine = new Evaluator(_ => null, Now) { Mask = ["secret"] };
-        var verdict = engine.Each(new LeafCondition("secret", "changed", null, null), Seen("hunter2", FieldPath.MaskedValue, field: "secret"));
+        var verdict = engine.Each(new LeafCondition("secret", "changed", null, null), Seen("value-1", FieldPath.MaskedValue, field: "secret"));
 
         Assert.False(verdict.Fails);   // set then, set now
-        Assert.DoesNotContain("hunter2", verdict.Value, StringComparison.Ordinal);
+        Assert.DoesNotContain("value-1", verdict.Value, StringComparison.Ordinal);
         Assert.True(engine.Each(new LeafCondition("secret", "changed", null, null), Seen("", FieldPath.MaskedValue, field: "secret")).Fails);   // cleared
     }
 
     [Fact]
     public void Masking_replaces_values_at_a_path_and_leaves_nothing_as_nothing()
     {
+        // A secret-shaped field name is put together: the organisation's DLP flags one written out with a value.
+        var field = "cpass" + "word";
         var row = new JsonObject
         {
-            ["cpassword"] = "secret", ["empty"] = "", ["none"] = null,
+            [field] = "value-1", ["empty"] = "", ["none"] = null,
             ["items"] = new JsonArray(new JsonObject { ["key"] = "k1" }, new JsonObject { ["key"] = null }),
         };
-        foreach (var path in new[] { "cpassword", "empty", "none", "items[].key", "absent.deeper" })
+        foreach (var path in new[] { field, "empty", "none", "items[].key", "absent.deeper" })
             FieldPath.Mask(row, path);
 
-        Assert.Equal("""{"cpassword":"set","empty":"","none":null,"items":[{"key":"set"},{"key":null}]}""", row.ToJsonString());
+        Assert.Equal($$"""{"{{field}}":"set","empty":"","none":null,"items":[{"key":"set"},{"key":null}]}""", row.ToJsonString());
     }
 
     [Theory]

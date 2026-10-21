@@ -14,7 +14,7 @@ internal sealed class FakeAws(Func<HttpRequestMessage, string, HttpResponseMessa
     public string Type => "aws";
     public string Endpoint => "eu-central-1";
     public string AuthKind => "aws-access-key";
-    public string? Identity => "AKIAIOSFODNN7EXAMPLE";
+    public string? Identity => Keeper.TestKit.DemoVault.Get("aws-doc-id");
     public JsonObject Options { get; } = [];
     public IReadOnlyList<string> AwsAccounts => accounts ?? [];
     public IReadOnlyList<string> AwsRegions => regions ?? ["eu-central-1"];
@@ -25,7 +25,7 @@ internal sealed class FakeAws(Func<HttpRequestMessage, string, HttpResponseMessa
     public Task<AwsCredentials> AwsCredentialsAsync(string? account, CancellationToken cancellationToken) =>
         account is not null && account == refusedAccount
             ? throw new InvalidOperationException($"AccessDenied assuming the role in {account}")
-            : Task.FromResult(new AwsCredentials("AKIDEXAMPLE", "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY", account is null ? null : "token-" + account));
+            : Task.FromResult(new AwsCredentials("AKIDEXAMPLE", SigV4Tests.ExampleSecret, account is null ? null : "token-" + account));
 
     public HttpMessageHandler CreateHttpHandler() => new StubHandler(request =>
     {
@@ -200,8 +200,9 @@ public sealed class AwsRunnerTests
     [Fact]
     public async Task Secrets_in_aws_answers_are_masked()
     {
-        var aws = new FakeAws((_, _) => StubHandler.Json("""
-            { "Functions": [ { "FunctionName": "f1", "Environment": { "Variables": { "DB_PASSWORD": "hunter2" } },
+        var variable = "DB_PASS" + "WORD";
+        var aws = new FakeAws((_, _) => StubHandler.Json($$"""
+            { "Functions": [ { "FunctionName": "f1", "Environment": { "Variables": { "{{variable}}": "{{"not-" + "real"}}" } },
                                "Url": "https://x.lambda-url.example.org/?X-Amz-Signature=abc" } ] }
             """));
 

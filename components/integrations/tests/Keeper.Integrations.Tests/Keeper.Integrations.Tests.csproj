@@ -1,5 +1,6 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <ItemGroup>
     <ProjectReference Include="..\..\src\Keeper.Integrations\Keeper.Integrations.csproj" />
+    <ProjectReference Include="..\..\..\testkit\src\Keeper.TestKit\Keeper.TestKit.csproj" />
   </ItemGroup>
 </Project>

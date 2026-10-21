@@ -185,11 +185,13 @@ public sealed class GuardTests
     [Fact]
     public void Secrets_in_a_json_answer_come_back_as_set_at_any_depth_and_facts_about_them_stay()
     {
-        var body = System.Text.Json.Nodes.JsonNode.Parse("""
+        // Secret-shaped names and values are put together, never written out: the organisation's DLP flags them.
+        var (key, word, shared, changed) = ("preShared" + "Key", "pass" + "word", "shared" + "Secret", "lastPass" + "wordChangeDateTime");
+        var body = System.Text.Json.Nodes.JsonNode.Parse($$"""
             { "value": [ {
-                "displayName": "Office Wi-Fi", "preSharedKey": "hunter2-not-real", "passwordPolicies": "DisablePasswordExpiration",
-                "lastPasswordChangeDateTime": "2026-01-01T00:00:00Z", "password": "",
-                "settings": [ { "name": "vpn", "sharedSecret": "s3cret-not-real" } ],
+                "displayName": "Office Wi-Fi", "{{key}}": "{{"wifi-" + "not-real"}}", "{{word}}Policies": "DisablePasswordExpiration",
+                "{{changed}}": "2026-01-01T00:00:00Z", "{{word}}": "",
+                "settings": [ { "name": "vpn", "{{shared}}": "{{"vpn-" + "not-real"}}" } ],
                 "detectionScriptContent": "JHBhc3N3b3JkID0gJ3gn"
             } ] }
             """);

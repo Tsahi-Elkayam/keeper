@@ -33,6 +33,10 @@
     <Project Path="components/rules/src/Keeper.Rules/Keeper.Rules.csproj" />
     <Project Path="components/rules/tests/Keeper.Rules.Tests/Keeper.Rules.Tests.csproj" />
   </Folder>
+  <Folder Name="/testkit/">
+    <Project Path="components/testkit/src/Keeper.TestKit/Keeper.TestKit.csproj" />
+    <Project Path="components/testkit/src/demo-vault/demo-vault.csproj" />
+  </Folder>
   <Folder Name="/runners/">
     <Project Path="components/runners/src/Keeper.Runners/Keeper.Runners.csproj" />
     <Project Path="components/runners/src/Keeper.Runners.Files/Keeper.Runners.Files.csproj" />

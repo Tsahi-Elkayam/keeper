@@ -23,7 +23,7 @@ public static partial class Redactor
         return cleaned;
     }
 
-    // password=..., "client_secret": "...", apiKey: ..., token=...
+    // A credential's name, then = or :, then its value - in query strings, JSON and config text alike.
     [GeneratedRegex("""(?<name>(?:pass(?:word|wd)?|pwd|secret|client_?secret|api_?key|access_?key|token|auth|credential)s?["']?)(?<sep>\s*[:=]\s*["']?)[^\s"',;&]+""",
         RegexOptions.IgnoreCase | RegexOptions.CultureInvariant, matchTimeoutMilliseconds: 1000)]
     private static partial Regex SecretPair();

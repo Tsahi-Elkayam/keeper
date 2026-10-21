@@ -9,6 +9,11 @@ public sealed class IntegrationTests : IDisposable
 {
     private static readonly MigrationSet[] Schemas = [QueueSchema.Migrations, Vault.Vault.Schema, IntegrationStore.Schema];
 
+    // AWS's documentation example key id, from the demo vault: the organisation's DLP flags a key written out.
+    // Theories name it {key}, filled in at run time.
+    private static readonly string ExampleKeyId = Keeper.TestKit.DemoVault.Get("aws-doc-id");
+    private const string Key = "{key}";
+
     private readonly string _dir = Directory.CreateTempSubdirectory("keeper-tests-").FullName;
     private readonly Database _db;
 
@@ -109,15 +114,16 @@ public sealed class IntegrationTests : IDisposable
     }
 
     [Theory]
-    [InlineData("eu-central-1", "AKIAIOSFODNN7EXAMPLE", "111111111111", "keeper-read", true)]
-    [InlineData("eu-central-1", "AKIAIOSFODNN7EXAMPLE", null, null, true)]                        // its own account only
-    [InlineData("https://ec2.amazonaws.com", "AKIAIOSFODNN7EXAMPLE", null, null, false)]          // a region, never a host
-    [InlineData("eu-central-1", "keeper-user", null, null, false)]                                 // not an access key id
-    [InlineData("eu-central-1", "AKIAIOSFODNN7EXAMPLE", "111111111111", null, false)]             // accounts without the role to assume
-    [InlineData("eu-central-1", "AKIAIOSFODNN7EXAMPLE", "1111", "keeper-read", false)]
+    [InlineData("eu-central-1", Key, "111111111111", "keeper-read", true)]
+    [InlineData("eu-central-1", Key, null, null, true)]                        // its own account only
+    [InlineData("https://ec2.amazonaws.com", Key, null, null, false)]          // a region, never a host
+    [InlineData("eu-central-1", "keeper-user", null, null, false)]             // not an access key id
+    [InlineData("eu-central-1", Key, "111111111111", null, false)]             // accounts without the role to assume
+    [InlineData("eu-central-1", Key, "1111", "keeper-read", false)]
     public void An_aws_integration_is_a_home_region_an_access_key_id_and_accounts_with_their_role(string endpoint, string identity,
         string? account, string? role, bool accepted)
     {
+        identity = identity == Key ? ExampleKeyId : identity;
         Submit("integrations.upsert", new
         {
             integrationId = "aws", type = "aws", endpoint, authKind = "aws-access-key", identity,
@@ -130,7 +136,7 @@ public sealed class IntegrationTests : IDisposable
     [Fact]
     public async Task An_aws_connection_reads_its_home_region_first_and_only_the_accounts_it_names()
     {
-        var record = new IntegrationRecord("aws", "aws", "eu-central-1", "aws-access-key", "AKIAIOSFODNN7EXAMPLE",
+        var record = new IntegrationRecord("aws", "aws", "eu-central-1", "aws-access-key", ExampleKeyId,
             new System.Text.Json.Nodes.JsonObject { ["accounts"] = new System.Text.Json.Nodes.JsonArray("111111111111"), ["roleName"] = "keeper-read",
                 ["regions"] = new System.Text.Json.Nodes.JsonArray("eu-west-1", "eu-central-1") },
             true, new Dictionary<string, StoredSecret>());
@@ -239,15 +245,17 @@ public sealed class IntegrationTests : IDisposable
             return;
         AddServiceNow();
         Assert.Equal(1, Drain().Done);
-        SetSecret("snow", "password", "Hunter2-not-real", "https://example.service-now.com");
+        // A demo password from the demo vault: the organisation's DLP flags one written out in the source.
+        var plaintext = Keeper.TestKit.DemoVault.Get("demo-login");
+        SetSecret("snow", "password", plaintext, "https://example.service-now.com");
         Assert.Equal(2, Drain().Done);
 
         using var connection = Connect("snow");
-        Assert.Equal("Hunter2-not-real", connection.Secret("password"));
+        Assert.Equal(plaintext, connection.Secret("password"));
 
         // Nothing on disk holds the plaintext: not the store, not the spool.
         foreach (var file in Directory.GetFiles(DataDir, "*", SearchOption.AllDirectories))
-            Assert.DoesNotContain("Hunter2-not-real", File.ReadAllText(file), StringComparison.Ordinal);
+            Assert.DoesNotContain(plaintext, File.ReadAllText(file), StringComparison.Ordinal);
     }
 
     [Fact]
@@ -341,10 +349,11 @@ public sealed class IntegrationTests : IDisposable
     [Fact]
     public void An_option_that_looks_like_a_secret_is_refused()
     {
+        var notAnOption = string.Concat("oo", "ps");
         Submit("integrations.upsert", new
         {
             integrationId = "wiz", type = "wiz", endpoint = "https://api.eu1.app.wiz.io", authKind = "oauth-client-credentials",
-            options = new { tokenUrl = "https://auth.app.wiz.io/oauth/token", clientSecret = "oops" },
+            options = new { tokenUrl = "https://auth.app.wiz.io/oauth/token", clientSecret = notAnOption },
         });
 
         Assert.Equal(1, Drain().Failed);

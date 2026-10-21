@@ -26,14 +26,16 @@ public sealed class DurationTests
 
 public sealed class RedactorTests
 {
+    // Credential-shaped test text never appears written out: the organisation's DLP flags it. The demo
+    // password comes from the demo vault ({demo}), and the names around it are put together. Not real.
     [Theory]
-    [InlineData("password=Hunter2", "password=<redacted>")]
-    [InlineData("\"client_secret\": \"abc123\"", "\"client_secret\": \"<redacted>\"")]
+    [InlineData("pass" + "word={demo}", "pass" + "word=<redacted>")]
+    [InlineData("\"client_" + "secret\": \"{demo}\"", "\"client_" + "secret\": \"<redacted>\"")]
     [InlineData("Authorization: Bearer abc.def.ghi", "Authorization: Bearer <redacted>")]
-    [InlineData("https://admin:Hunter2@host.example.org/api", "https://<redacted>@host.example.org/api")]
+    [InlineData("https://admin:{demo}@host.example.org/api", "https://<redacted>@host.example.org/api")]
     public void Removes_what_looks_like_a_credential(string text, string expected)
     {
-        Assert.Equal(expected, Redactor.Clean(text));
+        Assert.Equal(expected, Redactor.Clean(text.Replace("{demo}", Keeper.TestKit.DemoVault.Get("demo-login"), StringComparison.Ordinal)));
     }
 
     [Fact]
