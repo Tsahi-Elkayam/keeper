@@ -1,0 +1,407 @@
+schema: keeper.rules/1
+system: entra-connect
+name: Microsoft Entra Connect Sync servers
+integration: cim
+
+# Rules for the servers that run the Entra Connect Sync engine, read over CIM/WinRM, the registry
+# (StdRegProv, read-only) and the event logs. Active Directory cannot tell which servers run the engine,
+# so this file has no targets block: the hosts come from the cim integration's `targets` option (the
+# active server and any staging server). Without targets every query fails and every rule is unknown.
+# The cloud side of synchronisation (sync age, features, sync accounts) is in entra.yaml.
+#
+# Paths below are the installer's defaults (%ProgramFiles%\Microsoft Azure AD Sync); an engine installed
+# elsewhere returns no rows for the file-based rules, which then judge nothing.
+
+defaults:
+  lens: both
+  refresh: 1d
+  entity: sync-server
+
+rules:
+  # ========================================================================= services ===
+  - id: ECSYNC-SERVICE-DOWN
+    title: Sync engine or a sync agent service is not running
+    kind: broken
+    category: HLT
+    severity:
+      field: Name
+      map: { ADSync: critical }
+      default: medium
+    entity: service
+    why: "With the engine service (ADSync) stopped or not automatic, no change reaches the cloud: leavers disabled in AD stay enabled in Entra. With a Connect Health or provisioning agent stopped (medium), nobody is told when sync breaks."
+    fix: "Read the Application and System events first (ECSYNC-APPLOG-ERRORS, ECSYNC-SERVICE-CRASH-EVENTS), then start the service and set the engine to automatic start."
+    refs: ["NIST-800-53:CP-2", "NIST-800-53:SI-4"]
+    query:
+      protocol: cim
+      wql: SELECT Name, DisplayName, State, StartMode, StartName, ProcessId FROM Win32_Service WHERE Name = 'ADSync' OR Name LIKE 'AzureADConnectHealth%' OR Name = 'AADConnectProvisioningAgent'
+      key: "{host}|{Name}"
+    each:
+      any:
+        - all:
+            - { field: Name, op: eq, value: ADSync }
+            - any:
+                - { field: State, op: ne, value: Running }
+                - { field: StartMode, op: ne, value: Auto }
+        - all:
+            - { field: Name, op: ne, value: ADSync }
+            - { field: State, op: ne, value: Running }
+    evidence: "{host}: {Name} ({DisplayName}) {State}, start {StartMode}, account {StartName}"
+
+  - id: ECSYNC-ENGINE-NOT-INSTALLED
+    title: Target listed as a sync server has no sync engine service
+    kind: missing
+    category: CFG
+    severity: medium
+    entity: sync-server
+    why: "A host in this integration's target list without the ADSync service is not a sync server (rebuilt, decommissioned, or the wrong name), so every other rule here judges nothing for it while the real server may be missing from the list."
+    fix: "Correct the cim integration's target list to the active and staging sync servers."
+    refs: ["NIST-800-53:CM-8"]
+    query:
+      protocol: cim
+      wql: SELECT Name, DisplayName, State, StartMode, StartName, ProcessId FROM Win32_Service WHERE Name = 'ADSync' OR Name LIKE 'AzureADConnectHealth%' OR Name = 'AADConnectProvisioningAgent'
+      key: "{host}|{Name}"
+    count:
+      op: lt
+      value: 1
+      where: { field: Name, op: eq, value: ADSync }
+    evidence: "{host}: no ADSync service among {rows} sync-related services"
+
+  # ================================================================ database and versions ===
+  - id: ECSYNC-LOCALDB-SIZE-HIGH
+    title: Sync database on LocalDB is approaching the 10 GB limit
+    kind: broken
+    category: HLT
+    severity:
+      field: FileSize
+      ranges: [ { min: 10200547328, value: critical } ]
+      default: high
+    entity: sync-server
+    why: "The bundled SQL Server Express LocalDB stops at 10 GB; at the limit the engine stops with 'stopped-database-disk-full' and nothing on the cloud side warns first. The rule reads the size of ADSync.mdf (high above 8 GB, critical above 9.5 GB); servers on a full SQL Server have no such file and are not judged."
+    fix: "Follow the LocalDB 10 GB recovery guidance: clear run history (and keep it short with Set-ADSyncScheduler -PurgeRunHistoryInterval), shrink the database; move to a full SQL Server if growth continues."
+    refs: ["NIST-800-53:CP-2", "NIST-800-53:SC-5"]
+    query:
+      protocol: cim
+      wql: >-
+        SELECT Name, FileSize, LastModified FROM CIM_DataFile
+        WHERE Name = 'C:\\Program Files\\Microsoft Azure AD Sync\\Data\\ADSync.mdf'
+      key: host
+    each: { field: FileSize, op: gt, value: 8589934592, threshold: entra-connect.localdb-max-bytes }
+    evidence: "{host}: {Name} is {FileSize} bytes (changed {LastModified})"
+
+  # Engine version: the file version of miiserver.exe. Microsoft retires each 2.x build 12 months after
+  # a newer one ships, and services stop for builds older than 2.6.84.0 (or without application-based
+  # authentication) after 7 April 2027. The default patterns reflect the support table of October 2026
+  # and must be updated as builds retire.
+  - id: ECSYNC-VERSION-RETIRED
+    title: Sync engine build is retired
+    kind: broken
+    category: LCM
+    severity: critical
+    entity: sync-server
+    why: "A retired build gets no fixes and is not supported; 1.x builds no longer synchronise at all, and retired 2.x builds break as the service changes underneath them. The default pattern covers 1.x and 2.x builds up to 2.5.79.0."
+    fix: "Upgrade in place to the current release, or swing through a staging server in a change window."
+    refs: ["NIST-800-53:SA-22", "NIST-800-53:SI-2"]
+    query:
+      protocol: cim
+      wql: >-
+        SELECT Name, Version, LastModified FROM CIM_DataFile
+        WHERE Name = 'C:\\Program Files\\Microsoft Azure AD Sync\\Bin\\miiserver.exe'
+      key: host
+    each: { field: Version, op: match, value: '^(1\.|2\.[0-4]\.|2\.5\.([0-9]|[1-6][0-9]|7[0-9])\.)', threshold: entra-connect.retired-version-pattern }
+    evidence: "{host}: sync engine {Version}"
+
+  - id: ECSYNC-VERSION-BELOW-MINIMUM
+    title: Sync engine build is older than the announced minimum
+    kind: broken
+    category: LCM
+    severity: high
+    entity: sync-server
+    why: "Microsoft announced that synchronisation stops after 7 April 2027 for servers below version 2.6.84.0 or without application-based authentication. Supported builds older than that still need an upgrade before the date. Retired builds have their own rule."
+    fix: "Upgrade to 2.6.84.0 or later and configure application-based authentication before the date."
+    refs: ["NIST-800-53:SA-22", "NIST-800-53:SI-2"]
+    query:
+      protocol: cim
+      wql: >-
+        SELECT Name, Version, LastModified FROM CIM_DataFile
+        WHERE Name = 'C:\\Program Files\\Microsoft Azure AD Sync\\Bin\\miiserver.exe'
+      key: host
+    each:
+      all:
+        - { field: Version, op: match, value: '^(1\.|2\.[0-5]\.|2\.6\.([0-9]|[1-7][0-9]|8[0-3])\.)', threshold: entra-connect.minimum-version-pattern }
+        - { field: Version, op: notmatch, value: '^(1\.|2\.[0-4]\.|2\.5\.([0-9]|[1-6][0-9]|7[0-9])\.)', threshold: entra-connect.retired-version-pattern }
+    evidence: "{host}: sync engine {Version}, minimum 2.6.84.0 by 7 April 2027"
+
+  - id: ECSYNC-DOTNET-BELOW-MINIMUM
+    title: .NET Framework on the sync server is older than 4.7.2
+    kind: broken
+    category: LCM
+    severity: medium
+    entity: sync-server
+    why: "Entra Connect Sync from 2.4.18.0 requires .NET Framework 4.7.2 or later (and its TLS 1.2 defaults); an older runtime blocks the next engine upgrade, which the version deadline makes unavoidable. Release values: 461808 = 4.7.2, 528040 = 4.8."
+    fix: "Install .NET Framework 4.8 or 4.8.1 in a maintenance window and restart."
+    refs: ["NIST-800-53:SI-2"]
+    query:
+      protocol: registry
+      path: SOFTWARE\Microsoft\NET Framework Setup\NDP\v4\Full
+      values: [Release, Version]
+      key: host
+    each: { field: Release, op: lt, value: 461808, threshold: entra-connect.dotnet-min-release }
+    evidence: "{host}: .NET Framework {Version} (release {Release})"
+
+  # ============================================================================ event logs ===
+  - id: ECSYNC-APPLOG-ERRORS
+    title: Sync engine logged errors or warnings in the last day
+    kind: broken
+    category: HLT
+    severity:
+      field: level
+      map: { '1': high, '2': high, '3': medium }
+      default: medium
+    entity: event
+    lens: maintenance
+    why: "Errors and warnings of the sync engine (ADSync) and of password hash sync (Directory Synchronization) in the Application log are the server-side record of failed run profiles, connector errors and authentication failures. One finding per host, source and event id; event 611 has its own rule; ids in entra-connect.acknowledged-event-ids are left out."
+    fix: "Look the event id up in the troubleshooting guidance, fix the cause, and record known-harmless ids in the acknowledged list."
+    refs: ["NIST-800-53:AU-6", "NIST-800-53:SI-4"]
+    query:
+      protocol: eventlog
+      log: Application
+      providers: [ADSync, Directory Synchronization]
+      days: 1
+      max: 5000
+      key: "{host}|{provider}|{id}"
+    each:
+      all:
+        - { field: level, op: in, value: [1, 2, 3] }
+        - { field: id, op: ne, value: 611 }
+        - field: id
+          op: notin
+          threshold: entra-connect.acknowledged-event-ids
+          value: []
+    evidence: "{host}: {provider} event {id} (level {level}) at {time}"
+
+  - id: ECSYNC-PHS-FAILURE-611
+    title: Password hash synchronisation failed for a domain
+    kind: broken
+    category: AUT
+    severity: high
+    entity: event
+    why: "Event 611 means password hashes could not be read from a domain (replication rights of the connector account, an unreachable domain controller, RPC): cloud passwords go stale and a leaver's or reset user's old password keeps working in the cloud."
+    fix: "Read the event text: restore the connector account's replication rights, the domain controller's reachability or RPC; then confirm event 654 heartbeats resume."
+    refs: ["NIST-800-53:IA-5", "NIST-800-53:SI-4"]
+    query:
+      protocol: eventlog
+      log: Application
+      providers: [Directory Synchronization]
+      ids: [611]
+      days: 1
+      max: 2000
+      key: "{host}|{id}"
+    each: any
+    evidence: "{host}: password hash sync error 611 at {time}"
+
+  - id: ECSYNC-PHS-HEARTBEAT-EVENTS-MISSING
+    title: No password hash sync heartbeat on the server for a day
+    kind: broken
+    category: AUT
+    severity: medium
+    entity: sync-server
+    why: "Password hash sync logs a heartbeat (event 654, end of ping) every 30 minutes on the server that runs it; none for a day means the password sync loop is not running even if the service is up. A staging server and a tenant without password hash sync legitimately have none: accept those hosts. The cloud-side view is ENTRA-SYNC-PASSWORD-HASH-STALE."
+    fix: "Restart the sync service and check the password hash sync configuration and the connector account; then confirm the heartbeats resume."
+    refs: ["NIST-800-53:IA-5", "NIST-800-53:SI-4"]
+    query:
+      protocol: eventlog
+      log: Application
+      providers: [Directory Synchronization]
+      ids: [654]
+      days: 1
+      max: 100
+      key: "{host}|{recordId}"
+    count: none
+    evidence: "{host}: no password hash sync heartbeat (event 654) in the last day"
+
+  - id: ECSYNC-PASSWORD-WRITEBACK-ERRORS
+    title: Password writeback logged errors or warnings this week
+    kind: broken
+    category: AUT
+    severity: medium
+    entity: event
+    why: "A self-service reset that cannot be written back succeeds in the portal and never reaches AD: the user is locked out at the next domain logon. Writeback problems are logged by the PasswordResetService source on the sync server; servers without writeback have none."
+    fix: "Follow the writeback troubleshooting guidance for the event id (connector account reset rights, outbound connectivity to the service bus)."
+    refs: ["NIST-800-53:IA-5", "NIST-800-53:SI-4"]
+    query:
+      protocol: eventlog
+      log: Application
+      providers: [PasswordResetService]
+      days: 7
+      max: 1000
+      key: "{host}|{id}"
+    each: { field: level, op: in, value: [1, 2, 3] }
+    evidence: "{host}: PasswordResetService event {id} (level {level}) at {time}"
+
+  - id: ECSYNC-SERVICE-CRASH-EVENTS
+    title: Sync engine or agent service crashed or failed to start this week
+    kind: broken
+    category: HLT
+    severity: high
+    entity: event
+    why: "Service Control Manager events 7000, 7023, 7031, 7034 and 7038 naming the sync engine or its agents mean the service failed to start, terminated or could not log on; a service that restarts on its own looks healthy at scan time. The service is told by the event's first parameter (its display name), matched by pattern."
+    fix: "Read the Application log around the time (database errors, encryption key access) before restarting; fix the service account logon for 7038."
+    refs: ["NIST-800-53:SI-4", "NIST-800-53:CP-2"]
+    query:
+      protocol: eventlog
+      log: System
+      providers: [Service Control Manager]
+      ids: [7000, 7023, 7031, 7034, 7038]
+      days: 7
+      max: 500
+      key: "{host}|{id}|{param1}"
+    each: { field: param1, op: match, value: '(Azure AD Sync|Entra ID Sync|Entra Connect|AD Connect Health|Provisioning Agent|^ADSync$)', threshold: entra-connect.service-display-pattern }
+    evidence: "{host}: event {id} for {param1} at {time}"
+
+  # ======================================================================== change and access ===
+  - id: ECSYNC-WIZARD-RUN-RECENT
+    title: Entra Connect wizard ran on the server this week
+    kind: misconfigured
+    category: CFG
+    severity: info
+    entity: file
+    lens: security
+    why: "Every wizard run writes a trace log under %ProgramData%\\AADConnect; each run is a tier-0 change (filtering, features, credentials, upgrade) that should match a change record. Metadata only: the trace content is never read."
+    fix: "Match the run to a change record; otherwise review who logged on to the server and what changed."
+    refs: ["NIST-800-53:CM-3", "NIST-800-53:AU-6"]
+    query:
+      protocol: cim
+      wql: SELECT Name, LastModified, FileSize FROM CIM_DataFile WHERE Drive = 'C:' AND Path = '\\ProgramData\\AADConnect\\' AND Extension = 'log'
+      key: "{host}|{Name}"
+    each: { field: LastModified, op: age-lt, value: 7, threshold: entra-connect.wizard-review-days }
+    evidence: "{host}: {Name} written {LastModified}"
+
+  - id: ECSYNC-ADSYNC-GROUP-MEMBER-UNEXPECTED
+    title: Member of the sync engine's ADSyncAdmins group is not on the approved list
+    kind: misconfigured
+    category: IAM
+    severity: high
+    entity: local-group-member
+    lens: security
+    why: "ADSyncAdmins members manage the sync engine: they change sync rules, filtering and connector credentials, which is tier-0 power over AD and Entra at once. Until the approved members are recorded in the threshold pattern, every member is listed for review. Installations that use domain groups have no local group and return no rows."
+    fix: "Keep the group to the approved tier-0 administrators (ideally one reviewed domain group); remove leavers and day-to-day accounts, then record the approved members as the pattern."
+    refs: ["NIST-800-53:AC-6(5)", "NIST-800-53:AC-2", "CIS-Controls-v8:5.4"]
+    query:
+      protocol: cim
+      wql: SELECT GroupComponent, PartComponent FROM Win32_GroupUser WHERE GroupComponent = "Win32_Group.Domain='{HOST}',Name='ADSyncAdmins'"
+      key: "{host}|{PartComponent}"
+    each: { field: PartComponent, op: notmatch, value: '(?!)', threshold: entra-connect.approved-admin-pattern }
+    evidence: "{host}: ADSyncAdmins member {PartComponent}"
+
+  - id: ECSYNC-LOGON-RIGHT-BROAD
+    title: Group Policy lets broad groups log on to the sync server
+    kind: misconfigured
+    category: IAM
+    severity: high
+    entity: policy-setting
+    lens: security
+    why: "Interactive or Remote Desktop logon rights on the sync server granted to Users, Domain Users, Authenticated Users or Everyone let non-tier-0 people sit on a box whose memory holds tier-0 secrets. Only rights set by Group Policy are visible (the policy result); network logon is left out because baselines grant it to Authenticated Users."
+    fix: "Apply a tier-0 server policy that limits interactive and Remote Desktop logon to the tier-0 administrators and denies the lower tiers."
+    refs: ["NIST-800-53:AC-6", "NIST-800-53:AC-17", "CIS-Controls-v8:5.4"]
+    query:
+      protocol: cim
+      namespace: root/rsop/computer
+      wql: SELECT UserRight, AccountList, precedence FROM RSOP_UserPrivilegeRight WHERE precedence = 1
+      key: "{host}|{UserRight}"
+    each:
+      all:
+        - { field: UserRight, op: in, value: [SeInteractiveLogonRight, SeRemoteInteractiveLogonRight] }
+        - { field: AccountList, op: match, value: '(^|\\)(Users|Domain Users|Authenticated Users|Everyone|Domain Computers|INTERACTIVE)$|^\*?S-1-1-0$|^\*?S-1-5-11$|^\*?S-1-5-4$|^\*?S-1-5-32-545$|^\*?S-1-5-21-[0-9-]+-51[35]$', threshold: entra-connect.broad-logon-pattern }
+    evidence: "{host}: {UserRight} granted to {AccountList}"
+
+  # One full read of the server's services serves the next two rules.
+  - id: ECSYNC-COHOSTED-SOFTWARE
+    title: Other software runs on the sync server
+    kind: misconfigured
+    category: CFG
+    severity: high
+    entity: service
+    lens: security
+    why: "The sync server is tier 0: every other product installed on it brings its own administrators, listeners and vulnerabilities into tier 0. The rule lists services whose binaries live outside the Windows folder and are not the engine, its agents, Microsoft security and management agents or common hypervisor and cloud guest agents (tune the approved pattern with the threshold); browsers have their own rule."
+    fix: "Move other products to tier-1 servers; until then record each with its owner and a move date (accept by override)."
+    refs: ["NIST-800-53:CM-7", "NIST-800-53:CM-8", "NIST-800-53:SC-7"]
+    query:
+      protocol: cim
+      wql: SELECT Name, DisplayName, PathName, StartName, StartMode, State FROM Win32_Service
+      key: "{host}|{Name}"
+    each:
+      all:
+        - { field: PathName, op: notmatch, value: '^"?[a-z]:\\windows\\' }
+        - { field: Name, op: notmatch, value: '^(ADSync|AzureADConnectHealth.*|AzureADConnectAgentUpdater.*|AADConnectProvisioningAgent|AzureADConnectAuthenticationAgent.*|WinDefend|WdNisSvc|MDCoreSvc|Sense|MsSense|CcmExec|CmRcService|smstsmgr|edgeupdate|edgeupdatem|MicrosoftEdgeElevationService|SQLWriter|VMTools|vm3dservice|VGAuthService|vmvss|AmazonSSMAgent|AWSLiteAgent|Ec2Config|EC2Launch|WindowsAzureGuestAgent|RdAgent|GCEAgent|QEMU-GA|xenagent)$', threshold: entra-connect.approved-service-pattern }
+        - { field: Name, op: notmatch, value: '^(gupdate|gupdatem|GoogleUpdater.*|GoogleChromeElevationService|MozillaMaintenance|brave.*|BraveElevationService.*)$', threshold: entra-connect.browser-service-pattern }
+    evidence: "{host}: {Name} ({DisplayName}) {State}, {PathName}, as {StartName}"
+
+  - id: ECSYNC-BROWSER-INSTALLED
+    title: Third-party browser installed on the sync server
+    kind: misconfigured
+    category: CFG
+    severity: medium
+    entity: service
+    lens: security
+    why: "A third-party browser on the tier-0 sync server is the clearest sign the box is used for browsing - with tier-0 secrets in memory. Browsers are told by their update and maintenance services; one installed without them is not seen here."
+    fix: "Uninstall the browser; block web browsing from the server by policy and at the network layer."
+    refs: ["NIST-800-53:CM-7", "NIST-800-53:SC-7(5)"]
+    query:
+      protocol: cim
+      wql: SELECT Name, DisplayName, PathName, StartName, StartMode, State FROM Win32_Service
+      key: "{host}|{Name}"
+    each: { field: Name, op: match, value: '^(gupdate|gupdatem|GoogleUpdater.*|GoogleChromeElevationService|MozillaMaintenance|brave.*|BraveElevationService.*)$', threshold: entra-connect.browser-service-pattern }
+    evidence: "{host}: {DisplayName} ({Name}) at {PathName}"
+
+  # ======================================================================== host hardening ===
+  - id: ECSYNC-CREDENTIAL-GUARD-OFF
+    title: Credential Guard is not running on the sync server
+    kind: misconfigured
+    category: AUT
+    severity: medium
+    entity: sync-server
+    lens: security
+    why: "Without Credential Guard, credentials of administrators who log on to the sync server can be dumped from memory by anyone with local admin rights - on a tier-0 server, that is a path to the whole directory. Instance types without virtualisation-based security support are accepted with the reason."
+    fix: "Enable virtualisation-based security and Credential Guard through the tier-0 server policy after testing with the engine."
+    refs: ["NIST-800-53:SC-39", "MITRE-ATTACK:T1003.001"]
+    query:
+      protocol: cim
+      namespace: root/Microsoft/Windows/DeviceGuard
+      wql: SELECT * FROM Win32_DeviceGuard
+      key: host
+    each: { field: SecurityServicesRunning, op: notcontains, value: 1 }
+    evidence: "{host}: VBS status {VirtualizationBasedSecurityStatus}, running services {SecurityServicesRunning}"
+
+  - id: ECSYNC-ROOT-AUTOUPDATE-DISABLED
+    title: Automatic root certificate update is turned off on the sync server
+    kind: misconfigured
+    category: PKI
+    severity: medium
+    entity: sync-server
+    why: "With automatic root updates off, the server does not learn new Microsoft roots: the engine's connections to the cloud fail at the next root rotation, and revoked roots stay trusted."
+    fix: "Remove DisableRootAutoUpdate from the policy, or distribute the Microsoft roots by policy if the server has no outbound access to Windows Update."
+    refs: ["NIST-800-53:SC-17", "NIST-800-53:SC-8"]
+    query:
+      protocol: registry
+      path: SOFTWARE\Policies\Microsoft\SystemCertificates\AuthRoot
+      values: [DisableRootAutoUpdate, EnableDisallowedCertAutoUpdate]
+      key: host
+    each: { field: DisableRootAutoUpdate, op: eq, value: 1 }
+    evidence: "{host}: DisableRootAutoUpdate = {DisableRootAutoUpdate}, EnableDisallowedCertAutoUpdate = {EnableDisallowedCertAutoUpdate}"
+
+  - id: ECSYNC-EVENT-FORWARDING-OFF
+    title: Sync server forwards no events to a collector
+    kind: missing
+    category: LOG
+    severity: medium
+    entity: sync-server
+    lens: security
+    why: "Without a Windows Event Forwarding subscription manager the server's Security and Application logs live only on the box and wrap within days, so a compromise of the tier-0 sync server leaves no record elsewhere. Estates that ship logs with an agent instead accept the finding."
+    fix: "Include the server in central log collection (event forwarding or the estate's log agent); raise local log sizes meanwhile."
+    refs: ["NIST-800-53:AU-4", "NIST-800-53:AU-6", "NIST-800-53:AU-9(2)"]
+    query:
+      protocol: registry
+      path: SOFTWARE\Policies\Microsoft\Windows\EventLog\EventForwarding\SubscriptionManager
+      key: host
+    each: { field: exists, op: eq, value: false }
+    evidence: "{host}: no event forwarding subscription manager configured"

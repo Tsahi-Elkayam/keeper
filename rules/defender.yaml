@@ -1,0 +1,141 @@
+schema: keeper.rules/1
+system: defender
+name: Microsoft Defender (Graph security API)
+integration: graph
+
+# Generic rules for Microsoft Defender XDR, Defender for Identity and Defender for Office 365, read
+# through the Microsoft Graph security API (GET only). Graph permissions per query:
+# docs\backlog\microsoft-cloud.md, section "Graph permissions". Defender for Endpoint's own API and
+# advanced hunting (a POST) are other integrations and stay in the backlog. Without the Defender
+# product behind an endpoint the query fails and the rule records unknown, never a pass.
+
+defaults:
+  lens: security
+  refresh: 1d
+
+rules:
+  # ================================================================== Defender for Identity ===
+  - id: DEFENDER-MDI-SENSOR-UNHEALTHY
+    title: Defender for Identity sensor is unhealthy or not up to date
+    kind: broken
+    category: MON
+    severity:
+      field: healthStatus
+      map: { notHealthyHigh: high, notHealthyMedium: medium, notHealthyLow: low }
+      default: low
+    entity: mdi-sensor
+    refresh: 6h
+    why: "An unhealthy sensor on a domain controller (or AD CS, AD FS or Entra Connect server) means directory attacks against that server go undetected, while every dashboard still shows the sensor as installed. Outdated, failed, unreachable and disconnected deployments count too; severity follows the sensor's own health status."
+    fix: "Open the sensor's health issues (DEFENDER-MDI-HEALTH-ISSUE-OPEN) and fix the service, auditing, connectivity or service-account problem they name; update outdated sensors."
+    refs: ["NIST-800-53:SI-4", "NIST-800-53:AU-12", "CIS-Controls-v8:8.2", "MITRE-ATTACK:T1003.006"]
+    query:
+      protocol: graph
+      path: /security/identities/sensors
+      key: id
+      name: displayName
+    each:
+      any:
+        - { field: healthStatus, op: ne, value: healthy }
+        - { field: deploymentStatus, op: in, value: [outdated, updateFailed, notConfigured, unreachable, disconnected, startFailure] }
+    evidence: "{displayName} ({sensorType}, {domainName}, version {version}): health {healthStatus}, deployment {deploymentStatus}, {openHealthIssuesCount} open health issues"
+
+  - id: DEFENDER-MDI-HEALTH-ISSUE-OPEN
+    title: Defender for Identity health issue left open
+    kind: broken
+    category: MON
+    severity:
+      field: severity
+      map: { high: high, medium: medium, low: low }
+      default: medium
+    entity: mdi-health-issue
+    refresh: 6h
+    why: "Health issues name what silently disables detections: missing object or advanced auditing on a domain controller removes whole alert families, a broken directory service account stops lateral-movement analysis, an outdated sensor misses new detections - all while the sensor can still show healthy. High-severity issues fire at once, the others after a week open."
+    fix: "Apply the recommendation of the issue: audit policy and object SACLs for auditing issues, the update path for outdated sensors, a group-managed service account for account issues; then close it."
+    refs: ["NIST-800-53:SI-4", "NIST-800-53:AU-2", "NIST-800-53:AU-12", "NIST-800-53:IA-5"]
+    query:
+      protocol: graph
+      path: /security/identities/healthIssues
+      filter: "status eq 'open'"
+      key: id
+      name: displayName
+    each:
+      all:
+        - { field: status, op: eq, value: open }
+        - any:
+            - { field: severity, op: eq, value: high }
+            - { field: createdDateTime, op: age-gt, value: 7, threshold: defender.mdi-health-issue-max-open-days }
+    evidence: "{displayName} ({healthIssueType}, {severity}) open since {createdDateTime} on {sensorDNSNames} {domainNames}: {recommendations}"
+
+  # ===================================================================== Defender XDR ===
+  - id: DEFENDER-INCIDENT-RESOLVED-UNCLASSIFIED
+    title: Incident resolved without a classification or determination
+    kind: misconfigured
+    category: MON
+    severity: low
+    entity: security-incident
+    why: "An incident closed as unknown teaches nothing, cannot be counted in reporting and may hide a true positive that deserved a root cause. Incidents resolved in the last 30 days are read."
+    fix: "Reopen the incident and close it with a classification and determination; make both mandatory steps of the triage procedure."
+    refs: ["NIST-800-53:IR-5", "NIST-800-53:IR-8", "CIS-Controls-v8:17.4"]
+    query:
+      protocol: graph
+      path: /security/incidents
+      filter: "status eq 'resolved' and lastUpdateDateTime ge {DAYS_AGO:30}"
+      key: id
+      name: displayName
+    each:
+      any:
+        - { field: classification, op: eq, value: unknown }
+        - { field: determination, op: eq, value: unknown }
+    evidence: "{displayName} ({severity}): resolved {lastUpdateDateTime}, classification {classification}, determination {determination}, assigned to '{assignedTo}'"
+
+  # ============================================================== Defender for Office 365 ===
+  - id: DEFENDER-USER-REPORT-PENDING
+    title: User-reported email threat still has no result after days
+    kind: broken
+    category: MON
+    severity:
+      daysLeft: createdDateTime
+      ranges: [ { max: -5, value: medium } ]
+      default: low
+    entity: threat-submission
+    why: "Staff reports are the earliest phishing signal; a report whose analysis has not completed after days is a report into the void, and a confirmed phish without a tenant block keeps arriving. Reports of the last 14 days are read; older than five days is medium. Only exposed in the beta API."
+    fix: "Triage the submission in the Defender portal; block the sender, domain or URL when it is malicious and tell the reporter."
+    refs: ["NIST-800-53:IR-6", "NIST-800-53:IR-4", "CIS-Controls-v8:17.2"]
+    query:
+      protocol: graph
+      version: beta
+      path: /security/threatSubmission/emailThreats
+      filter: "createdDateTime ge {DAYS_AGO:14}"
+      key: id
+      name: subject
+    each:
+      all:
+        - { field: source, op: eq, value: user }
+        - { field: status, op: in, value: [notStarted, running] }
+        - { field: createdDateTime, op: age-gt, value: 2, threshold: defender.user-report-max-pending-days }
+    evidence: "'{subject}' ({category}, {contentType}) reported {createdDateTime}: {status}"
+
+  - id: DEFENDER-ATTACK-SIM-STALE
+    title: No attack simulation completed in the last six months
+    kind: missing
+    category: MON
+    severity: low
+    entity: tenant
+    refresh: 7d
+    why: "Users are the last filter; a phishing simulation measures who clicks and trains them. None completed for half a year means the click rate is unknown. A tenant that runs simulations with another vendor accepts the finding. Needs Defender for Office 365 Plan 2."
+    fix: "Schedule a simulation campaign with the training payload and review the click and compromise rates afterwards."
+    refs: ["NIST-800-53:AT-2", "NIST-800-53:AT-2(1)", "CIS-Controls-v8:14.2"]
+    query:
+      protocol: graph
+      path: /security/attackSimulation/simulations
+      select: [id, displayName, status, attackType, attackTechnique, launchDateTime, completionDateTime]
+      key: id
+      name: displayName
+    count:
+      op: lt
+      value: 1
+      where:
+        all:
+          - { field: status, op: eq, value: succeeded }
+          - { field: completionDateTime, op: age-lt, value: 180, threshold: defender.attack-sim-max-age-days }
+    evidence: "{count} simulations completed in the window, among {rows}"

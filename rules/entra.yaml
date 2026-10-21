@@ -343,6 +343,210 @@ rules:
           value: '/(applications|servicePrincipals)/(credentials|owners)/update|/servicePrincipals/synchronizationCredentials/|/servicePrincipals/appRoleAssignedTo/update|/users/password/update|/users/authenticationMethods/|/roleAssignments/|/roleDefinitions/|/groups/(members|owners)/update|/allTasks$'
     evidence: "{displayName}: allows {rolePermissions[].allowedResourceActions}"
 
+  - id: ENTRA-ROLE-HOLDER-NAMING
+    title: Directory role held by an account outside the admin-account naming convention
+    kind: misconfigured
+    category: IAM
+    severity: low
+    entity: role-assignment
+    why: "A role on an account that does not follow the organisation's admin-account convention is usually a daily account (mailbox, browsing, Teams) that also carries administrative power. The convention is tenant-specific: put it in the threshold as a pattern; until then the rule checks nothing. Service principals and the emergency-access accounts (entra.breakglass-user-ids) are left out."
+    fix: "Move the role to a dedicated admin account that follows the convention, or rename the account if it already is a dedicated one."
+    refs: ["NIST-800-53:AC-6(2)", "NIST-800-53:IA-4", "CIS-Controls-v8:5.4"]
+    query:
+      protocol: graph
+      path: /roleManagement/directory/roleAssignments
+      expand: principal
+      key: id
+      name: principal.displayName
+    each:
+      all:
+        - { field: principal.userPrincipalName, op: exists }
+        - { field: principal.userPrincipalName, op: notmatch, value: '.*', threshold: entra.admin-account-pattern }
+        - field: principalId
+          op: notin
+          threshold: entra.breakglass-user-ids
+          value: []
+    evidence: "{principal.userPrincipalName} holds role {roleDefinitionId} (scope {directoryScopeId})"
+
+  - id: ENTRA-ROLE-AU-SCOPED-ASSIGNMENT
+    title: Directory role scoped to an administrative unit or a single object
+    kind: misconfigured
+    category: IAM
+    severity: info
+    entity: role-assignment
+    why: "A role scoped below the tenant (an administrative unit, one application, one group) lets its holder reset passwords, manage members or change credentials inside that scope; such grants are invisible in the tenant-wide role review. A review list: accept each scope that is documented."
+    fix: "Confirm each scoped holder and scope with its owner; remove the ones nobody can explain, and keep admin accounts in a restricted-management unit so scoped admins cannot reach them."
+    refs: ["NIST-800-53:AC-6", "NIST-800-53:AC-2(7)"]
+    query:
+      protocol: graph
+      path: /roleManagement/directory/roleAssignments
+      expand: principal
+      key: id
+      name: principal.displayName
+    each: { field: directoryScopeId, op: ne, value: '/' }
+    evidence: "{principal.displayName} {principal.userPrincipalName} holds role {roleDefinitionId} on scope {directoryScopeId}"
+
+  # Workload administrator role template ids (Microsoft constants, threshold entra.workload-admin-role-ids):
+  #   11648597-926c-4cf3-9c36-bcebb0ba8dcc Power Platform Administrator
+  #   44367163-eba1-44c3-98af-f5787879f96a Dynamics 365 Administrator
+  #   a9ea8996-122f-4c74-9520-8edcd192826c Fabric Administrator
+  - id: PP-ADMIN-ROLE-PERMANENT
+    title: Power Platform, Dynamics 365 or Fabric administrator role held permanently
+    kind: misconfigured
+    category: IAM
+    severity: medium
+    entity: role-assignment
+    why: "These roles control every Power Platform environment, every data-loss policy and the whole BI service, yet they are not on the tier-0 list, so the permanent tier-0 rule never sees them. A permanent (non-PIM) assignment is usable at every moment by whoever controls the account. Needs Entra ID P2 for PIM."
+    fix: "Convert the holders to eligible PIM assignments with approval; keep at most one documented permanent holder."
+    refs: ["NIST-800-53:AC-6(5)", "NIST-800-53:AC-2(7)", "CIS-Controls-v8:5.4", CIS-M365:5.3.1]
+    query:
+      protocol: graph
+      path: /roleManagement/directory/roleAssignmentScheduleInstances
+      filter: "assignmentType eq 'Assigned'"
+      expand: principal
+      key: id
+      name: principal.displayName
+    each:
+      all:
+        - field: roleDefinitionId
+          op: in
+          threshold: entra.workload-admin-role-ids
+          value: [11648597-926c-4cf3-9c36-bcebb0ba8dcc, 44367163-eba1-44c3-98af-f5787879f96a, a9ea8996-122f-4c74-9520-8edcd192826c]
+        - { field: memberType, op: eq, value: Direct }
+        - { field: endDateTime, op: absent }
+    evidence: "{principal.displayName} {principal.userPrincipalName} holds workload admin role {roleDefinitionId} permanently"
+
+  # ------------------------------------------------------------- PIM role settings, per rule ---
+  # One request per directory role's PIM policy: the policy assignments (scope '/', DirectoryRole) give
+  # policyId and roleDefinitionId, and /policies/roleManagementPolicies/{policyId}/rules returns one row
+  # per PIM rule (Expiration_EndUser_Assignment, Enablement_EndUser_Assignment, Approval_EndUser_Assignment,
+  # Expiration_Admin_Eligibility, ...) with the role as parent. Needs Entra ID P2 for PIM.
+  - id: ENTRA-PIM-ACTIVATION-NO-MFA
+    title: Activating a privileged role in PIM asks for no MFA
+    kind: misconfigured
+    category: AUT
+    severity:
+      field: parent.roleDefinitionId
+      map: { 62e90394-69f5-4237-9190-012177145e10: high, e8611ab8-c189-46e8-94e1-60213ab1f814: high, 7be44c8a-adaf-4e2a-84d6-ab2649e08a13: high, 194ae4cb-b126-40b2-bd5b-6091b380977d: high, 8ac3fc64-6eca-42ea-9e69-59f4c7b60eb2: high, b1be1c3e-b65d-4f19-8427-f6fa0d97feb9: high, 9b895d92-2cd3-44c7-9d02-a6ac2d5ea5c3: high, 158c047a-c907-4556-b7ef-446551a6b5f7: high, be2f45a1-457d-42af-a067-6ec1fa63bc45: high, 8329153b-31d0-4727-b945-745eb3bc5f31: high, 3a2c62db-5318-420d-8d74-23affee5d9d5: high }
+      default: medium
+    entity: pim-rule
+    why: "Without MFA on activation, a stolen password of an eligible account is enough to switch the role on; PIM then adds only a delay. Tier-0 roles are high. A role that requires an authentication context instead of MFA (AuthenticationContext_EndUser_Assignment) also shows here: accept it by override."
+    fix: "In the role's PIM settings require Azure MFA (or a phishing-resistant authentication context) on activation."
+    refs: ["NIST-800-53:IA-2(1)", "NIST-800-53:AC-6(5)", "MITRE-ATTACK:T1098.003"]
+    query:
+      protocol: graph
+      path: /policies/roleManagementPolicies/{policyId}/rules
+      for_each:
+        path: /policies/roleManagementPolicyAssignments
+        filter: "scopeId eq '/' and scopeType eq 'DirectoryRole'"
+        select: [id, policyId, roleDefinitionId]
+        field: policyId
+        max: 300
+      key: "{parent.roleDefinitionId}|{id}"
+      name: parent.roleDefinitionId
+    each:
+      all:
+        - { field: id, op: eq, value: Enablement_EndUser_Assignment }
+        - field: parent.roleDefinitionId
+          op: in
+          threshold: entra.privileged-role-ids
+          value: [62e90394-69f5-4237-9190-012177145e10, e8611ab8-c189-46e8-94e1-60213ab1f814, 7be44c8a-adaf-4e2a-84d6-ab2649e08a13, 194ae4cb-b126-40b2-bd5b-6091b380977d, 8ac3fc64-6eca-42ea-9e69-59f4c7b60eb2, b1be1c3e-b65d-4f19-8427-f6fa0d97feb9, 9b895d92-2cd3-44c7-9d02-a6ac2d5ea5c3, 158c047a-c907-4556-b7ef-446551a6b5f7, be2f45a1-457d-42af-a067-6ec1fa63bc45, 8329153b-31d0-4727-b945-745eb3bc5f31, 3a2c62db-5318-420d-8d74-23affee5d9d5, 29232cdf-9323-42fd-ade2-1d097af3e4de, f28a1f50-f6e7-4571-818b-6a12f2af6b6c, 69091246-20e8-4a56-aa4d-066075b2a7a8, fe930be7-5e62-47db-91af-98c3a49a38b1, c4e39bd9-1100-46d3-8c65-fb160da0071f, 729827e3-9c14-49f7-bb1b-9608f156bbb8, 966707d0-3269-4727-9be2-8c3a10f19b9d, b0f54661-2d74-4c50-afa3-1ec803f12efe, fdd7a751-b60b-444a-984c-02652fe8fa1c, f2ef992c-3afb-46b9-b7cf-a126ee74c451]
+        - { field: enabledRules, op: notcontains, value: MultiFactorAuthentication }
+    evidence: "role {parent.roleDefinitionId}: activation requires {enabledRules}"
+
+  - id: ENTRA-PIM-ACTIVATION-NO-JUSTIFICATION
+    title: Activating a privileged role in PIM needs no justification
+    kind: misconfigured
+    category: IAM
+    severity: low
+    entity: pim-rule
+    why: "Without a justification an activation leaves no reason in the audit trail, so a review cannot tell routine work from misuse."
+    fix: "In the role's PIM settings require a justification (and a ticket number where the change process has one) on activation."
+    refs: ["NIST-800-53:AU-3", "NIST-800-53:AC-6(5)"]
+    query:
+      protocol: graph
+      path: /policies/roleManagementPolicies/{policyId}/rules
+      for_each:
+        path: /policies/roleManagementPolicyAssignments
+        filter: "scopeId eq '/' and scopeType eq 'DirectoryRole'"
+        select: [id, policyId, roleDefinitionId]
+        field: policyId
+        max: 300
+      key: "{parent.roleDefinitionId}|{id}"
+      name: parent.roleDefinitionId
+    each:
+      all:
+        - { field: id, op: eq, value: Enablement_EndUser_Assignment }
+        - field: parent.roleDefinitionId
+          op: in
+          threshold: entra.privileged-role-ids
+          value: [62e90394-69f5-4237-9190-012177145e10, e8611ab8-c189-46e8-94e1-60213ab1f814, 7be44c8a-adaf-4e2a-84d6-ab2649e08a13, 194ae4cb-b126-40b2-bd5b-6091b380977d, 8ac3fc64-6eca-42ea-9e69-59f4c7b60eb2, b1be1c3e-b65d-4f19-8427-f6fa0d97feb9, 9b895d92-2cd3-44c7-9d02-a6ac2d5ea5c3, 158c047a-c907-4556-b7ef-446551a6b5f7, be2f45a1-457d-42af-a067-6ec1fa63bc45, 8329153b-31d0-4727-b945-745eb3bc5f31, 3a2c62db-5318-420d-8d74-23affee5d9d5, 29232cdf-9323-42fd-ade2-1d097af3e4de, f28a1f50-f6e7-4571-818b-6a12f2af6b6c, 69091246-20e8-4a56-aa4d-066075b2a7a8, fe930be7-5e62-47db-91af-98c3a49a38b1, c4e39bd9-1100-46d3-8c65-fb160da0071f, 729827e3-9c14-49f7-bb1b-9608f156bbb8, 966707d0-3269-4727-9be2-8c3a10f19b9d, b0f54661-2d74-4c50-afa3-1ec803f12efe, fdd7a751-b60b-444a-984c-02652fe8fa1c, f2ef992c-3afb-46b9-b7cf-a126ee74c451]
+        - { field: enabledRules, op: notcontains, value: Justification }
+    evidence: "role {parent.roleDefinitionId}: activation requires {enabledRules}"
+
+  - id: ENTRA-PIM-ACTIVATION-LONG
+    title: A privileged role can be activated for more than eight hours
+    kind: misconfigured
+    category: IAM
+    severity:
+      field: parent.roleDefinitionId
+      map: { 62e90394-69f5-4237-9190-012177145e10: medium, e8611ab8-c189-46e8-94e1-60213ab1f814: medium, 7be44c8a-adaf-4e2a-84d6-ab2649e08a13: medium, 194ae4cb-b126-40b2-bd5b-6091b380977d: medium, 8ac3fc64-6eca-42ea-9e69-59f4c7b60eb2: medium, b1be1c3e-b65d-4f19-8427-f6fa0d97feb9: medium, 9b895d92-2cd3-44c7-9d02-a6ac2d5ea5c3: medium, 158c047a-c907-4556-b7ef-446551a6b5f7: medium, be2f45a1-457d-42af-a067-6ec1fa63bc45: medium, 8329153b-31d0-4727-b945-745eb3bc5f31: medium, 3a2c62db-5318-420d-8d74-23affee5d9d5: medium }
+      default: low
+    entity: pim-rule
+    why: "Each activation stays usable for its whole duration; one longer than a working day leaves the role on overnight for whoever holds the session. The maximum is an ISO 8601 duration (PT8H); the rule accepts anything up to eight hours by pattern (tune it with the threshold)."
+    fix: "Cap the activation maximum duration at a few hours (tier-0 roles one to four) in the role's PIM settings."
+    refs: ["NIST-800-53:AC-6(5)", "NIST-800-53:AC-2(7)"]
+    query:
+      protocol: graph
+      path: /policies/roleManagementPolicies/{policyId}/rules
+      for_each:
+        path: /policies/roleManagementPolicyAssignments
+        filter: "scopeId eq '/' and scopeType eq 'DirectoryRole'"
+        select: [id, policyId, roleDefinitionId]
+        field: policyId
+        max: 300
+      key: "{parent.roleDefinitionId}|{id}"
+      name: parent.roleDefinitionId
+    each:
+      all:
+        - { field: id, op: eq, value: Expiration_EndUser_Assignment }
+        - field: parent.roleDefinitionId
+          op: in
+          threshold: entra.privileged-role-ids
+          value: [62e90394-69f5-4237-9190-012177145e10, e8611ab8-c189-46e8-94e1-60213ab1f814, 7be44c8a-adaf-4e2a-84d6-ab2649e08a13, 194ae4cb-b126-40b2-bd5b-6091b380977d, 8ac3fc64-6eca-42ea-9e69-59f4c7b60eb2, b1be1c3e-b65d-4f19-8427-f6fa0d97feb9, 9b895d92-2cd3-44c7-9d02-a6ac2d5ea5c3, 158c047a-c907-4556-b7ef-446551a6b5f7, be2f45a1-457d-42af-a067-6ec1fa63bc45, 8329153b-31d0-4727-b945-745eb3bc5f31, 3a2c62db-5318-420d-8d74-23affee5d9d5, 29232cdf-9323-42fd-ade2-1d097af3e4de, f28a1f50-f6e7-4571-818b-6a12f2af6b6c, 69091246-20e8-4a56-aa4d-066075b2a7a8, fe930be7-5e62-47db-91af-98c3a49a38b1, c4e39bd9-1100-46d3-8c65-fb160da0071f, 729827e3-9c14-49f7-bb1b-9608f156bbb8, 966707d0-3269-4727-9be2-8c3a10f19b9d, b0f54661-2d74-4c50-afa3-1ec803f12efe, fdd7a751-b60b-444a-984c-02652fe8fa1c, f2ef992c-3afb-46b9-b7cf-a126ee74c451]
+        - { field: maximumDuration, op: notmatch, value: '^PT(([1-7]H)?([1-9]|[1-5][0-9])M|[1-8]H)$', threshold: entra.pim-activation-ok-pattern }
+    evidence: "role {parent.roleDefinitionId}: activation lasts up to {maximumDuration}"
+
+  - id: ENTRA-PIM-ELIGIBILITY-PERMANENT-ALLOWED
+    title: PIM allows permanent eligibility for a tier-0 role
+    kind: misconfigured
+    category: IAM
+    severity: medium
+    entity: pim-rule
+    why: "When the role's settings do not require eligible assignments to expire, nobody ever re-decides who may activate the most powerful roles; ENTRA-ROLE-ELIGIBLE-NO-END lists the eligibilities that already have no end date, this finds the setting that allows them."
+    fix: "In the role's PIM settings turn off 'allow permanent eligible assignment' and set a maximum eligibility (for example one year), renewed through an access review."
+    refs: ["NIST-800-53:AC-2(3)", "NIST-800-53:AC-6(7)"]
+    query:
+      protocol: graph
+      path: /policies/roleManagementPolicies/{policyId}/rules
+      for_each:
+        path: /policies/roleManagementPolicyAssignments
+        filter: "scopeId eq '/' and scopeType eq 'DirectoryRole'"
+        select: [id, policyId, roleDefinitionId]
+        field: policyId
+        max: 300
+      key: "{parent.roleDefinitionId}|{id}"
+      name: parent.roleDefinitionId
+    each:
+      all:
+        - { field: id, op: eq, value: Expiration_Admin_Eligibility }
+        - field: parent.roleDefinitionId
+          op: in
+          threshold: entra.tier0-role-ids
+          value: [62e90394-69f5-4237-9190-012177145e10, e8611ab8-c189-46e8-94e1-60213ab1f814, 7be44c8a-adaf-4e2a-84d6-ab2649e08a13, 194ae4cb-b126-40b2-bd5b-6091b380977d, 8ac3fc64-6eca-42ea-9e69-59f4c7b60eb2, b1be1c3e-b65d-4f19-8427-f6fa0d97feb9, 9b895d92-2cd3-44c7-9d02-a6ac2d5ea5c3, 158c047a-c907-4556-b7ef-446551a6b5f7, be2f45a1-457d-42af-a067-6ec1fa63bc45, 8329153b-31d0-4727-b945-745eb3bc5f31, 3a2c62db-5318-420d-8d74-23affee5d9d5]
+        - { field: isExpirationRequired, op: eq, value: false }
+    evidence: "role {parent.roleDefinitionId}: eligible assignments may be permanent (maximum {maximumDuration})"
+
   # ==================================================================== Conditional Access ===
   - id: ENTRA-CA-NONE
     title: The tenant has no Conditional Access policy
@@ -1236,6 +1440,111 @@ rules:
         - { field: 'ipRanges[].cidrAddress', op: match, value: '^\d+\.\d+\.\d+\.\d+/([0-9]|1[0-5])$', threshold: entra.wide-cidr-pattern }
     evidence: "{displayName}: trusted ranges {ipRanges[].cidrAddress}"
 
+  - id: ENTRA-NAMEDLOC-TRUSTED-REVIEW
+    title: Named location is marked trusted
+    kind: misconfigured
+    category: AUT
+    severity: info
+    entity: named-location
+    why: "A trusted location is usually an exception somewhere (MFA skipped, risk lowered, a block lifted). ENTRA-NAMEDLOC-WIDE-TRUSTED-RANGE judges how wide it is; this lists every one so each stays a known, owned egress range. Accept each documented location."
+    fix: "Keep trusted locations to the organisation's documented egress addresses; remove the ones nobody can explain and never trust whole countries."
+    refs: ["NIST-800-53:AC-3", "NIST-800-53:SC-7"]
+    query:
+      protocol: graph
+      path: /identity/conditionalAccess/namedLocations
+      key: id
+      name: displayName
+    each: { field: isTrusted, op: eq, value: true }
+    evidence: "{displayName}: trusted, ranges {ipRanges[].cidrAddress}"
+
+  - id: ENTRA-CA-BASELINE-APP-ENFORCED-RESTRICTIONS
+    title: No enforced policy limits Exchange and SharePoint on unmanaged devices
+    kind: missing
+    category: AUT
+    severity: medium
+    entity: tenant
+    why: "The Exchange web mailbox policy and SharePoint's unmanaged-device access (read-only browser, no downloads) only take effect when a Conditional Access policy passes app-enforced restrictions to the service; without one, a home or kiosk browser downloads every attachment and file. A policy counts if it is enabled, uses the app-enforced restrictions session control and targets Office 365, Exchange Online, SharePoint Online or all resources."
+    fix: "Create a policy for unmanaged devices (device filter, or exclude compliant and hybrid-joined devices) targeting Office 365 with the 'use app enforced restrictions' session control; then set the web mailbox policy and SharePoint unmanaged-device access to limited."
+    refs: ["NIST-800-53:AC-19", "NIST-800-53:AC-20", "CIS-Controls-v8:4.1"]
+    query:
+      protocol: graph
+      path: /identity/conditionalAccess/policies
+      key: id
+      name: displayName
+    count:
+      op: lt
+      value: 1
+      where:
+        all:
+          - { field: state, op: eq, value: enabled }
+          - { field: sessionControls.applicationEnforcedRestrictions.isEnabled, op: eq, value: true }
+          - any:
+              - { field: conditions.applications.includeApplications, op: contains, value: Office365 }
+              - { field: conditions.applications.includeApplications, op: contains, value: 00000002-0000-0ff1-ce00-000000000000 }
+              - { field: conditions.applications.includeApplications, op: contains, value: 00000003-0000-0ff1-ce00-000000000000 }
+              - { field: conditions.applications.includeApplications, op: contains, value: All }
+    evidence: "{count} enforced app-enforced-restriction policies among {rows} policies"
+
+  - id: ENTRA-CA-BASELINE-APP-PROTECTION
+    title: No enforced policy requires app protection for Office 365 on iOS and Android
+    kind: missing
+    category: AUT
+    severity: medium
+    entity: tenant
+    why: "Without it, users outside device management read mail and files on phones in apps with no protection at all, and native mail apps keep a copy of the mailbox outside any control. A policy counts if it is enabled, covers iOS and Android (or all platforms), targets Office 365, Exchange Online or all resources and grants 'require app protection policy'. The older 'require approved client app' grant also counts while it stays enabled (Microsoft made it read-only in 2026)."
+    fix: "Create the policy (all users, platforms iOS and Android, target Office 365, grant require app protection policy) in report-only first, then enforce; replace approved-client-app policies with it."
+    refs: ["NIST-800-53:AC-19", "NIST-800-53:AC-20(3)", "CIS-Controls-v8:4.1"]
+    query:
+      protocol: graph
+      path: /identity/conditionalAccess/policies
+      key: id
+      name: displayName
+    count:
+      op: lt
+      value: 1
+      where:
+        all:
+          - { field: state, op: eq, value: enabled }
+          - any:
+              - { field: conditions.platforms.includePlatforms, op: contains, value: all }
+              - all:
+                  - { field: conditions.platforms.includePlatforms, op: contains, value: iOS }
+                  - { field: conditions.platforms.includePlatforms, op: contains, value: android }
+          - any:
+              - { field: conditions.applications.includeApplications, op: contains, value: Office365 }
+              - { field: conditions.applications.includeApplications, op: contains, value: 00000002-0000-0ff1-ce00-000000000000 }
+              - { field: conditions.applications.includeApplications, op: contains, value: All }
+          - any:
+              - { field: grantControls.builtInControls, op: contains, value: compliantApplication }
+              - { field: grantControls.builtInControls, op: contains, value: approvedApplication }
+    evidence: "{count} enforced mobile app-protection policies among {rows} policies"
+
+  - id: ENTRA-SYNC-ACCOUNT-NO-LOCATION-POLICY
+    title: No enforced policy limits the directory-sync role to known locations
+    kind: missing
+    category: AUT
+    severity: medium
+    entity: tenant
+    why: "The account the sync engine signs in with holds the Directory Synchronization Accounts role (d29b2b05-8046-44ba-8758-1e26182fcf32, a Microsoft constant) and must be left out of MFA; without a location policy its password is a from-anywhere path to directory writes. A policy counts if it is enabled, includes that role, includes all locations, excludes at least one named location and grants Block. Tenants without directory synchronisation accept the finding."
+    fix: "Create a policy: directory role Directory Synchronization Accounts, locations All except the sync servers' egress, grant Block; or move the sync engine to application-based authentication with a certificate."
+    refs: ["NIST-800-53:AC-17", "NIST-800-53:AC-2(12)", "MITRE-ATTACK:T1078.004"]
+    query:
+      protocol: graph
+      path: /identity/conditionalAccess/policies
+      key: id
+      name: displayName
+    count:
+      op: lt
+      value: 1
+      where:
+        all:
+          - { field: state, op: eq, value: enabled }
+          - { field: conditions.users.includeRoles, op: contains, value: d29b2b05-8046-44ba-8758-1e26182fcf32 }
+          - { field: conditions.locations.includeLocations, op: contains, value: All }
+          - { field: conditions.locations.excludeLocations, op: notempty }
+          - { field: grantControls.builtInControls, op: contains, value: block }
+    evidence: "{count} enforced location policies cover the directory-sync role, among {rows} policies"
+
   # ===================================================================== security defaults ===
   - id: ENTRA-SECURITY-DEFAULTS-OFF
     title: Security defaults are off
@@ -1801,6 +2110,54 @@ rules:
         - not: { field: methodsRegistered, op: match, value: '^(microsoftAuthenticatorPush|microsoftAuthenticatorPasswordless|softwareOneTimePasscode|hardwareOneTimePasscode|fido2|windowsHelloForBusiness|passKey.*|macOsSecureEnclaveKey|x509Certificate.*|externalAuthenticationMethod)$' }
     evidence: "{userPrincipalName}: methods {methodsRegistered}"
 
+  - id: ENTRA-BREAKGLASS-WEAK-METHODS
+    title: Emergency-access account can be reached through a weak method or has no passkey
+    kind: misconfigured
+    category: AUT
+    severity: high
+    entity: user
+    why: "The most powerful accounts in the tenant must not be reachable through the weakest factors: a phone, e-mail, software code or Temporary Access Pass registered on an emergency-access account can be redirected, phished or issued by a help desk, and without a passkey (FIDO2 key) the account cannot pass a phishing-resistant policy. List the account ids in entra.breakglass-user-ids; with the list empty the rule checks nothing. The registration report is refreshed by Microsoft a few times a day."
+    fix: "Register two FIDO2 security keys per emergency-access account, keep them offline in separate places, remove every phone, e-mail and code method, and leave the accounts out of registration campaigns."
+    refs: ["NIST-800-53:IA-2(1)", "NIST-800-53:IA-2(6)", "NIST-800-53:CP-2", "MITRE-ATTACK:T1621"]
+    query:
+      protocol: graph
+      path: /reports/authenticationMethods/userRegistrationDetails
+      key: id
+      name: userPrincipalName
+    each:
+      all:
+        - field: id
+          op: in
+          threshold: entra.breakglass-user-ids
+          value: []
+        - any:
+            - { field: methodsRegistered, op: empty }
+            - { field: methodsRegistered, op: match, value: '^(mobilePhone|alternateMobilePhone|officePhone|email|softwareOneTimePasscode|temporaryAccessPass)$', threshold: entra.breakglass-weak-method-pattern }
+            - not: { field: methodsRegistered, op: match, value: '^(passKey.*|fido2.*)$' }
+    evidence: "{userPrincipalName}: methods {methodsRegistered}"
+
+  - id: ENTRA-SSPR-MEMBER-NOT-REGISTERED
+    title: Member in scope for self-service password reset has not registered for it
+    kind: missing
+    category: AUT
+    severity: low
+    entity: user
+    lens: both
+    why: "A user who may reset their password but registered no reset method calls the help desk when locked out, and the help desk resets passwords over the phone - the step social engineering aims for. Measures what 'require registration at sign-in' and registration campaigns achieve. Needs Entra ID P1."
+    fix: "Turn on registration enforcement at sign-in for self-service password reset, or run a registration campaign; check the remaining users individually."
+    refs: [CIS-M365:5.2.4.3, "NIST-800-53:IA-5"]
+    query:
+      protocol: graph
+      path: /reports/authenticationMethods/userRegistrationDetails
+      key: id
+      name: userPrincipalName
+    each:
+      all:
+        - { field: userType, op: eq, value: member }
+        - { field: isSsprEnabled, op: eq, value: true }
+        - { field: isSsprRegistered, op: eq, value: false }
+    evidence: "{userPrincipalName}: SSPR enabled, not registered (methods {methodsRegistered})"
+
   # ============================================================ users (shared inventory) ===
   # The user inventory query below is the one reusable Entra user query (entity user). It is
   # repeated verbatim in every rule that uses it, so the engine fetches it once.
@@ -1817,7 +2174,7 @@ rules:
     query:
       protocol: graph
       path: /users
-      select: [id, userPrincipalName, accountEnabled, userType, createdDateTime, onPremisesSyncEnabled, onPremisesSecurityIdentifier, signInActivity, assignedLicenses, mail, onPremisesSamAccountName]
+      select: [id, userPrincipalName, accountEnabled, userType, createdDateTime, onPremisesSyncEnabled, onPremisesSecurityIdentifier, signInActivity, assignedLicenses, mail, onPremisesSamAccountName, displayName, givenName, surname, department, jobTitle, usageLocation, onPremisesDomainName, onPremisesUserPrincipalName, proxyAddresses, passwordPolicies]
       top: 500
       key: id
       name: userPrincipalName
@@ -1846,7 +2203,7 @@ rules:
     query:
       protocol: graph
       path: /users
-      select: [id, userPrincipalName, accountEnabled, userType, createdDateTime, onPremisesSyncEnabled, onPremisesSecurityIdentifier, signInActivity, assignedLicenses, mail, onPremisesSamAccountName]
+      select: [id, userPrincipalName, accountEnabled, userType, createdDateTime, onPremisesSyncEnabled, onPremisesSecurityIdentifier, signInActivity, assignedLicenses, mail, onPremisesSamAccountName, displayName, givenName, surname, department, jobTitle, usageLocation, onPremisesDomainName, onPremisesUserPrincipalName, proxyAddresses, passwordPolicies]
       top: 500
       key: id
       name: userPrincipalName
@@ -1874,7 +2231,7 @@ rules:
     query:
       protocol: graph
       path: /users
-      select: [id, userPrincipalName, accountEnabled, userType, createdDateTime, onPremisesSyncEnabled, onPremisesSecurityIdentifier, signInActivity, assignedLicenses, mail, onPremisesSamAccountName]
+      select: [id, userPrincipalName, accountEnabled, userType, createdDateTime, onPremisesSyncEnabled, onPremisesSecurityIdentifier, signInActivity, assignedLicenses, mail, onPremisesSamAccountName, displayName, givenName, surname, department, jobTitle, usageLocation, onPremisesDomainName, onPremisesUserPrincipalName, proxyAddresses, passwordPolicies]
       top: 500
       key: id
       name: userPrincipalName
@@ -1904,7 +2261,7 @@ rules:
     query:
       protocol: graph
       path: /users
-      select: [id, userPrincipalName, accountEnabled, userType, createdDateTime, onPremisesSyncEnabled, onPremisesSecurityIdentifier, signInActivity, assignedLicenses, mail, onPremisesSamAccountName]
+      select: [id, userPrincipalName, accountEnabled, userType, createdDateTime, onPremisesSyncEnabled, onPremisesSecurityIdentifier, signInActivity, assignedLicenses, mail, onPremisesSamAccountName, displayName, givenName, surname, department, jobTitle, usageLocation, onPremisesDomainName, onPremisesUserPrincipalName, proxyAddresses, passwordPolicies]
       top: 500
       key: id
       name: userPrincipalName
@@ -1929,7 +2286,7 @@ rules:
     query:
       protocol: graph
       path: /users
-      select: [id, userPrincipalName, accountEnabled, userType, createdDateTime, onPremisesSyncEnabled, onPremisesSecurityIdentifier, signInActivity, assignedLicenses, mail, onPremisesSamAccountName]
+      select: [id, userPrincipalName, accountEnabled, userType, createdDateTime, onPremisesSyncEnabled, onPremisesSecurityIdentifier, signInActivity, assignedLicenses, mail, onPremisesSamAccountName, displayName, givenName, surname, department, jobTitle, usageLocation, onPremisesDomainName, onPremisesUserPrincipalName, proxyAddresses, passwordPolicies]
       top: 500
       key: id
       name: userPrincipalName
@@ -1952,7 +2309,7 @@ rules:
     query:
       protocol: graph
       path: /users
-      select: [id, userPrincipalName, accountEnabled, userType, createdDateTime, assignedLicenses, licenseAssignmentStates, onPremisesSyncEnabled, onPremisesDistinguishedName, onPremisesProvisioningErrors, passwordPolicies, lastPasswordChangeDateTime, externalUserState, externalUserStateChangeDateTime]
+      select: [id, userPrincipalName, accountEnabled, userType, createdDateTime, assignedLicenses, licenseAssignmentStates, onPremisesSyncEnabled, onPremisesDistinguishedName, onPremisesProvisioningErrors, passwordPolicies, lastPasswordChangeDateTime, externalUserState, externalUserStateChangeDateTime, serviceProvisioningErrors]
       top: 999
       key: id
       name: userPrincipalName
@@ -1979,7 +2336,7 @@ rules:
     query:
       protocol: graph
       path: /users
-      select: [id, userPrincipalName, accountEnabled, userType, createdDateTime, assignedLicenses, licenseAssignmentStates, onPremisesSyncEnabled, onPremisesDistinguishedName, onPremisesProvisioningErrors, passwordPolicies, lastPasswordChangeDateTime, externalUserState, externalUserStateChangeDateTime]
+      select: [id, userPrincipalName, accountEnabled, userType, createdDateTime, assignedLicenses, licenseAssignmentStates, onPremisesSyncEnabled, onPremisesDistinguishedName, onPremisesProvisioningErrors, passwordPolicies, lastPasswordChangeDateTime, externalUserState, externalUserStateChangeDateTime, serviceProvisioningErrors]
       top: 999
       key: id
       name: userPrincipalName
@@ -2002,7 +2359,7 @@ rules:
     query:
       protocol: graph
       path: /users
-      select: [id, userPrincipalName, accountEnabled, userType, createdDateTime, assignedLicenses, licenseAssignmentStates, onPremisesSyncEnabled, onPremisesDistinguishedName, onPremisesProvisioningErrors, passwordPolicies, lastPasswordChangeDateTime, externalUserState, externalUserStateChangeDateTime]
+      select: [id, userPrincipalName, accountEnabled, userType, createdDateTime, assignedLicenses, licenseAssignmentStates, onPremisesSyncEnabled, onPremisesDistinguishedName, onPremisesProvisioningErrors, passwordPolicies, lastPasswordChangeDateTime, externalUserState, externalUserStateChangeDateTime, serviceProvisioningErrors]
       top: 999
       key: id
       name: userPrincipalName
@@ -2031,7 +2388,7 @@ rules:
     query:
       protocol: graph
       path: /users
-      select: [id, userPrincipalName, accountEnabled, userType, createdDateTime, assignedLicenses, licenseAssignmentStates, onPremisesSyncEnabled, onPremisesDistinguishedName, onPremisesProvisioningErrors, passwordPolicies, lastPasswordChangeDateTime, externalUserState, externalUserStateChangeDateTime]
+      select: [id, userPrincipalName, accountEnabled, userType, createdDateTime, assignedLicenses, licenseAssignmentStates, onPremisesSyncEnabled, onPremisesDistinguishedName, onPremisesProvisioningErrors, passwordPolicies, lastPasswordChangeDateTime, externalUserState, externalUserStateChangeDateTime, serviceProvisioningErrors]
       top: 999
       key: id
       name: userPrincipalName
@@ -2053,7 +2410,7 @@ rules:
     query:
       protocol: graph
       path: /users
-      select: [id, userPrincipalName, accountEnabled, userType, createdDateTime, assignedLicenses, licenseAssignmentStates, onPremisesSyncEnabled, onPremisesDistinguishedName, onPremisesProvisioningErrors, passwordPolicies, lastPasswordChangeDateTime, externalUserState, externalUserStateChangeDateTime]
+      select: [id, userPrincipalName, accountEnabled, userType, createdDateTime, assignedLicenses, licenseAssignmentStates, onPremisesSyncEnabled, onPremisesDistinguishedName, onPremisesProvisioningErrors, passwordPolicies, lastPasswordChangeDateTime, externalUserState, externalUserStateChangeDateTime, serviceProvisioningErrors]
       top: 999
       key: id
       name: userPrincipalName
@@ -2077,7 +2434,7 @@ rules:
     query:
       protocol: graph
       path: /users
-      select: [id, userPrincipalName, accountEnabled, userType, createdDateTime, assignedLicenses, licenseAssignmentStates, onPremisesSyncEnabled, onPremisesDistinguishedName, onPremisesProvisioningErrors, passwordPolicies, lastPasswordChangeDateTime, externalUserState, externalUserStateChangeDateTime]
+      select: [id, userPrincipalName, accountEnabled, userType, createdDateTime, assignedLicenses, licenseAssignmentStates, onPremisesSyncEnabled, onPremisesDistinguishedName, onPremisesProvisioningErrors, passwordPolicies, lastPasswordChangeDateTime, externalUserState, externalUserStateChangeDateTime, serviceProvisioningErrors]
       top: 999
       key: id
       name: userPrincipalName
@@ -2117,7 +2474,7 @@ rules:
     query:
       protocol: graph
       path: /users
-      select: [id, userPrincipalName, accountEnabled, userType, createdDateTime, onPremisesSyncEnabled, onPremisesSecurityIdentifier, signInActivity, assignedLicenses, mail, onPremisesSamAccountName]
+      select: [id, userPrincipalName, accountEnabled, userType, createdDateTime, onPremisesSyncEnabled, onPremisesSecurityIdentifier, signInActivity, assignedLicenses, mail, onPremisesSamAccountName, displayName, givenName, surname, department, jobTitle, usageLocation, onPremisesDomainName, onPremisesUserPrincipalName, proxyAddresses, passwordPolicies]
       top: 500
       key: id
       name: userPrincipalName
@@ -2140,7 +2497,7 @@ rules:
     query:
       protocol: graph
       path: /users
-      select: [id, userPrincipalName, accountEnabled, userType, createdDateTime, onPremisesSyncEnabled, onPremisesSecurityIdentifier, signInActivity, assignedLicenses, mail, onPremisesSamAccountName]
+      select: [id, userPrincipalName, accountEnabled, userType, createdDateTime, onPremisesSyncEnabled, onPremisesSecurityIdentifier, signInActivity, assignedLicenses, mail, onPremisesSamAccountName, displayName, givenName, surname, department, jobTitle, usageLocation, onPremisesDomainName, onPremisesUserPrincipalName, proxyAddresses, passwordPolicies]
       top: 500
       key: id
       name: userPrincipalName
@@ -2198,6 +2555,431 @@ rules:
         - { field: riskLevel, op: in, value: [high, medium] }
         - { field: riskLastUpdatedDateTime, op: age-gt, value: 7, threshold: entra.risky-user-max-days }
     evidence: "{userPrincipalName}: {riskLevel} risk, {riskState} since {riskLastUpdatedDateTime} ({riskDetail})"
+
+  # ------------------------------------------------ users: emergency access, hygiene, attributes ---
+  # These rules read the shared user inventory query (identical select in every rule, see the note
+  # above ENTRA-USER-INACTIVE). Tenant lists (emergency-access ids, naming patterns) are thresholds;
+  # with a list threshold empty the rule checks nothing, with a pattern threshold unset the default
+  # given here applies.
+  - id: ENTRA-BREAKGLASS-UNTESTED
+    title: Emergency-access account has not signed in for a quarter
+    kind: misconfigured
+    category: AVL
+    severity: medium
+    entity: user
+    lens: both
+    why: "An emergency-access account nobody has tested this quarter may be blocked by a newer policy, carry an expired key or a lost password exactly on the day it is needed. The accounts are tenant-specific: list their object ids in the threshold entra.breakglass-user-ids; with the list empty the rule checks nothing. Needs Entra ID P1 for signInActivity."
+    fix: "Run the scheduled test sign-in with each emergency-access account, confirm the sign-in alert fires, and record the test."
+    refs: ["NIST-800-53:CP-2", "NIST-800-53:CP-4", "NIST-800-53:AC-2"]
+    query:
+      protocol: graph
+      path: /users
+      select: [id, userPrincipalName, accountEnabled, userType, createdDateTime, onPremisesSyncEnabled, onPremisesSecurityIdentifier, signInActivity, assignedLicenses, mail, onPremisesSamAccountName, displayName, givenName, surname, department, jobTitle, usageLocation, onPremisesDomainName, onPremisesUserPrincipalName, proxyAddresses, passwordPolicies]
+      top: 500
+      key: id
+      name: userPrincipalName
+    each:
+      all:
+        - field: id
+          op: in
+          threshold: entra.breakglass-user-ids
+          value: []
+        - any:
+            - { field: signInActivity.lastSuccessfulSignInDateTime, op: absent }
+            - { field: signInActivity.lastSuccessfulSignInDateTime, op: age-gt, value: 90, threshold: entra.breakglass-test-days }
+    evidence: "{userPrincipalName}: last successful sign-in {signInActivity.lastSuccessfulSignInDateTime}, enabled {accountEnabled}"
+
+  - id: ENTRA-USER-NAME-PATTERN-SUSPECT
+    title: Enabled account named like a test, temporary or old account
+    kind: misconfigured
+    category: HYG
+    severity: low
+    entity: user
+    lens: both
+    why: "Test, temporary, demo and 'old' accounts are created for a day and live for years, often with a shared or simple password and nobody watching their sign-ins. Tune the word list with the threshold."
+    fix: "Delete or disable the account; turn the ones still in use into named accounts with an owner."
+    refs: ["NIST-800-53:AC-2", "CIS-Controls-v8:5.1"]
+    query:
+      protocol: graph
+      path: /users
+      select: [id, userPrincipalName, accountEnabled, userType, createdDateTime, onPremisesSyncEnabled, onPremisesSecurityIdentifier, signInActivity, assignedLicenses, mail, onPremisesSamAccountName, displayName, givenName, surname, department, jobTitle, usageLocation, onPremisesDomainName, onPremisesUserPrincipalName, proxyAddresses, passwordPolicies]
+      top: 500
+      key: id
+      name: userPrincipalName
+    each:
+      all:
+        - { field: accountEnabled, op: eq, value: true }
+        - any:
+            - { field: displayName, op: match, value: '(^|[^a-z])(test|temp|tmp|demo|old|copy|backup)([^a-z]|$)', threshold: entra.suspect-name-pattern }
+            - { field: userPrincipalName, op: match, value: '(^|[^a-z])(test|temp|tmp|demo|old|copy|backup)([^a-z]|$)', threshold: entra.suspect-name-pattern }
+    evidence: "{userPrincipalName} ({displayName}): created {createdDateTime}, last successful sign-in {signInActivity.lastSuccessfulSignInDateTime}"
+
+  - id: ENTRA-USER-SYNC-UNEXPECTED-DOMAIN
+    title: Synchronised user comes from an unexpected on-premises domain
+    kind: misconfigured
+    category: IAM
+    severity: low
+    entity: user
+    why: "A synchronised object whose on-premises domain is not one the organisation expects points at an old sync rule, a second sync server or a forest nobody documented - each one a path into the cloud directory outside the known one. The expected domains are tenant-specific: set the pattern in the threshold; until then the rule checks nothing."
+    fix: "Find the sync source of the domain; remove it from the sync scope or document it."
+    refs: ["NIST-800-53:CM-8", "NIST-800-53:AC-2"]
+    query:
+      protocol: graph
+      path: /users
+      select: [id, userPrincipalName, accountEnabled, userType, createdDateTime, onPremisesSyncEnabled, onPremisesSecurityIdentifier, signInActivity, assignedLicenses, mail, onPremisesSamAccountName, displayName, givenName, surname, department, jobTitle, usageLocation, onPremisesDomainName, onPremisesUserPrincipalName, proxyAddresses, passwordPolicies]
+      top: 500
+      key: id
+      name: userPrincipalName
+    each:
+      all:
+        - { field: onPremisesSyncEnabled, op: eq, value: true }
+        - { field: onPremisesDomainName, op: notmatch, value: '.*', threshold: entra.expected-onprem-domain-pattern }
+    evidence: "{userPrincipalName}: synchronised from {onPremisesDomainName}"
+
+  - id: ENTRA-USER-ATTR-MISSING
+    title: Enabled member account is missing core directory attributes
+    kind: missing
+    category: HYG
+    severity: low
+    entity: user
+    lens: maintenance
+    why: "Department, job title, given name and surname drive dynamic groups, approvals, address books and HR joins; a usage location is what licensing and country-bound services read. An account without them falls through every rule that keys on them. Accounts younger than the grace period and accounts matching the service-account pattern are left out. One finding per account, the evidence lists what is empty; tenants that never fill one of these attributes accept the rule by override."
+    fix: "Fill the attributes at the source (the HR feed, or AD for synchronised accounts), never by hand in the cloud."
+    refs: ["NIST-800-53:CM-8", "NIST-800-53:AC-2", "CIS-Controls-v8:5.1"]
+    query:
+      protocol: graph
+      path: /users
+      select: [id, userPrincipalName, accountEnabled, userType, createdDateTime, onPremisesSyncEnabled, onPremisesSecurityIdentifier, signInActivity, assignedLicenses, mail, onPremisesSamAccountName, displayName, givenName, surname, department, jobTitle, usageLocation, onPremisesDomainName, onPremisesUserPrincipalName, proxyAddresses, passwordPolicies]
+      top: 500
+      key: id
+      name: userPrincipalName
+    each:
+      all:
+        - { field: accountEnabled, op: eq, value: true }
+        - { field: userType, op: eq, value: Member }
+        - any:
+            - { field: createdDateTime, op: absent }
+            - { field: createdDateTime, op: age-gt, value: 30, threshold: entra.attr-grace-days }
+        - { field: userPrincipalName, op: notmatch, value: '^(svc|srv|sa|mbx|room|shared|sync)[-_.]', threshold: entra.service-account-upn-pattern }
+        - any:
+            - { field: department, op: empty }
+            - { field: jobTitle, op: empty }
+            - { field: givenName, op: empty }
+            - { field: surname, op: empty }
+            - all:
+                - { field: assignedLicenses, op: notempty }
+                - { field: usageLocation, op: empty }
+    evidence: "{userPrincipalName}: department '{department}', job title '{jobTitle}', given name '{givenName}', surname '{surname}', usage location '{usageLocation}'"
+
+  - id: ENTRA-USER-ATTR-FORMAT
+    title: Directory attribute of an enabled member is badly formatted
+    kind: misconfigured
+    category: HYG
+    severity: low
+    entity: user
+    lens: maintenance
+    why: "Leading, trailing or doubled spaces in names, departments and titles, digits in given names or surnames, characters outside letters, digits, dot, dash and underscore in the UPN, or a space in the mail address break dynamic group rules, sorting, HR joins and SaaS sign-in names. Each pattern is its own threshold; set one to (?!) to switch that check off."
+    fix: "Correct the value at the source (HR feed or AD) so the next sync carries it."
+    refs: ["NIST-800-53:CM-8", "NIST-800-53:IA-4"]
+    query:
+      protocol: graph
+      path: /users
+      select: [id, userPrincipalName, accountEnabled, userType, createdDateTime, onPremisesSyncEnabled, onPremisesSecurityIdentifier, signInActivity, assignedLicenses, mail, onPremisesSamAccountName, displayName, givenName, surname, department, jobTitle, usageLocation, onPremisesDomainName, onPremisesUserPrincipalName, proxyAddresses, passwordPolicies]
+      top: 500
+      key: id
+      name: userPrincipalName
+    each:
+      all:
+        - { field: accountEnabled, op: eq, value: true }
+        - { field: userType, op: eq, value: Member }
+        - any:
+            - { field: displayName, op: match, value: '^\s|\s$|\s{2,}', threshold: entra.attr-space-pattern }
+            - { field: department, op: match, value: '^\s|\s$|\s{2,}', threshold: entra.attr-space-pattern }
+            - { field: jobTitle, op: match, value: '^\s|\s$|\s{2,}', threshold: entra.attr-space-pattern }
+            - { field: givenName, op: match, value: '\d', threshold: entra.attr-name-digit-pattern }
+            - { field: surname, op: match, value: '\d', threshold: entra.attr-name-digit-pattern }
+            - { field: userPrincipalName, op: match, value: '^[^@]*[^a-z0-9._@-][^@]*@', threshold: entra.upn-local-char-pattern }
+            - { field: mail, op: match, value: '\s', threshold: entra.mail-format-pattern }
+    evidence: "{userPrincipalName}: display name '{displayName}', given '{givenName}', surname '{surname}', department '{department}', title '{jobTitle}', mail '{mail}'"
+
+  - id: ENTRA-USER-UPN-ONMICROSOFT
+    title: Synchronised or licensed member signs in with the onmicrosoft.com domain
+    kind: misconfigured
+    category: IAM
+    severity:
+      field: onPremisesSyncEnabled
+      map: { 'true': medium }
+      default: low
+    entity: user
+    why: "A person whose UPN sits on the tenant's initial onmicrosoft.com domain signs in under a name nobody uses, mail and UPN differ, and SSO to apps that key on the UPN breaks. For a synchronised account (medium) it means the on-premises UPN suffix is not a verified domain. Unlicensed cloud-only accounts (dedicated admin and emergency-access accounts are often deliberately on onmicrosoft.com) are left out, as are the listed emergency-access ids."
+    fix: "Verify the organisation's domain and change the UPN suffix (in AD for synchronised users, adding the suffix there first)."
+    refs: ["NIST-800-53:IA-4", "NIST-800-53:IA-2"]
+    query:
+      protocol: graph
+      path: /users
+      select: [id, userPrincipalName, accountEnabled, userType, createdDateTime, onPremisesSyncEnabled, onPremisesSecurityIdentifier, signInActivity, assignedLicenses, mail, onPremisesSamAccountName, displayName, givenName, surname, department, jobTitle, usageLocation, onPremisesDomainName, onPremisesUserPrincipalName, proxyAddresses, passwordPolicies]
+      top: 500
+      key: id
+      name: userPrincipalName
+    each:
+      all:
+        - { field: accountEnabled, op: eq, value: true }
+        - { field: userType, op: eq, value: Member }
+        - { field: userPrincipalName, op: match, value: '@[^@]+\.onmicrosoft\.com$' }
+        - { field: userPrincipalName, op: notmatch, value: '^Sync_', threshold: entra-connect.sync-account-pattern }
+        - field: id
+          op: notin
+          threshold: entra.breakglass-user-ids
+          value: []
+        - any:
+            - { field: onPremisesSyncEnabled, op: eq, value: true }
+            - { field: assignedLicenses, op: notempty }
+    evidence: "{userPrincipalName}: synchronised {onPremisesSyncEnabled}, on-premises UPN {onPremisesUserPrincipalName}, mail {mail}"
+
+  - id: ENTRA-USER-MAIL-UPN-MISMATCH
+    title: Member's primary mail address differs from the UPN
+    kind: misconfigured
+    category: IAM
+    severity: low
+    entity: user
+    why: "SaaS apps match a person on mail or on UPN; when the two differ the same person becomes two identities in an app that keys on one and is provisioned on the other - double seats, broken SSO and a leaver who keeps the second account. Tenants that use different UPNs by design accept the rule by override."
+    fix: "Align the UPN with the primary mail address at the source, or make the provisioning target match on the same attribute it signs in with."
+    refs: ["NIST-800-53:IA-4", "NIST-800-53:AC-2"]
+    query:
+      protocol: graph
+      path: /users
+      select: [id, userPrincipalName, accountEnabled, userType, createdDateTime, onPremisesSyncEnabled, onPremisesSecurityIdentifier, signInActivity, assignedLicenses, mail, onPremisesSamAccountName, displayName, givenName, surname, department, jobTitle, usageLocation, onPremisesDomainName, onPremisesUserPrincipalName, proxyAddresses, passwordPolicies]
+      top: 500
+      key: id
+      name: userPrincipalName
+    each:
+      all:
+        - { field: accountEnabled, op: eq, value: true }
+        - { field: userType, op: eq, value: Member }
+        - { field: mail, op: ne, value: { field: userPrincipalName } }
+    evidence: "{userPrincipalName}: mail {mail}"
+
+  - id: ENTRA-USER-UPN-ONPREM-MISMATCH
+    title: Synchronised user's cloud UPN differs from its on-premises UPN
+    kind: misconfigured
+    category: IAM
+    severity: medium
+    entity: user
+    why: "When the cloud UPN of a synchronised account differs from the AD one, the on-premises suffix was not verified (Entra fell back to onmicrosoft.com) or the cloud value was edited; the person signs in under one name on-premises and another in the cloud, and apps that match on either see two people."
+    fix: "Verify the UPN suffix used in AD as a domain in the tenant (or change the AD suffix to a verified one) and let the next sync align the cloud UPN."
+    refs: ["NIST-800-53:IA-4", "NIST-800-53:IA-2"]
+    query:
+      protocol: graph
+      path: /users
+      select: [id, userPrincipalName, accountEnabled, userType, createdDateTime, onPremisesSyncEnabled, onPremisesSecurityIdentifier, signInActivity, assignedLicenses, mail, onPremisesSamAccountName, displayName, givenName, surname, department, jobTitle, usageLocation, onPremisesDomainName, onPremisesUserPrincipalName, proxyAddresses, passwordPolicies]
+      top: 500
+      key: id
+      name: userPrincipalName
+    each:
+      all:
+        - { field: onPremisesSyncEnabled, op: eq, value: true }
+        - { field: onPremisesUserPrincipalName, op: ne, value: { field: userPrincipalName } }
+    evidence: "{userPrincipalName}: on-premises UPN {onPremisesUserPrincipalName} (domain {onPremisesDomainName})"
+
+  - id: ENTRA-USER-PRIMARY-ADDRESS-ONMICROSOFT
+    title: Member's primary SMTP address is on the onmicrosoft.com domain
+    kind: misconfigured
+    category: CFG
+    severity: low
+    entity: user
+    why: "Mail sent from a primary address on the tenant's onmicrosoft.com domain fails the organisation's DMARC alignment and looks like phishing to recipients; it is usually an account created before the domain was set as default. The primary address is the proxy address with an upper-case SMTP: prefix (matched case-sensitively). Service accounts that must keep it are listed in entra.onmicrosoft-primary-allow-ids."
+    fix: "Set the primary SMTP address on the organisation's domain (in AD for synchronised accounts) and keep onmicrosoft.com as a secondary alias."
+    refs: ["NIST-800-53:CM-6", "NIST-800-53:SI-8", "CIS-Controls-v8:9.5"]
+    query:
+      protocol: graph
+      path: /users
+      select: [id, userPrincipalName, accountEnabled, userType, createdDateTime, onPremisesSyncEnabled, onPremisesSecurityIdentifier, signInActivity, assignedLicenses, mail, onPremisesSamAccountName, displayName, givenName, surname, department, jobTitle, usageLocation, onPremisesDomainName, onPremisesUserPrincipalName, proxyAddresses, passwordPolicies]
+      top: 500
+      key: id
+      name: userPrincipalName
+    each:
+      all:
+        - { field: accountEnabled, op: eq, value: true }
+        - { field: userType, op: eq, value: Member }
+        - { field: proxyAddresses, op: match, value: '(?-i)^SMTP:(?i)[^@]+@[^@]*\.onmicrosoft\.com$' }
+        - field: id
+          op: notin
+          threshold: entra.onmicrosoft-primary-allow-ids
+          value: []
+    evidence: "{userPrincipalName}: addresses {proxyAddresses}"
+
+  # Directory-sync identities in the cloud: user accounts whose UPN matches the threshold pattern
+  # entra-connect.sync-account-pattern (the installer names them Sync_<server>_<id>; MSOL_ and AAD_
+  # accounts are on-premises AD accounts, not cloud ones). From version 2.5.76.0 the engine signs in
+  # with an application (ConnectSyncProvisioning_<server>_<id>) instead, and the legacy account is
+  # left behind until someone removes it.
+  - id: ENTRA-SYNC-ACCOUNT-MULTIPLE
+    title: More directory-sync accounts than sync servers
+    kind: misconfigured
+    category: IAM
+    severity: medium
+    entity: tenant
+    why: "Each installation of the sync engine creates its own cloud sync account with directory-write rights, and uninstalling a server does not delete it. More enabled sync accounts than the active and staging servers is a directory-write credential nobody watches. Set the expected number (active plus staging servers) in the threshold."
+    fix: "Match each account to a running server (its name carries the server name); delete the accounts of servers that no longer exist after confirming them in the role's member list."
+    refs: ["NIST-800-53:AC-2(3)", "CIS-Controls-v8:5.3"]
+    query:
+      protocol: graph
+      path: /users
+      select: [id, userPrincipalName, accountEnabled, userType, createdDateTime, onPremisesSyncEnabled, onPremisesSecurityIdentifier, signInActivity, assignedLicenses, mail, onPremisesSamAccountName, displayName, givenName, surname, department, jobTitle, usageLocation, onPremisesDomainName, onPremisesUserPrincipalName, proxyAddresses, passwordPolicies]
+      top: 500
+      key: id
+      name: userPrincipalName
+    count:
+      op: gt
+      value: 2
+      threshold: entra-connect.expected-sync-accounts
+      where:
+        all:
+          - { field: accountEnabled, op: eq, value: true }
+          - { field: userPrincipalName, op: match, value: '^Sync_', threshold: entra-connect.sync-account-pattern }
+    evidence: "{count} enabled directory-sync accounts (ids {sample})"
+
+  - id: ENTRA-SYNC-ACCOUNT-IDLE
+    title: Directory-sync account is disabled or has not signed in for weeks
+    kind: misconfigured
+    category: HYG
+    severity: medium
+    entity: user
+    lens: both
+    why: "The live sync account signs in every cycle; one that is disabled or idle for weeks belongs to a server that was removed or rebuilt, or to an engine that moved to application-based authentication - a leftover account with directory-write rights."
+    fix: "Confirm no running server uses the account (the account name carries the server name); on a server that moved to application-based authentication remove it with Remove-ADSyncAADServiceAccount, otherwise delete it."
+    refs: ["NIST-800-53:AC-2(3)", "CIS-Controls-v8:5.3"]
+    query:
+      protocol: graph
+      path: /users
+      select: [id, userPrincipalName, accountEnabled, userType, createdDateTime, onPremisesSyncEnabled, onPremisesSecurityIdentifier, signInActivity, assignedLicenses, mail, onPremisesSamAccountName, displayName, givenName, surname, department, jobTitle, usageLocation, onPremisesDomainName, onPremisesUserPrincipalName, proxyAddresses, passwordPolicies]
+      top: 500
+      key: id
+      name: userPrincipalName
+    each:
+      all:
+        - { field: userPrincipalName, op: match, value: '^Sync_', threshold: entra-connect.sync-account-pattern }
+        - any:
+            - { field: accountEnabled, op: eq, value: false }
+            - { field: signInActivity.lastSuccessfulSignInDateTime, op: absent }
+            - { field: signInActivity.lastSuccessfulSignInDateTime, op: age-gt, value: 30, threshold: entra-connect.sync-account-idle-days }
+    evidence: "{userPrincipalName}: enabled {accountEnabled}, last successful sign-in {signInActivity.lastSuccessfulSignInDateTime} (created {createdDateTime})"
+
+  # ---------------------------------------------------------------- managers (own user query) ---
+  - id: M365-USER-NO-MANAGER
+    title: Enabled member account has no manager
+    kind: missing
+    category: HYG
+    severity: low
+    entity: user
+    lens: maintenance
+    why: "OneDrive hand-over at leaving, access-review routing, approval flows and lifecycle workflows all key on the manager attribute; an account without one is skipped by all of them. Accounts matching the service-account pattern are left out."
+    fix: "Populate the manager in the source directory (HR feed or AD); exclude service and resource accounts by naming them to the pattern."
+    refs: ["NIST-800-53:PS-4", "NIST-800-53:AC-2(1)"]
+    query:
+      protocol: graph
+      path: /users
+      filter: "accountEnabled eq true and userType eq 'Member'"
+      select: [id, userPrincipalName, displayName, accountEnabled, createdDateTime, onPremisesSyncEnabled]
+      expand: manager
+      key: id
+      name: userPrincipalName
+    each:
+      all:
+        - { field: manager, op: absent }
+        - any:
+            - { field: createdDateTime, op: absent }
+            - { field: createdDateTime, op: age-gt, value: 30, threshold: entra.attr-grace-days }
+        - { field: userPrincipalName, op: notmatch, value: '^(svc|srv|sa|mbx|room|shared|sync)[-_.]', threshold: entra.service-account-upn-pattern }
+        - { field: userPrincipalName, op: notmatch, value: '^Sync_', threshold: entra-connect.sync-account-pattern }
+    evidence: "{userPrincipalName}: no manager (created {createdDateTime})"
+
+  # ----------------------------------------------------------- deleted users (restore window) ---
+  - id: ENTRA-USER-DELETED-RECENT
+    title: User deleted in the last week
+    kind: misconfigured
+    category: BCK
+    severity: info
+    entity: user
+    lens: maintenance
+    why: "A deleted user can be restored with its licences, group memberships and app assignments for 30 days; a daily look at recent deletions catches a mistaken one while it is still cheap to undo."
+    fix: "Confirm each deletion with whoever made it; restore the ones that were mistakes."
+    refs: ["NIST-800-53:CP-9", "NIST-800-53:AC-2"]
+    query:
+      protocol: graph
+      path: /directory/deletedItems/microsoft.graph.user
+      select: [id, userPrincipalName, displayName, deletedDateTime, assignedLicenses]
+      key: id
+      name: userPrincipalName
+    each: { field: deletedDateTime, op: age-lt, value: 7, threshold: entra.deleted-review-days }
+    evidence: "{userPrincipalName} ({displayName}) deleted {deletedDateTime}, licences at deletion {assignedLicenses[].skuId}"
+
+  - id: ENTRA-USER-DELETED-PURGE-SOON
+    title: Deleted user is about to be purged for good
+    kind: broken
+    category: BCK
+    severity:
+      daysLeft: deletedDateTime
+      ranges: [ { max: -27, value: high } ]
+      default: medium
+    entity: user
+    lens: maintenance
+    why: "Thirty days after deletion the account is purged, and with it the mailbox (unless held) and, after its own retention, the OneDrive. This is the last moment to restore a leaver whose deletion was a mistake or whose mail and files were never preserved. The rule fires from day 23 (threshold) and turns high from day 27; the purge date is 30 days after the deletion date shown."
+    fix: "Restore the user if the mailbox or OneDrive must be kept, convert or hold the mailbox and hand the OneDrive over, then delete again; otherwise record the decision."
+    refs: ["NIST-800-53:CP-9", "NIST-800-53:AU-11", "NIST-800-53:PS-4", "CIS-Controls-v8:11.2"]
+    query:
+      protocol: graph
+      path: /directory/deletedItems/microsoft.graph.user
+      select: [id, userPrincipalName, displayName, deletedDateTime, assignedLicenses]
+      key: id
+      name: userPrincipalName
+    each: { field: deletedDateTime, op: age-gt, value: 23, threshold: entra.deleted-user-warn-after-days }
+    evidence: "{userPrincipalName} ({displayName}) deleted {deletedDateTime}, purged 30 days later; licences at deletion {assignedLicenses[].skuId}"
+
+  - id: ENTRA-USER-PER-USER-MFA-ENABLED
+    title: Member account still uses legacy per-user MFA
+    kind: misconfigured
+    category: AUT
+    severity: low
+    entity: user
+    why: "Per-user MFA (enabled or enforced) is the legacy mechanism: it prompts outside Conditional Access logic, cannot use authentication strengths and keeps app passwords alive; the benchmark wants it off for everyone once Conditional Access enforces MFA. One request per enabled member (at most 2000 per scan, weekly; larger tenants get a partial result); beta API."
+    fix: "Once Conditional Access requires MFA, set the per-user MFA state of every account to disabled, in batches, and remove app passwords."
+    refs: [CIS-M365:5.1.2.1, "NIST-800-53:IA-2(1)"]
+    refresh: 7d
+    query:
+      protocol: graph
+      version: beta
+      path: /users/{id}/authentication/requirements
+      for_each:
+        path: /users
+        filter: "accountEnabled eq true and userType eq 'Member'"
+        select: [id, userPrincipalName]
+        field: id
+        max: 2000
+      key: "{parent.id}"
+      name: parent.userPrincipalName
+    each: { field: perUserMfaState, op: in, value: [enabled, enforced] }
+    evidence: "{parent.userPrincipalName}: per-user MFA {perUserMfaState}"
+
+  - id: M365-USER-SERVICE-PROVISIONING-ERROR
+    title: User has an unresolved service provisioning error
+    kind: broken
+    category: HLT
+    severity: medium
+    entity: user
+    lens: maintenance
+    why: "A workload such as Exchange Online reported that it could not provision the user (a duplicate proxy address, an invalid attribute); until the source attribute is fixed the mailbox is not created or not updated. ENTRA-SYNC-PROVISIONING-ERROR sees directory-sync errors only, not these."
+    fix: "Correct the attribute named in the error at its source (on-premises AD for synchronised users, Entra for cloud users) and wait one sync cycle."
+    refs: ["NIST-800-53:CM-8", "NIST-800-53:SI-10"]
+    query:
+      protocol: graph
+      path: /users
+      select: [id, userPrincipalName, accountEnabled, userType, createdDateTime, assignedLicenses, licenseAssignmentStates, onPremisesSyncEnabled, onPremisesDistinguishedName, onPremisesProvisioningErrors, passwordPolicies, lastPasswordChangeDateTime, externalUserState, externalUserStateChangeDateTime, serviceProvisioningErrors]
+      top: 999
+      key: id
+      name: userPrincipalName
+    each: { field: 'serviceProvisioningErrors[].isResolved', op: eq, value: false }
+    evidence: "{userPrincipalName}: {serviceProvisioningErrors[].serviceInstance} error since {serviceProvisioningErrors[].createdDateTime}"
 
   # ============================================================ applications and secrets ===
   - id: ENTRA-APP-SECRET-EXPIRY
@@ -2554,6 +3336,25 @@ rules:
         - { field: federatedIdentityCredentials, op: notempty }
         - { field: 'federatedIdentityCredentials[].subject', op: match, value: '(\*|:pull_request$)', threshold: entra.federated-subject-broad-pattern }
     evidence: "{displayName} (appId {appId}): subjects {federatedIdentityCredentials[].subject} from {federatedIdentityCredentials[].issuer}"
+
+  - id: ENTRA-APP-USES-CLIENT-SECRET
+    title: App registration authenticates with a client secret
+    kind: misconfigured
+    category: PKI
+    severity: low
+    entity: application
+    why: "Client secrets get copied into config files, scripts and pipelines and leak with them; certificates, managed identities and federated credentials do not. A hygiene list, below the long-lived and many-secrets rules in priority: every app on it is a candidate to move off secrets."
+    fix: "Replace the secret with a certificate, a managed identity or a federated credential, then delete the secret."
+    refs: ["NIST-800-53:IA-5", "CIS-Controls-v8:4.1", "MITRE-ATTACK:T1552.001"]
+    query:
+      protocol: graph
+      path: /applications
+      select: [id, appId, displayName, signInAudience, createdDateTime, passwordCredentials, keyCredentials, web, spa, isFallbackPublicClient, disabledByMicrosoftStatus]
+      top: 999
+      key: id
+      name: displayName
+    each: { field: passwordCredentials, op: notempty }
+    evidence: "{displayName} (appId {appId}): secrets {passwordCredentials[].displayName} ending {passwordCredentials[].endDateTime}"
 
   # ===================================================== enterprise apps (service principals) ===
   - id: ENTRA-SP-SAML-CERT-EXPIRY
@@ -2913,6 +3714,27 @@ rules:
           value: [678536fe-1083-478a-9c59-b99265e6b0d3, fbcd29d2-fcca-4405-aded-518d457caae4]
     evidence: "{principalDisplayName} holds SharePoint application permission {appRoleId} (granted {createdDateTime})"
 
+  # WindowsDefenderATP (fc780465-2017-40d4-a0c5-307022471b92) is the Defender for Endpoint API resource,
+  # a Microsoft first-party application id. Tenants where Defender for Endpoint was never provisioned
+  # have no such service principal and the query fails (the rule records unknown).
+  - id: DEFENDER-APPPERM-MDE-API
+    title: Application holds application permissions on the Defender for Endpoint API
+    kind: misconfigured
+    category: IAM
+    severity: medium
+    entity: app-permission-grant
+    why: "Depending on the role, an application with Defender for Endpoint API permissions reads every device and alert, isolates devices, runs live response or allow-lists files through indicators; its credential is as valuable as a security administrator's password. The grants sit on the Defender for Endpoint resource, so the Graph permission rules do not see them. A review list: accept each documented integration (SIEM, SOAR) with its owner."
+    fix: "Keep only the integrations that need the access, read-only roles where possible; remove unknown grants and rotate the credentials of apps that held more than they needed."
+    refs: ["MITRE-ATTACK:T1098.001", "NIST-800-53:AC-6", "NIST-800-53:IA-9", "CIS-Controls-v8:6.8"]
+    query:
+      protocol: graph
+      path: /servicePrincipals(appId='fc780465-2017-40d4-a0c5-307022471b92')/appRoleAssignedTo
+      top: 999
+      key: id
+      name: principalDisplayName
+    each: { field: principalType, op: eq, value: ServicePrincipal }
+    evidence: "{principalDisplayName} holds Defender for Endpoint application role {appRoleId} (granted {createdDateTime})"
+
   - id: ENTRA-CONSENT-TENANT-WIDE-BROAD
     title: Tenant-wide delegated consent with broad write or mail scopes
     kind: misconfigured
@@ -3148,6 +3970,48 @@ rules:
         - { field: b2bDirectConnectInbound.usersAndGroups.accessType, op: eq, value: allowed }
         - { field: b2bDirectConnectInbound.applications.accessType, op: eq, value: allowed }
     evidence: "default B2B direct connect inbound: users {b2bDirectConnectInbound.usersAndGroups.accessType}, applications {b2bDirectConnectInbound.applications.accessType}"
+
+  - id: ENTRA-XTAP-B2B-COLLABORATION-OPEN
+    title: B2B collaboration is open in both directions with every organisation
+    kind: misconfigured
+    category: IAM
+    severity: low
+    entity: policy
+    why: "Microsoft's default cross-tenant settings allow every user to collaborate with every other organisation, inbound and outbound, for all applications. That is a decision the tenant should make on purpose; left at the default nobody decided which partners may bring guests in or which tenants staff may join. Low, and accepted by override once decided."
+    fix: "Decide the default: restrict inbound and outbound B2B collaboration in the default settings and open it per partner organisation where needed, or record the decision to stay open."
+    refs: ["NIST-800-53:AC-20", "NIST-800-53:AC-21"]
+    query:
+      protocol: graph
+      path: /policies/crossTenantAccessPolicy/default
+      key: id
+    each:
+      all:
+        - { field: b2bCollaborationInbound.usersAndGroups.accessType, op: eq, value: allowed }
+        - { field: 'b2bCollaborationInbound.usersAndGroups.targets[].target', op: eq, value: AllUsers }
+        - { field: b2bCollaborationInbound.applications.accessType, op: eq, value: allowed }
+        - { field: 'b2bCollaborationInbound.applications.targets[].target', op: eq, value: AllApplications }
+        - { field: b2bCollaborationOutbound.usersAndGroups.accessType, op: eq, value: allowed }
+        - { field: b2bCollaborationOutbound.applications.accessType, op: eq, value: allowed }
+    evidence: "default B2B collaboration: inbound users {b2bCollaborationInbound.usersAndGroups.accessType} ({b2bCollaborationInbound.usersAndGroups.targets[].target}), inbound apps {b2bCollaborationInbound.applications.accessType}, outbound users {b2bCollaborationOutbound.usersAndGroups.accessType}, outbound apps {b2bCollaborationOutbound.applications.accessType}"
+
+  - id: ENTRA-XTAP-PARTNER-PRESENT
+    title: Partner-specific cross-tenant access settings exist
+    kind: misconfigured
+    category: IAM
+    severity:
+      field: inboundTrust.isMfaAccepted
+      map: { 'true': medium }
+      default: info
+    entity: xtap-partner
+    why: "Each partner configuration was added for one project and is rarely removed; one that trusts the partner's MFA (medium) lets the partner's own, possibly weaker, MFA satisfy this tenant's policies. A review list: remove stale partners and accept the rest with their owner recorded. Settings left to inherit the default show as empty."
+    fix: "Remove partner configurations nobody can explain; for the rest record the owner and purpose, and trust partner MFA or devices only where the partner's controls are known."
+    refs: ["NIST-800-53:AC-20", "NIST-800-53:IA-8", "MITRE-ATTACK:T1199"]
+    query:
+      protocol: graph
+      path: /policies/crossTenantAccessPolicy/partners
+      key: tenantId
+    each: any
+    evidence: "partner tenant {tenantId}: service provider {isServiceProvider}, trusts MFA {inboundTrust.isMfaAccepted}, compliant devices {inboundTrust.isCompliantDeviceAccepted}, B2B inbound users {b2bCollaborationInbound.usersAndGroups.accessType}, direct connect inbound users {b2bDirectConnectInbound.usersAndGroups.accessType}"
 
   # ================================================================= device registration ===
   - id: ENTRA-DEVREG-QUOTA-HIGH
@@ -3387,6 +4251,446 @@ rules:
         - { field: appRoleAssignments, op: empty }
     evidence: "{displayName}: onboarding group with no application assignment"
 
+  # ------------------------------------------------------------ group inventory with owners ---
+  # One fetch of every group with its owners (the expand returns at most 20 owners per group).
+  # "Cloud group" = onPremisesSyncEnabled absent or false; synchronised groups are judged in AD.
+  - id: ENTRA-GROUP-NO-OWNER
+    title: Cloud group has no owner
+    kind: missing
+    category: HYG
+    severity: low
+    entity: group
+    lens: both
+    why: "A group with no owner cannot be reviewed by anyone who knows why it exists, and its members drift. Microsoft 365 groups have their own rule (ENTRA-GROUP-M365-NO-OWNER); role-assignable groups are meant to have no owner and are left out."
+    fix: "Assign two owners who answer for the group's purpose and members, or delete the group if nobody claims it."
+    refs: ["NIST-800-53:AC-2", "NIST-800-53:CM-8(4)", "CIS-Controls-v8:5.1"]
+    query:
+      protocol: graph
+      path: /groups
+      select: [id, displayName, description, groupTypes, securityEnabled, mailEnabled, mail, onPremisesSyncEnabled, isAssignableToRole, createdDateTime, expirationDateTime, renewedDateTime, assignedLabels, serviceProvisioningErrors]
+      expand: owners($select=id,userPrincipalName,accountEnabled)
+      key: id
+      name: displayName
+    each:
+      all:
+        - any:
+            - { field: onPremisesSyncEnabled, op: absent }
+            - { field: onPremisesSyncEnabled, op: eq, value: false }
+        - { field: groupTypes, op: notcontains, value: Unified }
+        - any:
+            - { field: isAssignableToRole, op: absent }
+            - { field: isAssignableToRole, op: eq, value: false }
+        - { field: owners, op: size-eq, value: 0 }
+    evidence: "{displayName} (security {securityEnabled}, mail {mailEnabled}, created {createdDateTime}): no owner"
+
+  - id: ENTRA-GROUP-OWNER-DISABLED
+    title: Cloud group is owned by a disabled account
+    kind: misconfigured
+    category: HYG
+    severity: low
+    entity: group
+    lens: both
+    why: "Ownership looks healthy while nobody can act on it, and a re-enabled leaver regains control of the group and of whatever it grants. Fires on any disabled owner; groups whose only owners are disabled are effectively ownerless."
+    fix: "Remove the disabled owner and add a current one; make owner hand-over part of the leaver process."
+    refs: ["NIST-800-53:AC-2(3)", "NIST-800-53:PS-4"]
+    query:
+      protocol: graph
+      path: /groups
+      select: [id, displayName, description, groupTypes, securityEnabled, mailEnabled, mail, onPremisesSyncEnabled, isAssignableToRole, createdDateTime, expirationDateTime, renewedDateTime, assignedLabels, serviceProvisioningErrors]
+      expand: owners($select=id,userPrincipalName,accountEnabled)
+      key: id
+      name: displayName
+    each:
+      all:
+        - any:
+            - { field: onPremisesSyncEnabled, op: absent }
+            - { field: onPremisesSyncEnabled, op: eq, value: false }
+        - { field: 'owners[].accountEnabled', op: eq, value: false }
+    evidence: "{displayName}: owners {owners[].userPrincipalName}, enabled {owners[].accountEnabled}"
+
+  - id: ENTRA-GROUP-NO-DESCRIPTION
+    title: Cloud groups without a description
+    kind: missing
+    category: HYG
+    severity: low
+    entity: tenant
+    lens: maintenance
+    why: "A group without a description leaves every reviewer, approver and new owner guessing what it grants. Counted once for the tenant (most tenants have many) with a sample; the per-group detail is in the scan rows."
+    fix: "Make a description part of group creation; describe the groups that grant access to applications, sites or roles first."
+    refs: ["NIST-800-53:CM-8", "NIST-800-53:AC-2"]
+    query:
+      protocol: graph
+      path: /groups
+      select: [id, displayName, description, groupTypes, securityEnabled, mailEnabled, mail, onPremisesSyncEnabled, isAssignableToRole, createdDateTime, expirationDateTime, renewedDateTime, assignedLabels, serviceProvisioningErrors]
+      expand: owners($select=id,userPrincipalName,accountEnabled)
+      key: id
+      name: displayName
+    count:
+      op: gt
+      value: 0
+      threshold: entra.groups-without-description-max
+      where:
+        all:
+          - any:
+              - { field: onPremisesSyncEnabled, op: absent }
+              - { field: onPremisesSyncEnabled, op: eq, value: false }
+          - { field: description, op: empty }
+    evidence: "{count} of {rows} groups are cloud groups without a description (ids {sample})"
+
+  - id: ENTRA-GROUP-MAIL-ENABLED-SECURITY
+    title: Mail-enabled security group
+    kind: misconfigured
+    category: IAM
+    severity: info
+    entity: group
+    why: "A mail-enabled security group serves two purposes at once: whoever manages the distribution list (often in Exchange, outside the access process) changes who has the access it grants. A review list."
+    fix: "Split the group into a distribution list and a security group, or record why one object serves both."
+    refs: ["NIST-800-53:AC-2", "NIST-800-53:CM-8"]
+    query:
+      protocol: graph
+      path: /groups
+      select: [id, displayName, description, groupTypes, securityEnabled, mailEnabled, mail, onPremisesSyncEnabled, isAssignableToRole, createdDateTime, expirationDateTime, renewedDateTime, assignedLabels, serviceProvisioningErrors]
+      expand: owners($select=id,userPrincipalName,accountEnabled)
+      key: id
+      name: displayName
+    each:
+      all:
+        - { field: securityEnabled, op: eq, value: true }
+        - { field: mailEnabled, op: eq, value: true }
+        - { field: groupTypes, op: notcontains, value: Unified }
+    evidence: "{displayName} ({mail}): mail-enabled security group, synchronised {onPremisesSyncEnabled}"
+
+  - id: M365-GROUP-NAME-OR-DESCRIPTION-POOR
+    title: Cloud group has a throwaway name
+    kind: misconfigured
+    category: HYG
+    severity: low
+    entity: group
+    lens: maintenance
+    why: "Groups called test, tmp, temp, new team or demo were made for a moment and kept; nobody can tell what they grant or whether they are still needed. Missing descriptions are counted by ENTRA-GROUP-NO-DESCRIPTION. Tune the name pattern with the threshold."
+    fix: "Rename and describe the group with its owner, or delete it; adopt a naming policy for new groups."
+    refs: ["NIST-800-53:CM-8"]
+    query:
+      protocol: graph
+      path: /groups
+      select: [id, displayName, description, groupTypes, securityEnabled, mailEnabled, mail, onPremisesSyncEnabled, isAssignableToRole, createdDateTime, expirationDateTime, renewedDateTime, assignedLabels, serviceProvisioningErrors]
+      expand: owners($select=id,userPrincipalName,accountEnabled)
+      key: id
+      name: displayName
+    each:
+      all:
+        - any:
+            - { field: onPremisesSyncEnabled, op: absent }
+            - { field: onPremisesSyncEnabled, op: eq, value: false }
+        - { field: displayName, op: match, value: '^(test|tmp|temp|new team|new group|demo|copy of)\b', threshold: m365.group-name-junk-pattern }
+    evidence: "{displayName}: created {createdDateTime}, owners {owners[].userPrincipalName}"
+
+  - id: M365-GROUP-EXPIRING-SOON
+    title: Microsoft 365 group will be deleted by the expiration policy soon
+    kind: broken
+    category: AVL
+    severity:
+      field: owners
+      map: { '[]': high }
+      default: medium
+    deadline: expirationDateTime
+    entity: group
+    lens: both
+    why: "On its expiration date the group is deleted with its mailbox, team and site unless an owner renews it; a group with no owner (high) never gets the renewal mail. It can be restored for 30 days, but the team is disrupted on the day."
+    fix: "Renew the group or give it an owner before the date; set the expiration policy's alternate notification address to a monitored mailbox."
+    refs: ["NIST-800-53:CP-2", "NIST-800-53:AC-2"]
+    query:
+      protocol: graph
+      path: /groups
+      select: [id, displayName, description, groupTypes, securityEnabled, mailEnabled, mail, onPremisesSyncEnabled, isAssignableToRole, createdDateTime, expirationDateTime, renewedDateTime, assignedLabels, serviceProvisioningErrors]
+      expand: owners($select=id,userPrincipalName,accountEnabled)
+      key: id
+      name: displayName
+    each:
+      all:
+        - { field: groupTypes, op: contains, value: Unified }
+        - { field: expirationDateTime, op: until-lt, value: 30, threshold: m365.group-expiry-notice-days }
+    evidence: "{displayName}: expires {expirationDateTime} (renewed {renewedDateTime}), owners {owners[].userPrincipalName}"
+
+  - id: M365-GROUP-SINGLE-OWNER
+    title: Microsoft 365 group or team has a single owner
+    kind: misconfigured
+    category: HYG
+    severity: low
+    entity: group
+    lens: maintenance
+    why: "One owner is one leaver away from an ownerless group: nobody approves members, renews it or answers for its content."
+    fix: "Ask the owner to add a co-owner; enable the ownerless-group policy so members are asked to take over."
+    refs: ["NIST-800-53:AC-2", "CIS-Controls-v8:5.1"]
+    query:
+      protocol: graph
+      path: /groups
+      select: [id, displayName, description, groupTypes, securityEnabled, mailEnabled, mail, onPremisesSyncEnabled, isAssignableToRole, createdDateTime, expirationDateTime, renewedDateTime, assignedLabels, serviceProvisioningErrors]
+      expand: owners($select=id,userPrincipalName,accountEnabled)
+      key: id
+      name: displayName
+    each:
+      all:
+        - { field: groupTypes, op: contains, value: Unified }
+        - { field: owners, op: size-eq, value: 1 }
+    evidence: "{displayName}: single owner {owners[].userPrincipalName}"
+
+  - id: M365-GROUP-NO-SENSITIVITY-LABEL
+    title: Microsoft 365 groups without a sensitivity label
+    kind: missing
+    category: IAM
+    severity: low
+    entity: tenant
+    why: "Without a container label no classification governs a group's privacy, guest access and the sharing of its site and team. Counted once for the tenant with a sample; a tenant that has not enabled labels for groups (AIP-CONTAINER-LABELS-OFF) sees every group here and accepts the finding until it does."
+    fix: "Publish a default container label and label the existing groups with their owners, most sensitive first."
+    refs: ["NIST-800-53:AC-16", "CIS-Controls-v8:3.7"]
+    query:
+      protocol: graph
+      path: /groups
+      select: [id, displayName, description, groupTypes, securityEnabled, mailEnabled, mail, onPremisesSyncEnabled, isAssignableToRole, createdDateTime, expirationDateTime, renewedDateTime, assignedLabels, serviceProvisioningErrors]
+      expand: owners($select=id,userPrincipalName,accountEnabled)
+      key: id
+      name: displayName
+    count:
+      op: gt
+      value: 0
+      where:
+        all:
+          - { field: groupTypes, op: contains, value: Unified }
+          - { field: assignedLabels, op: empty }
+    evidence: "{count} Microsoft 365 groups carry no sensitivity label (ids {sample})"
+
+  - id: M365-GROUP-SERVICE-PROVISIONING-ERROR
+    title: Group has an unresolved service provisioning error
+    kind: broken
+    category: HLT
+    severity: medium
+    entity: group
+    lens: maintenance
+    why: "A workload such as Exchange Online could not provision the group (a duplicate proxy address, an invalid alias); its mailbox or address does not work as configured until the attribute is fixed."
+    fix: "Correct the attribute named in the error at its source (AD for synchronised groups) and wait one sync cycle."
+    refs: ["NIST-800-53:CM-8", "NIST-800-53:SI-10"]
+    query:
+      protocol: graph
+      path: /groups
+      select: [id, displayName, description, groupTypes, securityEnabled, mailEnabled, mail, onPremisesSyncEnabled, isAssignableToRole, createdDateTime, expirationDateTime, renewedDateTime, assignedLabels, serviceProvisioningErrors]
+      expand: owners($select=id,userPrincipalName,accountEnabled)
+      key: id
+      name: displayName
+    each: { field: 'serviceProvisioningErrors[].isResolved', op: eq, value: false }
+    evidence: "{displayName} ({mail}): {serviceProvisioningErrors[].serviceInstance} error since {serviceProvisioningErrors[].createdDateTime}"
+
+  # ----------------------------------------------------------- group inventory with members ---
+  # Members are expanded (at most 20 per group, which is enough for empty, single and mixed checks).
+  # The member objects carry their type only as @odata.type, so the type tests match the JSON text of
+  # each member element. Graph v1.0 does not return service principals among group members.
+  - id: ENTRA-GROUP-EMPTY
+    title: Cloud group has no members
+    kind: misconfigured
+    category: HYG
+    severity: low
+    entity: group
+    lens: maintenance
+    why: "An empty group is dead configuration: assignments, policies and exclusions that point at it do nothing, and someone may fill it later without knowing what it grants. Groups younger than a week and dynamic groups (their own rule) are left out."
+    fix: "Delete the group, or fill it if it is meant to grant something; first check what is assigned to it."
+    refs: ["NIST-800-53:AC-2", "NIST-800-53:CM-6"]
+    query:
+      protocol: graph
+      path: /groups
+      select: [id, displayName, groupTypes, securityEnabled, mailEnabled, onPremisesSyncEnabled, membershipRule, membershipRuleProcessingState, createdDateTime]
+      expand: members($select=id)
+      key: id
+      name: displayName
+    each:
+      all:
+        - any:
+            - { field: onPremisesSyncEnabled, op: absent }
+            - { field: onPremisesSyncEnabled, op: eq, value: false }
+        - { field: groupTypes, op: notcontains, value: DynamicMembership }
+        - any:
+            - { field: createdDateTime, op: absent }
+            - { field: createdDateTime, op: age-gt, value: 7 }
+        - { field: members, op: size-eq, value: 0 }
+    evidence: "{displayName} (created {createdDateTime}): no members"
+
+  - id: ENTRA-GROUP-DYNAMIC-EMPTY
+    title: Dynamic group matches nobody
+    kind: broken
+    category: IAM
+    severity: medium
+    entity: group
+    lens: both
+    why: "A dynamic group with no members usually tests an attribute value that no longer exists (a renamed department, a changed company name); joiners are then silently never added to whatever the group grants."
+    fix: "Check the membership rule against the current attribute values and correct it; delete the group if it is no longer needed."
+    refs: ["NIST-800-53:AC-2", "NIST-800-53:CM-6"]
+    query:
+      protocol: graph
+      path: /groups
+      select: [id, displayName, groupTypes, securityEnabled, mailEnabled, onPremisesSyncEnabled, membershipRule, membershipRuleProcessingState, createdDateTime]
+      expand: members($select=id)
+      key: id
+      name: displayName
+    each:
+      all:
+        - { field: groupTypes, op: contains, value: DynamicMembership }
+        - any:
+            - { field: createdDateTime, op: absent }
+            - { field: createdDateTime, op: age-gt, value: 1 }
+        - { field: members, op: size-eq, value: 0 }
+    evidence: "{displayName}: no members for rule {membershipRule} (processing {membershipRuleProcessingState})"
+
+  - id: ENTRA-GROUP-SINGLE-MEMBER
+    title: Cloud group has exactly one member
+    kind: misconfigured
+    category: HYG
+    severity: info
+    entity: group
+    lens: maintenance
+    why: "A group with one member is often a permission given to one person in disguise, outside the review that would see a direct assignment. A review hint, not a verdict."
+    fix: "Assign the access directly if it really is for one person, or fill the group as intended; delete it if it is a leftover."
+    refs: ["NIST-800-53:AC-2", "NIST-800-53:AC-6"]
+    query:
+      protocol: graph
+      path: /groups
+      select: [id, displayName, groupTypes, securityEnabled, mailEnabled, onPremisesSyncEnabled, membershipRule, membershipRuleProcessingState, createdDateTime]
+      expand: members($select=id)
+      key: id
+      name: displayName
+    each:
+      all:
+        - any:
+            - { field: onPremisesSyncEnabled, op: absent }
+            - { field: onPremisesSyncEnabled, op: eq, value: false }
+        - { field: groupTypes, op: notcontains, value: DynamicMembership }
+        - { field: members, op: size-eq, value: 1 }
+    evidence: "{displayName}: one member {members[].id}"
+
+  - id: ENTRA-GROUP-NONUSER-MEMBER
+    title: Group mixes user accounts with devices or contacts
+    kind: misconfigured
+    category: IAM
+    severity: low
+    entity: group
+    why: "A group meant for people that also holds devices or mail contacts (or the reverse) is usually a mistake: policies and app assignments meant for one kind land on the other, and exclusions miss. Pure device groups are normal and not flagged; only groups holding both kinds are."
+    fix: "Split the group into a user group and a device group, or remove the members of the wrong kind."
+    refs: ["NIST-800-53:AC-2", "NIST-800-53:CM-6"]
+    query:
+      protocol: graph
+      path: /groups
+      select: [id, displayName, groupTypes, securityEnabled, mailEnabled, onPremisesSyncEnabled, membershipRule, membershipRuleProcessingState, createdDateTime]
+      expand: members($select=id)
+      key: id
+      name: displayName
+    each:
+      all:
+        - { field: members, op: match, value: '"@odata\.type":"#microsoft\.graph\.user"' }
+        - { field: members, op: match, value: '"@odata\.type":"#microsoft\.graph\.(device|orgContact)"' }
+    evidence: "{displayName}: holds users and devices or contacts"
+
+  # --------------------------------------------- directory settings (Group.Unified template) ---
+  # /groupSettings returns the tenant-level settings objects (no $filter); each carries its template
+  # id and its settings as a values[] array of name/value pairs. A pair is tested by matching the JSON
+  # text of one element: (?=.*"name":"X")(?=.*"value":"Y"). Without a Group.Unified object the
+  # Microsoft defaults apply (group creation open, no naming policy, labels for groups off).
+  - id: ENTRA-GROUP-NAMING-POLICY-NONE
+    title: No naming policy applies to Microsoft 365 groups
+    kind: missing
+    category: CFG
+    severity: low
+    entity: tenant
+    lens: maintenance
+    why: "Without a prefix or suffix requirement and a blocked-words list, user-created groups (and their teams, sites and mail addresses) look exactly like official ones and can take names such as 'HR' or 'Payroll'."
+    fix: "Set a prefix or suffix naming requirement and a blocked-words list in the Group.Unified directory settings."
+    refs: ["NIST-800-53:CM-6"]
+    query:
+      protocol: graph
+      path: /groupSettings
+      select: [id, displayName, templateId, values]
+      key: id
+      name: displayName
+    count:
+      op: lt
+      value: 1
+      where:
+        all:
+          - { field: templateId, op: eq, value: 62375ab9-6b52-47ed-826b-58e47e0e304b }
+          - any:
+              - { field: values, op: match, value: '(?=.*"name":"PrefixSuffixNamingRequirement")(?=.*"value":"[^"])' }
+              - { field: values, op: match, value: '(?=.*"name":"CustomBlockedWordsList")(?=.*"value":"[^"])' }
+    evidence: "{count} Group.Unified settings objects carry a naming policy, among {rows} settings objects"
+
+  - id: M365-GROUP-CREATION-UNRESTRICTED
+    title: Any user can create Microsoft 365 groups
+    kind: misconfigured
+    category: IAM
+    severity: low
+    entity: tenant
+    lens: both
+    why: "When group creation is open (Microsoft's default, or EnableGroupCreation left true) every user can create groups, and with them teams, SharePoint sites and mailboxes, each with its own sharing and guest settings. Companion of M365-SPO-USER-SITE-CREATION."
+    fix: "Instantiate the Group.Unified settings, set EnableGroupCreation to false and name the group allowed to create groups (GroupCreationAllowedGroupId); publish a request path."
+    refs: ["NIST-800-53:AC-6", "NIST-800-53:CM-11", "CIS-Controls-v8:6.8"]
+    query:
+      protocol: graph
+      path: /groupSettings
+      select: [id, displayName, templateId, values]
+      key: id
+      name: displayName
+    count:
+      op: lt
+      value: 1
+      where:
+        all:
+          - { field: templateId, op: eq, value: 62375ab9-6b52-47ed-826b-58e47e0e304b }
+          - { field: values, op: match, value: '(?=.*"name":"EnableGroupCreation")(?=.*"value":"false")' }
+    evidence: "{count} Group.Unified settings objects restrict group creation, among {rows} settings objects"
+
+  # ------------------------------------------------------------------ deleted groups, guests ---
+  - id: M365-GROUP-DELETED-RECENT
+    title: Group deleted in the last week
+    kind: misconfigured
+    category: BCK
+    severity: info
+    entity: group
+    lens: maintenance
+    why: "A deleted Microsoft 365 group takes its team, site and mailbox with it, and the mistake is often noticed weeks later; for 30 days it can be restored whole."
+    fix: "Confirm each deletion with the admin or owner who made it; restore the group if it was a mistake."
+    refs: ["NIST-800-53:CP-9", "NIST-800-53:AU-6"]
+    query:
+      protocol: graph
+      path: /directory/deletedItems/microsoft.graph.group
+      select: [id, displayName, mail, groupTypes, deletedDateTime]
+      key: id
+      name: displayName
+    each: { field: deletedDateTime, op: age-lt, value: 7, threshold: m365.deleted-group-review-days }
+    evidence: "{displayName} ({mail}, {groupTypes}) deleted {deletedDateTime}; restorable for 30 days"
+
+  - id: M365-GROUP-HAS-GUESTS
+    title: Microsoft 365 group or team contains a guest
+    kind: misconfigured
+    category: IAM
+    severity: low
+    entity: group-member
+    why: "A guest in a team sees every standard channel and file; project guests are rarely removed when the project ends. One finding per guest membership, as a review list for the group owners. One request per Microsoft 365 group (at most 2000)."
+    fix: "Owners confirm or remove each guest; put groups with guests under a recurring access review."
+    refs: ["NIST-800-53:AC-2(13)", "NIST-800-53:AC-21", "CIS-Controls-v8:6.2"]
+    refresh: 7d
+    query:
+      protocol: graph
+      path: /groups/{id}/members/microsoft.graph.user
+      filter: "userType eq 'Guest'"
+      consistency: eventual
+      select: [id, userPrincipalName, userType, accountEnabled]
+      for_each:
+        path: /groups
+        filter: "groupTypes/any(c:c eq 'Unified')"
+        select: [id, displayName]
+        field: id
+        max: 2000
+      key: "{parent.id}|{id}"
+      name: parent.displayName
+    each: { field: userType, op: eq, value: Guest }
+    evidence: "{parent.displayName}: guest {userPrincipalName} (enabled {accountEnabled})"
+
   # ======================================================================= devices ===
   - id: ENTRA-DEVICE-STALE
     title: Enabled device object with no sign-in for a long time
@@ -3467,6 +4771,75 @@ rules:
         - { field: operatingSystemVersion, op: match, value: '^10\.0\.(\d{1,4}|1\d{4}|2[01]\d{3}|22[0-5]\d{2}|226[0-2]\d|22630)(\.|$)', threshold: entra.windows-unsupported-build-pattern }
     evidence: "{displayName}: Windows {operatingSystemVersion}, last sign-in {approximateLastSignInDateTime}"
 
+  - id: ENTRA-DEVICE-DISABLED-STALE
+    title: Disabled device object kept long after its last sign-in
+    kind: misconfigured
+    category: HYG
+    severity: low
+    entity: device
+    lens: maintenance
+    why: "Disabling is the first half of device clean-up; a disabled object that is never deleted keeps its BitLocker keys, certificates and group memberships and clutters every device report."
+    fix: "Delete disabled device objects after the grace period (hybrid-joined ones in AD, so sync removes them); keep the BitLocker keys you still need first."
+    refs: ["NIST-800-53:CM-8(3)"]
+    query:
+      protocol: graph
+      path: /devices
+      select: [id, displayName, accountEnabled, operatingSystem, operatingSystemVersion, trustType, isManaged, isCompliant, approximateLastSignInDateTime, registrationDateTime]
+      top: 999
+      key: id
+      name: displayName
+    each:
+      all:
+        - { field: accountEnabled, op: eq, value: false }
+        - any:
+            - { field: approximateLastSignInDateTime, op: age-gt, value: 30, threshold: entra.disabled-device-keep-days }
+            - all:
+                - { field: approximateLastSignInDateTime, op: absent }
+                - { field: registrationDateTime, op: age-gt, value: 30, threshold: entra.disabled-device-keep-days }
+    evidence: "{displayName} ({trustType}, {operatingSystem}): disabled, last sign-in {approximateLastSignInDateTime}"
+
+  - id: ENTRA-DEVICE-REGISTERED-PERSONAL
+    title: Personally registered device gets tokens without management
+    kind: misconfigured
+    category: IAM
+    severity: info
+    entity: device
+    why: "A registered (workplace-joined) device is a personal device that holds the user's tokens for corporate apps; unless app protection or a compliance requirement covers it, nothing controls what it keeps. A review list of what is registered."
+    fix: "Require app protection or a compliant device for access from registered devices; remove registrations of devices the user no longer has."
+    refs: ["NIST-800-53:AC-19", "NIST-800-53:CM-8"]
+    query:
+      protocol: graph
+      path: /devices
+      select: [id, displayName, accountEnabled, operatingSystem, operatingSystemVersion, trustType, isManaged, isCompliant, approximateLastSignInDateTime, registrationDateTime]
+      top: 999
+      key: id
+      name: displayName
+    each:
+      all:
+        - { field: accountEnabled, op: eq, value: true }
+        - { field: trustType, op: eq, value: Workplace }
+    evidence: "{displayName} ({operatingSystem} {operatingSystemVersion}): registered {registrationDateTime}, managed {isManaged}, compliant {isCompliant}, last sign-in {approximateLastSignInDateTime}"
+
+  # BitLocker recovery keys: the list returns key metadata only (the key itself needs a separate read
+  # with another permission, which no rule makes).
+  - id: ENTRA-BITLOCKER-KEY-OLD
+    title: BitLocker recovery key in Entra is years old
+    kind: misconfigured
+    category: PKI
+    severity: low
+    entity: bitlocker-key
+    lens: both
+    why: "A recovery key that was never rotated in years has typically been shown to someone (help desk, user) at least once and is still valid; the key inventory is also what a missing-escrow join needs. Tune the age with the threshold."
+    fix: "Rotate the recovery password on the device (manage-bde or the Intune rotate action) and require rotation after each use in the disk-encryption policy."
+    refs: ["NIST-800-53:SC-28", "NIST-800-53:CP-9", "CIS-Controls-v8:3.6"]
+    query:
+      protocol: graph
+      path: /informationProtection/bitlocker/recoveryKeys
+      key: id
+      name: deviceId
+    each: { field: createdDateTime, op: age-gt, value: 1095, threshold: entra.bitlocker-key-max-age-days }
+    evidence: "recovery key {id} for device {deviceId} (volume type {volumeType}) created {createdDateTime}"
+
   # ========================================================== tenant, sync and contacts ===
   - id: ENTRA-SYNC-STALE
     title: Directory synchronisation has not run recently
@@ -3482,7 +4855,7 @@ rules:
     query:
       protocol: graph
       path: /organization
-      select: [id, displayName, onPremisesSyncEnabled, onPremisesLastSyncDateTime, technicalNotificationMails, securityComplianceNotificationMails]
+      select: [id, displayName, onPremisesSyncEnabled, onPremisesLastSyncDateTime, technicalNotificationMails, securityComplianceNotificationMails, privacyProfile]
       key: id
       name: displayName
     each:
@@ -3549,6 +4922,176 @@ rules:
     each: { field: features.blockCloudObjectTakeoverThroughHardMatchEnabled, op: eq, value: false }
     evidence: "blockCloudObjectTakeoverThroughHardMatchEnabled = {features.blockCloudObjectTakeoverThroughHardMatchEnabled}, blockSoftMatchEnabled = {features.blockSoftMatchEnabled}"
 
+  - id: ENTRA-SYNC-SOFT-MATCH-OPEN
+    title: Soft matching from AD is still allowed
+    kind: misconfigured
+    category: IAM
+    severity: medium
+    entity: sync-configuration
+    why: "With soft match open, an on-premises object whose UPN or primary SMTP address matches an existing cloud-only account takes that account over at the next sync, administrators included. Soft match is needed only during a planned migration of cloud accounts to synchronised ones. Not applicable to cloud-only tenants."
+    fix: "Enable blockSoftMatch once the last planned match is done; open it only for a dated migration window."
+    refs: ["NIST-800-53:AC-2", "NIST-800-53:IA-4", "MITRE-ATTACK:T1098"]
+    query:
+      protocol: graph
+      path: /directory/onPremisesSynchronization
+      key: id
+    each: { field: features.blockSoftMatchEnabled, op: eq, value: false }
+    evidence: "blockSoftMatchEnabled = {features.blockSoftMatchEnabled}"
+
+  - id: ENTRA-SYNC-ACCIDENTAL-DELETE-PREVENTION-WEAK
+    title: Accidental-deletion prevention for directory sync is off or too loose
+    kind: misconfigured
+    category: BCK
+    severity:
+      field: configuration.accidentalDeletionPrevention.synchronizationPreventionType
+      map: { disabled: high }
+      default: medium
+    entity: sync-configuration
+    lens: both
+    why: "One filtering mistake or a moved OU deletes every out-of-scope user in the cloud in a single cycle, with their mailboxes, files and licences. Prevention stops the export above a threshold; disabled (high) nothing stops it, and a threshold above 500 objects or 5 percent lets a large share through first."
+    fix: "Enable prevention for a count of 500 or less (or 5 percent); lift it only for one reviewed export."
+    refs: ["NIST-800-53:CM-3", "NIST-800-53:CP-9"]
+    query:
+      protocol: graph
+      path: /directory/onPremisesSynchronization
+      key: id
+    each:
+      any:
+        - { field: configuration.accidentalDeletionPrevention.synchronizationPreventionType, op: eq, value: disabled }
+        - all:
+            - { field: configuration.accidentalDeletionPrevention.synchronizationPreventionType, op: eq, value: enabledForCount }
+            - { field: configuration.accidentalDeletionPrevention.alertThreshold, op: gt, value: 500, threshold: entra.sync-delete-threshold-max }
+        - all:
+            - { field: configuration.accidentalDeletionPrevention.synchronizationPreventionType, op: eq, value: enabledForPercentage }
+            - { field: configuration.accidentalDeletionPrevention.alertThreshold, op: gt, value: 5, threshold: entra.sync-delete-percent-max }
+    evidence: "accidental deletion prevention {configuration.accidentalDeletionPrevention.synchronizationPreventionType}, threshold {configuration.accidentalDeletionPrevention.alertThreshold}"
+
+  - id: ENTRA-SYNC-RETIRED-FEATURE-ON
+    title: Retired group writeback (v2) is still switched on
+    kind: misconfigured
+    category: LCM
+    severity: medium
+    entity: sync-configuration
+    why: "Object-level group writeback for additional group types (group writeback v2) is decommissioned in Entra Connect Sync; a tenant that still has it on depends on a feature that stops working without a visible error and complicates the next engine upgrade. Microsoft 365 group writeback (v1) still works and is not flagged here."
+    fix: "Move the group types that need writeback to Cloud Sync group provisioning to AD, then disable writeback v2 (irreversible: afterwards all Microsoft 365 groups are written back, so plan it)."
+    refs: ["NIST-800-53:SA-22", "NIST-800-53:CM-2"]
+    query:
+      protocol: graph
+      path: /directory/onPremisesSynchronization
+      key: id
+    each: { field: features.groupWriteBackEnabled, op: eq, value: true }
+    evidence: "groupWriteBackEnabled = {features.groupWriteBackEnabled}, unifiedGroupWritebackEnabled = {features.unifiedGroupWritebackEnabled}"
+
+  - id: ENTRA-SYNC-WRITEBACK-ENABLED
+    title: Cloud-to-AD writeback is switched on
+    kind: misconfigured
+    category: IAM
+    severity: low
+    entity: sync-configuration
+    why: "Each writeback (devices, users, Microsoft 365 groups) lets the cloud change on-premises AD - a path from the tenant into tier 0. A writeback nobody uses is that path with no benefit. A review list: accept each with the feature it serves. (Password writeback is not visible through this resource.)"
+    fix: "Disable the writebacks that serve nothing in the Entra Connect wizard; accept the rest with their purpose recorded."
+    refs: ["NIST-800-53:AC-6", "NIST-800-53:CM-7"]
+    query:
+      protocol: graph
+      path: /directory/onPremisesSynchronization
+      key: id
+    each:
+      any:
+        - { field: features.deviceWritebackEnabled, op: eq, value: true }
+        - { field: features.userWritebackEnabled, op: eq, value: true }
+        - { field: features.unifiedGroupWritebackEnabled, op: eq, value: true }
+    evidence: "writeback: devices {features.deviceWritebackEnabled}, users {features.userWritebackEnabled}, Microsoft 365 groups {features.unifiedGroupWritebackEnabled}"
+
+  - id: ENTRA-SYNC-CLOUD-PASSWORD-POLICY-OFF
+    title: Expired and must-change AD passwords keep working in the cloud
+    kind: misconfigured
+    category: AUT
+    severity: low
+    entity: sync-configuration
+    why: "With password hash sync, a synchronised user's cloud password never expires and 'must change password at next logon' is ignored unless two features are on: an expired or reset-flagged AD account keeps signing in to cloud services with the old password. The behaviour may be wanted; review it."
+    fix: "Enable cloudPasswordPolicyForPasswordSyncedUsersEnabled and userForcePasswordChangeOnLogonEnabled after reading the caveats on temporary passwords and service accounts."
+    refs: ["NIST-800-53:IA-5(1)"]
+    query:
+      protocol: graph
+      path: /directory/onPremisesSynchronization
+      key: id
+    each:
+      all:
+        - { field: features.passwordSyncEnabled, op: eq, value: true }
+        - any:
+            - { field: features.cloudPasswordPolicyForPasswordSyncedUsersEnabled, op: eq, value: false }
+            - { field: features.userForcePasswordChangeOnLogonEnabled, op: eq, value: false }
+    evidence: "cloud password policy {features.cloudPasswordPolicyForPasswordSyncedUsersEnabled}, force change on logon {features.userForcePasswordChangeOnLogonEnabled}"
+
+  - id: ENTRA-SYNC-INTERVAL-LONG
+    title: Directory sync runs less often than every 30 minutes
+    kind: misconfigured
+    category: CFG
+    severity: low
+    entity: sync-configuration
+    lens: both
+    why: "Leaver disablements and licence changes arrive one cycle late; a customised interval is usually a troubleshooting step nobody undid. The intervals are ISO 8601 durations, accepted by pattern (30 minutes or less; tune it with the threshold). Only exposed in the beta API."
+    fix: "Clear the customised interval on the sync server (Set-ADSyncScheduler -CustomizedSyncCycleInterval) back to the default."
+    refs: ["NIST-800-53:AC-2"]
+    query:
+      protocol: graph
+      version: beta
+      path: /directory/onPremisesSynchronization
+      key: id
+    each:
+      any:
+        - { field: configuration.synchronizationInterval, op: notmatch, value: '^(PT0S|PT([1-9]|[12][0-9]|30)M)$', threshold: entra.sync-interval-ok-pattern }
+        - { field: configuration.customerRequestedSynchronizationInterval, op: notmatch, value: '^(PT0S|PT([1-9]|[12][0-9]|30)M)$', threshold: entra.sync-interval-ok-pattern }
+    evidence: "sync interval {configuration.synchronizationInterval}, customer-requested {configuration.customerRequestedSynchronizationInterval}"
+
+  - id: ENTRA-SYNC-DIRECTORY-EXTENSION-SENSITIVE
+    title: Synchronised directory extension looks like personal data
+    kind: misconfigured
+    category: IAM
+    severity: medium
+    entity: extension-property
+    why: "Directory extensions that Entra Connect syncs are stored on the 'Tenant Schema Extension App' and readable by every application with directory read access. An extension named like a national identifier, salary, health or birth data puts that data in front of all of them. Tune the name pattern with the threshold."
+    fix: "Remove the attribute from the directory extension list in the Entra Connect wizard and clear it in the cloud; involve the data-protection owner."
+    refs: ["NIST-800-53:PT-2", "NIST-800-53:SC-28", "NIST-800-53:AC-3"]
+    query:
+      protocol: graph
+      path: /applications/{id}/extensionProperties
+      for_each:
+        path: /applications
+        filter: "startswith(displayName,'Tenant Schema Extension')"
+        select: [id, appId, displayName]
+        field: id
+        max: 20
+      key: "{parent.id}|{name}"
+      name: name
+    each: { field: name, op: match, value: '(ssn|social.?security|national.?id|passport|salary|wage|health|medical|birth|religio|ethnic)', threshold: entra-connect.sensitive-extension-pattern }
+    evidence: "{name} ({dataType}) on {targetObjects}, defined on {parent.displayName}"
+
+  - id: ENTRA-SYNC-NO-PREMIUM-ENTITLEMENT
+    title: No enabled subscription carries Entra ID P1
+    kind: missing
+    category: LCM
+    severity: low
+    entity: tenant
+    lens: both
+    why: "Conditional Access, sign-in activity, Connect Health for sync and several hybrid features need an Entra ID P1 service plan; a licence clean-up that removes the last SKU carrying it switches them off quietly (and many rules in this pack then report unknown). A plan counts if its SKU is enabled and the plan name starts with AAD_PREMIUM."
+    fix: "Keep at least one enabled SKU with the Entra ID P1 (or P2) plan in the licence plan before removing overlapping suites."
+    refs: ["NIST-800-53:SA-4", "NIST-800-53:PM-3"]
+    query:
+      protocol: graph
+      path: /subscribedSkus
+      select: [id, skuId, skuPartNumber, capabilityStatus, servicePlans]
+      key: skuId
+      name: skuPartNumber
+    count:
+      op: lt
+      value: 1
+      where:
+        all:
+          - { field: capabilityStatus, op: eq, value: Enabled }
+          - { field: 'servicePlans[].servicePlanName', op: match, value: '^AAD_PREMIUM' }
+    evidence: "{count} enabled SKUs carry an Entra ID P1 or P2 plan, among {rows} SKUs"
+
   - id: ENTRA-TENANT-NO-TECH-CONTACT
     title: No technical notification contact is set
     kind: missing
@@ -3562,7 +5105,7 @@ rules:
     query:
       protocol: graph
       path: /organization
-      select: [id, displayName, onPremisesSyncEnabled, onPremisesLastSyncDateTime, technicalNotificationMails, securityComplianceNotificationMails]
+      select: [id, displayName, onPremisesSyncEnabled, onPremisesLastSyncDateTime, technicalNotificationMails, securityComplianceNotificationMails, privacyProfile]
       key: id
       name: displayName
     each: { field: technicalNotificationMails, op: empty }
@@ -3580,11 +5123,79 @@ rules:
     query:
       protocol: graph
       path: /organization
-      select: [id, displayName, onPremisesSyncEnabled, onPremisesLastSyncDateTime, technicalNotificationMails, securityComplianceNotificationMails]
+      select: [id, displayName, onPremisesSyncEnabled, onPremisesLastSyncDateTime, technicalNotificationMails, securityComplianceNotificationMails, privacyProfile]
       key: id
       name: displayName
     each: { field: securityComplianceNotificationMails, op: empty }
     evidence: "securityComplianceNotificationMails is empty"
+
+  - id: ENTRA-TENANT-PRIVACY-PROFILE-UNSET
+    title: Tenant has no privacy statement or privacy contact
+    kind: missing
+    category: CFG
+    severity: low
+    entity: organization
+    lens: maintenance
+    why: "Guests and users who consent to apps are shown the organisation's privacy statement and contact; with neither set they see nothing, and the data-protection paperwork has a gap."
+    fix: "Set the privacy statement URL and a monitored privacy contact address in the tenant properties."
+    refs: ["NIST-800-53:PT-5"]
+    query:
+      protocol: graph
+      path: /organization
+      select: [id, displayName, onPremisesSyncEnabled, onPremisesLastSyncDateTime, technicalNotificationMails, securityComplianceNotificationMails, privacyProfile]
+      key: id
+      name: displayName
+    each:
+      any:
+        - { field: privacyProfile.statementUrl, op: empty }
+        - { field: privacyProfile.contactEmail, op: empty }
+    evidence: "privacy statement '{privacyProfile.statementUrl}', privacy contact '{privacyProfile.contactEmail}'"
+
+  # Activity-based timeout policies sign idle browser sessions out of the applications they name
+  # (definition: {"ActivityBasedTimeoutPolicy":{...,"ApplicationPolicies":[{"ApplicationId":"default",
+  # "WebSessionIdleTimeout":"01:00:00"}]}}, format [d.]hh:mm:ss).
+  - id: ENTRA-IDLE-SESSION-TIMEOUT-NONE
+    title: No organisation-wide idle session timeout policy
+    kind: missing
+    category: AUT
+    severity: low
+    entity: tenant
+    why: "Without an activity-based timeout policy an unattended browser session in a supported Microsoft portal stays signed in, including on a shared or home computer. A policy counts if it is the organisation default and sets a web session idle timeout."
+    fix: "Create an organisation-default activity-based timeout policy (for example one to three hours); turn on the Microsoft 365 idle session timeout for the web apps as well."
+    refs: [CIS-M365:1.3.2, "NIST-800-53:AC-11", "NIST-800-53:AC-12"]
+    query:
+      protocol: graph
+      path: /policies/activityBasedTimeoutPolicies
+      key: id
+      name: displayName
+    count:
+      op: lt
+      value: 1
+      where:
+        all:
+          - { field: isOrganizationDefault, op: eq, value: true }
+          - { field: definition, op: match, value: 'WebSessionIdleTimeout' }
+    evidence: "{count} organisation-default idle timeout policies among {rows} activity-based timeout policies"
+
+  - id: ENTRA-IDLE-SESSION-TIMEOUT-LONG
+    title: Idle session timeout lets sessions sit idle for more than three hours
+    kind: misconfigured
+    category: AUT
+    severity: low
+    entity: policy
+    why: "A timeout of half a day or a day still leaves a session open long after its user walked away. The default pattern flags anything of four hours or more (or with a day part); tune it with the threshold."
+    fix: "Set WebSessionIdleTimeout to three hours or less in the organisation-default policy."
+    refs: [CIS-M365:1.3.2, "NIST-800-53:AC-11"]
+    query:
+      protocol: graph
+      path: /policies/activityBasedTimeoutPolicies
+      key: id
+      name: displayName
+    each:
+      all:
+        - { field: isOrganizationDefault, op: eq, value: true }
+        - { field: definition, op: match, value: '"WebSessionIdleTimeout"\s*:\s*"(\d+\.|0?[4-9]:|1\d:|2[0-3]:)', threshold: entra.idle-timeout-long-pattern }
+    evidence: "{displayName}: {definition}"
 
   - id: ENTRA-ACCESS-REVIEWS-NONE
     title: No access reviews are defined
@@ -3602,6 +5213,32 @@ rules:
       name: displayName
     count: none
     evidence: "no access review definitions"
+
+  - id: ENTRA-ACCESS-REVIEW-SETTINGS-WEAK
+    title: Access review is set up so that it cannot remove access
+    kind: misconfigured
+    category: IAM
+    severity: low
+    entity: access-review
+    why: "A review that does not recur, does not apply its decisions, runs for weeks, or (for guest reviews) keeps access when nobody answers, leaves everything as it was while looking like governance. ENTRA-ACCESS-REVIEWS-NONE sees that reviews exist; this sees whether they bite. Needs Entra ID P2 or Governance."
+    fix: "Make the review recur, auto-apply decisions, keep each instance to two weeks or less, and for guest reviews deny access when the reviewer does not respond."
+    refs: [CIS-M365:5.3.2, CIS-M365:5.3.3, "NIST-800-53:AC-2(3)", "NIST-800-53:AC-6(7)"]
+    query:
+      protocol: graph
+      path: /identityGovernance/accessReviews/definitions
+      key: id
+      name: displayName
+    each:
+      all:
+        - { field: status, op: ne, value: Completed }
+        - any:
+            - { field: settings.autoApplyDecisionsEnabled, op: eq, value: false }
+            - { field: settings.recurrence.pattern.type, op: empty }
+            - { field: settings.instanceDurationInDays, op: gt, value: 14, threshold: entra.access-review-max-days }
+            - all:
+                - { field: scope, op: match, value: 'userType eq .{0,6}Guest' }
+                - { field: settings.defaultDecision, op: ne, value: Deny }
+    evidence: "{displayName} ({status}): auto-apply {settings.autoApplyDecisionsEnabled}, recurrence {settings.recurrence.pattern.type} every {settings.recurrence.pattern.interval}, duration {settings.instanceDurationInDays} days, no-response decision {settings.defaultDecision} (enabled {settings.defaultDecisionEnabled})"
 
   - id: ENTRA-RECOMMENDATION-ACTIVE
     title: Open Microsoft Entra recommendation
@@ -3752,6 +5389,71 @@ rules:
     each: { field: riskState, op: in, value: [atRisk, confirmedCompromised] }
     evidence: "{userPrincipalName}: {riskLevelDuringSignIn} risk ({riskEventTypes_v2}), {riskState}, to {appDisplayName} from {ipAddress} ({location.countryOrRegion}) at {createdDateTime}"
 
+  - id: ENTRA-RISK-DETECTION-OPEN-RECENT
+    title: Identity Protection risk detection of the last week is still open
+    kind: broken
+    category: AUT
+    severity:
+      field: riskEventType
+      map: { leakedCredentials: critical, passwordSpray: critical }
+      default: high
+    entity: risk-detection
+    why: "A risk detection names the attack technique behind a risky user - leaked credentials, password spray, anonymous IP, impossible travel, token anomaly - so the response can match it. One finding per user and detection type still at risk; leaked credentials and password spray are critical because the password is known to someone else. Premium detection types need Entra ID P2 (others show as generic)."
+    fix: "Leaked credential or spray: reset the password and revoke sessions. Anonymous IP or atypical travel: confirm with the user. Token anomaly: revoke refresh tokens. Then confirm compromised or dismiss the risk so the next detection stands out."
+    refs: ["NIST-800-53:SI-4", "NIST-800-53:IR-4", "MITRE-ATTACK:T1110.003", "MITRE-ATTACK:T1078.004"]
+    query:
+      protocol: graph
+      path: /identityProtection/riskDetections
+      filter: "detectedDateTime ge {DAYS_AGO:7}"
+      top: 500
+      maxPages: 20
+      key: "{userId}|{riskEventType}"
+      name: userPrincipalName
+    each: { field: riskState, op: eq, value: atRisk }
+    evidence: "{userPrincipalName}: {riskEventType} ({riskLevel}) detected {detectedDateTime} from {ipAddress} ({location.countryOrRegion}), {riskState}"
+
+  - id: ENTRA-SIGNIN-FOREIGN-SUCCESS-RECENT
+    title: Successful sign-in from outside the organisation's home countries
+    kind: broken
+    category: AUT
+    severity: medium
+    entity: sign-in
+    why: "For an organisation that works from known countries, a successful interactive sign-in from anywhere else is either travel to confirm or a stolen session. The home countries are tenant-specific: put a pattern of two-letter country codes in the threshold (for example ^(GB|IE)$); until then the rule checks nothing. One finding per user and country over the last two days; Graph does not filter on location, so the window is read in full (capped) and judged here."
+    fix: "Confirm each user and country; for unexplained ones reset the password, revoke sessions and check the MFA methods; add a location-based Conditional Access policy for the countries the organisation never works from."
+    refs: ["NIST-800-53:AC-2(12)", "NIST-800-53:SI-4", "MITRE-ATTACK:T1078.004"]
+    query:
+      protocol: graph
+      path: /auditLogs/signIns
+      filter: "createdDateTime ge {DAYS_AGO:2} and status/errorCode eq 0"
+      maxPages: 50
+      key: "{userId}|{location.countryOrRegion}"
+      name: userPrincipalName
+    each:
+      all:
+        - { field: location.countryOrRegion, op: notempty }
+        - { field: location.countryOrRegion, op: notmatch, value: '.*', threshold: entra.home-country-pattern }
+    evidence: "{userPrincipalName}: signed in to {appDisplayName} from {location.city}, {location.countryOrRegion} ({ipAddress}) at {createdDateTime}, Conditional Access {conditionalAccessStatus}"
+
+  - id: ENTRA-SIGNIN-BLOCKED-DEVICE-COMPLIANCE-RECENT
+    title: Sign-ins blocked because the device was not compliant or not managed
+    kind: broken
+    category: AUT
+    severity: low
+    entity: sign-in
+    lens: both
+    why: "After a compliance or device-based policy goes live, these are the users who are cut off and the devices whose compliance data is wrong (errors 53000 not compliant, 53001 not domain-joined, 530003 not managed). One finding per user and device over the last week."
+    fix: "Fix the device's enrolment or compliance state (or the policy's scope); if a whole group is blocked, move it back a rollout ring until its devices are ready."
+    refs: ["NIST-800-53:AC-19", "NIST-800-53:AU-6", CIS-M365:5.2.2.9]
+    query:
+      protocol: graph
+      path: /auditLogs/signIns
+      filter: "createdDateTime ge {DAYS_AGO:7} and conditionalAccessStatus eq 'failure'"
+      maxPages: 20
+      key: "{userId}|{deviceDetail.deviceId}"
+      name: userPrincipalName
+    each: { field: status.errorCode, op: in, value: [53000, 53001, 530003] }
+    evidence: "{userPrincipalName}: error {status.errorCode} on {deviceDetail.displayName} ({deviceDetail.operatingSystem}, managed {deviceDetail.isManaged}, compliant {deviceDetail.isCompliant}) to {appDisplayName} at {createdDateTime}"
+
   # Role grants: activityDisplayName covers direct assignments, scoped assignments and PIM assignments
   # (eligible and active); PIM requests and routine activations are left out by the pattern. The tier-0
   # test matches the role template ids anywhere in the JSON text of targetResources (the role's id for
@@ -3799,6 +5501,69 @@ rules:
         - { field: activityDisplayName, op: match, value: '^Add (eligible |scoped )?member to role(?!.*(request|activat))', threshold: entra.audit-role-activity-pattern }
         - { field: targetResources, op: match, value: '(62e90394-69f5-4237-9190-012177145e10|e8611ab8-c189-46e8-94e1-60213ab1f814|7be44c8a-adaf-4e2a-84d6-ab2649e08a13|194ae4cb-b126-40b2-bd5b-6091b380977d|8ac3fc64-6eca-42ea-9e69-59f4c7b60eb2|b1be1c3e-b65d-4f19-8427-f6fa0d97feb9|9b895d92-2cd3-44c7-9d02-a6ac2d5ea5c3|158c047a-c907-4556-b7ef-446551a6b5f7|be2f45a1-457d-42af-a067-6ec1fa63bc45|8329153b-31d0-4727-b945-745eb3bc5f31|3a2c62db-5318-420d-8d74-23affee5d9d5)', threshold: entra.tier0-role-id-pattern }
     evidence: "{activityDateTime}: {activityDisplayName} by {initiatedBy.user.userPrincipalName}{initiatedBy.app.displayName} - {targetResources[].displayName} {targetResources[].userPrincipalName}"
+
+  # Tenant-level directory changes of the last week (category DirectoryManagement). The two rules share
+  # one query; activity names are the ones of the Entra audit activity reference.
+  - id: M365-AUDIT-TENANT-CHANGE-RECENT
+    title: Tenant-level domain, federation, partner or company setting changed this week
+    kind: misconfigured
+    category: IAM
+    severity:
+      field: activityDisplayName
+      map: { 'Set domain authentication': high, 'Set federation settings on domain': high }
+      default: medium
+    entity: audit-event
+    why: "Adding or verifying a domain, switching a domain to federation, changing federation settings, adding or removing a partner, or changing the company information and password policy are rare, tenant-wide changes - and the first steps of several tenant takeover techniques (a rogue federated domain mints sign-ins for any user). Federation and domain-authentication changes are high. The audit log keeps 30 days."
+    fix: "Match each event to a change record; revert the ones nobody asked for, and treat a federation or domain-authentication change without a ticket as an incident."
+    refs: ["MITRE-ATTACK:T1484.002", "NIST-800-53:AU-6", "NIST-800-53:CM-3", "CIS-Controls-v8:8.11"]
+    query:
+      protocol: graph
+      path: /auditLogs/directoryAudits
+      filter: "activityDateTime ge {DAYS_AGO:7} and category eq 'DirectoryManagement' and result eq 'success'"
+      maxPages: 20
+      key: id
+      name: activityDisplayName
+    each: { field: activityDisplayName, op: match, value: '^(Set domain authentication|Set federation settings on domain|Verify (email verified )?domain|Add (un)?verified domain|Update domain|Add partner to company|Remove partner from company|Set Company Information|Set password policy)$', threshold: entra.audit-tenant-activity-pattern }
+    evidence: "{activityDateTime}: {activityDisplayName} by {initiatedBy.user.userPrincipalName}{initiatedBy.app.displayName} - {targetResources[].displayName}"
+
+  - id: ENTRA-SYNC-AUDIT-SETTINGS-CHANGED-RECENT
+    title: Directory synchronisation settings changed this week
+    kind: misconfigured
+    category: CFG
+    severity: medium
+    entity: audit-event
+    lens: both
+    why: "Turning directory synchronisation on or off, changing its features (soft and hard match, writeback, password policies) or the accidental-deletion threshold changes how on-premises AD can rewrite the cloud directory; the audit log is the only place these land, and it keeps 30 days."
+    fix: "Match each event to a change record; revert unexplained changes and review the actor's other activity."
+    refs: ["NIST-800-53:AU-6", "NIST-800-53:CM-3", "MITRE-ATTACK:T1484"]
+    query:
+      protocol: graph
+      path: /auditLogs/directoryAudits
+      filter: "activityDateTime ge {DAYS_AGO:7} and category eq 'DirectoryManagement' and result eq 'success'"
+      maxPages: 20
+      key: id
+      name: activityDisplayName
+    each: { field: activityDisplayName, op: match, value: '^(Set DirSync feature|Set DirSyncEnabled flag|Set directory feature on tenant|Set accidental deletion threshold)$', threshold: entra.audit-sync-activity-pattern }
+    evidence: "{activityDateTime}: {activityDisplayName} by {initiatedBy.user.userPrincipalName}{initiatedBy.app.displayName} - {targetResources[].modifiedProperties[].displayName}"
+
+  - id: M365-GROUP-GUEST-ADDED-RECENT
+    title: External account added to a group this week
+    kind: misconfigured
+    category: IAM
+    severity: low
+    entity: audit-event
+    why: "A guest added to a group gets whatever the group grants - for a team, every standard channel and file. The weekly list is what group owners should confirm while the reason is still remembered."
+    fix: "The group owner confirms or removes the guest; put groups that take guests under a recurring access review."
+    refs: ["NIST-800-53:AC-2(13)", "NIST-800-53:AU-6", "CIS-Controls-v8:6.2"]
+    query:
+      protocol: graph
+      path: /auditLogs/directoryAudits
+      filter: "activityDateTime ge {DAYS_AGO:7} and activityDisplayName eq 'Add member to group' and result eq 'success'"
+      maxPages: 20
+      key: id
+      name: activityDisplayName
+    each: { field: 'targetResources[].userPrincipalName', op: contains, value: '#EXT#' }
+    evidence: "{activityDateTime}: {initiatedBy.user.userPrincipalName}{initiatedBy.app.displayName} added {targetResources[].userPrincipalName} to {targetResources[].displayName}"
 
   # ================================================= SaaS provisioning (SCIM) jobs and logs ===
   # The job rules share one per-object query: every enterprise app (service principals tagged

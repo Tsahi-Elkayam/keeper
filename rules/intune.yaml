@@ -347,6 +347,152 @@ rules:
         - { field: lastSyncDateTime, op: age-lt, value: 30, threshold: intune.device-stale-days }
     evidence: "{deviceName} ({operatingSystem} {osVersion}, {userPrincipalName}, serial {serialNumber}): not supervised"
 
+  # Managed devices read from the beta API: managementState and the Android Enterprise enrolment types
+  # exist only there. A separate fetch from the v1.0 device query above (whose select stays unchanged).
+  - id: INTUNE-DEVICE-ACTION-PENDING-STALE
+    title: Retire, wipe or delete of a device was issued long ago and never completed
+    kind: broken
+    category: HYG
+    severity: low
+    entity: managed-device
+    lens: both
+    why: "A device whose retire, wipe or delete is still pending after weeks usually never checks in again: it keeps company data on it, holds a licence and stays in every report as managed."
+    fix: "Confirm the device is gone or wiped by other means, then delete the record; if it is still in use, find out why it does not check in."
+    refs: ["NIST-800-53:MP-6", "NIST-800-53:CM-8"]
+    query:
+      protocol: graph
+      version: beta
+      path: /deviceManagement/managedDevices
+      select: [id, deviceName, operatingSystem, osVersion, managementState, deviceEnrollmentType, managedDeviceOwnerType, lastSyncDateTime, userPrincipalName, serialNumber, freeStorageSpaceInBytes, totalStorageSpaceInBytes]
+      key: id
+      name: deviceName
+    each:
+      all:
+        - { field: managementState, op: in, value: [retirePending, retireIssued, retireFailed, wipePending, wipeIssued, wipeFailed, deletePending] }
+        - { field: lastSyncDateTime, op: age-gt, value: 14, threshold: intune.pending-action-max-days }
+    evidence: "{deviceName} ({operatingSystem}, {userPrincipalName}, serial {serialNumber}): {managementState}, last sync {lastSyncDateTime}"
+
+  - id: INTUNE-DEVICE-STORAGE-LOW
+    title: Active Windows device has little free disk space
+    kind: broken
+    category: HLT
+    severity: low
+    entity: managed-device
+    lens: maintenance
+    why: "Feature and quality updates, app installs and the BitLocker recovery environment fail on a disk with only a few gigabytes free, and the failures show up as unrelated errors. The limit is absolute (10 GB by default; a percentage would need the disk size ratio)."
+    fix: "Apply a Storage Sense policy or a clean-up remediation; replace small disks before the next feature update."
+    refs: ["NIST-800-53:CP-2", "NIST-800-53:SI-2"]
+    query:
+      protocol: graph
+      version: beta
+      path: /deviceManagement/managedDevices
+      select: [id, deviceName, operatingSystem, osVersion, managementState, deviceEnrollmentType, managedDeviceOwnerType, lastSyncDateTime, userPrincipalName, serialNumber, freeStorageSpaceInBytes, totalStorageSpaceInBytes]
+      key: id
+      name: deviceName
+    each:
+      all:
+        - { field: operatingSystem, op: eq, value: Windows }
+        - { field: lastSyncDateTime, op: age-lt, value: 30, threshold: intune.device-stale-days }
+        - { field: totalStorageSpaceInBytes, op: gt, value: 0 }
+        - { field: freeStorageSpaceInBytes, op: lt, value: 10737418240, threshold: intune.free-storage-min-bytes }
+    evidence: "{deviceName} ({userPrincipalName}): {freeStorageSpaceInBytes} bytes free of {totalStorageSpaceInBytes}"
+
+  - id: INTUNE-DEVICE-OWNERSHIP-MISMATCH
+    title: Device enrolled through a corporate-only path is marked personal
+    kind: misconfigured
+    category: CFG
+    severity: low
+    entity: managed-device
+    why: "Ownership decides which remote actions are allowed, what inventory is collected and which compliance and enrolment rules apply. A device enrolled through Apple automated enrolment, Windows bulk or Autopilot self-deploying enrolment, co-management or an Android Enterprise corporate mode is corporate by construction; marked personal, it gets the personal treatment."
+    fix: "Correct the ownership in the device record and check why the enrolment path did not set it."
+    refs: ["NIST-800-53:CM-8", "NIST-800-53:AC-19"]
+    query:
+      protocol: graph
+      version: beta
+      path: /deviceManagement/managedDevices
+      select: [id, deviceName, operatingSystem, osVersion, managementState, deviceEnrollmentType, managedDeviceOwnerType, lastSyncDateTime, userPrincipalName, serialNumber, freeStorageSpaceInBytes, totalStorageSpaceInBytes]
+      key: id
+      name: deviceName
+    each:
+      all:
+        - { field: managedDeviceOwnerType, op: eq, value: personal }
+        - field: deviceEnrollmentType
+          op: in
+          threshold: intune.corporate-enrollment-types
+          value: [appleBulkWithUser, appleBulkWithoutUser, windowsBulkAzureDomainJoin, windowsBulkUserless, windowsAzureADJoinUsingDeviceAuth, windowsCoManagement, androidEnterpriseFullyManaged, androidEnterpriseDedicatedDevice, androidEnterpriseCorporateWorkProfile]
+    evidence: "{deviceName} ({operatingSystem}, {userPrincipalName}): enrolled as {deviceEnrollmentType}, owner {managedDeviceOwnerType}"
+
+  - id: INTUNE-DEVICE-ENCRYPTION-NOT-READY
+    title: Device cannot encrypt, or its encryption policy is in error
+    kind: broken
+    category: CFG
+    severity: medium
+    entity: managed-device
+    lens: security
+    why: "The policy can report as deployed while the disk stays clear: the device is not ready for encryption (no usable TPM, recovery environment off, firmware mode), the encryption setting is in error or conflict, or the device is ready but still not encrypted. Only exposed in the beta API."
+    fix: "Fix the readiness blocker (enable the TPM and WinRE, switch to UEFI), resolve the conflicting policy, then let the encryption policy apply and escrow the key."
+    refs: ["NIST-800-53:SC-28", "NIST-800-53:MP-5", "CIS-Controls-v8:3.6"]
+    query:
+      protocol: graph
+      version: beta
+      path: /deviceManagement/managedDeviceEncryptionStates
+      select: [id, deviceName, deviceType, osVersion, userPrincipalName, encryptionState, encryptionReadinessState, encryptionPolicySettingState, tpmSpecificationVersion]
+      key: id
+      name: deviceName
+    each:
+      any:
+        - { field: encryptionReadinessState, op: eq, value: notReady }
+        - { field: encryptionPolicySettingState, op: in, value: [error, conflict] }
+        - all:
+            - { field: encryptionState, op: eq, value: notEncrypted }
+            - { field: encryptionReadinessState, op: eq, value: ready }
+    evidence: "{deviceName} ({deviceType} {osVersion}, {userPrincipalName}): {encryptionState}, readiness {encryptionReadinessState}, policy state {encryptionPolicySettingState}, TPM {tpmSpecificationVersion}"
+
+  - id: INTUNE-ANALYTICS-STARTUP-SCORE-LOW
+    title: Device starts slowly or crashes (Endpoint analytics)
+    kind: broken
+    category: HLT
+    severity: low
+    entity: managed-device
+    lens: maintenance
+    why: "Endpoint analytics measures boot and sign-in times and blue screens per device: the slow-PC complaint, measured without touching the PC. A startup score below the threshold, a core boot over a minute, or a blue screen in the last 30 days is a device to look at. A tenant without Endpoint analytics returns no rows. Only exposed in the beta API."
+    fix: "Look at the model and disk type first (replace hard disks), trim startup apps, and update or remove the driver behind the blue screens."
+    refs: ["NIST-800-53:SI-4", "NIST-800-53:CP-2"]
+    query:
+      protocol: graph
+      version: beta
+      path: /deviceManagement/userExperienceAnalyticsDevicePerformance
+      select: [id, deviceName, model, manufacturer, diskType, coreBootTimeInMs, coreLoginTimeInMs, startupPerformanceScore, restartCount, blueScreenCount]
+      key: id
+      name: deviceName
+    each:
+      any:
+        - { field: startupPerformanceScore, op: lt, value: 50, threshold: intune.startup-score-min }
+        - { field: coreBootTimeInMs, op: gt, value: 60000, threshold: intune.core-boot-max-ms }
+        - { field: blueScreenCount, op: gt, value: 0, threshold: intune.blue-screens-max }
+    evidence: "{deviceName} ({manufacturer} {model}, disk {diskType}): startup score {startupPerformanceScore}, core boot {coreBootTimeInMs} ms, sign-in {coreLoginTimeInMs} ms, {blueScreenCount} blue screens and {restartCount} restarts in 30 days"
+
+  # Windows LAPS backups in Entra: the list never returns the passwords (they need another permission
+  # and a per-device read, which no rule makes).
+  - id: INTUNE-LAPS-BACKUP-STALE
+    title: Windows LAPS password backup is older than the rotation window
+    kind: broken
+    category: IAM
+    severity: medium
+    entity: device
+    lens: security
+    why: "A LAPS backup older than the rotation period plus a grace means the device stopped rotating (policy gone, device off the network, LAPS broken): its local administrator password has been valid for too long, and the stored copy may no longer be the real one. Tune the age with the threshold (default 30 days of rotation plus 7)."
+    fix: "Check the LAPS policy scope (INTUNE-ESEC-LAPS-NONE) and Entra LAPS (ENTRA-DEVREG-LAPS-OFF); force a rotation on the stale devices or retire the ones that are gone."
+    refs: ["NIST-800-53:IA-5(1)", "NIST-800-53:CP-9", "MITRE-ATTACK:T1078.003"]
+    query:
+      protocol: graph
+      path: /directory/deviceLocalCredentials
+      select: [id, deviceName, lastBackupDateTime, refreshDateTime]
+      key: id
+      name: deviceName
+    each: { field: lastBackupDateTime, op: age-gt, value: 37, threshold: intune.laps-backup-max-age-days }
+    evidence: "{deviceName}: last LAPS backup {lastBackupDateTime}, next rotation {refreshDateTime}"
+
   # =================================================================== compliance policies ===
   - id: INTUNE-COMPLIANCE-NONE
     title: No device compliance policy exists
@@ -724,6 +870,98 @@ rules:
     each: { field: osMinimumVersion, op: empty }
     evidence: "{displayName}: no minimum OS version"
 
+  - id: INTUNE-COMPLIANCE-ANDROID-NO-PLAY-INTEGRITY
+    title: Android compliance policy does not require the Play Integrity verdicts
+    kind: misconfigured
+    category: CFG
+    severity: medium
+    entity: compliance-policy
+    lens: security
+    why: "Play Integrity's basic-integrity and certified-device verdicts are what tell a tampered, rooted or emulated Android device from a genuine one; a policy that requires neither lets such a device stay compliant. Read from the beta API so that every Android policy type is included."
+    fix: "Require both basic integrity and a certified device in every Android compliance policy, and add a security patch level floor."
+    refs: ["NIST-800-53:SI-7", "NIST-800-53:AC-19", "CIS-Controls-v8:4.1"]
+    query:
+      protocol: graph
+      version: beta
+      path: /deviceManagement/deviceCompliancePolicies
+      key: id
+      name: displayName
+    each:
+      all:
+        - { field: securityRequireSafetyNetAttestationBasicIntegrity, op: exists }
+        - any:
+            - { field: securityRequireSafetyNetAttestationBasicIntegrity, op: eq, value: false }
+            - { field: securityRequireSafetyNetAttestationCertifiedDevice, op: eq, value: false }
+    evidence: "{displayName}: basic integrity {securityRequireSafetyNetAttestationBasicIntegrity}, certified device {securityRequireSafetyNetAttestationCertifiedDevice}"
+
+  # Actions for noncompliance: every compliance policy has exactly one 'block' (mark noncompliant)
+  # scheduled action; its grace period is the delay before a failing device counts as noncompliant.
+  # The block element is found by matching the JSON text of each action element.
+  - id: INTUNE-COMPLIANCE-NO-BLOCK-ACTION
+    title: Compliance policy marks failing devices noncompliant only after a long grace period
+    kind: misconfigured
+    category: CFG
+    severity: medium
+    entity: compliance-policy
+    lens: security
+    why: "Until the grace period of the 'mark device noncompliant' action ends, a device that fails the policy stays compliant and passes every compliance-based Conditional Access policy. A grace of days turns noncompliance into a report line. The default pattern flags more than 72 hours; tune it with the threshold. Unassigned policies are left out."
+    fix: "Set the 'mark device noncompliant' action to a grace of one to three days and add an end-user notification before it."
+    refs: [CIS-M365:4.1, "NIST-800-53:CM-6", "NIST-800-53:AC-19"]
+    query:
+      protocol: graph
+      path: /deviceManagement/deviceCompliancePolicies/{id}/scheduledActionsForRule
+      expand: scheduledActionConfigurations
+      for_each:
+        path: /deviceManagement/deviceCompliancePolicies
+        select: [id, displayName]
+        expand: assignments
+        field: id
+        max: 500
+      key: "{parent.id}|{id}"
+      name: parent.displayName
+    each:
+      all:
+        - { field: parent.assignments, op: notempty }
+        - { field: scheduledActionConfigurations, op: match, value: '(?=.*"actionType":"block")(?=.*"gracePeriodHours":(7[3-9]|[89]\d|\d{3,})[,}])', threshold: intune.noncompliance-grace-long-pattern }
+    evidence: "{parent.displayName}: actions {scheduledActionConfigurations[].actionType} after {scheduledActionConfigurations[].gracePeriodHours} hours"
+
+  - id: INTUNE-ASSIGNMENT-ALL-NO-FILTER-COMPLIANCE
+    title: Compliance policy assigned to all users or all devices without a filter
+    kind: misconfigured
+    category: CFG
+    severity: low
+    entity: compliance-policy
+    why: "An all-users or all-devices assignment without an assignment filter lands on every enrolled device of the platform, including servers, shared and kiosk devices enrolled by mistake; a filter makes the intended scope explicit. The target kind is only in the assignment's @odata.type, so the rule matches the JSON text of each assignment."
+    fix: "Add a platform or ownership assignment filter, or assign to a group."
+    refs: ["NIST-800-53:CM-6"]
+    query:
+      protocol: graph
+      path: /deviceManagement/deviceCompliancePolicies
+      expand: assignments
+      key: id
+      name: displayName
+    each: { field: assignments, op: match, value: '(?=.*#microsoft\.graph\.all(Devices|LicensedUsers)AssignmentTarget)(?!.*"deviceAndAppManagementAssignmentFilterId":"[0-9a-f-]{36}")' }
+    evidence: "{displayName}: assigned to all without a filter"
+
+  - id: INTUNE-POLICY-NAME-NONCONFORMING-COMPLIANCE
+    title: Compliance policy name does not follow the naming convention
+    kind: misconfigured
+    category: HYG
+    severity: info
+    entity: compliance-policy
+    lens: maintenance
+    why: "A naming convention (platform, purpose, ring) is how admins tell policies apart in assignment lists and reports. The convention is tenant-specific: set the pattern in the threshold; until then the rule checks nothing."
+    fix: "Rename the policy to the convention."
+    refs: ["NIST-800-53:CM-8"]
+    query:
+      protocol: graph
+      path: /deviceManagement/deviceCompliancePolicies
+      expand: assignments
+      key: id
+      name: displayName
+    each: { field: displayName, op: notmatch, value: '.*', threshold: intune.policy-name-pattern }
+    evidence: "{displayName}"
+
   - id: INTUNE-COMPLIANCE-UNKNOWN-DEVICES
     title: Devices have never been evaluated for compliance
     kind: broken
@@ -812,6 +1050,93 @@ rules:
         - { field: deviceStatusOverview.errorCount, op: gt, value: 0, threshold: intune.profile-error-devices-max }
         - { field: deviceStatusOverview.failedCount, op: gt, value: 0, threshold: intune.profile-error-devices-max }
     evidence: "{displayName}: {deviceStatusOverview.errorCount} in error, {deviceStatusOverview.failedCount} failed, {deviceStatusOverview.successCount} succeeded"
+
+  # Profiles of a given type are told by a field only that type carries (the @odata.type is not
+  # addressable): Delivery Optimization deliveryOptimizationMode, shared PC allowedAccounts.
+  - id: INTUNE-DELIVERY-OPTIMIZATION-NONE
+    title: No assigned Delivery Optimization profile
+    kind: missing
+    category: CFG
+    severity: low
+    entity: tenant
+    lens: maintenance
+    why: "Without a Delivery Optimization profile every PC downloads update and app content on its own, across the WAN, instead of sharing it with peers on the same site. Settings-catalog equivalents are not seen here; a tenant that uses them accepts the finding."
+    fix: "Create and assign a Delivery Optimization profile with peering by site or subnet and a business-hours bandwidth cap."
+    refs: ["NIST-800-53:SC-5", "NIST-800-53:CP-2"]
+    query:
+      protocol: graph
+      path: /deviceManagement/deviceConfigurations
+      expand: assignments
+      key: id
+      name: displayName
+    count:
+      op: lt
+      value: 1
+      where:
+        all:
+          - { field: deliveryOptimizationMode, op: exists }
+          - { field: assignments, op: notempty }
+    evidence: "{count} assigned Delivery Optimization profiles among {rows} configuration profiles"
+
+  - id: INTUNE-SHAREDPC-GUEST-ALLOWED
+    title: Assigned shared PC profile allows guest accounts
+    kind: misconfigured
+    category: IAM
+    severity: low
+    entity: configuration-profile
+    lens: security
+    why: "Guest accounts on a shared PC give anyone at the keyboard an unauthenticated session on a device that holds cached data and network access."
+    fix: "Allow domain accounts only in the shared PC profile; keep guest or kiosk sign-in to dedicated, isolated kiosk devices."
+    refs: ["NIST-800-53:AC-14", "NIST-800-53:AC-2"]
+    query:
+      protocol: graph
+      path: /deviceManagement/deviceConfigurations
+      expand: assignments
+      key: id
+      name: displayName
+    each:
+      all:
+        - { field: allowedAccounts, op: exists }
+        - { field: assignments, op: notempty }
+        - { field: allowedAccounts, op: contains, value: guest }
+    evidence: "{displayName}: allowed accounts {allowedAccounts}"
+
+  - id: INTUNE-ASSIGNMENT-ALL-NO-FILTER
+    title: Configuration profile assigned to all users or all devices without a filter
+    kind: misconfigured
+    category: CFG
+    severity: low
+    entity: configuration-profile
+    why: "An all-users or all-devices assignment without an assignment filter lands on every enrolled device of the platform, including servers, shared and kiosk devices enrolled by mistake; a filter makes the intended scope explicit. The target kind is only in the assignment's @odata.type, so the rule matches the JSON text of each assignment."
+    fix: "Add a platform or ownership assignment filter, or assign to a group."
+    refs: ["NIST-800-53:CM-6"]
+    query:
+      protocol: graph
+      path: /deviceManagement/deviceConfigurations
+      expand: assignments
+      key: id
+      name: displayName
+    each: { field: assignments, op: match, value: '(?=.*#microsoft\.graph\.all(Devices|LicensedUsers)AssignmentTarget)(?!.*"deviceAndAppManagementAssignmentFilterId":"[0-9a-f-]{36}")' }
+    evidence: "{displayName}: assigned to all without a filter"
+
+  - id: INTUNE-POLICY-NAME-NONCONFORMING
+    title: Configuration profile name does not follow the naming convention
+    kind: misconfigured
+    category: HYG
+    severity: info
+    entity: configuration-profile
+    lens: maintenance
+    why: "A naming convention (platform, purpose, ring) is how admins tell profiles apart in assignment lists and reports. The convention is tenant-specific: set the pattern in the threshold; until then the rule checks nothing."
+    fix: "Rename the profile to the convention."
+    refs: ["NIST-800-53:CM-8"]
+    query:
+      protocol: graph
+      path: /deviceManagement/deviceConfigurations
+      expand: assignments
+      key: id
+      name: displayName
+    each: { field: displayName, op: notmatch, value: '.*', threshold: intune.policy-name-pattern }
+    evidence: "{displayName}"
 
   # ===================================================================== Windows updates ===
   # Update rings are deviceConfigurations of type windowsUpdateForBusinessConfiguration, told by
@@ -1166,11 +1491,12 @@ rules:
     severity: low
     entity: enrollment-configuration
     lens: security
-    why: "With 'allow use on install failure', a PC whose security apps failed to install during setup is handed to the user anyway and stays without them until someone notices."
+    why: "With 'allow use on install failure', a PC whose security apps failed to install during setup is handed to the user anyway and stays without them until someone notices. The enrolment status page settings are only exposed in the beta API."
     fix: "Block device use until the required apps install, collect logs on failure and make the security apps the blocking apps."
     refs: ["NIST-800-53:CM-2", "NIST-800-53:CM-6"]
     query:
       protocol: graph
+      version: beta
       path: /deviceManagement/deviceEnrollmentConfigurations
       key: id
       name: displayName
@@ -1179,6 +1505,97 @@ rules:
         - { field: showInstallationProgress, op: eq, value: true }
         - { field: allowDeviceUseOnInstallFailure, op: eq, value: true }
     evidence: "{displayName} (priority {priority}): device usable after install failure"
+
+  - id: INTUNE-ENROLL-ESP-NONE
+    title: No enrolment status page holds new Windows devices until setup completes
+    kind: missing
+    category: CFG
+    severity: low
+    entity: tenant
+    lens: security
+    why: "Without an enrolment status page that shows installation progress, a new or reset PC reaches the desktop before its security apps and policies are in place. A configuration counts if it shows installation progress (the default configuration counts too). Tenants that image through another tool accept the finding. Only exposed in the beta API."
+    fix: "Turn on the enrolment status page with the security apps as blocking apps and a timeout of about an hour."
+    refs: ["NIST-800-53:CM-2", "NIST-800-53:CM-6"]
+    query:
+      protocol: graph
+      version: beta
+      path: /deviceManagement/deviceEnrollmentConfigurations
+      key: id
+      name: displayName
+    count:
+      op: lt
+      value: 1
+      where:
+        all:
+          - { field: blockDeviceSetupRetryByUser, op: exists }
+          - { field: showInstallationProgress, op: eq, value: true }
+    evidence: "{count} enrolment status pages show installation progress, among {rows} enrolment configurations"
+
+  - id: INTUNE-ENROLL-DEVICE-LIMIT-HIGH
+    title: Users may enrol many devices
+    kind: misconfigured
+    category: CFG
+    severity: low
+    entity: enrollment-configuration
+    lens: security
+    why: "A high device limit hides device sprawl and lets one stolen account enrol several attacker devices that then look managed. The Entra registration quota is ENTRA-DEVREG-QUOTA-HIGH."
+    fix: "Lower the default enrolment limit (5 or fewer) and give device enrolment managers a separate, named configuration."
+    refs: ["NIST-800-53:AC-19", "NIST-800-53:CM-8"]
+    query:
+      protocol: graph
+      path: /deviceManagement/deviceEnrollmentConfigurations
+      key: id
+      name: displayName
+    each:
+      all:
+        - { field: limit, op: exists }
+        - { field: limit, op: gt, value: 5, threshold: intune.enroll-device-limit-max }
+    evidence: "{displayName} (priority {priority}): up to {limit} devices per user"
+
+  - id: INTUNE-CORPORATE-IDENTIFIERS-NONE
+    title: No corporate device identifiers are uploaded
+    kind: missing
+    category: CFG
+    severity: low
+    entity: tenant
+    lens: security
+    why: "When personal enrolment is blocked, corporate device identifiers (serial numbers, IMEI) are what let the organisation's own devices through by any enrolment path; without any, the block relies on the enrolment path alone. Tenants that enrol only through hybrid join or Autopilot accept the finding. Only exposed in the beta API."
+    fix: "Upload the serial numbers of corporate devices as corporate identifiers, or record the decision to rely on Autopilot and hybrid join."
+    refs: ["NIST-800-53:CM-8", "NIST-800-53:AC-19"]
+    query:
+      protocol: graph
+      version: beta
+      path: /deviceManagement/importedDeviceIdentities
+      select: [id, importedDeviceIdentityType, platform, enrollmentState, lastContactedDateTime]
+      key: id
+    count: none
+    evidence: "no corporate device identifiers uploaded"
+
+  - id: INTUNE-ENROLL-FAILURES-RECENT
+    title: Device enrolment failures in the last week
+    kind: broken
+    category: HLT
+    severity:
+      field: failureCategory
+      map: { userAbandonment: low, clientDisconnected: low }
+      default: medium
+    entity: enrollment-failure
+    lens: maintenance
+    why: "Enrolment failures from licences, enrolment restrictions, authentication or unsupported devices block every new or replaced device of the people they hit; a burst of one category is one cause. One finding per failure category and platform; abandoned and disconnected attempts are low. Only exposed in the beta API."
+    fix: "Fix the restriction, licence, token or MDM authority behind the top category, then have the users enrol again."
+    refs: ["NIST-800-53:CM-8", "NIST-800-53:AC-19"]
+    query:
+      protocol: graph
+      version: beta
+      path: /deviceManagement/troubleshootingEvents
+      maxPages: 50
+      key: "{failureCategory}|{operatingSystem}"
+      name: failureCategory
+    each:
+      all:
+        - { field: failureCategory, op: exists }
+        - { field: eventDateTime, op: age-lt, value: 7, threshold: intune.enroll-failure-window-days }
+    evidence: "{failureCategory} on {operatingSystem} {osVersion} ({enrollmentType}) at {eventDateTime}: {failureReason}"
 
   # ========================================================= Apple and Android connections ===
   - id: INTUNE-APNS-MISSING
@@ -1215,7 +1632,7 @@ rules:
     query:
       protocol: graph
       path: /deviceManagement/applePushNotificationCertificate
-      select: [id, topicIdentifier, expirationDateTime, lastModifiedDateTime]
+      select: [id, topicIdentifier, expirationDateTime, lastModifiedDateTime, appleIdentifier]
       key: id
     each: { field: expirationDateTime, op: until-lt, value: 30, threshold: intune.apple-token-notice-days }
     evidence: "Apple push certificate ends {expirationDateTime}"
@@ -1236,7 +1653,7 @@ rules:
     query:
       protocol: graph
       path: /deviceAppManagement/vppTokens
-      select: [id, organizationName, vppTokenAccountType, expirationDateTime, lastSyncDateTime, state, lastSyncStatus]
+      select: [id, organizationName, vppTokenAccountType, expirationDateTime, lastSyncDateTime, state, lastSyncStatus, appleId]
       key: id
       name: organizationName
     each: { field: expirationDateTime, op: until-lt, value: 30, threshold: intune.apple-token-notice-days }
@@ -1254,7 +1671,7 @@ rules:
     query:
       protocol: graph
       path: /deviceAppManagement/vppTokens
-      select: [id, organizationName, vppTokenAccountType, expirationDateTime, lastSyncDateTime, state, lastSyncStatus]
+      select: [id, organizationName, vppTokenAccountType, expirationDateTime, lastSyncDateTime, state, lastSyncStatus, appleId]
       key: id
       name: organizationName
     each:
@@ -1280,7 +1697,7 @@ rules:
       protocol: graph
       version: beta
       path: /deviceManagement/depOnboardingSettings
-      select: [id, tokenName, tokenExpirationDateTime, lastSuccessfulSyncDateTime, lastSyncErrorCode]
+      select: [id, tokenName, tokenExpirationDateTime, lastSuccessfulSyncDateTime, lastSyncErrorCode, appleIdentifier]
       key: id
       name: tokenName
     each: { field: tokenExpirationDateTime, op: until-lt, value: 30, threshold: intune.apple-token-notice-days }
@@ -1299,11 +1716,76 @@ rules:
       protocol: graph
       version: beta
       path: /deviceManagement/depOnboardingSettings
-      select: [id, tokenName, tokenExpirationDateTime, lastSuccessfulSyncDateTime, lastSyncErrorCode]
+      select: [id, tokenName, tokenExpirationDateTime, lastSuccessfulSyncDateTime, lastSyncErrorCode, appleIdentifier]
       key: id
       name: tokenName
     each: { field: lastSuccessfulSyncDateTime, op: age-gt, value: 7, threshold: intune.dep-sync-max-age-days }
     evidence: "{tokenName}: last successful sync {lastSuccessfulSyncDateTime}, last error {lastSyncErrorCode}"
+
+  # The Apple ID behind each Apple connection. Renewal needs that same Apple ID; a personal or consumer
+  # address leaves with its owner. The role-mailbox pattern, when set, flags every other address too.
+  - id: INTUNE-APPLE-TOKEN-PERSONAL-ACCOUNT
+    title: Apple MDM push certificate belongs to a personal or consumer Apple ID
+    kind: misconfigured
+    category: IAM
+    severity: medium
+    entity: apple-push-certificate
+    why: "The push certificate can only be renewed with the Apple ID that created it; renewed with another one, every Apple device must re-enrol. On a consumer or personal address the renewal warning reaches someone who may leave, and the organisation does not control the account."
+    fix: "Move to a role Apple ID owned by a shared, monitored mailbox with documented recovery at the next renewal (which still needs the current Apple ID once)."
+    refs: ["NIST-800-53:AC-2", "NIST-800-53:CP-2", "NIST-800-53:IR-6"]
+    query:
+      protocol: graph
+      path: /deviceManagement/applePushNotificationCertificate
+      select: [id, topicIdentifier, expirationDateTime, lastModifiedDateTime, appleIdentifier]
+      key: id
+    each:
+      any:
+        - { field: appleIdentifier, op: match, value: '@(gmail|googlemail|outlook|hotmail|live|msn|yahoo|icloud|me|mac)\.', threshold: intune.consumer-mail-pattern }
+        - { field: appleIdentifier, op: notmatch, value: '.*', threshold: intune.role-mailbox-pattern }
+    evidence: "Apple push certificate created with {appleIdentifier}, ends {expirationDateTime}"
+
+  - id: INTUNE-APPLE-TOKEN-PERSONAL-ACCOUNT-DEP
+    title: Apple automated enrolment token belongs to a personal or consumer Apple ID
+    kind: misconfigured
+    category: IAM
+    severity: medium
+    entity: apple-token
+    why: "The automated device enrolment token is renewed through the Apple Business or School Manager account that holds it; on a personal or consumer address, renewal and recovery depend on one person. Only exposed in the beta API."
+    fix: "Hold the Apple Business Manager account on a role Apple ID with a shared, monitored mailbox; renew the token from it."
+    refs: ["NIST-800-53:AC-2", "NIST-800-53:CP-2"]
+    query:
+      protocol: graph
+      version: beta
+      path: /deviceManagement/depOnboardingSettings
+      select: [id, tokenName, tokenExpirationDateTime, lastSuccessfulSyncDateTime, lastSyncErrorCode, appleIdentifier]
+      key: id
+      name: tokenName
+    each:
+      any:
+        - { field: appleIdentifier, op: match, value: '@(gmail|googlemail|outlook|hotmail|live|msn|yahoo|icloud|me|mac)\.', threshold: intune.consumer-mail-pattern }
+        - { field: appleIdentifier, op: notmatch, value: '.*', threshold: intune.role-mailbox-pattern }
+    evidence: "{tokenName}: Apple ID {appleIdentifier}"
+
+  - id: INTUNE-APPLE-TOKEN-PERSONAL-ACCOUNT-VPP
+    title: Apple volume purchase token belongs to a personal or consumer Apple ID
+    kind: misconfigured
+    category: IAM
+    severity: medium
+    entity: apple-token
+    why: "Purchased app licences are tied to the location token's account; on a personal or consumer Apple ID, renewal and the licences themselves depend on one person."
+    fix: "Hold the volume purchase location in Apple Business Manager under a role Apple ID with a shared, monitored mailbox."
+    refs: ["NIST-800-53:AC-2", "NIST-800-53:SA-4"]
+    query:
+      protocol: graph
+      path: /deviceAppManagement/vppTokens
+      select: [id, organizationName, vppTokenAccountType, expirationDateTime, lastSyncDateTime, state, lastSyncStatus, appleId]
+      key: id
+      name: organizationName
+    each:
+      any:
+        - { field: appleId, op: match, value: '@(gmail|googlemail|outlook|hotmail|live|msn|yahoo|icloud|me|mac)\.', threshold: intune.consumer-mail-pattern }
+        - { field: appleId, op: notmatch, value: '.*', threshold: intune.role-mailbox-pattern }
+    evidence: "VPP token of {organizationName}: Apple ID {appleId}"
 
   - id: INTUNE-MGP-CONSUMER-ACCOUNT
     title: Managed Google Play is bound to a consumer Google account
@@ -1355,11 +1837,34 @@ rules:
       protocol: graph
       version: beta
       path: /deviceManagement/androidDeviceOwnerEnrollmentProfiles
-      select: [id, displayName, enrollmentMode, tokenCreationDateTime, tokenExpirationDateTime, enrolledDeviceCount]
+      select: [id, displayName, enrollmentMode, tokenCreationDateTime, tokenExpirationDateTime, enrolledDeviceCount, createdDateTime]
       key: id
       name: displayName
     each: { field: tokenExpirationDateTime, op: until-lt, value: 7, threshold: intune.enrollment-token-notice-days }
     evidence: "{displayName} ({enrollmentMode}): token ends {tokenExpirationDateTime}, {enrolledDeviceCount} device(s) enrolled"
+
+  - id: INTUNE-ANDROID-ENROLLMENT-PROFILE-UNUSED
+    title: Corporate Android enrolment profile has never enrolled a device
+    kind: misconfigured
+    category: HYG
+    severity: low
+    entity: enrollment-profile
+    lens: both
+    why: "A fully managed or dedicated-device profile with no enrolled device long after it was created is a leftover whose token and QR code may still enrol devices into a profile nobody maintains. Only exposed in the beta API."
+    fix: "Delete the profile (which revokes its token), or document what it is kept for."
+    refs: ["NIST-800-53:CM-8(3)", "NIST-800-53:AC-19"]
+    query:
+      protocol: graph
+      version: beta
+      path: /deviceManagement/androidDeviceOwnerEnrollmentProfiles
+      select: [id, displayName, enrollmentMode, tokenCreationDateTime, tokenExpirationDateTime, enrolledDeviceCount, createdDateTime]
+      key: id
+      name: displayName
+    each:
+      all:
+        - { field: enrolledDeviceCount, op: eq, value: 0 }
+        - { field: createdDateTime, op: age-gt, value: 90, threshold: intune.enrollment-profile-unused-days }
+    evidence: "{displayName} ({enrollmentMode}): created {createdDateTime}, no enrolled device, token ends {tokenExpirationDateTime}"
 
   # ========================================================================= Autopilot ===
   - id: INTUNE-AUTOPILOT-NO-PROFILE
@@ -1661,6 +2166,101 @@ rules:
     each: { field: isAssigned, op: eq, value: false }
     evidence: "{displayName}: not assigned"
 
+  - id: INTUNE-MAM-IOS-OFFLINE-WIPE-LONG
+    title: iOS app protection keeps data on devices offline for months, or sets no OS minimum
+    kind: misconfigured
+    category: CFG
+    severity: low
+    entity: app-protection-policy
+    lens: security
+    why: "Corporate data stays on a phone that has not checked in until the offline-wipe period ends; without a minimum OS version, devices that stopped receiving security updates keep the data too. The period is an ISO 8601 duration, accepted by pattern up to 90 days (tune it with the threshold)."
+    fix: "Wipe app data after 90 days offline or less and set a minimum iOS version (and minimum app versions) in conditional launch."
+    refs: ["NIST-800-53:AC-19", "NIST-800-53:MP-6", "NIST-800-53:SI-2"]
+    query:
+      protocol: graph
+      path: /deviceAppManagement/iosManagedAppProtections
+      key: id
+      name: displayName
+    each:
+      all:
+        - { field: isAssigned, op: eq, value: true }
+        - any:
+            - { field: periodOfflineBeforeWipeIsEnforced, op: absent }
+            - { field: periodOfflineBeforeWipeIsEnforced, op: notmatch, value: '^(P([1-9]|[1-8]\d|90)D(T.*)?|PT([1-9]\d{0,2}|1\d{3}|20\d\d|21[0-5]\d|2160)H)$', threshold: intune.mam-offline-wipe-ok-pattern }
+            - { field: minimumRequiredOsVersion, op: empty }
+    evidence: "{displayName}: offline wipe after {periodOfflineBeforeWipeIsEnforced}, minimum OS '{minimumRequiredOsVersion}'"
+
+  - id: INTUNE-MAM-ANDROID-OFFLINE-WIPE-LONG
+    title: Android app protection keeps data on devices offline for months, or sets no OS minimum
+    kind: misconfigured
+    category: CFG
+    severity: low
+    entity: app-protection-policy
+    lens: security
+    why: "Corporate data stays on a phone that has not checked in until the offline-wipe period ends; without a minimum OS version, devices that stopped receiving security updates keep the data too. The period is an ISO 8601 duration, accepted by pattern up to 90 days (tune it with the threshold)."
+    fix: "Wipe app data after 90 days offline or less and set a minimum Android version (and patch level) in conditional launch."
+    refs: ["NIST-800-53:AC-19", "NIST-800-53:MP-6", "NIST-800-53:SI-2"]
+    query:
+      protocol: graph
+      path: /deviceAppManagement/androidManagedAppProtections
+      key: id
+      name: displayName
+    each:
+      all:
+        - { field: isAssigned, op: eq, value: true }
+        - any:
+            - { field: periodOfflineBeforeWipeIsEnforced, op: absent }
+            - { field: periodOfflineBeforeWipeIsEnforced, op: notmatch, value: '^(P([1-9]|[1-8]\d|90)D(T.*)?|PT([1-9]\d{0,2}|1\d{3}|20\d\d|21[0-5]\d|2160)H)$', threshold: intune.mam-offline-wipe-ok-pattern }
+            - { field: minimumRequiredOsVersion, op: empty }
+    evidence: "{displayName}: offline wipe after {periodOfflineBeforeWipeIsEnforced}, minimum OS '{minimumRequiredOsVersion}'"
+
+  # App protection registrations (one row per app and device under app protection). The platform is
+  # told by the app identifier: iOS apps carry bundleId, Android apps packageId. The version patterns
+  # are the same thresholds as the managed-device OS rules.
+  - id: INTUNE-MAM-REGISTRATION-OLD-PLATFORM-IOS
+    title: App protection is active on an iOS version that no longer gets security updates
+    kind: misconfigured
+    category: LCM
+    severity: low
+    entity: app-registration
+    lens: security
+    why: "Corporate data under app protection on a phone whose iOS no longer gets security fixes is exposed to known exploits; MAM has no device record, so the managed-device OS rules never see these phones."
+    fix: "Set a minimum iOS version in the app protection conditional launch so such registrations block themselves; ask the users to update."
+    refs: ["NIST-800-53:SI-2", "NIST-800-53:AC-19"]
+    query:
+      protocol: graph
+      path: /deviceAppManagement/managedAppRegistrations
+      key: id
+      name: deviceName
+    each:
+      all:
+        - { field: appIdentifier.bundleId, op: exists }
+        - { field: lastSyncDateTime, op: age-lt, value: 30, threshold: intune.device-stale-days }
+        - { field: platformVersion, op: match, value: '^([1-9]|1[0-7])(\.|$)', threshold: intune.ios-unsupported-version-pattern }
+    evidence: "{deviceName} ({deviceType}): {appIdentifier.bundleId} on iOS {platformVersion}, last sync {lastSyncDateTime}"
+
+  - id: INTUNE-MAM-REGISTRATION-OLD-PLATFORM-ANDROID
+    title: App protection is active on an Android version that no longer gets security updates
+    kind: misconfigured
+    category: LCM
+    severity: low
+    entity: app-registration
+    lens: security
+    why: "Corporate data under app protection on a phone whose Android no longer gets security fixes is exposed to known exploits; MAM has no device record, so the managed-device OS rules never see these phones."
+    fix: "Set a minimum Android version and patch level in the app protection conditional launch; ask the users to update or replace the phone."
+    refs: ["NIST-800-53:SI-2", "NIST-800-53:AC-19"]
+    query:
+      protocol: graph
+      path: /deviceAppManagement/managedAppRegistrations
+      key: id
+      name: deviceName
+    each:
+      all:
+        - { field: appIdentifier.packageId, op: exists }
+        - { field: lastSyncDateTime, op: age-lt, value: 30, threshold: intune.device-stale-days }
+        - { field: platformVersion, op: match, value: '^([1-9]|1[0-2])(\.|$)', threshold: intune.android-unsupported-version-pattern }
+    evidence: "{deviceName} ({deviceType}): {appIdentifier.packageId} on Android {platformVersion}, last sync {lastSyncDateTime}"
+
   # ====================================================== endpoint security (settings catalog) ===
   # Endpoint security and settings-catalog policies (beta configurationPolicies) carry their template
   # family, so the existence of an assigned policy per family is visible without reading each setting.
@@ -1853,6 +2453,32 @@ rules:
           - { field: templateReference.templateFamily, op: eq, value: baseline }
     evidence: "{count} assigned security baselines among {rows} configuration policies"
 
+  - id: INTUNE-ESEC-APP-CONTROL-NONE
+    title: No assigned App Control for Business policy
+    kind: missing
+    category: CFG
+    severity: medium
+    entity: tenant
+    lens: security
+    why: "Without application control, any executable a standard user downloads (or malware drops) runs, as long as the store block or SmartScreen do not catch it. A policy counts if it is assigned and comes from the App Control for Business template family. Device-side enforcement is checked by the workstation pack."
+    fix: "Deploy an App Control for Business policy in audit mode to a pilot ring, review the audit events, then enforce for all Windows devices."
+    refs: ["NIST-800-53:CM-7(5)", "NIST-800-53:CM-11", "CIS-Controls-v8:2.5", "MITRE-ATTACK:T1204.002"]
+    query:
+      protocol: graph
+      version: beta
+      path: /deviceManagement/configurationPolicies
+      select: [id, name, platforms, technologies, isAssigned, settingCount, templateReference, createdDateTime, lastModifiedDateTime]
+      key: id
+      name: name
+    count:
+      op: lt
+      value: 1
+      where:
+        all:
+          - { field: isAssigned, op: eq, value: true }
+          - { field: templateReference.templateFamily, op: eq, value: endpointSecurityApplicationControl }
+    evidence: "{count} assigned App Control for Business policies among {rows} configuration policies"
+
   - id: INTUNE-CONFIGPOLICY-UNASSIGNED
     title: Settings catalog or endpoint security policy is assigned to nobody
     kind: misconfigured
@@ -1872,6 +2498,118 @@ rules:
       name: name
     each: { field: isAssigned, op: eq, value: false }
     evidence: "{name} ({templateReference.templateDisplayName}, {platforms}): not assigned, last changed {lastModifiedDateTime}"
+
+  - id: INTUNE-POLICY-NAME-NONCONFORMING-SETTINGS
+    title: Settings catalog or endpoint security policy name does not follow the naming convention
+    kind: misconfigured
+    category: HYG
+    severity: info
+    entity: configuration-policy
+    lens: maintenance
+    why: "A naming convention (platform, purpose, ring) is how admins tell policies apart in assignment lists and reports. The convention is tenant-specific: set the pattern in the threshold; until then the rule checks nothing."
+    fix: "Rename the policy to the convention."
+    refs: ["NIST-800-53:CM-8"]
+    query:
+      protocol: graph
+      version: beta
+      path: /deviceManagement/configurationPolicies
+      select: [id, name, platforms, technologies, isAssigned, settingCount, templateReference, createdDateTime, lastModifiedDateTime]
+      key: id
+      name: name
+    each: { field: name, op: notmatch, value: '.*', threshold: intune.policy-name-pattern }
+    evidence: "{name} ({templateReference.templateDisplayName})"
+
+  - id: INTUNE-DRIVER-UPDATE-PROFILE-NONE
+    title: No assigned Windows driver update profile
+    kind: missing
+    category: LCM
+    severity: low
+    entity: tenant
+    lens: maintenance
+    why: "Without a driver update profile, drivers and firmware are nobody's job in Intune: they arrive whenever Windows Update decides, or never when updates for other products are off. A tenant that services firmware with another tool accepts the finding. Only exposed in the beta API."
+    fix: "Create a driver update profile (automatic approval for a pilot ring, manual approval for the broad ring) and assign it."
+    refs: ["NIST-800-53:SI-2", "CIS-Controls-v8:7.4"]
+    query:
+      protocol: graph
+      version: beta
+      path: /deviceManagement/windowsDriverUpdateProfiles
+      select: [id, displayName, approvalType, deviceReporting, newUpdates, lastModifiedDateTime]
+      expand: assignments
+      key: id
+      name: displayName
+    count:
+      op: lt
+      value: 1
+      where: { field: assignments, op: notempty }
+    evidence: "{count} assigned driver update profiles among {rows}"
+
+  # ======================================================== RBAC and multi-admin approval ===
+  - id: INTUNE-RBAC-ASSIGNMENT-UNSCOPED
+    title: Intune role assignment reaches every device or every user
+    kind: misconfigured
+    category: IAM
+    severity: medium
+    entity: role-assignment
+    lens: security
+    why: "An Intune role scoped to all devices or all licensed users lets a help-desk or regional role act on the whole estate - wipe, retire, run remediations - instead of the groups it serves. Full-estate roles are expected only for the roles in the threshold pattern. Only exposed in the beta API."
+    fix: "Scope the assignment to the groups the team serves, and use scope tags to limit what it sees."
+    refs: ["NIST-800-53:AC-6(1)", "NIST-800-53:AC-2(7)", "CIS-Controls-v8:6.8"]
+    query:
+      protocol: graph
+      version: beta
+      path: /deviceManagement/roleAssignments
+      expand: roleDefinition
+      key: id
+      name: displayName
+    each:
+      all:
+        - { field: scopeType, op: in, value: [allDevices, allLicensedUsers, allDevicesAndLicensedUsers] }
+        - { field: roleDefinition.displayName, op: notmatch, value: '^(Intune Administrator|Endpoint Security Manager)$', threshold: intune.rbac-full-scope-role-pattern }
+    evidence: "{displayName}: role {roleDefinition.displayName} on {scopeType}, members {members}"
+
+  - id: INTUNE-ROLE-CUSTOM-SCRIPT-RIGHTS
+    title: Custom Intune role can deploy code or wipe devices
+    kind: misconfigured
+    category: IAM
+    severity: medium
+    entity: role-definition
+    lens: security
+    why: "Creating or assigning configuration profiles (which include scripts) or apps is code execution as SYSTEM on every targeted PC, and remote wipe or retire takes devices away; in a custom role these rights hide under a name nobody reviews. The resource action strings are matched by pattern; confirm them against the tenant's role definitions."
+    fix: "Split the role: keep script, app and destructive rights with named administrators (ideally behind multi-admin approval), give everyone else read and help-desk actions."
+    refs: ["NIST-800-53:AC-6(1)", "NIST-800-53:CM-5", "CIS-Controls-v8:6.8"]
+    query:
+      protocol: graph
+      path: /deviceManagement/roleDefinitions
+      key: id
+      name: displayName
+    each:
+      all:
+        - { field: isBuiltIn, op: eq, value: false }
+        - { field: 'rolePermissions[].resourceActions[].allowedResourceActions', op: match, value: '(DeviceConfigurations_(Create|Update|Assign)|MobileApps_(Create|Update|Assign)|RemoteTasks_(Wipe|Retire)|ManagedDevices_Delete)', threshold: intune.role-powerful-action-pattern }
+    evidence: "{displayName}: allows {rolePermissions[].resourceActions[].allowedResourceActions}"
+
+  - id: INTUNE-MAA-POLICY-NONE
+    title: No multi-admin approval is required to wipe devices
+    kind: missing
+    category: IAM
+    severity: medium
+    entity: tenant
+    lens: security
+    why: "Without a multi-admin approval access policy for device wipe, one compromised Intune administrator can wipe every managed device in minutes - a destructive attack seen in the wild. Only exposed in the beta API."
+    fix: "Create access policies for device wipe (and retire, delete, scripts, apps and roles) with an approver group of at least two named staff."
+    refs: ["NIST-800-53:AC-5", "NIST-800-53:CM-5(1)", "CIS-Controls-v8:5.4"]
+    query:
+      protocol: graph
+      version: beta
+      path: /deviceManagement/operationApprovalPolicies
+      select: [id, displayName, policyType, policyPlatform, approverGroupIds, lastModifiedDateTime]
+      key: id
+      name: displayName
+    count:
+      op: lt
+      value: 1
+      where: { field: policyType, op: eq, value: deviceWipe }
+    evidence: "{count} device-wipe approval policies among {rows} access policies"
 
   # ============================================================ scripts and connectors ===
   # Script queries select metadata only: the script bodies (detection, remediation and platform script
@@ -1946,3 +2684,131 @@ rules:
         - { field: state, op: eq, value: inactive }
         - { field: lastConnectionDateTime, op: age-gt, value: 1, threshold: intune.connector-max-age-days }
     evidence: "{displayName} on {machineName} (version {connectorVersion}): state {state}, last connection {lastConnectionDateTime}"
+
+  # ============================================================ retired features, apps ===
+  - id: INTUNE-RETIRED-FEATURE-IN-USE-WIP
+    title: Windows Information Protection (MDM) policy still exists
+    kind: misconfigured
+    category: LCM
+    severity: low
+    entity: wip-policy
+    lens: maintenance
+    why: "Windows Information Protection is retired: its policies no longer apply reliably and cannot be edited, while the console still shows them as protection. Data-protection intent left in them is protecting nothing."
+    fix: "Move the intent to app protection, Purview sensitivity labels or data-loss prevention, then delete the WIP policies."
+    refs: ["NIST-800-53:SA-22", "NIST-800-53:CM-7"]
+    query:
+      protocol: graph
+      path: /deviceAppManagement/mdmWindowsInformationProtectionPolicies
+      select: [id, displayName, lastModifiedDateTime]
+      key: id
+      name: displayName
+    each: any
+    evidence: "{displayName}: last changed {lastModifiedDateTime}"
+
+  - id: INTUNE-RETIRED-FEATURE-IN-USE-WIP-MAM
+    title: Windows Information Protection (without enrolment) policy still exists
+    kind: misconfigured
+    category: LCM
+    severity: low
+    entity: wip-policy
+    lens: maintenance
+    why: "Windows Information Protection without enrolment is retired along with the rest of WIP; the policy protects nothing while it remains listed."
+    fix: "Move the intent to app protection for Edge, Purview labels or data-loss prevention, then delete the policy."
+    refs: ["NIST-800-53:SA-22", "NIST-800-53:CM-7"]
+    query:
+      protocol: graph
+      path: /deviceAppManagement/windowsInformationProtectionPolicies
+      select: [id, displayName, lastModifiedDateTime]
+      key: id
+      name: displayName
+    each: any
+    evidence: "{displayName}: last changed {lastModifiedDateTime}"
+
+  - id: INTUNE-RETIRED-FEATURE-IN-USE-EXCHANGE
+    title: On-premises Exchange connector is still configured in Intune
+    kind: misconfigured
+    category: LCM
+    severity: low
+    entity: exchange-connector
+    lens: maintenance
+    why: "The Intune on-premises Exchange connector belongs to a retired way of controlling Exchange ActiveSync access; a configured connector is a stale integration with a service account on an Exchange server."
+    fix: "Delete the connector in Intune and uninstall it from the server; control mobile mail access with Conditional Access instead."
+    refs: ["NIST-800-53:SA-22", "NIST-800-53:CM-7"]
+    query:
+      protocol: graph
+      path: /deviceManagement/exchangeConnectors
+      key: id
+      name: serverName
+    each: { field: exchangeConnectorType, op: eq, value: onPremises }
+    evidence: "connector to {serverName} ({exchangeConnectorType}): status {status}, last sync {lastSyncDateTime}"
+
+  - id: INTUNE-APP-UNASSIGNED
+    title: Uploaded app is assigned to nobody
+    kind: misconfigured
+    category: HYG
+    severity: info
+    entity: mobile-app
+    lens: maintenance
+    why: "An app uploaded months ago and never assigned is content that never shipped: it confuses the app list, carries old installers and is easy to assign by mistake. Microsoft-published apps are left out by the publisher pattern."
+    fix: "Assign the app to its intended group or delete it."
+    refs: ["NIST-800-53:CM-8(3)"]
+    query:
+      protocol: graph
+      path: /deviceAppManagement/mobileApps
+      select: [id, displayName, publisher, isAssigned, createdDateTime, lastModifiedDateTime]
+      key: id
+      name: displayName
+    each:
+      all:
+        - { field: isAssigned, op: eq, value: false }
+        - { field: createdDateTime, op: age-gt, value: 90, threshold: intune.app-unassigned-days }
+        - { field: publisher, op: notmatch, value: '^Microsoft', threshold: intune.app-unassigned-ignore-publisher-pattern }
+    evidence: "{displayName} ({publisher}): unassigned, created {createdDateTime}, last changed {lastModifiedDateTime}"
+
+  # ============================================================================ audit log ===
+  # Intune audit events of the last two days. activityType is free text written by Intune; the
+  # destructive pattern below must be confirmed against the tenant's own events.
+  - id: INTUNE-AUDIT-DESTRUCTIVE-ACTION-RECENT
+    title: Wipe, retire, delete or lock issued in Intune in the last two days
+    kind: misconfigured
+    category: IAM
+    severity: high
+    entity: audit-event
+    lens: security
+    why: "Wiping, retiring or deleting devices, fresh starts, passcode resets and remote locks are what an attacker with Intune rights does first, and a mass wipe is a known destructive attack. Every one should match a ticket by the next morning."
+    fix: "Match each action to a request; for an unexplained one treat it as an incident (revoke the admin's sessions, check its other actions) and turn on multi-admin approval (INTUNE-MAA-POLICY-NONE)."
+    refs: ["NIST-800-53:AU-6", "NIST-800-53:IR-4", "CIS-Controls-v8:8.11", "MITRE-ATTACK:T1485"]
+    query:
+      protocol: graph
+      path: /deviceManagement/auditEvents
+      filter: "activityDateTime ge {DAYS_AGO:2}"
+      maxPages: 20
+      key: id
+      name: activityType
+    each: { field: activityType, op: match, value: '(wipe|retire|delete|freshStart|cleanWindowsDevice|resetPasscode|remoteLock|bulk)', threshold: intune.audit-destructive-activity-pattern }
+    evidence: "{activityDateTime}: {activityType} ({activityResult}) by {actor.userPrincipalName}{actor.applicationDisplayName} on {resources[].displayName}"
+
+  - id: INTUNE-AUDIT-CHANGES-RECENT
+    title: Intune configuration changed in the last two days
+    kind: misconfigured
+    category: CFG
+    severity: info
+    entity: audit-event
+    lens: both
+    why: "Every create, delete, patch and assign in Intune, with its actor - the morning review list that tells planned changes from surprises. Expected actors (automation accounts) can be left out with the threshold pattern; by default every change is listed."
+    fix: "Match each change to a ticket; ask the actor about the rest."
+    refs: ["NIST-800-53:AU-6", "NIST-800-53:CM-3", "CIS-Controls-v8:8.11"]
+    query:
+      protocol: graph
+      path: /deviceManagement/auditEvents
+      filter: "activityDateTime ge {DAYS_AGO:2}"
+      maxPages: 20
+      key: id
+      name: activityType
+    each:
+      all:
+        - { field: activityOperationType, op: in, value: [create, delete, patch, action, assign] }
+        - any:
+            - { field: actor.userPrincipalName, op: absent }
+            - { field: actor.userPrincipalName, op: notmatch, value: '(?!)', threshold: intune.audit-expected-actor-pattern }
+    evidence: "{activityDateTime}: {activityType} ({activityOperationType}, {activityResult}) by {actor.userPrincipalName}{actor.applicationDisplayName} on {resources[].displayName}"

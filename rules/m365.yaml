@@ -127,6 +127,95 @@ rules:
           value: [f30db892-07e9-47e9-837c-80727f46fd3d, a403ebcc-fae0-4ca2-8c8c-7a907fd6c235, 710779e8-3d4a-4c88-adb9-386c958d1fdf, dcb1a3ae-b33f-4487-846a-a640262fadf4, 5b631642-bd26-49fe-bd20-1daaa972ef80, 1f2f344a-700d-42c9-9427-5cea1d5d7ba6, 6470687e-a428-4b7a-bef2-8a291ad947c9, 8c4ce438-32a7-4ac5-91a6-e22ae08d9c8b, bc946dac-7877-4271-b2f7-99d2db13cd2c, 440eaaa8-b3e0-484b-a8be-62870b9ba70a, 94763226-9b3c-4e75-a931-5c89701abe66, 314c4481-f395-4525-be8b-2ec4bb1e9d91]
     evidence: "{skuPartNumber}: {prepaidUnits.enabled} units bought, none assigned"
 
+  # Seat arithmetic compares two fields of the same SKU row (consumedUnits against prepaidUnits.enabled);
+  # the ratios are fixed in the rule because a threshold replaces the whole compared value.
+  - id: M365-SKU-OVERASSIGNED
+    title: More licences assigned than the SKU has enabled units
+    kind: broken
+    category: LCM
+    severity: medium
+    entity: sku
+    lens: both
+    why: "Consumed units above the enabled units mean units were removed or expired under existing assignments: new assignments fail, group-based licensing starts erroring, and at the next state change users lose the service."
+    fix: "Buy the missing units, or remove assignments from inactive and disabled accounts first (M365-LICENSED-USER-INACTIVE, M365-LICENSED-USER-DISABLED)."
+    refs: ["NIST-800-53:SA-4", "NIST-800-53:CP-2"]
+    query:
+      protocol: graph
+      path: /subscribedSkus
+      select: [id, skuId, skuPartNumber, appliesTo, capabilityStatus, consumedUnits, prepaidUnits]
+      key: skuId
+      name: skuPartNumber
+    each:
+      all:
+        - { field: capabilityStatus, op: eq, value: Enabled }
+        - { field: consumedUnits, op: gt, value: { field: prepaidUnits.enabled } }
+        - field: skuId
+          op: notin
+          threshold: m365.free-sku-ids
+          value: [f30db892-07e9-47e9-837c-80727f46fd3d, a403ebcc-fae0-4ca2-8c8c-7a907fd6c235, 710779e8-3d4a-4c88-adb9-386c958d1fdf, dcb1a3ae-b33f-4487-846a-a640262fadf4, 5b631642-bd26-49fe-bd20-1daaa972ef80, 1f2f344a-700d-42c9-9427-5cea1d5d7ba6, 6470687e-a428-4b7a-bef2-8a291ad947c9, 8c4ce438-32a7-4ac5-91a6-e22ae08d9c8b, bc946dac-7877-4271-b2f7-99d2db13cd2c, 440eaaa8-b3e0-484b-a8be-62870b9ba70a, 94763226-9b3c-4e75-a931-5c89701abe66, 314c4481-f395-4525-be8b-2ec4bb1e9d91]
+    evidence: "{skuPartNumber}: {consumedUnits} assigned, {prepaidUnits.enabled} enabled, {prepaidUnits.warning} in warning"
+
+  - id: M365-SKU-NO-HEADROOM
+    title: Paid SKU has no free seat for the next joiner
+    kind: broken
+    category: LCM
+    severity: medium
+    entity: sku
+    lens: maintenance
+    why: "When every enabled unit is assigned (or, on SKUs of 50 units or more, fewer than 2 percent are free) the next joiner cannot be licensed: group-based licensing fails for them silently until someone reclaims or buys seats. Over-assignment has its own rule."
+    fix: "Reclaim seats from inactive and disabled accounts, or raise the order before the next joiner wave."
+    refs: ["NIST-800-53:SA-4", "NIST-800-53:CP-2", "CIS-Controls-v8:2.1"]
+    query:
+      protocol: graph
+      path: /subscribedSkus
+      select: [id, skuId, skuPartNumber, appliesTo, capabilityStatus, consumedUnits, prepaidUnits]
+      key: skuId
+      name: skuPartNumber
+    each:
+      all:
+        - { field: appliesTo, op: eq, value: User }
+        - { field: capabilityStatus, op: eq, value: Enabled }
+        - { field: prepaidUnits.enabled, op: gt, value: 0 }
+        - { field: consumedUnits, op: le, value: { field: prepaidUnits.enabled } }
+        - any:
+            - { field: consumedUnits, op: eq, value: { field: prepaidUnits.enabled } }
+            - all:
+                - { field: prepaidUnits.enabled, op: ge, value: 50, threshold: m365.sku-headroom-min-size }
+                - { field: consumedUnits, op: ge, value: { field: prepaidUnits.enabled, times: 0.98 } }
+        - field: skuId
+          op: notin
+          threshold: m365.free-sku-ids
+          value: [f30db892-07e9-47e9-837c-80727f46fd3d, a403ebcc-fae0-4ca2-8c8c-7a907fd6c235, 710779e8-3d4a-4c88-adb9-386c958d1fdf, dcb1a3ae-b33f-4487-846a-a640262fadf4, 5b631642-bd26-49fe-bd20-1daaa972ef80, 1f2f344a-700d-42c9-9427-5cea1d5d7ba6, 6470687e-a428-4b7a-bef2-8a291ad947c9, 8c4ce438-32a7-4ac5-91a6-e22ae08d9c8b, bc946dac-7877-4271-b2f7-99d2db13cd2c, 440eaaa8-b3e0-484b-a8be-62870b9ba70a, 94763226-9b3c-4e75-a931-5c89701abe66, 314c4481-f395-4525-be8b-2ec4bb1e9d91]
+    evidence: "{skuPartNumber}: {consumedUnits} of {prepaidUnits.enabled} units assigned"
+
+  - id: M365-SKU-UNUSED-UNITS-MANY
+    title: Paid SKU has a large share of seats nobody uses
+    kind: misconfigured
+    category: CST
+    severity: low
+    entity: sku
+    why: "More than a fifth of the purchased units (and at least five) unassigned is money spent for nothing until the renewal, or the trace of a bulk removal nobody planned. SKUs with nothing assigned at all are M365-SKU-PAID-UNASSIGNED."
+    fix: "Assign the seats to the people they were bought for, or reduce the quantity at the next renewal."
+    refs: ["NIST-800-53:PM-3", "NIST-800-53:SA-4", "CIS-Controls-v8:2.1"]
+    query:
+      protocol: graph
+      path: /subscribedSkus
+      select: [id, skuId, skuPartNumber, appliesTo, capabilityStatus, consumedUnits, prepaidUnits]
+      key: skuId
+      name: skuPartNumber
+    each:
+      all:
+        - { field: appliesTo, op: eq, value: User }
+        - { field: capabilityStatus, op: eq, value: Enabled }
+        - { field: consumedUnits, op: gt, value: 0 }
+        - { field: consumedUnits, op: lt, value: { field: prepaidUnits.enabled, times: 0.8 } }
+        - { field: consumedUnits, op: le, value: { field: prepaidUnits.enabled, plus: -5 } }
+        - field: skuId
+          op: notin
+          threshold: m365.free-sku-ids
+          value: [f30db892-07e9-47e9-837c-80727f46fd3d, a403ebcc-fae0-4ca2-8c8c-7a907fd6c235, 710779e8-3d4a-4c88-adb9-386c958d1fdf, dcb1a3ae-b33f-4487-846a-a640262fadf4, 5b631642-bd26-49fe-bd20-1daaa972ef80, 1f2f344a-700d-42c9-9427-5cea1d5d7ba6, 6470687e-a428-4b7a-bef2-8a291ad947c9, 8c4ce438-32a7-4ac5-91a6-e22ae08d9c8b, bc946dac-7877-4271-b2f7-99d2db13cd2c, 440eaaa8-b3e0-484b-a8be-62870b9ba70a, 94763226-9b3c-4e75-a931-5c89701abe66, 314c4481-f395-4525-be8b-2ec4bb1e9d91]
+    evidence: "{skuPartNumber}: {consumedUnits} of {prepaidUnits.enabled} units assigned"
+
   # ======================================================================= subscriptions ===
   - id: M365-SUBSCRIPTION-LIFECYCLE-SOON
     title: Subscription reaches its renewal or expiry date soon
@@ -215,7 +304,7 @@ rules:
     query:
       protocol: graph
       path: /users
-      select: [id, userPrincipalName, accountEnabled, userType, createdDateTime, onPremisesSyncEnabled, onPremisesSecurityIdentifier, signInActivity, assignedLicenses, mail, onPremisesSamAccountName]
+      select: [id, userPrincipalName, accountEnabled, userType, createdDateTime, onPremisesSyncEnabled, onPremisesSecurityIdentifier, signInActivity, assignedLicenses, mail, onPremisesSamAccountName, displayName, givenName, surname, department, jobTitle, usageLocation, onPremisesDomainName, onPremisesUserPrincipalName, proxyAddresses, passwordPolicies]
       top: 500
       key: id
       name: userPrincipalName
@@ -247,7 +336,7 @@ rules:
     query:
       protocol: graph
       path: /users
-      select: [id, userPrincipalName, accountEnabled, userType, createdDateTime, onPremisesSyncEnabled, onPremisesSecurityIdentifier, signInActivity, assignedLicenses, mail, onPremisesSamAccountName]
+      select: [id, userPrincipalName, accountEnabled, userType, createdDateTime, onPremisesSyncEnabled, onPremisesSecurityIdentifier, signInActivity, assignedLicenses, mail, onPremisesSamAccountName, displayName, givenName, surname, department, jobTitle, usageLocation, onPremisesDomainName, onPremisesUserPrincipalName, proxyAddresses, passwordPolicies]
       top: 500
       key: id
       name: userPrincipalName
@@ -273,7 +362,7 @@ rules:
     query:
       protocol: graph
       path: /users
-      select: [id, userPrincipalName, accountEnabled, userType, createdDateTime, onPremisesSyncEnabled, onPremisesSecurityIdentifier, signInActivity, assignedLicenses, mail, onPremisesSamAccountName]
+      select: [id, userPrincipalName, accountEnabled, userType, createdDateTime, onPremisesSyncEnabled, onPremisesSecurityIdentifier, signInActivity, assignedLicenses, mail, onPremisesSamAccountName, displayName, givenName, surname, department, jobTitle, usageLocation, onPremisesDomainName, onPremisesUserPrincipalName, proxyAddresses, passwordPolicies]
       top: 500
       key: id
       name: userPrincipalName
@@ -295,7 +384,7 @@ rules:
     query:
       protocol: graph
       path: /users
-      select: [id, userPrincipalName, accountEnabled, userType, createdDateTime, onPremisesSyncEnabled, onPremisesSecurityIdentifier, signInActivity, assignedLicenses, mail, onPremisesSamAccountName]
+      select: [id, userPrincipalName, accountEnabled, userType, createdDateTime, onPremisesSyncEnabled, onPremisesSecurityIdentifier, signInActivity, assignedLicenses, mail, onPremisesSamAccountName, displayName, givenName, surname, department, jobTitle, usageLocation, onPremisesDomainName, onPremisesUserPrincipalName, proxyAddresses, passwordPolicies]
       top: 500
       key: id
       name: userPrincipalName
@@ -323,7 +412,7 @@ rules:
     query:
       protocol: graph
       path: /users
-      select: [id, userPrincipalName, accountEnabled, userType, createdDateTime, onPremisesSyncEnabled, onPremisesSecurityIdentifier, signInActivity, assignedLicenses, mail, onPremisesSamAccountName]
+      select: [id, userPrincipalName, accountEnabled, userType, createdDateTime, onPremisesSyncEnabled, onPremisesSecurityIdentifier, signInActivity, assignedLicenses, mail, onPremisesSamAccountName, displayName, givenName, surname, department, jobTitle, usageLocation, onPremisesDomainName, onPremisesUserPrincipalName, proxyAddresses, passwordPolicies]
       top: 500
       key: id
       name: userPrincipalName
@@ -351,7 +440,7 @@ rules:
     query:
       protocol: graph
       path: /users
-      select: [id, userPrincipalName, accountEnabled, userType, createdDateTime, onPremisesSyncEnabled, onPremisesSecurityIdentifier, signInActivity, assignedLicenses, mail, onPremisesSamAccountName]
+      select: [id, userPrincipalName, accountEnabled, userType, createdDateTime, onPremisesSyncEnabled, onPremisesSecurityIdentifier, signInActivity, assignedLicenses, mail, onPremisesSamAccountName, displayName, givenName, surname, department, jobTitle, usageLocation, onPremisesDomainName, onPremisesUserPrincipalName, proxyAddresses, passwordPolicies]
       top: 500
       key: id
       name: userPrincipalName
@@ -376,7 +465,7 @@ rules:
     query:
       protocol: graph
       path: /users
-      select: [id, userPrincipalName, accountEnabled, userType, createdDateTime, assignedLicenses, licenseAssignmentStates, onPremisesSyncEnabled, onPremisesDistinguishedName, onPremisesProvisioningErrors, passwordPolicies, lastPasswordChangeDateTime, externalUserState, externalUserStateChangeDateTime]
+      select: [id, userPrincipalName, accountEnabled, userType, createdDateTime, assignedLicenses, licenseAssignmentStates, onPremisesSyncEnabled, onPremisesDistinguishedName, onPremisesProvisioningErrors, passwordPolicies, lastPasswordChangeDateTime, externalUserState, externalUserStateChangeDateTime, serviceProvisioningErrors]
       top: 999
       key: id
       name: userPrincipalName
@@ -395,7 +484,7 @@ rules:
     query:
       protocol: graph
       path: /users
-      select: [id, userPrincipalName, accountEnabled, userType, createdDateTime, assignedLicenses, licenseAssignmentStates, onPremisesSyncEnabled, onPremisesDistinguishedName, onPremisesProvisioningErrors, passwordPolicies, lastPasswordChangeDateTime, externalUserState, externalUserStateChangeDateTime]
+      select: [id, userPrincipalName, accountEnabled, userType, createdDateTime, assignedLicenses, licenseAssignmentStates, onPremisesSyncEnabled, onPremisesDistinguishedName, onPremisesProvisioningErrors, passwordPolicies, lastPasswordChangeDateTime, externalUserState, externalUserStateChangeDateTime, serviceProvisioningErrors]
       top: 999
       key: id
       name: userPrincipalName
@@ -417,7 +506,7 @@ rules:
     query:
       protocol: graph
       path: /users
-      select: [id, userPrincipalName, accountEnabled, userType, createdDateTime, assignedLicenses, licenseAssignmentStates, onPremisesSyncEnabled, onPremisesDistinguishedName, onPremisesProvisioningErrors, passwordPolicies, lastPasswordChangeDateTime, externalUserState, externalUserStateChangeDateTime]
+      select: [id, userPrincipalName, accountEnabled, userType, createdDateTime, assignedLicenses, licenseAssignmentStates, onPremisesSyncEnabled, onPremisesDistinguishedName, onPremisesProvisioningErrors, passwordPolicies, lastPasswordChangeDateTime, externalUserState, externalUserStateChangeDateTime, serviceProvisioningErrors]
       top: 999
       key: id
       name: userPrincipalName
@@ -446,6 +535,93 @@ rules:
       name: displayName
     each: any
     evidence: "{displayName}: members with licence errors (assigns {assignedLicenses[].skuId})"
+
+  # Meeting-room resource accounts, told by a Teams Rooms licence (threshold m365.room-device-sku-ids;
+  # defaults are Microsoft's SKU ids for Teams Rooms Pro, Pro without Audio Conferencing, Basic, Basic
+  # without Audio Conferencing, Standard and Premium).
+  - id: M365-ROOM-ACCOUNT-NO-SIGNIN
+    title: Meeting-room account has not signed in for days
+    kind: broken
+    category: AVL
+    severity: medium
+    entity: user
+    why: "A Teams Rooms device signs in as its resource account every day; an account with no successful sign-in for two days means the room is signed out or down (expired password, a Conditional Access or MFA change caught it) and stays 'not working' until someone complains. Needs Entra ID P1 for signInActivity."
+    fix: "Sign the device in again; give the resource account a non-expiring password and its own device-based Conditional Access policy instead of the user MFA policy."
+    refs: ["NIST-800-53:SI-4", "NIST-800-53:CP-2"]
+    query:
+      protocol: graph
+      path: /users
+      select: [id, userPrincipalName, accountEnabled, userType, createdDateTime, onPremisesSyncEnabled, onPremisesSecurityIdentifier, signInActivity, assignedLicenses, mail, onPremisesSamAccountName, displayName, givenName, surname, department, jobTitle, usageLocation, onPremisesDomainName, onPremisesUserPrincipalName, proxyAddresses, passwordPolicies]
+      top: 500
+      key: id
+      name: userPrincipalName
+    each:
+      all:
+        - { field: accountEnabled, op: eq, value: true }
+        - field: 'assignedLicenses[].skuId'
+          op: in
+          threshold: m365.room-device-sku-ids
+          value: [4cde982a-ede4-4409-9ae6-b003453c8ea6, 21943e3a-2429-4f83-84c1-02735cd49e78, 6af4b3d6-14bb-4a2a-960c-6c902aad34f3, 50509a35-f0bd-4c5e-89ac-22f0e16a00f8, 6070a4c8-34c6-4937-8dfb-39bbc6397a60, 4fb214cb-a430-4a91-9c91-4976763aa78f]
+        - any:
+            - { field: createdDateTime, op: absent }
+            - { field: createdDateTime, op: age-gt, value: 2, threshold: m365.room-signin-max-days }
+        - any:
+            - { field: signInActivity.lastSuccessfulSignInDateTime, op: absent }
+            - { field: signInActivity.lastSuccessfulSignInDateTime, op: age-gt, value: 2, threshold: m365.room-signin-max-days }
+    evidence: "room {userPrincipalName} ({displayName}): last successful sign-in {signInActivity.lastSuccessfulSignInDateTime}"
+
+  - id: M365-TEAMS-ROOM-ACCOUNT-PASSWORD-EXPIRES
+    title: Meeting-room account's password can expire
+    kind: misconfigured
+    category: AVL
+    severity: medium
+    entity: user
+    why: "A room device signs in unattended; when its cloud password expires the room silently goes offline with no prompt anyone sees. Synchronised room accounts follow the AD password policy and are left out; tenants whose domains never expire passwords (M365-DOMAIN-PASSWORD-EXPIRY passes) accept the finding."
+    fix: "Set DisablePasswordExpiration on the resource account (or rotate its password on a managed schedule) and keep it out of the user MFA policies."
+    refs: ["NIST-800-53:IA-5", "NIST-800-53:AC-2", "CIS-Controls-v8:5.2"]
+    query:
+      protocol: graph
+      path: /users
+      select: [id, userPrincipalName, accountEnabled, userType, createdDateTime, onPremisesSyncEnabled, onPremisesSecurityIdentifier, signInActivity, assignedLicenses, mail, onPremisesSamAccountName, displayName, givenName, surname, department, jobTitle, usageLocation, onPremisesDomainName, onPremisesUserPrincipalName, proxyAddresses, passwordPolicies]
+      top: 500
+      key: id
+      name: userPrincipalName
+    each:
+      all:
+        - { field: accountEnabled, op: eq, value: true }
+        - field: 'assignedLicenses[].skuId'
+          op: in
+          threshold: m365.room-device-sku-ids
+          value: [4cde982a-ede4-4409-9ae6-b003453c8ea6, 21943e3a-2429-4f83-84c1-02735cd49e78, 6af4b3d6-14bb-4a2a-960c-6c902aad34f3, 50509a35-f0bd-4c5e-89ac-22f0e16a00f8, 6070a4c8-34c6-4937-8dfb-39bbc6397a60, 4fb214cb-a430-4a91-9c91-4976763aa78f]
+        - any:
+            - { field: onPremisesSyncEnabled, op: absent }
+            - { field: onPremisesSyncEnabled, op: eq, value: false }
+        - any:
+            - { field: passwordPolicies, op: absent }
+            - { field: passwordPolicies, op: notcontains, value: DisablePasswordExpiration }
+    evidence: "room {userPrincipalName} ({displayName}): passwordPolicies '{passwordPolicies}'"
+
+  # Service plan ids are Microsoft constants: 2f442157-a11c-46b9-ae5b-6e39ff4e5849 = M365_ADVANCED_AUDITING.
+  - id: M365-LICENSE-ADVANCED-AUDIT-PLAN-DISABLED
+    title: Advanced auditing plan is disabled for a user who has it in their licence
+    kind: misconfigured
+    category: LOG
+    severity: low
+    entity: user
+    lens: security
+    why: "The advanced auditing service plan writes the richer audit events (mail items accessed, search queries) that investigations depend on; disabled in the licence assignment, those events are never written for exactly the accounts that paid for them. The plan's assignedPlans entry is matched as one element (plan id together with a state other than Enabled)."
+    fix: "Re-enable the Microsoft 365 Advanced Auditing service plan in the licensing group's plan selection."
+    refs: ["NIST-800-53:AU-2", "NIST-800-53:AU-12", "CIS-Controls-v8:8.2"]
+    query:
+      protocol: graph
+      path: /users
+      filter: "accountEnabled eq true"
+      select: [id, userPrincipalName, assignedPlans]
+      top: 999
+      key: id
+      name: userPrincipalName
+    each: { field: assignedPlans, op: match, value: '(?=.*"servicePlanId":"2f442157-a11c-46b9-ae5b-6e39ff4e5849")(?!.*"capabilityStatus":"Enabled")' }
+    evidence: "{userPrincipalName}: advanced auditing plan not enabled"
 
   # ============================================================ service health and changes ===
   - id: M365-SERVICE-ISSUE-OPEN
@@ -650,6 +826,234 @@ rules:
       key: id
     each: { field: isSiteCreationEnabled, op: eq, value: true }
     evidence: "isSiteCreationEnabled = {isSiteCreationEnabled}"
+
+  - id: M365-ONEDRIVE-DEFAULT-QUOTA-DRIFT
+    title: Default OneDrive storage quota differs from the recorded value
+    kind: misconfigured
+    category: CFG
+    severity: low
+    entity: sharepoint-tenant
+    why: "The default quota decides what every new user's OneDrive, and a leaver's retained one, can hold; a changed default quietly alters storage cost and retention planning. The reference is Microsoft's default (1 TB = 1048576 MB) unless the tenant records its own value in the threshold."
+    fix: "Set the default back, or record the new value in the threshold once the change is approved."
+    refs: ["NIST-800-53:CM-6"]
+    query:
+      protocol: graph
+      path: /admin/sharepoint/settings
+      key: id
+    each: { field: personalSiteDefaultStorageLimitInMB, op: ne, value: 1048576, threshold: m365.onedrive-default-quota-mb }
+    evidence: "personalSiteDefaultStorageLimitInMB = {personalSiteDefaultStorageLimitInMB}"
+
+  # ======================================================================== usage reports ===
+  # Beta usage reports answer in JSON with $format=application/json (v1.0 redirects to a CSV, which the
+  # runner does not follow). With the report privacy setting on (M365-REPORTS-NAMES-CONCEALED) user,
+  # group and site names are hashed, and keys are hashes too.
+  - id: M365-REPORTS-NAMES-CONCEALED
+    title: Usage reports conceal user, group and site names
+    kind: misconfigured
+    category: LOG
+    severity: info
+    entity: org-setting
+    why: "Not wrong in itself, but with concealed names every report-based rule (mailbox quota, site storage, inactive teams, Copilot seats) shows hashes, so the finding cannot name the mailbox or site. The rule makes that state visible instead of silent."
+    fix: "Record the privacy decision; if operations need names, turn concealment off in the reports settings, otherwise accept that report rules work on hashes."
+    refs: ["NIST-800-53:AU-3", "NIST-800-53:PT-2"]
+    query:
+      protocol: graph
+      path: /admin/reportSettings
+      key: id
+    each:
+      any:
+        - all:
+            - { field: displayConcealedNames, op: exists }
+            - { field: displayConcealedNames, op: eq, value: true }
+        - all:
+            - { field: displayConcealedNames, op: absent }
+            - { field: value.displayConcealedNames, op: eq, value: true }
+    evidence: "displayConcealedNames = {displayConcealedNames}{value.displayConcealedNames}"
+
+  - id: M365-MAILBOX-NEAR-QUOTA
+    title: Mailbox is at or above 90 percent of its send quota
+    kind: broken
+    category: AVL
+    severity: medium
+    entity: mailbox
+    why: "Past the prohibit-send quota the mailbox cannot send; past the send-and-receive quota incoming mail bounces, which on a shared, public-facing mailbox is a silent service failure. The quotas in the report reflect the mailbox's licence (an unlicensed shared mailbox stops at 50 GB)."
+    fix: "Enable the archive (auto-expanding where licensed) and an archiving policy, clean up with the owner, or move the mailbox to a plan with a larger quota."
+    refs: ["NIST-800-53:CP-2", "NIST-800-53:SC-5"]
+    query:
+      protocol: graph
+      version: beta
+      path: "/reports/getMailboxUsageDetail(period='D7')?$format=application/json"
+      key: userPrincipalName
+      name: displayName
+    each:
+      all:
+        - { field: isDeleted, op: eq, value: false }
+        - { field: prohibitSendQuotaInBytes, op: gt, value: 0 }
+        - { field: storageUsedInBytes, op: ge, value: { field: prohibitSendQuotaInBytes, times: 0.9 } }
+    evidence: "{displayName}: {storageUsedInBytes} bytes used, send quota {prohibitSendQuotaInBytes}, send/receive quota {prohibitSendReceiveQuotaInBytes}, archive {hasArchive}"
+
+  - id: M365-OUTLOOK-VERSION-UNSUPPORTED
+    title: Users connect with Outlook releases that are out of support
+    kind: misconfigured
+    category: LCM
+    severity: medium
+    entity: report
+    lens: both
+    why: "Outlook 2007 to 2019 receive no security fixes any more, and Microsoft no longer supports them for connecting to Microsoft 365; they keep older authentication behaviour and break as the service changes. The report counts users per release over the last 30 days (never concealed); releases newer than 2019 are not broken out by the report."
+    fix: "Upgrade the clients to Microsoft 365 Apps through the endpoint management tool; once done, block old clients with an authentication policy."
+    refs: ["NIST-800-53:SI-2", "NIST-800-53:SA-22", "CIS-Controls-v8:2.2"]
+    query:
+      protocol: graph
+      version: beta
+      path: "/reports/getEmailAppUsageVersionsUserCounts(period='D30')?$format=application/json"
+      key: reportPeriod
+    each:
+      any:
+        - { field: outlook2007, op: gt, value: 0, threshold: m365.outlook-unsupported-max-users }
+        - { field: outlook2010, op: gt, value: 0, threshold: m365.outlook-unsupported-max-users }
+        - { field: outlook2013, op: gt, value: 0, threshold: m365.outlook-unsupported-max-users }
+        - { field: outlook2016, op: gt, value: 0, threshold: m365.outlook-unsupported-max-users }
+        - { field: outlook2019, op: gt, value: 0, threshold: m365.outlook-unsupported-max-users }
+    evidence: "users per release over {reportPeriod} days: 2007 {outlook2007}, 2010 {outlook2010}, 2013 {outlook2013}, 2016 {outlook2016}, 2019 {outlook2019}, Microsoft 365 {outlookM365}, undetermined {undetermined}"
+
+  - id: M365-SPO-SITE-STORAGE-HIGH
+    title: SharePoint site is at or above 90 percent of its storage allocation
+    kind: broken
+    category: AVL
+    severity: medium
+    entity: site
+    why: "When a site reaches its allocation, uploads fail - for a team site that means the team's Files tab. Sites on automatic storage management have the tenant pool as allocation and rarely show here; sites with a manual quota do."
+    fix: "Review versions and the preservation hold library with the owner, raise the site quota, or buy pooled storage."
+    refs: ["NIST-800-53:CP-2", "NIST-800-53:SC-5"]
+    query:
+      protocol: graph
+      version: beta
+      path: "/reports/getSharePointSiteUsageDetail(period='D180')?$format=application/json"
+      key: siteId
+      name: siteUrl
+    each:
+      all:
+        - { field: isDeleted, op: eq, value: false }
+        - { field: storageAllocatedInBytes, op: gt, value: 0 }
+        - { field: storageUsedInBytes, op: ge, value: { field: storageAllocatedInBytes, times: 0.9 } }
+    evidence: "{siteUrl} ({rootWebTemplate}, owner {ownerPrincipalName}): {storageUsedInBytes} of {storageAllocatedInBytes} bytes"
+
+  - id: M365-SPO-SITE-INACTIVE
+    title: SharePoint site with no activity for half a year
+    kind: misconfigured
+    category: HYG
+    severity: low
+    entity: site
+    lens: both
+    why: "A site nobody uses still holds data, sharing links and guests - the cheapest exposure to retire or archive."
+    fix: "Ask the owner; archive the site, make it read-only or delete it by decision."
+    refs: ["NIST-800-53:CM-8", "CIS-Controls-v8:3.1"]
+    query:
+      protocol: graph
+      version: beta
+      path: "/reports/getSharePointSiteUsageDetail(period='D180')?$format=application/json"
+      key: siteId
+      name: siteUrl
+    each:
+      all:
+        - { field: isDeleted, op: eq, value: false }
+        - any:
+            - { field: lastActivityDate, op: absent }
+            - { field: lastActivityDate, op: age-gt, value: 180, threshold: m365.site-inactive-days }
+    evidence: "{siteUrl} ({rootWebTemplate}, owner {ownerPrincipalName}): last activity {lastActivityDate}, {fileCount} files, {anonymousLinkCount} anyone links"
+
+  - id: M365-ONEDRIVE-ACCOUNT-STORAGE-HIGH
+    title: OneDrive is at or above 90 percent of its allocation
+    kind: broken
+    category: AVL
+    severity: low
+    entity: site
+    why: "A full OneDrive stops syncing the user's desktop and documents, which are often their only copy."
+    fix: "Raise the user's quota or clean up with the user; check that folder backup is not syncing a bulk folder."
+    refs: ["NIST-800-53:CP-2"]
+    query:
+      protocol: graph
+      version: beta
+      path: "/reports/getOneDriveUsageAccountDetail(period='D7')?$format=application/json"
+      key: siteUrl
+      name: ownerPrincipalName
+    each:
+      all:
+        - { field: isDeleted, op: eq, value: false }
+        - { field: storageAllocatedInBytes, op: gt, value: 0 }
+        - { field: storageUsedInBytes, op: ge, value: { field: storageAllocatedInBytes, times: 0.9 } }
+    evidence: "{ownerPrincipalName}: {storageUsedInBytes} of {storageAllocatedInBytes} bytes, {fileCount} files"
+
+  - id: M365-TEAMS-INACTIVE
+    title: Team with no activity for half a year
+    kind: misconfigured
+    category: HYG
+    severity:
+      field: 'details[].guests'
+      ranges: [ { min: 1, value: medium } ]
+      default: low
+    entity: team
+    lens: both
+    why: "An inactive team still holds files, channels and members; one that still has guests (medium) is both clutter and exposure."
+    fix: "Archive or delete the team with its owner; remove the guests first."
+    refs: ["NIST-800-53:CM-8", "NIST-800-53:AC-2(13)"]
+    query:
+      protocol: graph
+      version: beta
+      path: "/reports/getTeamsTeamActivityDetail(period='D180')?$format=application/json"
+      key: teamId
+      name: teamName
+    each:
+      any:
+        - { field: lastActivityDate, op: absent }
+        - { field: lastActivityDate, op: age-gt, value: 180, threshold: m365.team-inactive-days }
+    evidence: "{teamName} ({teamType}): last activity {lastActivityDate}, guests {details[].guests}, active users {details[].activeUsers}"
+
+  - id: M365-COPILOT-SEAT-IDLE
+    title: Copilot licence holder has not used Copilot for two months
+    kind: misconfigured
+    category: CST
+    severity: low
+    entity: user
+    why: "Copilot is the most expensive per-seat add-on; a seat with no Copilot activity for two months is money idle. The report lists licensed users only; a tenant without Copilot returns no rows."
+    fix: "Reassign the seat to someone who will use it, or reduce the count at renewal."
+    refs: ["NIST-800-53:SA-4", "CIS-Controls-v8:2.1"]
+    query:
+      protocol: graph
+      version: beta
+      path: "/copilot/reports/getMicrosoft365CopilotUsageUserDetail(period='D90')"
+      key: userPrincipalName
+      name: displayName
+    each:
+      any:
+        - { field: lastActivityDate, op: absent }
+        - { field: lastActivityDate, op: age-gt, value: 60, threshold: m365.copilot-idle-days }
+    evidence: "{userPrincipalName}: last Copilot activity {lastActivityDate}"
+
+  # ===================================================== directory settings (labels for groups) ===
+  - id: AIP-CONTAINER-LABELS-OFF
+    title: Sensitivity labels cannot be applied to groups, teams and sites
+    kind: missing
+    category: CFG
+    severity: low
+    entity: tenant
+    why: "Container labels are the only way to tie a group's privacy, guest access and the external sharing of its site to a classification; with EnableMIPLabels off (Microsoft's default) every group gets the tenant defaults. A decision: accept the finding when deliberately off."
+    fix: "Set EnableMIPLabels to true in the Group.Unified directory settings, then publish container labels in a label policy."
+    refs: ["NIST-800-53:AC-16", "NIST-800-53:AC-21", "CIS-Controls-v8:3.7"]
+    query:
+      protocol: graph
+      path: /groupSettings
+      select: [id, displayName, templateId, values]
+      key: id
+      name: displayName
+    count:
+      op: lt
+      value: 1
+      where:
+        all:
+          - { field: templateId, op: eq, value: 62375ab9-6b52-47ed-826b-58e47e0e304b }
+          - { field: values, op: match, value: '(?=.*"name":"EnableMIPLabels")(?=.*"value":"true")' }
+    evidence: "{count} Group.Unified settings objects enable labels for groups, among {rows} settings objects"
 
   # ============================================================================ domains ===
   - id: M365-DOMAIN-UNVERIFIED
@@ -856,3 +1260,157 @@ rules:
         - { field: severity, op: in, value: [high, medium] }
         - { field: createdDateTime, op: age-gt, value: 1, threshold: m365.alert-max-open-days }
     evidence: "{title} ({serviceSource}, {category}): {severity}, {status} since {createdDateTime}, incident {incidentId}, assigned to '{assignedTo}' - {alertWebUrl}"
+
+  # ========================================================================== eDiscovery ===
+  # eDiscovery (Premium) cases through Graph v1.0. Newer case operation actions (exportReport,
+  # exportResult, purgeData) come back as unknownFutureValue without a Prefer header the runner does not
+  # send, so the export rule sees contentExport only.
+  - id: M365-EDISCOVERY-CASE-STALE
+    title: eDiscovery case left active with no change for months
+    kind: misconfigured
+    category: IAM
+    severity: low
+    entity: ediscovery-case
+    lens: security
+    why: "An active case keeps its holds - and so data and storage - indefinitely, and its members keep search and export rights over the held content long after the matter ended."
+    fix: "Close the case with legal, which releases its holds, or record why it stays open."
+    refs: ["NIST-800-53:AU-11", "NIST-800-53:AC-6(9)", "NIST-800-53:SI-12"]
+    query:
+      protocol: graph
+      path: /security/cases/ediscoveryCases
+      select: [id, displayName, status, createdDateTime, lastModifiedDateTime, closedDateTime]
+      key: id
+      name: displayName
+    each:
+      all:
+        - { field: status, op: eq, value: active }
+        - { field: lastModifiedDateTime, op: age-gt, value: 180, threshold: m365.ediscovery-case-idle-days }
+    evidence: "{displayName}: active since {createdDateTime}, last changed {lastModifiedDateTime}"
+
+  - id: M365-EDISCOVERY-HOLD-ON-CLOSED-CASE
+    title: Legal hold still enabled on a closed eDiscovery case, or in error
+    kind: misconfigured
+    category: CFG
+    severity:
+      field: status
+      map: { error: medium }
+      default: low
+    entity: ediscovery-hold
+    lens: both
+    why: "A hold that stays enabled after its case closed keeps data and consumes storage after the matter ended; a hold in error (medium) holds nothing while appearing to."
+    fix: "Release the hold by legal decision, or repair its locations and re-sync it."
+    refs: ["NIST-800-53:AU-11", "NIST-800-53:SI-12"]
+    query:
+      protocol: graph
+      path: /security/cases/ediscoveryCases/{id}/legalHolds
+      for_each:
+        path: /security/cases/ediscoveryCases
+        select: [id, displayName, status]
+        field: id
+        max: 500
+      key: "{parent.id}|{id}"
+      name: displayName
+    each:
+      any:
+        - all:
+            - { field: parent.status, op: in, value: [closed, closedWithError, closing] }
+            - { field: isEnabled, op: eq, value: true }
+        - { field: status, op: eq, value: error }
+    evidence: "case {parent.displayName} ({parent.status}): hold {displayName} enabled {isEnabled}, status {status}, errors {errors}"
+
+  - id: M365-EDISCOVERY-EXPORT-RECENT
+    title: Content exported from an eDiscovery case this week
+    kind: misconfigured
+    category: IAM
+    severity: medium
+    entity: ediscovery-operation
+    lens: security
+    why: "An export is a bulk copy of mailboxes or sites leaving the tenant; each one should map to a legal request, checked the next morning. Searches made outside a case are only in the unified audit log."
+    fix: "Confirm each export against the case's request; investigate exports made by people outside the eDiscovery role groups."
+    refs: ["NIST-800-53:AU-6", "NIST-800-53:AC-6(9)", "CIS-Controls-v8:8.11"]
+    query:
+      protocol: graph
+      path: /security/cases/ediscoveryCases/{id}/operations
+      for_each:
+        path: /security/cases/ediscoveryCases
+        select: [id, displayName, status]
+        field: id
+        max: 500
+      key: "{parent.id}|{id}"
+      name: parent.displayName
+    each:
+      all:
+        - { field: action, op: eq, value: contentExport }
+        - { field: createdDateTime, op: age-lt, value: 7, threshold: m365.ediscovery-export-window-days }
+    evidence: "case {parent.displayName}: {action} {status} by {createdBy.user.userPrincipalName}{createdBy.user.displayName} at {createdDateTime}"
+
+  # ================================================================== mailbox inbox rules ===
+  # One request per licensed, enabled member's inbox (at most 2000 per scan; mailboxes beyond that,
+  # and licensed users without a mailbox, make the result partial with the reason). Hidden rules are
+  # not returned by Graph. Rows: messageRule with parent = the user.
+  - id: M365-INBOX-RULE-FORWARD
+    title: Inbox rule forwards or redirects mail
+    kind: misconfigured
+    category: IAM
+    severity: high
+    entity: inbox-rule
+    lens: security
+    why: "An inbox rule that forwards, redirects or forwards as attachment is the classic post-compromise way to keep reading a mailbox after the password reset, and under a no-forwarding policy it is a breach of that policy in itself. Every target counts unless it matches the allow pattern (empty by default: nothing allowed)."
+    fix: "Disable the rule and treat the mailbox as possibly compromised (review sign-ins, revoke sessions, reset the password); then block automatic external forwarding tenant-wide and document the approved exceptions in the threshold."
+    refs: [CIS-M365:6.2.1, "MITRE-ATTACK:T1114.003", "NIST-800-53:AC-4", "NIST-800-53:SI-4"]
+    query:
+      protocol: graph
+      path: /users/{id}/mailFolders/inbox/messageRules
+      for_each:
+        path: /users
+        filter: "accountEnabled eq true and userType eq 'Member' and assignedLicenses/$count ne 0"
+        consistency: eventual
+        select: [id, userPrincipalName]
+        field: id
+        max: 2000
+      key: "{parent.id}|{id}"
+      name: parent.userPrincipalName
+    each:
+      all:
+        - { field: isEnabled, op: eq, value: true }
+        - any:
+            - { field: 'actions.forwardTo[].emailAddress.address', op: notmatch, value: '(?!)', threshold: m365.forwarding-allow-pattern }
+            - { field: 'actions.redirectTo[].emailAddress.address', op: notmatch, value: '(?!)', threshold: m365.forwarding-allow-pattern }
+            - { field: 'actions.forwardAsAttachmentTo[].emailAddress.address', op: notmatch, value: '(?!)', threshold: m365.forwarding-allow-pattern }
+    evidence: "{parent.userPrincipalName}: rule '{displayName}' forwards to {actions.forwardTo[].emailAddress.address} {actions.forwardAsAttachmentTo[].emailAddress.address}, redirects to {actions.redirectTo[].emailAddress.address}"
+
+  - id: M365-INBOX-RULE-HIDE-KEYWORD
+    title: Inbox rule hides mail about security or account activity
+    kind: misconfigured
+    category: IAM
+    severity: medium
+    entity: inbox-rule
+    lens: security
+    why: "A rule that deletes, moves or marks as read messages mentioning passwords, phishing, sign-ins or a hack is how an intruder keeps the owner from seeing the warnings and replies their activity causes. Tune the keyword pattern with the threshold."
+    fix: "Disable the rule, ask the owner whether they made it, and if not treat the mailbox as compromised."
+    refs: ["MITRE-ATTACK:T1564.008", "NIST-800-53:SI-4", "NIST-800-53:AC-4"]
+    query:
+      protocol: graph
+      path: /users/{id}/mailFolders/inbox/messageRules
+      for_each:
+        path: /users
+        filter: "accountEnabled eq true and userType eq 'Member' and assignedLicenses/$count ne 0"
+        consistency: eventual
+        select: [id, userPrincipalName]
+        field: id
+        max: 2000
+      key: "{parent.id}|{id}"
+      name: parent.userPrincipalName
+    each:
+      all:
+        - { field: isEnabled, op: eq, value: true }
+        - any:
+            - { field: actions.delete, op: eq, value: true }
+            - { field: actions.permanentDelete, op: eq, value: true }
+            - { field: actions.moveToFolder, op: notempty }
+            - { field: actions.markAsRead, op: eq, value: true }
+        - any:
+            - { field: 'conditions.subjectContains', op: match, value: '(password|phish|hack|compromis|suspicious|unusual|sign-in|signin|security alert|fraud|help ?desk)', threshold: m365.inbox-rule-hide-keyword-pattern }
+            - { field: 'conditions.bodyOrSubjectContains', op: match, value: '(password|phish|hack|compromis|suspicious|unusual|sign-in|signin|security alert|fraud|help ?desk)', threshold: m365.inbox-rule-hide-keyword-pattern }
+            - { field: 'conditions.bodyContains', op: match, value: '(password|phish|hack|compromis|suspicious|unusual|sign-in|signin|security alert|fraud|help ?desk)', threshold: m365.inbox-rule-hide-keyword-pattern }
+    evidence: "{parent.userPrincipalName}: rule '{displayName}' on '{conditions.subjectContains}{conditions.bodyOrSubjectContains}{conditions.bodyContains}': delete {actions.delete}, move to {actions.moveToFolder}, mark read {actions.markAsRead}"
