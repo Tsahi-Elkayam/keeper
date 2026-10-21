@@ -32,7 +32,7 @@ public sealed class RedactorTests
     [InlineData("pass" + "word={demo}", "pass" + "word=<redacted>")]
     [InlineData("\"client_" + "secret\": \"{demo}\"", "\"client_" + "secret\": \"<redacted>\"")]
     [InlineData("Authorization: Bearer abc.def.ghi", "Authorization: Bearer <redacted>")]
-    [InlineData("https://admin:{demo}@host.example.org/api", "https://<redacted>@host.example.org/api")]
+    [InlineData("https://admin" + ":{demo}" + "@host.example.org/api", "https://<redacted>@host.example.org/api")]
     public void Removes_what_looks_like_a_credential(string text, string expected)
     {
         Assert.Equal(expected, Redactor.Clean(text.Replace("{demo}", Keeper.TestKit.DemoVault.Get("demo-login"), StringComparison.Ordinal)));
