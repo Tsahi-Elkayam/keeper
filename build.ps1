@@ -3,25 +3,29 @@
     Builds Keeper into .\build\<runtime>: every keeper binary, side by side, with the rules.
 
 .DESCRIPTION
-    The repo holds source only. Binaries go to .\build\<runtime>\ (disposable); everything that
-    belongs to a tenant - settings, deny-list, its own rules and queries, the store, scan output -
-    lives in the Keeper home, outside the repo:
+    Everything stays in this one folder. Git tracks the source; it ignores the three folders that
+    are not source:
 
-      $env:KEEPER_HOME if set (one folder per tenant), else %LOCALAPPDATA%\Keeper
-        settings\   settings.json, denylist.txt, rules\*.yaml, queries\*.sql
-        data\       keeper.db, spool\, runs\, builds\, imports\, backups\
+      build\<runtime>\   the binaries and the rules (disposable)
+      home\              the Keeper home: everything that belongs to the tenant
+        settings\          settings.json, denylist.txt, rules\*.yaml, queries\*.sql
+        data\              keeper.db, spool\, runs\, builds\, imports\, reports\, backups\
+      demo\              a second home with sample data ($env:KEEPER_HOME = '<this folder>\demo')
 
-    1. Refuses to run if the Keeper home is inside the repo, or if an old build\settings or
-       build\data is still here (it prints how to move them; it never moves or deletes them).
-    2. Leak check: scans the repo for the identifiers in <home>\settings\denylist.txt and stops
-       if any are found.
+    $env:KEEPER_HOME, when set, points every binary at another home.
+
+    1. Refuses to run if the Keeper home is inside the repo anywhere but home\ or demo\ (both listed
+       in .gitignore), or if an old build\settings or build\data is still here.
+    2. Leak check: scans the source (not build\, home\ or demo\) for the identifiers in
+       <home>\settings\denylist.txt and stops if any are found. A line is plain text, or a regular
+       expression after 're:' (e.g. re:\b10\.\d+\.\d+\.\d+\b).
     3. Validates every rule file in rules\.
     4. With -Test, runs the unit tests.
     5. Publishes every binary (components\*\src\keeper and keeper-*) into .\build\<runtime>
        (framework-dependent: needs the .NET 10 runtime where it runs), and replaces
        .\build\<runtime>\rules with the repo's rules\.
 
-    Writes only to .\build\<runtime>. Never touches the Keeper home: 'keeper setup' creates it.
+    Writes only to .\build\<runtime>. Never touches the Keeper home: 'keeper setup --apply' creates it.
     Runs on Windows PowerShell 5.1.
 
 .PARAMETER Runtime
@@ -50,7 +54,7 @@ $repo = $PSScriptRoot
 $out  = Join-Path (Join-Path $repo 'build') $Runtime
 
 # $keeperHome, never $home - that is PowerShell's read-only automatic variable.
-$keeperHome = if ($env:KEEPER_HOME) { $env:KEEPER_HOME } else { Join-Path $env:LOCALAPPDATA 'Keeper' }
+$keeperHome = if ($env:KEEPER_HOME) { $env:KEEPER_HOME } else { Join-Path $repo 'home' }
 $keeperHome = [IO.Path]::GetFullPath($keeperHome)
 $denyList   = Join-Path (Join-Path $keeperHome 'settings') 'denylist.txt'
 
@@ -61,9 +65,13 @@ function Test-Under([string]$Path, [string]$Folder) {
     return $p.StartsWith($f, [StringComparison]::OrdinalIgnoreCase)
 }
 
-# 1. Tenant files stay out of the repo
-if (Test-Under $keeperHome $repo) {
-    throw "The Keeper home ($keeperHome) is inside the repo ($repo). Point KEEPER_HOME outside it."
+# 1. Tenant files stay out of what git tracks: inside the repo only home\ or demo\, and only while .gitignore lists them
+$ignored = @(Get-Content (Join-Path $repo '.gitignore') | ForEach-Object { $_.Trim() })
+foreach ($name in 'home', 'demo') {
+    if ($ignored -notcontains "/$name/") { throw ".gitignore no longer lists /$name/ - put it back before building." }
+}
+if ((Test-Under $keeperHome $repo) -and -not ((Test-Under $keeperHome (Join-Path $repo 'home')) -or (Test-Under $keeperHome (Join-Path $repo 'demo')))) {
+    throw "The Keeper home ($keeperHome) is inside the repo but not in home\ or demo\. Point KEEPER_HOME at one of them, or outside the repo."
 }
 
 $legacy = @('settings', 'data') | ForEach-Object { Join-Path (Join-Path $repo 'build') $_ } | Where-Object { Test-Path $_ }
@@ -84,12 +92,18 @@ if (Test-Path $denyList) {
     $terms = @(Get-Content $denyList -Encoding UTF8 |
         ForEach-Object { $_.Trim() } |
         Where-Object { $_ -and -not $_.StartsWith('#') })
-    $skip  = '\\(build|bin|obj|artifacts|\.git|\.vs|TestResults)\\'
+    $plain   = @($terms | Where-Object { -not $_.StartsWith('re:') })
+    $regexes = @($terms | Where-Object { $_.StartsWith('re:') } | ForEach-Object { $_.Substring(3) })
+    $skip  = '^\\(build|home|demo)\\|\\(bin|obj|artifacts|\.git|\.vs|TestResults)\\'
     $files = @(Get-ChildItem $repo -Recurse -File -Force |
-        Where-Object { $_.FullName.Substring($repo.Length) -notmatch $skip })
+        Where-Object { $_.FullName.Substring($repo.Length) -notmatch $skip } |
+        ForEach-Object { $_.FullName })
 
     if ($terms.Count -gt 0 -and $files.Count -gt 0) {
-        $hits = @($files | Select-String -Pattern $terms -SimpleMatch)
+        # Positions only: the matched text is a tenant identifier and must not reach a console log.
+        $hits = @()
+        if ($plain.Count -gt 0)   { $hits += @(Select-String -LiteralPath $files -Pattern $plain -SimpleMatch) }
+        if ($regexes.Count -gt 0) { $hits += @(Select-String -LiteralPath $files -Pattern $regexes) }
         if ($hits.Count -gt 0) {
             Write-Host 'LEAK CHECK FAILED - tenant identifiers found in the repo:' -ForegroundColor Red
             foreach ($hit in $hits) {
@@ -106,7 +120,8 @@ else {
 
 # 3. Every rule file loads, and ids are unique across them
 $validator = Join-Path $repo 'components\scan\src\keeper-rules\keeper-rules.csproj'
-& dotnet run --project $validator -c $Configuration --nologo -- validate (Join-Path $repo 'rules')
+# No --nologo here: dotnet run hands options it does not know to the program, which would read it as its own.
+& dotnet run --project $validator -c $Configuration -- validate (Join-Path $repo 'rules')
 if ($LASTEXITCODE -ne 0) { throw "Rule validation failed (exit $LASTEXITCODE): fix the file:line:col above." }
 
 # 4. Tests

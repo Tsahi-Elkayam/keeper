@@ -18,10 +18,6 @@ Names and values below are written from documentation or field use and have not 
 live host by Keeper yet. A wrong name makes a query fail (unknown, visible in coverage) or a rule
 silent; check each one on a sample before trusting a pass.
 
-- Validator: `artifacts\validator\keeper-rules.exe` (built 2026-10-20 16:14) predates the registry
-  protocol's `path:` field and field-reference values. It refuses every registry rule ("key is
-  required") and WS-SERVICES-EXE-BUSY ("needs a number"); the newer debug build accepts the registry
-  rules. Rebuild the validator, then validate the whole folder again.
 - Registry: SecureBoot\Servicing UEFICA2023Status / WindowsUEFICA2023Capable and the value "Updated"
   (WS-/WINSRV-REG-SECUREBOOT-CA2023); `Windows Advanced Threat Protection\Status` OnboardingState
   (REG-MDE-NOT-ONBOARDED); SrpV2\Exe EnforcementMode 0 = audit (REG-APPLOCKER-AUDIT-ONLY);

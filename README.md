@@ -16,9 +16,9 @@ names, tenant IDs, hostnames, IP addresses, people's names, counts from a real s
 output. Examples and tests use `example.com` / `example.org` and the documentation IP ranges
 `192.0.2.0/24`, `198.51.100.0/24` and `203.0.113.0/24`.
 
-A tenant's settings and data live in the **Keeper home**, a private folder outside this repo. The
-binaries refuse to start if their settings or data are inside a source tree, beside the binaries,
-or readable by other users.
+A tenant's settings and data live in the **Keeper home**, a private folder: `home\` in this folder,
+which git ignores, unless `KEEPER_HOME` points elsewhere. The binaries refuse to start if their
+settings or data are anywhere else in a source tree, beside the binaries, or readable by other users.
 
 ## The daily loop
 
@@ -119,12 +119,17 @@ Each verb is its own binary beside `keeper.exe`, so each process holds only the 
 | `components\keeper` | The composed binaries: `keeper`, `keeper-run`, `keeper-db`, `keeper-qm`, `keeper-query` |
 | `rules\` | The generic rule packs, one file per system type |
 | `docs\` | `ARCHITECTURE.md`, `RULES.md` (the rule format), `SECURITY.md`, `backlog\` (checks not yet rules, and why) |
+| `build\<runtime>\` | The binaries and the rules (`build.ps1` output; git ignores it) |
+| `home\` | The Keeper home: your tenant's settings and data (git ignores it) |
+| `demo\` | A second home with sample data, for trying Keeper out (git ignores it) |
+
+Everything lives in this one folder; git tracks only the source.
 
 ## Keeper home
 
 | | |
 |---|---|
-| Where | `KEEPER_HOME` if set, else `%LOCALAPPDATA%\Keeper` (Windows) / `~/Library/Application Support/Keeper` (macOS) |
+| Where | `KEEPER_HOME` if set; else, for a build inside this folder, `home\`; else `%LOCALAPPDATA%\Keeper` (Windows) / `~/Library/Application Support/Keeper` (macOS) |
 | `settings\` | `settings.json` (tenant name and data path only), `denylist.txt`, the tenant's own `rules\*.yaml` and `queries\*.sql` |
 | `data\` | `keeper.db`, `spool\`, `runs\`, `builds\`, `imports\` (other tools' reports), `reports\`, `backups\` |
 
@@ -144,5 +149,6 @@ Needs the .NET 10 SDK; packages restore from nuget.org only (`nuget.config`, wit
 
 ### Leak check
 
-List your tenant's identifiers in `settings\denylist.txt` in the Keeper home, one per line.
-`build.ps1` scans the repo for them and stops if any are found. Build before you commit.
+List your tenant's identifiers in `settings\denylist.txt` in the Keeper home, one per line: plain text,
+or a regular expression after `re:`. `build.ps1` scans the source (not `build\`, `home\` or `demo\`) for
+them and stops if any are found, printing positions only. Build before you commit.

@@ -1,8 +1,13 @@
-# Build output - binaries only. Tenant settings and data live in the Keeper home, outside this repo.
+# Build output - binaries only.
 build/
 bin/
 obj/
 TestResults/
+
+# The Keeper home (tenant settings and data) and the demo home. Keeper accepts a home inside this
+# folder only when these two lines are here - keep them.
+/home/
+/demo/
 
 # Tenant files - a backstop in case one lands in the repo anyway
 settings.json

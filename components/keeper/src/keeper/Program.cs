@@ -82,7 +82,7 @@ static int Help(Dictionary<string, string> verbs)
 
           keeper <question>      any question from 'keeper query list', e.g. keeper broken, keeper expiring
 
-        Every binary reads the Keeper home: KEEPER_HOME, else the per-user application data folder.
+        Every binary reads the Keeper home: KEEPER_HOME, else the keeper folder's home\ (git ignores it).
         --settings <file> points one command at another home's settings.json.
         """);
     return ExitCodes.Ok;
@@ -97,7 +97,7 @@ static int Setup(CliArgs cli)
               keeper setup --tenant <name>           show what it would create; nothing changes
               keeper setup --tenant <name> --apply   create it; a second run only fills in what is missing
               then keeper db init --apply            create the store
-              The home is KEEPER_HOME, else the per-user application data folder, and never inside the code folder.
+              The home is KEEPER_HOME, else the keeper folder's home\ (git ignores home\ and demo\).
             """, asked: true);
     var apply = cli.Has("apply");
     var home = KeeperHome.Resolve();
