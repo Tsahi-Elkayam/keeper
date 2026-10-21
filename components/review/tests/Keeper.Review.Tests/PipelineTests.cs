@@ -466,6 +466,54 @@ public sealed class PipelineTests : IDisposable
     }
 
     [Fact]
+    public void An_exception_lapses_after_its_until_day_and_the_finding_comes_back_saying_so()
+    {
+        _store.Submit("review.override", $$"""{ "op": "add", "checkId": "{{Rule}}", "decision": "exception", "entity": "u1", "until": "2026-10-25" }""");
+        Assert.Equal(1, _store.Manager(_clock).DrainOnce().Done);
+
+        Scan(u1Fails: true);
+        Cycle();
+        Assert.Equal("exception", U1()["status"]);
+
+        _clock.Now = new DateTimeOffset(2026, 10, 25, 23, 0, 0, TimeSpan.Zero);   // the last day it holds
+        Scan(u1Fails: true);
+        Cycle();
+        Assert.Equal("exception", U1()["status"]);
+
+        _clock.Now = new DateTimeOffset(2026, 10, 26, 6, 0, 0, TimeSpan.Zero);
+        Scan(u1Fails: true);
+        Cycle();
+        Assert.Equal("open", U1()["status"]);
+        Assert.Equal("the exception ended on 2026-10-25", _store.Scalar("SELECT note FROM finding_event WHERE event = 'reopened'"));
+    }
+
+    [Fact]
+    public void A_lapsed_exception_gives_its_finding_back_even_when_nothing_scans_it_again()
+    {
+        _store.Submit("review.override", $$"""{ "op": "add", "checkId": "{{Rule}}", "decision": "exception", "entity": "u1", "until": "2026-10-25" }""");
+        Assert.Equal(1, _store.Manager(_clock).DrainOnce().Done);
+        Scan(u1Fails: true);
+        Cycle();
+        Scan(u1Fails: true, ruleRan: false);   // the newest scan does not report it: the rule did not run
+        Cycle();
+        Assert.Equal("exception", U1()["status"]);
+
+        _clock.Now = new DateTimeOffset(2026, 10, 26, 6, 0, 0, TimeSpan.Zero);
+        Cycle();   // no scan since
+
+        Assert.Equal(("open", "reopened"), ((string)U1()["status"]!, (string)U1()["lifecycle"]!));
+        Assert.StartsWith("the exception ended on 2026-10-25; not scanned since", (string)_store.Scalar("SELECT note FROM finding_event WHERE event = 'reopened'")!, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void An_override_cannot_end_before_it_is_made()
+    {
+        _store.Submit("review.override", $$"""{ "op": "add", "checkId": "{{Rule}}", "decision": "disable", "until": "2026-10-19" }""");
+
+        Assert.Equal(1, _store.Manager(_clock).DrainOnce().Failed);
+    }
+
+    [Fact]
     public void A_tampered_run_folder_is_refused_by_the_loader()
     {
         Scan(u1Fails: true);

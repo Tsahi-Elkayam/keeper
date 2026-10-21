@@ -5,9 +5,10 @@ namespace Keeper.Review.Handlers;
 
 /// <summary>
 /// review.override: disable a rule, change its threshold, or accept one entity as it is.
-/// Add:    { "op": "add", "checkId", "decision": "disable|threshold|exception", "entity", "value" }
+/// Add:    { "op": "add", "checkId", "decision": "disable|threshold|exception", "entity", "value", "until" }
 /// Remove: { "op": "remove", "overrideId" }
-/// The envelope's reason is recorded as why. Removing keeps the row.
+/// The envelope's reason is recorded as why. Removing keeps the row. until (yyyy-MM-dd) is the last day the
+/// override holds; after it the rule judges as before, and an accepted finding comes back.
 /// </summary>
 public sealed class OverrideHandler : IRequestHandler
 {
@@ -28,7 +29,10 @@ public sealed class OverrideHandler : IRequestHandler
         var decision = Payload.OneOf(payload, "decision", "disable", "threshold", "exception");
         var entity = Payload.Text(payload, "entity") ?? "";
         var value = Payload.Text(payload, "value") ?? "";
+        var until = Payload.Date(payload, "until");
 
+        if (until is not null && string.CompareOrdinal(until, context.NowText[..10]) < 0)
+            throw new RequestException($"until {until} has already passed.");
         if (decision == "disable" && entity.Length > 0)
             throw new RequestException("disable applies to the whole rule; leave payload.entity empty.");
         if (decision == "threshold" && value.Length == 0)
@@ -42,10 +46,10 @@ public sealed class OverrideHandler : IRequestHandler
 
         context.Execute(
             """
-            INSERT INTO override (override_id, check_id, decision, entity, value, actor, at, why)
-            VALUES (:id, :check, :decision, :entity, :value, :actor, :at, :why);
+            INSERT INTO override (override_id, check_id, decision, entity, value, until, actor, at, why)
+            VALUES (:id, :check, :decision, :entity, :value, :until, :actor, :at, :why);
             """,
-            (":id", id), (":check", checkId), (":decision", decision), (":entity", entity), (":value", value),
+            (":id", id), (":check", checkId), (":decision", decision), (":entity", entity), (":value", value), (":until", until),
             (":actor", context.Request.SubmittedBy), (":at", context.NowText), (":why", context.Request.Reason));
     }
 

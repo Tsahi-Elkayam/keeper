@@ -88,6 +88,128 @@ public static class Values
     }
 
     /// <summary>
+    /// A date in the format a condition names (format:), for values the automatic reading would miss or
+    /// misread: ole (OLE Automation days, as Excel and some exports write them), unix or unix-ms (any year),
+    /// or a .NET custom format such as dd/MM/yyyy HH:mm - read as UTC unless the format carries an offset.
+    /// 0 is never-happened in the numeric formats, as a FILETIME 0 is. No format: <see cref="TryDate(string?, out DateTimeOffset)"/>.
+    /// </summary>
+    public static bool TryDate(string? text, string? format, out DateTimeOffset date)
+    {
+        if (format is null)
+            return TryDate(text, out date);
+        date = default;
+        if (string.IsNullOrWhiteSpace(text))
+            return false;
+        text = text.Trim();
+        switch (format)
+        {
+            case "ole":
+                // DateTime.FromOADate's own range: 100-01-01 to 9999-12-31.
+                if (!double.TryParse(text, NumberStyles.Float, CultureInfo.InvariantCulture, out var days) || !double.IsFinite(days) || days is < -657434 or > 2958465)
+                    return false;
+                date = days == 0 ? DateTimeOffset.MinValue : new DateTimeOffset(DateTime.SpecifyKind(DateTime.FromOADate(days), DateTimeKind.Utc));
+                return true;
+            case "unix":
+            case "unix-ms":
+                if (!long.TryParse(text, NumberStyles.AllowLeadingSign, CultureInfo.InvariantCulture, out var epoch))
+                    return false;
+                try
+                {
+                    date = epoch == 0 ? DateTimeOffset.MinValue
+                        : format == "unix" ? DateTimeOffset.FromUnixTimeSeconds(epoch) : DateTimeOffset.FromUnixTimeMilliseconds(epoch);
+                    return true;
+                }
+                catch (ArgumentOutOfRangeException)
+                {
+                    return false;
+                }
+            default:
+                return DateTimeOffset.TryParseExact(text, format, CultureInfo.InvariantCulture,
+                    DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal, out date);
+        }
+    }
+
+    /// <summary>
+    /// A format: value a condition can name: ole, unix, unix-ms, or a custom format that writes and reads back a
+    /// whole date - year included, in any year, or a year-less format would read every date as this year's. For
+    /// an hour of the day (<paramref name="timeOfDay"/>), a time alone (HH:mm) is enough.
+    /// </summary>
+    public static bool IsDateFormat(string? format, bool timeOfDay = false)
+    {
+        if (format is "ole" or "unix" or "unix-ms")
+            return true;
+        if (string.IsNullOrWhiteSpace(format) || format.Length > 64)
+            return false;
+        try
+        {
+            DateTimeOffset[] samples = [new(2026, 11, 23, 14, 35, 0, TimeSpan.Zero), new(1999, 2, 3, 9, 5, 0, TimeSpan.Zero)];
+            return samples.All(sample => TryDate(sample.ToString(format, CultureInfo.InvariantCulture), format, out var back)
+                                         && (timeOfDay ? back.Hour == sample.Hour : back.Date == sample.Date));
+        }
+        catch (FormatException)
+        {
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Whether a time names its instant (UTC or an offset: true), only the clock time as written (false), or
+    /// cannot be told (null). Decided by what the parser read, not by the text's shape: FILETIME, Unix time,
+    /// LDAP generalized time and /Date()/ are instants; text with Z, UTC, GMT or an offset is an instant;
+    /// "2026-10-19 23:30" or an OLE day number is someone's clock - for an hour of the day, the organisation's.
+    /// </summary>
+    public static bool? NamesInstant(string text, string? format)
+    {
+        var t = text.Trim();
+        switch (format)
+        {
+            case "unix" or "unix-ms":
+                return true;
+            case "ole":
+                return false;
+            case null:
+                if (t.All(char.IsAsciiDigit) || t.StartsWith("/Date(", StringComparison.Ordinal)
+                    || (t.Length >= 14 && t[..14].All(char.IsAsciiDigit)))
+                    return true;
+                return DateTime.TryParse(t, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out var parsed)
+                    ? parsed.Kind != DateTimeKind.Unspecified
+                    : null;
+            default:
+                // Standard formats that always write UTC or an offset; a format ending in a literal Z, quoted or
+                // not (Z is no specifier), writes UTC too.
+                if (format is "o" or "O" or "u" or "r" or "R" || format.TrimEnd('\'', '"').EndsWith('Z'))
+                    return true;
+                return DateTime.TryParseExact(t, format, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out var exact)
+                    ? exact.Kind != DateTimeKind.Unspecified
+                    : null;
+        }
+    }
+
+    /// <summary>
+    /// Hours of the day: "22-6" (from 22:00 up to 06:00, across midnight), "12" (12:00 to 12:59), several
+    /// comma-separated or as a list. Hours are 0 to 23; a range's end is not included.
+    /// </summary>
+    public static bool TryHours(IEnumerable<string> ranges, out bool[] hours)
+    {
+        hours = new bool[24];
+        var any = false;
+        foreach (var range in ranges)
+        {
+            var ends = range.Split('-', StringSplitOptions.TrimEntries);
+            if (ends.Length is not (1 or 2) || !ends.All(e => int.TryParse(e, NumberStyles.None, CultureInfo.InvariantCulture, out var h) && h is >= 0 and <= 23))
+                return false;
+            var from = int.Parse(ends[0], CultureInfo.InvariantCulture);
+            var to = ends.Length == 1 ? (from + 1) % 24 : int.Parse(ends[1], CultureInfo.InvariantCulture);
+            if (from == to && ends.Length == 2)
+                return false;   // "8-8" is no hours, or every hour: say which
+            for (var h = from; h != to; h = (h + 1) % 24)
+                hours[h] = true;
+            any = true;
+        }
+        return any;
+    }
+
+    /// <summary>
     /// A dotted version: "10.0.19045.3803", "v8.1", "2.4.1-beta". Missing parts compare as 0, so 10.0 equals
     /// 10.0.0; a pre-release ("-beta") is below its release; "+build" is ignored. False for anything with a
     /// non-numeric part - and for a "-" after a bare number, which is a date (2026-10-21), not a version.

@@ -59,6 +59,174 @@ public sealed class EvaluatorTests
         Assert.Equal(olderThan30Days, Engine().Each(Leaf("at", "age-gt", "30"), new JsonObject { ["at"] = value }).Fails);
     }
 
+    [Theory]
+    [InlineData("46200", "ole", true)]                  // OLE days: 2026-06-27
+    [InlineData("46314.5", "ole", false)]               // yesterday noon
+    [InlineData("0", "ole", true)]                      // never
+    [InlineData("01/09/2026", "dd/MM/yyyy", true)]
+    [InlineData("15/10/2026", "dd/MM/yyyy", false)]
+    [InlineData("2026-10-15", "dd/MM/yyyy", null)]      // not in the format named: n/a
+    [InlineData("9999999999", "unix", false)]           // named, any year counts: 2286
+    [InlineData("1760918400000", "unix-ms", true)]
+    [InlineData("NaN", "ole", null)]
+    [InlineData("Infinity", "ole", null)]
+    public void A_named_date_format_reads_what_the_automatic_reading_would_miss(string value, string format, bool? olderThan30Days)
+    {
+        var leaf = Leaf("at", "age-gt", "30") with { Format = format };
+
+        Assert.Equal(olderThan30Days, Engine().Each(leaf, new JsonObject { ["at"] = value }).Fails);
+    }
+
+    [Theory]
+    [InlineData("2026-10-19T20:30:00Z", "22-6", true)]    // 23:30 in Jerusalem (UTC+3 in October)
+    [InlineData("2026-10-19T08:00:00Z", "22-6", false)]   // 11:00
+    [InlineData("2026-10-19T02:59:00Z", "22-6", true)]    // 05:59
+    [InlineData("2026-10-19T03:00:00Z", "22-6", false)]   // 06:00: the end hour is not included
+    [InlineData("2026-10-19T04:00:00Z", "8-17,22-6", false)]
+    [InlineData("1760918400", "0-6", true)]               // unix seconds: 03:00 local
+    [InlineData("tomorrow", "0-23", null)]                // not a time: n/a
+    public void An_hour_of_the_day_is_read_on_the_organisations_clock(string value, string hours, bool? fails)
+    {
+        var engine = Engine(new() { [Rule.TimeZoneSetting] = "Asia/Jerusalem" });
+
+        Assert.Equal(fails, engine.Each(Leaf("at", "hour-in", hours), new JsonObject { ["at"] = value }).Fails);
+    }
+
+    [Theory]
+    [InlineData("2026-10-19 23:30", null, true)]                      // no Z, no offset: already the organisation's clock
+    [InlineData("2026-10-19T23:30:00+03:00", null, true)]
+    [InlineData("19/10/2026 23:30", "dd/MM/yyyy HH:mm", true)]
+    [InlineData("23:30", "HH:mm", true)]                             // a time alone, for an hour of the day
+    [InlineData("2026-10-19 20:30 +00:00", "yyyy-MM-dd HH:mm zzz", true)]   // the format names an offset: converted
+    [InlineData("46314.979", "ole", true)]                           // 23:30 as Excel wrote it
+    [InlineData("2026-10-19 20:30:00+00:00", null, true)]            // an offset after a space is still an offset
+    [InlineData("Mon, 19 Oct 2026 20:30:00 GMT", null, true)]
+    [InlineData("2026-10-19T20:30:00.0000000Z", "o", true)]          // a standard format that writes UTC
+    [InlineData("20261019203000Z", "yyyyMMddHHmmss'Z'", true)]       // a literal Z the format quotes
+    [InlineData("20261019203000.0Z", "yyyyMMddHHmmss.0Z", true)]     // or does not: Z is no specifier
+    public void A_clock_time_without_an_offset_is_the_organisations_own(string value, string? format, bool fails)
+    {
+        var engine = Engine(new() { [Rule.TimeZoneSetting] = "Asia/Jerusalem" });
+
+        Assert.Equal(fails, engine.Each(Leaf("at", "hour-in", "22-6") with { Format = format }, new JsonObject { ["at"] = value }).Fails);
+    }
+
+    [Theory]
+    [InlineData("dd/MM/yyyy", false, true)]
+    [InlineData("MM/dd", false, false)]        // no year: every date would be this year's
+    [InlineData("HH:mm", false, false)]
+    [InlineData("HH:mm", true, true)]          // enough for an hour of the day
+    [InlineData("dd MMM", true, false)]
+    public void A_custom_format_must_hold_what_the_condition_needs(string format, bool timeOfDay, bool valid) =>
+        Assert.Equal(valid, Values.IsDateFormat(format, timeOfDay));
+
+    [Fact]
+    public void Conditions_on_the_last_read_are_unknown_without_one()
+    {
+        var absent = Leaf("_previous.owner", "absent");
+
+        Assert.Null(Engine().Each(absent, new JsonObject { ["owner"] = "x" }).Fails);                           // no earlier read
+        Assert.Null(Engine().Each(Leaf("_new", "absent"), new JsonObject()).Fails);
+        Assert.Null(Engine().Each(absent, new JsonObject { ["_new"] = true }).Fails);                           // new: no earlier row
+        Assert.True(Engine().Each(absent, new JsonObject { ["_new"] = false, ["_previous"] = new JsonObject() }).Fails);
+    }
+
+    [Fact]
+    public void An_hour_of_the_day_without_a_known_time_zone_cannot_be_judged()
+    {
+        var row = new JsonObject { ["at"] = "2026-10-19T20:30:00Z" };
+
+        Assert.Null(Engine().Each(Leaf("at", "hour-in", "22-6"), row).Fails);
+        Assert.Null(Engine(new() { [Rule.TimeZoneSetting] = "Mars/Olympus" }).Each(Leaf("at", "hour-in", "22-6"), row).Fails);
+    }
+
+    [Theory]
+    [InlineData("S-1-5-21-1004336348-1177238915-682003330-512", "domain-admins", true)]   // any domain's 512
+    [InlineData("S-1-5-21-1004336348-1177238915-682003330-513", "domain-admins", false)]
+    [InlineData("S-1-5-21-1004336348-1177238915-682003330-519", "rid:519", true)]
+    [InlineData("S-1-5-32-544", "domain-admins", false)]                                  // a builtin group is no domain group
+    [InlineData("S-1-1-0", "everyone,anonymous", true)]
+    [InlineData("S-1-5-21-1-2-3-4-512", "domain-admins", false)]                         // too many parts for a domain SID
+    [InlineData("CN=Domain Admins", "domain-admins", null)]                               // not a SID: n/a
+    public void Sids_match_by_name_rid_or_value(string sid, string names, bool? fails)
+    {
+        Assert.Equal(fails, Engine().Each(Leaf("sid", "sid-in", names), new JsonObject { ["sid"] = sid }).Fails);
+    }
+
+    [Fact]
+    public void Any_member_sid_in_the_list_fires()
+    {
+        var row = new JsonObject { ["members"] = new JsonArray("S-1-5-21-1-2-3-1105", "S-1-5-11") };
+
+        Assert.True(Engine().Each(Leaf("members", "sid-in", "authenticated-users"), row).Fails);
+        Assert.True(Engine().Each(Leaf("members", "sid-notin", "authenticated-users"), row).Fails);   // 1105 is not
+    }
+
+    private static JsonObject Seen(JsonNode? now, JsonNode? before, bool? isNew = false, string field = "members")
+    {
+        var row = new JsonObject { [field] = now };
+        if (isNew is null)
+            return row;
+        row["_new"] = isNew;
+        if (isNew == false)
+            row["_previous"] = new JsonObject { [field] = before };
+        return row;
+    }
+
+    [Fact]
+    public void Changed_compares_with_the_last_clean_read_arrays_as_sets()
+    {
+        var changed = new LeafCondition("members", "changed", null, null);
+
+        Assert.False(Engine().Each(changed, Seen(new JsonArray("b", "a"), new JsonArray("A", "b"))).Fails);   // order and case are no change
+        Assert.True(Engine().Each(changed, Seen(new JsonArray("a", "c"), new JsonArray("a", "b"))).Fails);
+        Assert.True(Engine().Each(changed, Seen(new JsonArray("a"), null, isNew: true)).Fails);                // new since that read
+        Assert.True(Engine().Each(changed, Seen(null, new JsonArray("a"))).Fails);                              // gone from the row
+        Assert.Null(Engine().Each(changed, Seen(new JsonArray("a"), null, isNew: null)).Fails);                // no earlier read
+    }
+
+    [Fact]
+    public void A_masked_field_is_compared_masked_so_its_value_is_never_shown()
+    {
+        var engine = new Evaluator(_ => null, Now) { Mask = ["secret"] };
+        var verdict = engine.Each(new LeafCondition("secret", "changed", null, null), Seen("hunter2", FieldPath.MaskedValue, field: "secret"));
+
+        Assert.False(verdict.Fails);   // set then, set now
+        Assert.DoesNotContain("hunter2", verdict.Value, StringComparison.Ordinal);
+        Assert.True(engine.Each(new LeafCondition("secret", "changed", null, null), Seen("", FieldPath.MaskedValue, field: "secret")).Fails);   // cleared
+    }
+
+    [Fact]
+    public void Masking_replaces_values_at_a_path_and_leaves_nothing_as_nothing()
+    {
+        var row = new JsonObject
+        {
+            ["cpassword"] = "secret", ["empty"] = "", ["none"] = null,
+            ["items"] = new JsonArray(new JsonObject { ["key"] = "k1" }, new JsonObject { ["key"] = null }),
+        };
+        foreach (var path in new[] { "cpassword", "empty", "none", "items[].key", "absent.deeper" })
+            FieldPath.Mask(row, path);
+
+        Assert.Equal("""{"cpassword":"set","empty":"","none":null,"items":[{"key":"set"},{"key":null}]}""", row.ToJsonString());
+    }
+
+    [Theory]
+    [InlineData("22-6", new[] { 22, 23, 0, 5 }, new[] { 6, 21 })]
+    [InlineData("12", new[] { 12 }, new[] { 11, 13 })]
+    [InlineData("19-0", new[] { 19, 23 }, new[] { 0, 18 })]
+    public void Hours_are_ranges_whose_end_is_not_included(string text, int[] inside, int[] outside)
+    {
+        Assert.True(Values.TryHours(text.Split(','), out var hours));
+        Assert.All(inside, h => Assert.True(hours[h]));
+        Assert.All(outside, h => Assert.False(hours[h]));
+    }
+
+    [Theory]
+    [InlineData("8-8")]
+    [InlineData("24")]
+    [InlineData("night")]
+    public void Hours_that_mean_nothing_are_refused(string text) => Assert.False(Values.TryHours([text], out _));
+
     private static readonly JsonObject Policy = new()
     {
         ["assignments"] = new JsonArray(

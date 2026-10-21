@@ -68,6 +68,49 @@ public static class FieldPath
 
     public static JsonNode? First(JsonNode? root, string path) => Resolve(root, path).FirstOrDefault(n => n is not null);
 
+    /// <summary>What a masked value becomes. Nothing and empty stay as they are, so exists and empty still read true.</summary>
+    public const string MaskedValue = "set";
+
+    /// <summary>Replaces each value at the path with <see cref="MaskedValue"/>. Changes the node.</summary>
+    public static void Mask(JsonNode? root, string path)
+    {
+        var parts = Parts(path).ToList();
+        if (parts.Count > 0)
+            Walk(root, 0);
+
+        void Walk(JsonNode? node, int i)
+        {
+            if (node is not JsonObject obj)
+                return;
+            var (name, flatten) = parts[i];
+            var key = obj.ContainsKey(name) ? name : obj.Select(p => p.Key).FirstOrDefault(k => string.Equals(k, name, StringComparison.OrdinalIgnoreCase));
+            if (key is null)
+                return;
+            var child = obj[key];
+            if (i < parts.Count - 1)
+            {
+                IEnumerable<JsonNode?> next = flatten ? child as JsonArray ?? new JsonArray() : new[] { child };
+                foreach (var item in next)
+                    Walk(item, i + 1);
+                return;
+            }
+            if (flatten && child is JsonArray array)
+            {
+                for (var j = 0; j < array.Count; j++)
+                {
+                    if (Holds(array[j]))
+                        array[j] = MaskedValue;
+                }
+            }
+            else if (Holds(child))
+            {
+                obj[key] = MaskedValue;
+            }
+        }
+
+        static bool Holds(JsonNode? value) => value is not null && value is not JsonArray { Count: 0 } && Values.Text(value) is { Length: > 0 };
+    }
+
     private static JsonNode? Child(JsonNode? node, string name)
     {
         if (node is not JsonObject obj)

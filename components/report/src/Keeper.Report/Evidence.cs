@@ -34,7 +34,11 @@ public sealed record EvidenceRow
     public string? RunFolder { get; init; }
 }
 
-public sealed record AcceptedRisk(string OverrideId, string CheckId, string Decision, string Entity, string Actor, string At, string Why);
+public sealed record AcceptedRisk(string OverrideId, string CheckId, string Decision, string Entity, string Actor, string At, string Why)
+{
+    /// <summary>The last day the acceptance holds, or null for no end date.</summary>
+    public string? Until { get; init; }
+}
 
 public sealed record Attested(string Obligation, string Target, string State, string? DoneOn, string Evidence, string? ExpiresOn, string Actor, string RecordedAt);
 
@@ -96,9 +100,13 @@ public static class EvidenceBuilder
             .ToList();
 
         var risks = Sql.Rows(connection,
-            "SELECT override_id, check_id, decision, entity, actor, at, why FROM override WHERE active = 1 AND decision IN ('exception', 'disable') ORDER BY at;")
+            """
+            SELECT override_id, check_id, decision, entity, actor, at, why, until FROM override
+            WHERE active = 1 AND decision IN ('exception', 'disable') AND (until IS NULL OR until >= :today) ORDER BY at;
+            """,
+            null, (":today", now.UtcDateTime.ToString("yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture)))
             .Select(r => new AcceptedRisk((string)r["override_id"]!, (string)r["check_id"]!, (string)r["decision"]!, (string)r["entity"]!,
-                (string)r["actor"]!, (string)r["at"]!, (string)r["why"]!))
+                (string)r["actor"]!, (string)r["at"]!, (string)r["why"]!) { Until = r["until"] as string })
             .ToList();
 
         var attested = Sql.Rows(connection,
@@ -156,7 +164,8 @@ public static class EvidenceBuilder
                     .ToList()));
         }
         sections.Add(new Section("Accepted risks",
-            set.AcceptedRisks.Select(a => $"{a.OverrideId}: {a.Decision} {a.CheckId}{(a.Entity.Length > 0 ? $" for {a.Entity}" : "")} - by {a.Actor} on {a.At}: {a.Why}").ToList(),
+            set.AcceptedRisks.Select(a => $"{a.OverrideId}: {a.Decision} {a.CheckId}{(a.Entity.Length > 0 ? $" for {a.Entity}" : "")} - by {a.Actor} on {a.At}" +
+                $"{(a.Until is null ? ", no end date" : $", until {a.Until}")}: {a.Why}").ToList(),
             "No exceptions or disabled rules."));
         sections.Add(new Section("Attestations (evidence people recorded)",
             set.Attestations.Select(a => $"{a.Obligation} / {a.Target}: {a.State}{(a.DoneOn is null ? "" : $", done {a.DoneOn}")}" +

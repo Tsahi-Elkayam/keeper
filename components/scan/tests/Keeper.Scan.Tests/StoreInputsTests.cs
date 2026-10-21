@@ -105,4 +105,28 @@ public sealed class StoreInputsTests : IDisposable
         Assert.False(previous.ContainsKey("q-x"));
         Assert.Equal(2, previous.Count);
     }
+
+    [Fact]
+    public void The_last_clean_rows_are_each_reads_own_newest_clean_read()
+    {
+        Run("r1", "ad-main", "active-directory", "2026-10-18T06:00:00Z", ("query", "q-groups", "ok", 1), ("target", "q-admins@pc01", "ok", 1));
+        Row("r1", "q-groups", "group", "admins", """{ "members": ["a", "b"] }""");
+        Row("r1", "q-admins", "member", "pc01|x", "{}", "pc01");
+        Run("r2", "ad-main", "active-directory", "2026-10-19T06:00:00Z", ("query", "q-groups", "partial", 1), ("target", "q-admins@pc01", "ok", 0));
+        Row("r2", "q-groups", "group", "admins", """{ "members": ["a"] }""");        // partial: not compared with
+        Run("r3", "ad-main", "active-directory", "2026-10-20T06:00:00Z", ("query", "q-groups-other", "ok", 1));
+        Run("r4", "ad-other", "active-directory", "2026-10-21T06:00:00Z", ("query", "q-groups", "ok", 1));
+        Row("r4", "q-groups", "group", "admins", """{ "members": [] }""");          // another integration
+
+        using var connection = Store.OpenReadOnly();
+        var inputs = new StoreInputs(connection);
+        var groups = inputs.LastCleanRows("ad-main", "active-directory", "q-groups");
+        var admins = inputs.LastCleanRows("ad-main", "active-directory", "q-admins");
+
+        var read = Assert.Single(groups);
+        Assert.Equal(("q-groups", "2026-10-18T06:00:00Z"), (read.Key, read.Value.At));
+        Assert.Equal("""["a","b"]""", read.Value.Rows["admins"]["members"]!.ToJsonString());
+        Assert.Empty(admins["q-admins@pc01"].Rows);   // the newest clean read of pc01 found no one: still a read
+        Assert.Empty(inputs.LastCleanRows("ad-main", "active-directory", "q-group"));   // a prefix of another query is not it
+    }
 }

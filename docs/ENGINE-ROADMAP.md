@@ -16,11 +16,11 @@ modules). Each stage is built, reviewed independently and fixed until a review f
    - http targets (a list of URLs), `for_each` from a list or threshold, `for_each` placeholders in
      params, 404 as empty, an environment label on the integration.
    - Thresholds in requests (`{DAYS_AGO:threshold.x|90}`), macros in GraphQL documents.
-2. **Condition language**: count per group / distinct / share (`pct`); same-element array conditions
-   and min/max over arrays; operators `version-lt/ge`, ISO 8601 durations, epoch-ms and custom date
-   formats, `in-cidr`, hour-of-day; rule plumbing (constant deadline, thresholds on severity ranges,
-   RID/SID macros, value masking, expiring exceptions); then two-level `for_each` and run-to-run
-   comparison in the store.
+2. **Condition language** (built): count per group / distinct / share; same-element array conditions
+   (min/max over an array is `element` with `match: all`); operators `version-*`, ISO 8601 durations,
+   epoch and named date formats (`format:` ole, unix, custom), `in-cidr`, `hour-in` on the organisation's
+   clock, `sid-in` with well-known names and RIDs, `changed` against the last clean read (`_new`,
+   `_previous`); constant deadline, masked fields, overrides with an end date; two-level `for_each`.
 3. **Microsoft APIs on other token audiences** (~330): Entra tokens per resource for Power Platform,
    Dataverse, Defender for Endpoint, Cloud Apps, Key Vault (metadata only); then Exchange Online and
    Purview through the REST endpoint the modules call, with a `Get-*` cmdlet allow-list.

@@ -60,7 +60,7 @@ A scan reads; it never changes the system it reads. Keeper writes only its own s
 |---|---|
 | `keeper today` | What to do today (`--format html --out today.html` for a page) |
 | `keeper <question>` | Any question: `broken`, `misconfigured`, `missing`, `expiring`, `blind-spots`, `changed --since <date>`, `stale-users`, ... (`keeper query list`) |
-| `keeper decide snooze <key> --until 2w` | Out of today's list until then (also `delegate --to`, `clear`, `accept`, `disable`, `threshold`, `undo`, `setting`, `attest`) |
+| `keeper decide snooze <key> --until 2w` | Out of today's list until then (also `delegate --to`, `clear`, `accept`, `disable`, `threshold`, `undo`, `setting`, `attest`; `accept`, `disable` and `threshold` take `--until` too, and the finding comes back after that day) |
 | `keeper system add <ID> --name ..` | The systems findings are grouped, routed and ranked by; `map` claims entities for them |
 | `keeper register licence set <id> --expires-on ..` | Licences, contracts, vendors, key dates, initiatives: rules warn before they bite |
 | `keeper report security` | `summary`, `security`, `expiring`, `changes --since` |

@@ -34,20 +34,23 @@ static int Decide(RequestCli r)
         {
             // An exception for this one entity: the rule keeps running on everything else.
             var finding = Find(r, 1);
-            return r.Submit("review.override", new { op = "add", checkId = finding.CheckId, decision = "exception", entity = finding.Target },
-                $"{finding.CheckId} accepted for {finding.Target}.");
+            var until = Until(cli);
+            return r.Submit("review.override", new { op = "add", checkId = finding.CheckId, decision = "exception", entity = finding.Target, until },
+                $"{finding.CheckId} accepted for {finding.Target}{Ends(until)}.");
         }
         case "disable":
         {
             var check = r.Positional(1, "the rule id (or a prefix ending in *)");
-            return r.Submit("review.override", new { op = "add", checkId = check, decision = "disable" }, $"{check} disabled.");
+            var until = Until(cli);
+            return r.Submit("review.override", new { op = "add", checkId = check, decision = "disable", until }, $"{check} disabled{Ends(until)}.");
         }
         case "threshold":
         {
             var check = r.Positional(1, "the rule id");
             var value = r.Positional(2, "the threshold value");
-            return r.Submit("review.override", new { op = "add", checkId = check, decision = "threshold", value },
-                $"{check} threshold set to {value}.");
+            var until = Until(cli);
+            return r.Submit("review.override", new { op = "add", checkId = check, decision = "threshold", value, until },
+                $"{check} threshold set to {value}{Ends(until)}.");
         }
         case "undo":
         {
@@ -81,6 +84,10 @@ static int Decide(RequestCli r)
     }
 }
 
+static string? Until(CliArgs cli) => cli.Get("until") is { } until ? RequestCli.Date(until, "--until") : null;
+
+static string Ends(string? until) => until is null ? "" : $" until {until}";
+
 static FindingRef Find(RequestCli r, int index)
 {
     using var connection = r.Read();
@@ -94,9 +101,10 @@ static int Usage(bool asked = false) =>
           keeper decide snooze <key> --until <yyyy-MM-dd|2w>      out of today's list until then
           keeper decide delegate <key> --to <owner>               waiting on someone else
           keeper decide clear <key>                               undo a snooze or hand-off
-          keeper decide accept <key>                              accept this one entity as it is (an exception)
-          keeper decide disable <rule-id>                         stop reporting a rule (prefix* allowed)
-          keeper decide threshold <rule-id> <value>               this rule's threshold, for this tenant
+          keeper decide accept <key> [--until <date|26w>]         accept this one entity as it is (an exception)
+          keeper decide disable <rule-id> [--until <date|4w>]     stop reporting a rule (prefix* allowed)
+          keeper decide threshold <rule-id> <value> [--until ..]  this rule's threshold, for this tenant
+                                                                  --until: the last day it holds; then the finding is back
           keeper decide undo <OVR-0001>                           remove an exception, disable or threshold
           keeper decide setting <key> <value> | --remove          e.g. threshold.ad.stale-user-days 120
           keeper decide attest <obligation> --evidence "<what>" [--state yes|no|na] [--target t]

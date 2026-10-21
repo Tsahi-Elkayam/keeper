@@ -56,6 +56,9 @@ public sealed record LeafCondition(string Field, string Op, JsonNode? Value, str
     /// rule is not configured - never a pass that nothing was compared with.
     /// </summary>
     public bool Required { get; init; }
+
+    /// <summary>How the field writes a date, when the automatic reading would miss it: ole, unix, unix-ms or a custom format.</summary>
+    public string? Format { get; init; }
 }
 
 public sealed record AllCondition(IReadOnlyList<Condition> Items) : Condition;
@@ -136,9 +139,52 @@ public sealed record Rule
     /// <summary>A result older than three refresh periods is stale.</summary>
     public int TtlMinutes => (int)Math.Max(1, Refresh.TotalMinutes * 3);
 
-    /// <summary>The thresholds this rule cannot be judged without (conditions marked required).</summary>
-    public IReadOnlyList<string> RequiredSettings => [.. Leaves(Each).Concat(Leaves(Count?.Where)).Where(l => l.Required && l.Threshold is not null)
-        .Select(l => l.Threshold!).Distinct(StringComparer.Ordinal)];
+    /// <summary>
+    /// Fields whose values never leave the scan: the rows it keeps and the results and evidence it writes show
+    /// "set" (or nothing) instead. Conditions still read the real value.
+    /// </summary>
+    public IReadOnlyList<string> Mask { get; init; } = [];
+
+    /// <summary>The thresholds this rule cannot be judged without (conditions marked required); an hour of the day needs the time zone.</summary>
+    public IReadOnlyList<string> RequiredSettings => [.. AllLeaves.Where(l => l.Required && l.Threshold is not null).Select(l => l.Threshold!)
+        .Concat(AllLeaves.Any(l => l.Op.StartsWith("hour-", StringComparison.Ordinal)) ? [TimeZoneSetting] : [])
+        .Distinct(StringComparer.Ordinal)];
+
+    /// <summary>The setting (threshold.time-zone) that names the organisation's time zone: Asia/Jerusalem, or a Windows id.</summary>
+    public const string TimeZoneSetting = "time-zone";
+
+    /// <summary>The rule compares a row with the entity's row in the last clean read (op changed, field _new or _previous).</summary>
+    public bool ComparesWithPrevious => AllLeaves.Any(l => l.Op == "changed" || IsPreviousField(l.Field));
+
+    public static bool IsPreviousField(string field) =>
+        field.Equals("_new", StringComparison.OrdinalIgnoreCase) || field.Equals("_previous_at", StringComparison.OrdinalIgnoreCase)
+        || field.Equals("_previous", StringComparison.OrdinalIgnoreCase) || field.StartsWith("_previous.", StringComparison.OrdinalIgnoreCase);
+
+    private IEnumerable<LeafCondition> AllLeaves => Leaves(Each).Concat(Leaves(Count?.Where));
+
+    /// <summary>Whether the rule's conditions read a field that is, holds or sits inside one of these (masked) fields.</summary>
+    public bool Reads(IReadOnlyList<string> fields) => fields.Count > 0 && FieldsOf(Each).Concat(FieldsOf(Count?.Where)).Any(f => fields.Any(m => Overlap(f, m)));
+
+    /// <summary>Two field paths are the same field, or one holds the other (a.b and a; items[].key and items).</summary>
+    public static bool Overlap(string a, string b)
+    {
+        static string Bare(string path) => path.Replace("[]", "", StringComparison.Ordinal);
+        var (x, y) = (Bare(a), Bare(b));
+        return x.Equals(y, StringComparison.OrdinalIgnoreCase)
+               || x.StartsWith(y + ".", StringComparison.OrdinalIgnoreCase) || y.StartsWith(x + ".", StringComparison.OrdinalIgnoreCase);
+    }
+
+    // An element's own conditions are relative to the array: the array's path stands for them.
+    private static IEnumerable<string> FieldsOf(Condition? condition) => condition switch
+    {
+        LeafCondition { Value: JsonObject reference } leaf when Values.Text(reference["field"]) is { } other => [leaf.Field, other],
+        LeafCondition leaf => [leaf.Field],
+        AllCondition all => all.Items.SelectMany(FieldsOf),
+        AnyCondition any => any.Items.SelectMany(FieldsOf),
+        NotCondition not => FieldsOf(not.Item),
+        ElementCondition element => [element.Of],
+        _ => [],
+    };
 
     private static IEnumerable<LeafCondition> Leaves(Condition? condition) => condition switch
     {

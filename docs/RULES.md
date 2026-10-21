@@ -126,10 +126,38 @@ the other field is n/a.
 | `version-lt` `version-le` `version-gt` `version-ge` | Dotted version comparison: 10.0.19045 < 10.0.22621; v and a -suffix are ignored; not a version is n/a |
 | `in-cidr` `notin-cidr` | An IPv4/IPv6 address is in / not in one of the networks (a list or comma-separated) |
 | `duration-gt` `duration-lt` | A length of time (ISO 8601 such as P90D, or d.hh:mm:ss) longer / shorter than N days |
+| `hour-in` `hour-notin` | A time falls in / outside hours of the day on the organisation's clock: `22-6` (22:00 up to 06:00), `12`, or a list. The rule is not configured until `threshold.time-zone` is set (Asia/Jerusalem, or a Windows id) |
+| `sid-in` `sid-notin` | A SID is / is not one of a list: names of fixed SIDs (everyone, authenticated-users, anonymous, builtin-administrators, backup-operators, ...), a domain's groups by name or RID in any domain (domain-admins, enterprise-admins, `rid:512`), or literal `S-1-...`; not a SID is n/a |
+| `changed` | The field differs from the same entity's in the last clean read, or the entity is new since; arrays compare as sets, text without case. No earlier clean read: n/a |
 
 Fields are paths: `signInActivity.lastSignInDateTime`, and `passwordCredentials[].endDateTime` (any
 element). Dates may be ISO 8601, Windows FILETIME, LDAP generalized time, or Unix time (10 digits in
-seconds, 13 in milliseconds, `/Date(ms)/`).
+seconds, 13 in milliseconds, `/Date(ms)/`). A date the automatic reading would miss or misread names
+its format on the condition: `{ field: Created, op: age-gt, value: 90, format: "dd/MM/yyyy HH:mm" }`,
+or `format: ole` (Excel's day numbers), `unix` / `unix-ms` (any year). A custom format must hold the
+year (a year-less one would read every date as this year's); for `hour-in` a time alone (`HH:mm`) will
+do. A date is read as UTC unless it holds an offset - except for `hour-in`, where a clock time written
+without Z or an offset (`2026-10-19 23:30`, an OLE number, a custom format without `z`/`K`) is taken
+as the organisation's own clock. Newest or oldest of an array is `element` with `match: all` - "the newest
+backup is older than 7 days" is every backup older than 7 days.
+
+**Against the last read.** A rule that uses `changed`, `_new` or `_previous` sees, beside each row, the
+same entity in its query's last clean read (of that host, per host): `_new` (true when that read did not
+have it), `_previous` (its row then) and `_previous_at`. "A new administrator since the last scan" is
+`{ field: _new, op: eq, value: true }`; evidence can say `was {_previous.members}`. With no earlier
+clean read, any condition on `_new` or `_previous` is n/a, never a finding about every row; for an
+entity that is new, conditions on `_previous` are n/a. Such a finding resolves on the next scan that
+sees no change, so give the rule the refresh you want it to stay visible for. A change inside one
+element of an array is not a condition: compare the whole field.
+
+**Masked fields.** `mask: [cpassword, pin]` on a rule keeps those values out of everything the scan
+writes - the rows it keeps (the value becomes `set`; empty stays empty), results and evidence - for
+every rule reading the same query; conditions still read the real value, and a severity may depend on
+it. A rule whose conditions read a masked field records no row values in its results; `_previous` is
+masked the same way. `changed` on a masked field sees only set and cleared, never one value replaced
+by another. The key (each field of a key template), the name, a count's `by` and `distinct` and a
+deadline field cannot be masked: they are shown everywhere. Secrets the runners know by name (password, clientSecret,
+connectionString...) are masked before any rule sees them.
 
 A missing field gives **n/a** for comparisons and is never a pass by default. A query that fails gives
 **unknown** with the reason, never a pass.
@@ -194,8 +222,17 @@ carries its object as `parent`:
 ```
 
 Only plain ids (letters, digits, `. _ : -`) are put into a path or a param; a failed object makes the
-result partial, never a pass. One level only; `max` defaults to 200 (at most 2000). Instead of a list
-query, `values: [a, b]` or `threshold: <name>` (the tenant's comma-separated setting) gives the objects.
+result partial, never a pass. `max` defaults to 200 (at most 2000). Instead of a list query,
+`values: [a, b]` or `threshold: <name>` (the tenant's comma-separated setting) gives the objects.
+
+Two levels at most: the list may itself be per object - sites, each site's lists, each list's items.
+Its rows carry their own parent, so `{parent.id}` names the object two levels up. Each level's `max`
+caps the rows of the level below it, so requests add up, never multiply:
+
+```yaml
+      path: /sites/{parent.id}/lists/{id}/items
+      for_each: { path: "/sites/{id}/lists", field: id, for_each: { path: /sites, field: id } }
+```
 
 **Dates relative to the scan** in `http` and `graph` paths, params, bodies and filters, and in `graphql`
 documents and variables: `{NOW}`, `{TODAY}`, `{DAYS_AGO:n}`, `{DAYS_AHEAD:n}` - e.g.

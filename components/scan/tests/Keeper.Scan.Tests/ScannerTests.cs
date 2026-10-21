@@ -379,6 +379,139 @@ public sealed class ScannerTests : IDisposable
         Assert.False(results.ContainsKey(("EX-COUNT", "(no site)")));   // b could not change the count
     }
 
+    private async Task<ScanReport> ScanRules(string rules, Func<string, IReadOnlyDictionary<string, CleanRead>>? lastClean = null,
+        Func<string, string?>? threshold = null)
+    {
+        var path = Path.Combine(_dir, "rules.yaml");
+        File.WriteAllText(path, "schema: keeper.rules/1\nsystem: example\nintegration: files\n" +
+            "defaults: { lens: both, refresh: 1d, category: IAM, kind: misconfigured, severity: high, entity: device }\nrules:\n" + rules);
+        return await new Scanner(Runners.Registry(), new Clock(Now)).RunAsync(new ScanRequest
+        {
+            Files = [RuleLoader.LoadFile(path, "test", Runners.Registry().Validators)], Connection = new FilesConnection(), RunsDir = Runs,
+            ImportsDir = Imports, Threshold = threshold ?? (_ => null), LastCleanRows = lastClean ?? (_ => new Dictionary<string, CleanRead>()),
+        }, CancellationToken.None);
+    }
+
+    private string RunText(ScanReport report) =>
+        string.Concat(Directory.GetFiles(Path.Combine(Runs, report.Manifest.RunId)).Select(File.ReadAllText));
+
+    [Fact]
+    public async Task A_masked_field_never_leaves_the_scan_but_conditions_still_read_it()
+    {
+        Drop("devices/d.json", """{ "devices": [ { "name": "d1", "pin": "4821", "model": "old" }, { "name": "d2", "pin": "", "model": "new" } ] }""");
+
+        var report = await ScanRules("""
+              - id: EX-PIN-STORED
+                title: A PIN is stored in clear
+                query: { protocol: file, path: "devices/d.json", items: devices, key: name }
+                each: { field: pin, op: notempty }
+                mask: [pin]
+                severity: { field: pin, ranges: [ { min: 1000, value: critical } ], default: low }
+              - id: EX-PIN-SHORT
+                title: Four-digit PIN
+                query: { protocol: file, path: "devices/d.json", items: devices, key: name }
+                each: { field: pin, op: match, value: "^[0-9]{4}$" }
+                evidence: "{name} has PIN {pin}"
+              - id: EX-OLD-MODEL
+                title: Old model
+                query: { protocol: file, path: "devices/d.json", items: devices, key: name }
+                each: { field: model, op: eq, value: old }
+            """);
+
+        Assert.DoesNotContain("4821", RunText(report), StringComparison.Ordinal);
+        var findings = Read<FindingRecord>(report, RunFolder.Findings).ToDictionary(f => f.RuleId);
+        Assert.Equal("the value is masked", findings["EX-PIN-STORED"].Evidence);
+        Assert.Equal("critical", findings["EX-PIN-STORED"].Severity);   // judged on the real value, which is not shown
+        Assert.Equal("d1 has PIN set", findings["EX-PIN-SHORT"].Evidence);   // another rule's mask holds on the same rows
+        var results = Read<ResultRecord>(report, RunFolder.Results).Where(r => r.EntityKey == "d1").ToDictionary(r => r.RuleId, r => r.Value);
+        Assert.Equal("(masked)", results["EX-PIN-SHORT"]);
+        Assert.Equal("old", results["EX-OLD-MODEL"]);   // a rule that does not read the masked field shows its value
+        Assert.Contains(Read<RowRecord>(report, RunFolder.Rows), r => r.EntityKey == "d2" && r.Attrs["pin"]!.ToString() == "");
+    }
+
+    private const string ChangeRule = """
+          - id: EX-MEMBERS-CHANGED
+            title: Group membership changed
+            query: { protocol: file, path: "groups/g.json", items: groups, key: name }
+            each: { field: members, op: changed }
+            evidence: "{name}: {members}, was {_previous.members}"
+        """;
+
+    [Fact]
+    public async Task A_change_is_judged_against_the_entitys_last_clean_read()
+    {
+        Drop("groups/g.json", """{ "groups": [ { "name": "admins", "members": ["a", "c"] }, { "name": "ops", "members": ["x"] }, { "name": "new-group", "members": ["z"] } ] }""");
+        var before = new CleanRead("2026-10-19T06:00:00Z", new Dictionary<string, JsonObject>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["admins"] = new() { ["name"] = "admins", ["members"] = new JsonArray("a", "b") },
+            ["ops"] = new() { ["name"] = "ops", ["members"] = new JsonArray("x") },
+        });
+
+        var report = await ScanRules(ChangeRule, query => new Dictionary<string, CleanRead> { [query] = before });
+
+        var results = Read<ResultRecord>(report, RunFolder.Results).ToDictionary(r => r.EntityKey, r => r.State);
+        Assert.Equal(("fail", "pass", "fail"), (results["admins"], results["ops"], results["new-group"]));
+        Assert.Contains(Read<FindingRecord>(report, RunFolder.Findings), f => f.Evidence == "admins: a, c, was a, b");
+        Assert.DoesNotContain("_previous", RunText(report), StringComparison.Ordinal);   // rows are kept as read
+    }
+
+    [Fact]
+    public async Task A_row_kept_before_a_field_was_masked_does_not_show_it_through_previous()
+    {
+        Drop("devices/d.json", """{ "devices": [ { "name": "d1", "pin": "4821" } ] }""");
+        var before = new CleanRead("2026-10-19T06:00:00Z", new Dictionary<string, JsonObject>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["d1"] = new() { ["name"] = "d1", ["pin"] = "1234" },   // kept when pin was not masked yet
+        });
+
+        var report = await ScanRules("""
+              - id: EX-PIN-CHANGED
+                title: PIN set or cleared
+                query: { protocol: file, path: "devices/d.json", items: devices, key: name }
+                each: { field: pin, op: changed }
+                mask: [pin]
+                evidence: "{name}: was {_previous.pin}"
+              - id: EX-ANY
+                title: Every device
+                query: { protocol: file, path: "devices/d.json", items: devices, key: name }
+                each: { field: _new, op: eq, value: false }
+                evidence: "{name} was {_previous.pin}"
+            """, query => new Dictionary<string, CleanRead> { [query] = before });
+
+        Assert.DoesNotContain("1234", RunText(report), StringComparison.Ordinal);
+        Assert.Equal("pass", Read<ResultRecord>(report, RunFolder.Results).Single(r => r.RuleId == "EX-PIN-CHANGED").State);   // set then, set now
+        Assert.Equal("d1 was set", Read<FindingRecord>(report, RunFolder.Findings).Single(f => f.RuleId == "EX-ANY").Evidence);
+    }
+
+    [Fact]
+    public async Task With_no_earlier_clean_read_a_change_cannot_be_judged()
+    {
+        Drop("groups/g.json", """{ "groups": [ { "name": "admins", "members": ["a"] } ] }""");
+
+        var report = await ScanRules(ChangeRule);
+
+        Assert.Equal("n-a", Assert.Single(Read<ResultRecord>(report, RunFolder.Results)).State);
+    }
+
+    [Fact]
+    public async Task An_hour_of_the_day_is_not_configured_until_the_time_zone_is_set()
+    {
+        Drop("users/d.json", """{ "users": [ { "name": "u1", "at": "2026-10-19T23:00:00Z" } ] }""");
+        const string night = """
+              - id: EX-NIGHT
+                title: Sign-in at night
+                query: { protocol: file, path: "users/d.json", items: users, key: name }
+                each: { field: at, op: hour-in, value: "22-6" }
+            """;
+
+        var unset = Assert.Single(Read<ResultRecord>(await ScanRules(night), RunFolder.Results));
+        var set = Assert.Single(Read<ResultRecord>(await ScanRules(night, threshold: n => n == Rule.TimeZoneSetting ? "UTC" : null), RunFolder.Results));
+
+        Assert.Equal("n-a", unset.State);
+        Assert.Contains("threshold.time-zone", unset.Why, StringComparison.Ordinal);
+        Assert.Equal("fail", set.State);
+    }
+
     [Fact]
     public async Task A_distinct_count_counts_values_not_rows()
     {

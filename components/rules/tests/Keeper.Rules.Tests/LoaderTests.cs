@@ -107,6 +107,13 @@ public sealed class LoaderTests : IDisposable
     [InlineData("count: { op: gt, value: 5, threshold: ad.max-domain-admins }", "count: { op: gt, value: 5, percent: true, distinct: site }", "cannot be combined with distinct")]
     [InlineData("count: { op: gt, value: 5, threshold: ad.max-domain-admins }", "count: { op: gt, value: 5, percent: maybe }", "percent must be true or false")]
     [InlineData("evidence: \"{sAMAccountName}\"", "evidence: \"{sAMAccountName}\"\n    deadline: 2026-02-30", "not a real date")]
+    [InlineData("op: flag, value: 65536", "op: flag, value: 65536, format: ole", "format applies to dates")]
+    [InlineData("op: flag, value: 65536", "op: age-gt, value: 90, format: banana", "format 'banana'")]
+    [InlineData("op: flag, value: 65536", "op: age-gt, value: 90, format: \"HH:mm\"", "format 'HH:mm'")]        // no date in it
+    [InlineData("op: flag, value: 65536", "op: hour-in, value: \"22-25\"", "hours of the day")]
+    [InlineData("op: flag, value: 65536", "op: sid-in, value: \"domain-admins,domain-wizards\"", "'domain-wizards' is not a SID")]
+    [InlineData("op: flag, value: 65536", "op: changed, value: 1", "takes no value")]
+    [InlineData("evidence: \"{sAMAccountName}\"", "evidence: \"{sAMAccountName}\"\n    mask: [sAMAccountName]", "mask 'sAMAccountName'")]   // the key
     public void New_operators_and_count_options_are_checked_at_load(string from, string to, string expected)
     {
         var path = Write("bad.yaml", Valid.Replace(from, to, StringComparison.Ordinal));
@@ -114,6 +121,78 @@ public sealed class LoaderTests : IDisposable
         var ex = Assert.Throws<RuleException>(() => RuleLoader.LoadFile(path, "builtin", Protocols));
 
         Assert.Contains(expected, ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Hours_need_the_time_zone_and_changes_need_the_last_read()
+    {
+        var file = RuleLoader.LoadFile(Write("ok.yaml", """
+            schema: keeper.rules/1
+            system: example
+            integration: ldap
+            defaults: { lens: security, category: IAM, refresh: 1d, entity: user, kind: misconfigured, severity: medium }
+            rules:
+              - id: EX-NIGHT-SIGN-IN
+                title: Admin sign-in at night
+                query: { protocol: ldap, filter: "(x=1)", key: id }
+                each: { field: lastSignIn, op: hour-in, value: [22-6], format: "yyyy-MM-dd HH:mm" }
+              - id: EX-NEW-ADMIN
+                title: New administrator since the last scan
+                query: { protocol: ldap, filter: "(x=2)", key: id }
+                each: { any: [ { field: _new, op: eq, value: true }, { field: memberOf, op: changed } ] }
+                mask: [comment]
+            """), "builtin", Protocols);
+
+        Assert.Equal([Rule.TimeZoneSetting], file.Rules[0].RequiredSettings);
+        Assert.Equal("yyyy-MM-dd HH:mm", Assert.IsType<LeafCondition>(file.Rules[0].Each).Format);
+        Assert.False(file.Rules[0].ComparesWithPrevious);
+        Assert.True(file.Rules[1].ComparesWithPrevious);
+        Assert.Equal(["comment"], file.Rules[1].Mask);
+    }
+
+    [Theory]
+    [InlineData("token", "{host}|{token}", null)]          // a field of the key template
+    [InlineData("creds", "{host}|{creds.id}", null)]       // the field holding one
+    [InlineData("expiry", "id", "expiry")]                 // the deadline
+    public void What_names_the_entity_or_the_finding_cannot_be_masked(string masked, string key, string? deadline)
+    {
+        var path = Write("bad.yaml", $$"""
+            schema: keeper.rules/1
+            system: example
+            integration: ldap
+            defaults: { lens: security, category: IAM, refresh: 1d, entity: user, kind: misconfigured, severity: medium }
+            rules:
+              - id: EX-MASK
+                title: Masked
+                query: { protocol: ldap, filter: "(x=1)", key: "{{key}}" }
+                each: any
+                mask: [{{masked}}]
+            {{(deadline is null ? "" : $"    deadline: {deadline}")}}
+            """);
+
+        var ex = Assert.Throws<RuleException>(() => RuleLoader.LoadFile(path, "builtin", Protocols));
+
+        Assert.Contains($"mask '{masked}'", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void A_change_is_judged_on_a_whole_row_not_on_an_element()
+    {
+        var path = Write("bad.yaml", """
+            schema: keeper.rules/1
+            system: example
+            integration: ldap
+            defaults: { lens: security, category: IAM, refresh: 1d, entity: user, kind: misconfigured, severity: medium }
+            rules:
+              - id: EX-ELEMENT-CHANGED
+                title: Changed assignment
+                query: { protocol: ldap, filter: "(x=1)", key: id }
+                each: { element: { of: assignments, where: { field: intent, op: changed } } }
+            """);
+
+        var ex = Assert.Throws<RuleException>(() => RuleLoader.LoadFile(path, "builtin", Protocols));
+
+        Assert.Contains("not an element of an array", ex.Message, StringComparison.Ordinal);
     }
 
     [Fact]

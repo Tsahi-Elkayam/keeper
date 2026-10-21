@@ -292,8 +292,22 @@ public sealed class Tracker(SqliteConnection connection, TimeProvider? clock = n
 
     // ---- findings ------------------------------------------------------------
 
-    private sealed record Override(string CheckPattern, string Decision, string Entity)
+    private sealed record Override(string CheckPattern, string Decision, string Entity, string? Until)
     {
+        /// <summary>In force through its until day (yyyy-MM-dd), or for good.</summary>
+        public bool InForce(string now) => Until is null || string.CompareOrdinal(Until, now[..10]) >= 0;
+
+        public bool Covers(FindingRecord r) => Covers(r.CheckId, r.RuleId, r.Target);
+
+        public bool Covers(string checkId, string ruleId, string target) => MatchesCheck(checkId, ruleId)
+            && (Decision == "disable" || Entity.Equals(target, StringComparison.OrdinalIgnoreCase));
+
+        /// <summary>The finding's status under the decisions in force: a disabled rule first, then an exception.</summary>
+        public static string StatusUnder(List<Override> overrides, string now, string checkId, string ruleId, string target) =>
+            overrides.Any(o => o.Decision == "disable" && o.InForce(now) && o.Covers(checkId, ruleId, target)) ? "disabled"
+            : overrides.Any(o => o.Decision == "exception" && o.InForce(now) && o.Covers(checkId, ruleId, target)) ? "exception"
+            : "open";
+
         public bool MatchesCheck(string checkId, string ruleId) => Matches(checkId) || Matches(ruleId);
 
         private bool Matches(string id) =>
@@ -305,8 +319,9 @@ public sealed class Tracker(SqliteConnection connection, TimeProvider? clock = n
     private List<FindingRow> TrackFindings(List<Dictionary<string, object?>> runs,
         Dictionary<(string, string, string), EntityRow> entities, List<SystemRule> systemRules, List<EventRow> events, string now)
     {
-        var overrides = Sql.Rows(connection, "SELECT check_id, decision, entity FROM override WHERE active = 1 AND decision IN ('disable', 'exception');")
-            .Select(r => new Override((string)r["check_id"]!, (string)r["decision"]!, (string)r["entity"]!))
+        // Lapsed ones too: a finding an override no longer covers says when its exception ended.
+        var overrides = Sql.Rows(connection, "SELECT check_id, decision, entity, until FROM override WHERE active = 1 AND decision IN ('disable', 'exception');")
+            .Select(r => new Override((string)r["check_id"]!, (string)r["decision"]!, (string)r["entity"]!, r["until"] as string))
             .ToList();
         var existing = Sql.Rows(connection, "SELECT * FROM finding;").ToDictionary(r => (string)r["finding_key"]!, r => r);
         var touched = new Dictionary<string, FindingRow>();
@@ -351,6 +366,28 @@ public sealed class Tracker(SqliteConnection connection, TimeProvider? clock = n
             if (claimed is not null)
                 touched[key] = claimed;
         }
+
+        // A decision that ended - its until day passed, or it was undone - gives its findings back even when no
+        // scan has reported them since: the last thing known about them is that they fail. Without this an
+        // unscanned entity would stay "accepted" in the evidence long after the acceptance ran out.
+        foreach (var (key, before) in existing.Where(e => !touched.ContainsKey(e.Key) && (string)e.Value["status"]! is "exception" or "disabled"))
+        {
+            var (checkId, ruleId, target) = ((string)before["check_id"]!, (string)before["rule_id"]!, (string)before["target"]!);
+            var status = Override.StatusUnder(overrides, now, checkId, ruleId, target);
+            if (status == (string)before["status"]!)
+                continue;
+            if (status != "open")
+            {
+                events.Add(new EventRow(key, now, status == "disabled" ? "disabled" : "exception", null, null, "by decision"));
+                touched[key] = Copy(before) with { Status = status, Lifecycle = "disabled" };
+                continue;
+            }
+            var lapsed = overrides.Where(o => !o.InForce(now) && o.Covers(checkId, ruleId, target)).MaxBy(o => o.Until);
+            events.Add(new EventRow(key, now, "reopened", null, null,
+                (lapsed is null ? "the decision was removed" : $"the {(lapsed.Decision == "disable" ? "disabled rule" : "exception")} ended on {lapsed.Until}")
+                + $"; not scanned since {before["last_seen"]}"));
+            touched[key] = Copy(before) with { Status = "open", Lifecycle = "reopened" };
+        }
         return touched.Values.ToList();
     }
 
@@ -358,10 +395,7 @@ public sealed class Tracker(SqliteConnection connection, TimeProvider? clock = n
         Dictionary<(string, string, string), EntityRow> entities, List<SystemRule> systemRules, List<Override> overrides,
         string runId, List<EventRow> events, string now)
     {
-        var decision = overrides.FirstOrDefault(o => o.Decision == "disable" && o.MatchesCheck(r.CheckId, r.RuleId))?.Decision
-            ?? overrides.FirstOrDefault(o => o.Decision == "exception" && o.MatchesCheck(r.CheckId, r.RuleId)
-                                             && o.Entity.Equals(r.Target, StringComparison.OrdinalIgnoreCase))?.Decision;
-        var status = decision switch { "disable" => "disabled", "exception" => "exception", _ => "open" };
+        var status = Override.StatusUnder(overrides, now, r.CheckId, r.RuleId, r.Target);
         var previousStatus = before?["status"] as string;
         var previousLifecycle = before?["lifecycle"] as string;
 
@@ -380,7 +414,10 @@ public sealed class Tracker(SqliteConnection connection, TimeProvider? clock = n
         else if (previousStatus is "resolved" or "disabled" or "exception")
         {
             lifecycle = "reopened";
-            events.Add(new EventRow(r.FindingKey, now, "reopened", runId, null, null));
+            var lapsed = previousStatus is "disabled" or "exception"
+                ? overrides.Where(o => !o.InForce(now) && o.Covers(r)).MaxBy(o => o.Until) : null;
+            events.Add(new EventRow(r.FindingKey, now, "reopened", runId, null,
+                lapsed is null ? null : $"the {(lapsed.Decision == "disable" ? "disabled rule" : "exception")} ended on {lapsed.Until}"));
         }
         else if (previousLifecycle == "claimed-fixed")
         {

@@ -24,7 +24,7 @@ public static partial class RuleLoader
     private static readonly string[] DefaultFields = ["kind", "lens", "category", "severity", "refresh", "entity"];
     private static readonly string[] TargetFields = ["entity", "where", "field", "list"];
     private static readonly string[] RuleFields =
-        ["id", "title", "kind", "lens", "category", "severity", "entity", "why", "fix", "refs", "refresh", "query", "each", "count", "evidence", "deadline", "emit"];
+        ["id", "title", "kind", "lens", "category", "severity", "entity", "why", "fix", "refs", "refresh", "query", "each", "count", "evidence", "deadline", "emit", "mask"];
     private static readonly string[] EmitFields = ["check", "title", "kind", "category", "severity"];
     private static readonly string[] SeverityMapFields = ["field", "daysLeft", "ranges", "map", "default"];
     private static readonly string[] RangeFields = ["min", "max", "value"];
@@ -237,6 +237,16 @@ public static partial class RuleLoader
                 e.TryGetValue("severity", out var emitSeverity) ? ReadSeverityMap(reader, emitSeverity, $"{what}.emit") : null);
         }
 
+        // What names the entity or the finding is shown everywhere, so none of it can be masked: the key (each
+        // field of a key template), the name, a count's by and distinct, a deadline field.
+        var mask = reader.Strings(fields, "mask", what);
+        var shown = new List<string>();
+        if (query is not null)
+            shown.AddRange(query.Key.Contains('{', StringComparison.Ordinal) ? Templates.Placeholders(query.Key) : [query.Key]);
+        shown.AddRange(new[] { query?.Name, count?.By, count?.Distinct, deadline is null || Values.IsLiteralDate(deadline) ? null : deadline }.OfType<string>());
+        foreach (var masked in mask.Where(m => m.Contains('{', StringComparison.Ordinal) || m.StartsWith('_') || shown.Any(s => Rule.Overlap(s, m))))
+            reader.Error(node, $"{what}: mask '{masked}' must be a field of the row - not the key, the name, a count's by or distinct or the deadline, which are shown everywhere.");
+
         var title = reader.Text(fields, "title", what, required: true) ?? "";
         return new Rule
         {
@@ -259,6 +269,7 @@ public static partial class RuleLoader
             Deadline = deadline,
             SeverityBy = severityBy,
             Emit = emit,
+            Mask = mask,
             Source = source,
             Line = reader.Line(node),
         };
@@ -339,7 +350,7 @@ public static partial class RuleLoader
             return combinator.Value == "all" ? new AllCondition(items!) : new AnyCondition(items!);
         }
 
-        var fields = reader.Fields(node, what, ["field", "op", "value", "threshold", "required"]);
+        var fields = reader.Fields(node, what, ["field", "op", "value", "threshold", "required", "format"]);
         if (fields is null)
             return null;
         var field = reader.Text(fields, "field", what, required: true);
@@ -351,6 +362,15 @@ public static partial class RuleLoader
             reader.Error(node, $"{what}: unknown op '{op}'. Known: {string.Join(", ", Evaluator.Ops.Order())}.");
             return null;
         }
+        var format = reader.Text(fields, "format", what);
+        if (format is not null && !Evaluator.DateOps.Contains(op))
+            reader.Error(node, $"{what}: format applies to dates (ops {string.Join(", ", Evaluator.DateOps)}), not to op '{op}'.");
+        else if (format is not null && !Values.IsDateFormat(format, timeOfDay: op is "hour-in" or "hour-notin"))
+            reader.Error(node, $"{what}: format '{format}' must be ole, unix, unix-ms or a date format with its year, such as dd/MM/yyyy HH:mm" +
+                $"{(op.StartsWith("hour-", StringComparison.Ordinal) ? " (or a time alone, such as HH:mm)" : "")}.");
+        // The row of the last read belongs to the row: an array's element has none to compare with.
+        if ((op == "changed" || Rule.IsPreviousField(field)) && what.Contains(".element.", StringComparison.Ordinal))
+            reader.Error(node, $"{what}: changed and _new / _previous compare a whole row with its last read, not an element of an array.");
 
         var value = fields.TryGetValue("value", out var valueNode) ? YamlReader.ToJson(valueNode) : null;
         if (value is null && !Evaluator.OpsWithoutValue.Contains(op))
@@ -370,8 +390,15 @@ public static partial class RuleLoader
             }
             if (fields.ContainsKey("required"))
                 reader.Error(node, $"{what}: required applies to a threshold, not to a field reference.");
-            return new LeafCondition(field, op, value, reader.Text(fields, "threshold", what));
+            return new LeafCondition(field, op, value, reader.Text(fields, "threshold", what)) { Format = format };
         }
+        if (op == "changed" && value is not null)
+            reader.Error(node, $"{what}: op changed takes no value: it compares the field with the entity's last clean read.");
+        IEnumerable<string> Entries() => value is JsonArray entries ? entries.Select(e => Values.Text(e) ?? "") : (Values.Text(value) ?? "").Split(',', StringSplitOptions.TrimEntries);
+        if (op is "hour-in" or "hour-notin" && value is not null && !Values.TryHours(Entries(), out _))
+            reader.Error(node, $"{what}: op '{op}' needs hours of the day such as 22-6 or [0-7, 19-0] (0 to 23; the end is not included).");
+        if (op is "sid-in" or "sid-notin" && value is not null && Entries().FirstOrDefault(e => !Sids.IsKnown(e)) is { } unknownSid)
+            reader.Error(node, $"{what}: '{unknownSid}' is not a SID (S-1-...), rid:N or a known name such as everyone or domain-admins.");
         if (op is "match" or "notmatch" && Values.Text(value) is { } pattern)
         {
             try
@@ -410,7 +437,7 @@ public static partial class RuleLoader
         };
         if (required && threshold is null)
             reader.Error(node, $"{what}: required: true needs the threshold the tenant must set.");
-        return new LeafCondition(field, op, value, threshold) { Required = required };
+        return new LeafCondition(field, op, value, threshold) { Required = required, Format = format };
 
         bool Invalid(string text)
         {

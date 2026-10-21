@@ -84,6 +84,8 @@ public static partial class RequestMacros
 /// integration - or given: values (a fixed list) or threshold (the tenant's comma-separated list). Each
 /// object's fields fill the {placeholders} of the path and of the params, and every row it returns carries
 /// that object as "parent". Capped (max, default 200), and an id that is not a plain id is never put in a request.
+/// The list may itself be per object (two levels): its rows carry their own parent, so {parent.id} names the
+/// object two levels up.
 /// </summary>
 public static partial class PerObject
 {
@@ -105,8 +107,15 @@ public static partial class PerObject
             yield return "for_each must be a mapping: the query that lists the objects, plus field";
             yield break;
         }
-        if (each["for_each"] is not null)
-            yield return "for_each cannot be nested";
+        // Two levels at most - sites, then each site's lists, then each list's items. The levels cap one after
+        // the other (each level's max applies to the rows of the level below), so requests add up, never multiply.
+        if (each["for_each"] is JsonObject { } inner && inner["for_each"] is not null)
+            yield return "for_each nests two levels at most";
+        else if (each["for_each"] is not null)
+        {
+            foreach (var innerProblem in Validate(new QuerySpec(query.Protocol, each, "-", null)))
+                yield return "for_each." + innerProblem;
+        }
         if (each["missing"] is not null)
             yield return "for_each's own list cannot take missing: a list that answers 404 has a wrong path";
         if (Values.Text(each["field"]) is not { Length: > 0 } field)

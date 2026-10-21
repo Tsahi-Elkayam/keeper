@@ -17,18 +17,30 @@ public sealed record Verdict(bool? Fails, string? Value, string? Operand, string
 /// </summary>
 public sealed class Evaluator(Func<string, string?> threshold, DateTimeOffset now)
 {
+    /// <summary>Fields the scan keeps masked: the last read holds them masked, so changed compares them masked too.</summary>
+    public IReadOnlyList<string> Mask { get; init; } = [];
+
     public static readonly IReadOnlySet<string> Ops = new HashSet<string>(StringComparer.Ordinal)
     {
         "eq", "ne", "gt", "ge", "lt", "le", "in", "notin", "contains", "notcontains", "match", "notmatch",
         "exists", "absent", "empty", "notempty", "age-gt", "age-lt", "until-lt", "flag", "noflag",
         "size-gt", "size-lt", "size-eq", "status",
         "version-lt", "version-le", "version-gt", "version-ge", "in-cidr", "notin-cidr", "duration-gt", "duration-lt",
+        "hour-in", "hour-notin", "sid-in", "sid-notin", "changed",
     };
 
     public static readonly IReadOnlySet<string> OpsWithoutValue = new HashSet<string>(StringComparer.Ordinal)
     {
-        "exists", "absent", "empty", "notempty", "status",
+        "exists", "absent", "empty", "notempty", "status", "changed",
     };
+
+    /// <summary>Ops that read the field as a date, and so may name its format.</summary>
+    public static readonly IReadOnlySet<string> DateOps = new HashSet<string>(StringComparer.Ordinal)
+    {
+        "age-gt", "age-lt", "until-lt", "hour-in", "hour-notin",
+    };
+
+    private static readonly ConcurrentDictionary<string, TimeZoneInfo?> Zones = new(StringComparer.OrdinalIgnoreCase);
 
     private static readonly HashSet<string> ArrayOps = new(StringComparer.Ordinal) { "size-gt", "size-lt", "size-eq", "empty", "notempty", "contains", "notcontains" };
     private static readonly string[] FailWords = ["fail", "failed", "false", "noncompliant", "non-compliant"];
@@ -129,6 +141,19 @@ public sealed class Evaluator(Func<string, string?> threshold, DateTimeOffset no
 
     private Verdict Leaf(LeafCondition leaf, JsonNode? row)
     {
+        if (leaf.Op == "changed")
+            return Changed(leaf.Field, row);
+        // With no earlier read, _new and _previous are missing, not false or empty: "absent" there is no finding.
+        if (Rule.IsPreviousField(leaf.Field))
+        {
+            switch (Values.Text(FieldPath.First(row, "_new")))
+            {
+                case null:
+                    return new Verdict(null, null, null, "no earlier clean read to compare with");
+                case "true" when leaf.Field.StartsWith("_previous.", StringComparison.OrdinalIgnoreCase) || leaf.Field.Equals("_previous", StringComparison.OrdinalIgnoreCase):
+                    return new Verdict(null, null, null, "new since the last read: there is no earlier row");
+            }
+        }
         var nodes = FieldPath.Resolve(row, leaf.Field);
         if (!ArrayOps.Contains(leaf.Op))
             nodes = nodes.SelectMany(n => n is JsonArray a ? a.ToList() : [n]).ToList();
@@ -198,6 +223,59 @@ public sealed class Evaluator(Func<string, string?> threshold, DateTimeOffset no
         return unknown ?? pass!;
     }
 
+    /// <summary>
+    /// The field against the same entity's in the last clean read (_previous, which the scan adds): fires when it
+    /// differs, or when the entity is new since that read. Arrays compare as sets, text without case; with no
+    /// earlier clean read there is nothing to compare with.
+    /// </summary>
+    private Verdict Changed(string field, JsonNode? row)
+    {
+        var current = row;
+        if (Mask.Count > 0 && row is not null)
+        {
+            current = row.DeepClone();
+            foreach (var path in Mask)
+                FieldPath.Mask(current, path);
+        }
+        var now = Canonical(FieldPath.Resolve(current, field));
+        switch (Values.Text(FieldPath.First(row, "_new")))
+        {
+            case "true":
+                return new Verdict(true, now, "new since the last read", null);
+            case "false":
+                var before = Canonical(FieldPath.Resolve(FieldPath.First(row, "_previous"), field));
+                var changed = !string.Equals(now, before, StringComparison.OrdinalIgnoreCase);
+                return new Verdict(changed, now, "was " + before, null);
+            default:
+                return new Verdict(null, now, null, "no earlier clean read to compare with");
+        }
+    }
+
+    private static string Canonical(IReadOnlyList<JsonNode?> nodes) =>
+        nodes.Count == 0 ? "(none)" : string.Join(", ", nodes.Select(Canonical).Order(StringComparer.OrdinalIgnoreCase));
+
+    private static string Canonical(JsonNode? node) => node switch
+    {
+        JsonObject o => "{" + string.Join(", ", o.Where(p => !p.Key.StartsWith("_previous", StringComparison.OrdinalIgnoreCase) && p.Key != "_new")
+            .OrderBy(p => p.Key, StringComparer.OrdinalIgnoreCase).Select(p => $"{p.Key}: {Canonical(p.Value)}")) + "}",
+        JsonArray a => "[" + string.Join(", ", a.Select(Canonical).Order(StringComparer.OrdinalIgnoreCase)) + "]",
+        _ => Values.Text(node) ?? "null",
+    };
+
+    private string? TimeZone => threshold(Rule.TimeZoneSetting);
+
+    private static TimeZoneInfo? Zone(string id) => Zones.GetOrAdd(id, name =>
+    {
+        try
+        {
+            return TimeZoneInfo.FindSystemTimeZoneById(name.Trim());
+        }
+        catch (Exception ex) when (ex is TimeZoneNotFoundException or InvalidTimeZoneException)
+        {
+            return null;
+        }
+    });
+
     private static bool IsEmpty(List<JsonNode?> present) =>
         present.Count == 0 || present.All(n => n is JsonArray { Count: 0 } || (n is JsonValue && Values.Text(n) is ""));
 
@@ -256,8 +334,8 @@ public sealed class Evaluator(Func<string, string?> threshold, DateTimeOffset no
             case "age-gt":
             case "age-lt":
             case "until-lt":
-                if (!Values.TryDate(value, out var date))
-                    return new Verdict(null, value, operand, $"{leaf.Field} is not a date");
+                if (!Values.TryDate(value, leaf.Format, out var date))
+                    return new Verdict(null, value, operand, $"{leaf.Field} is not a date{(leaf.Format is null ? "" : $" in the format {leaf.Format}")}");
                 if (!Values.TryNumber(operand, out var days))
                     return new Verdict(null, value, operand, "operand is not a number of days");
                 fails = leaf.Op switch
@@ -300,6 +378,32 @@ public sealed class Evaluator(Func<string, string?> threshold, DateTimeOffset no
                     inside |= network.Contains(address.IsIPv4MappedToIPv6 ? address.MapToIPv4() : address);
                 }
                 fails = leaf.Op == "in-cidr" ? inside : !inside;
+                break;
+            case "hour-in":
+            case "hour-notin":
+                // The hour on the organisation's clock: 23:30 UTC is already the next morning in Jerusalem.
+                if (!Values.TryDate(value, leaf.Format, out var when) || when == DateTimeOffset.MinValue || when == DateTimeOffset.MaxValue)
+                    return new Verdict(null, value, operand, $"{leaf.Field} is not a time");
+                if (TimeZone is not { Length: > 0 } zoneId || Zone(zoneId) is not { } zone)
+                    return new Verdict(null, value, operand, $"threshold.{Rule.TimeZoneSetting} '{TimeZone}' is not a time zone (e.g. Asia/Jerusalem)");
+                if (!Values.TryHours(ListOf(leaf.Value, operand), out var hours))
+                    return new Verdict(null, value, operand, $"'{operand}' is not hours of the day such as 22-6");
+                // A time written as a clock time (no Z, no offset) is already the organisation's clock: it was read
+                // as UTC only to keep its numbers.
+                if (Values.NamesInstant(value, leaf.Format) is not { } instant)
+                    return new Verdict(null, value, operand, $"{leaf.Field}: cannot tell whether the time is UTC or a clock time; name its format");
+                var local = instant ? TimeZoneInfo.ConvertTime(when, zone) : when;
+                fails = leaf.Op == "hour-in" ? hours[local.Hour] : !hours[local.Hour];
+                return new Verdict(fails, $"{value} ({local:HH:mm} local)", operand, null);
+            case "sid-in":
+            case "sid-notin":
+                if (!Sids.IsSid(value))
+                    return new Verdict(null, value, operand, $"{leaf.Field} is not a SID");
+                var entries = ListOf(leaf.Value, operand);
+                if (entries.FirstOrDefault(e => !Sids.IsKnown(e)) is { } unknownEntry)
+                    return new Verdict(null, value, operand, $"'{unknownEntry}' is not a known SID name, rid:N or S-1-... (check the threshold setting)");
+                var named = entries.Any(e => Sids.Matches(value, e));
+                fails = leaf.Op == "sid-in" ? named : !named;
                 break;
             case "duration-gt":
             case "duration-lt":

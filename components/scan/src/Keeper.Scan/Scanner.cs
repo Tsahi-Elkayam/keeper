@@ -33,6 +33,12 @@ public sealed record ScanRequest
     /// </summary>
     public Func<string, PreviousRead?> PreviousRows { get; init; } = _ => null;
 
+    /// <summary>
+    /// A query's newest clean read in this system's earlier scans, by coverage item - for rules that compare a row
+    /// with the same entity's last read (changed, _new, _previous). Asked only for queries such rules read.
+    /// </summary>
+    public Func<string, IReadOnlyDictionary<string, CleanRead>> LastCleanRows { get; init; } = _ => new Dictionary<string, CleanRead>();
+
     public TimeSpan Timeout { get; init; } = TimeSpan.FromSeconds(60);
     public int Parallelism { get; init; } = 8;
     public Action<string> Log { get; init; } = _ => { };
@@ -79,6 +85,8 @@ public sealed class Scanner(RunnerRegistry registry, TimeProvider? clock = null)
             Distrust(outcome, group.Key, group.Max(g => g.Rule.Query.MinRows), dropCheck ? request.PreviousRows : _ => null, dropRatio,
                 confirmScans, confirmAge, started);
             outcomes[group.Key] = outcome;
+            // A field any rule of the query masks is masked in every row the scan keeps; conditions read the real value.
+            outcome.Mask = [.. group.SelectMany(g => g.Rule.Mask).Distinct(StringComparer.OrdinalIgnoreCase)];
 
             foreach (var (row, target) in outcome.Rows)
                 run.Row(new RowRecord
@@ -90,9 +98,12 @@ public sealed class Scanner(RunnerRegistry registry, TimeProvider? clock = null)
                     EntityKey = KeyOf(rule.Query, row, target),
                     EntityName = rule.Query.Name is { } nameField ? Values.Text(FieldPath.First(row, nameField)) : null,
                     Target = target,
-                    Attrs = row,
+                    Attrs = outcome.Masked(row),
                     ObservedAt = observedAt,
                 });
+            // Rows are written as read; a rule that compares with the last read sees that read beside each row.
+            if (group.Any(g => g.Rule.ComparesWithPrevious))
+                AddLastRead(outcome, group.Key, rule.Query, request.LastCleanRows(group.Key));
             foreach (var target in outcome.Targets)
                 run.Coverage(new CoverageRecord
                 {
@@ -169,10 +180,50 @@ public sealed class Scanner(RunnerRegistry registry, TimeProvider? clock = null)
         }
     }
 
+    /// <summary>
+    /// Beside each row, the same entity in the query's last clean read (of its host, per host): _new (true when
+    /// that read did not have it), _previous (its row then) and _previous_at. No clean read yet: none of them,
+    /// so changed is unknown rather than "everything is new".
+    /// </summary>
+    private static void AddLastRead(QueryOutcome outcome, string queryId, QuerySpec query, IReadOnlyDictionary<string, CleanRead> reads)
+    {
+        foreach (var (row, target) in outcome.Rows)
+        {
+            if (!reads.TryGetValue(RunFolder.CoverageItem(queryId, target), out var read))
+                continue;
+            row["_previous_at"] = read.At;
+            if (read.Rows.TryGetValue(KeyOf(query, row, target), out var before))
+            {
+                // Masked as the rows are now, whatever the mask was then: a row kept before a field was masked
+                // holds its value, and evidence can name _previous.
+                row["_new"] = false;
+                row["_previous"] = outcome.Masked(before) is var masked && ReferenceEquals(masked, before) ? before.DeepClone() : masked;
+            }
+            else
+            {
+                row["_new"] = true;
+            }
+        }
+    }
+
     private sealed record TargetOutcome(string? Target, string State, string? Reason, int Count);
 
     private sealed record QueryOutcome(List<(JsonObject Row, string? Target)> Rows, List<TargetOutcome> Targets)
     {
+        /// <summary>Fields masked in what the scan keeps.</summary>
+        public IReadOnlyList<string> Mask { get; set; } = [];
+
+        /// <summary>The row as the scan may keep it: a copy with the masked fields replaced, or the row itself.</summary>
+        public JsonObject Masked(JsonObject row)
+        {
+            if (Mask.Count == 0)
+                return row;
+            var copy = (JsonObject)row.DeepClone();
+            foreach (var path in Mask)
+                FieldPath.Mask(copy, path);
+            return copy;
+        }
+
         public string State =>
             Targets.All(t => t.State == "ok") ? "ok"
             : Targets.Any(t => t.State is "ok" or "partial") ? "partial"
@@ -290,11 +341,14 @@ public sealed class Scanner(RunnerRegistry registry, TimeProvider? clock = null)
             Instance = instance, System = system, Scope = "rule", Item = rule.Id, State = state,
             Reason = reason is null ? null : Redactor.Clean(reason), Count = count, ObservedAt = observedAt,
         });
+        // A rule whose conditions read a masked field (its own mask or another rule's on the same query) keeps no
+        // row value in its results: the value may be the masked one. A count is only a number.
+        var hide = rule.Count is null && rule.Reads(outcome.Mask);
         void Result(string entityType, string key, Verdict verdict, string? why = null) => run.Result(new ResultRecord
         {
             Instance = instance, System = system, RuleId = rule.Id, EntityType = entityType, EntityKey = key,
-            State = verdict.State, Value = Truncate(verdict.Value), Operand = verdict.Operand, Why = why ?? verdict.Why,
-            TtlMinutes = rule.TtlMinutes, At = observedAt,
+            State = verdict.State, Value = hide ? Hidden(verdict.Value) : Truncate(verdict.Value), Operand = hide ? Hidden(verdict.Operand) : verdict.Operand,
+            Why = why ?? verdict.Why, TtlMinutes = rule.TtlMinutes, At = observedAt,
         });
 
         // A rule that compares with the tenant's own list (names of its agents, its admin groups) says nothing
@@ -355,17 +409,20 @@ public sealed class Scanner(RunnerRegistry registry, TimeProvider? clock = null)
             foreach (var (row, target) in outcome.Rows)
             {
                 var key = KeyOf(rule.Query, row, target);
-                var evaluator = new Evaluator(name => request.OverrideThreshold(rule.Id, key) ?? request.Threshold(name), now);
+                var evaluator = new Evaluator(name => request.OverrideThreshold(rule.Id, key) ?? request.Threshold(name), now) { Mask = outcome.Mask };
                 var verdict = evaluator.Each(rule.Each!, row);
                 Result(rule.EntityType, key, verdict);
                 if (verdict.Fails != true)
                     continue;
 
+                // Evidence, titles and check ids are written from the row as the scan keeps it, masked fields masked.
+                var kept = outcome.Masked(row);
                 var name = rule.Query.Name is { } nameField ? Values.Text(FieldPath.First(row, nameField)) : null;
-                var evidence = rule.Evidence is null
-                    ? verdict.Value is null ? null : $"value {verdict.Value}{(verdict.Operand is null ? "" : $" (rule: {verdict.Operand})")}"
-                    : Templates.Render(rule.Evidence, row);
-                run.Finding(BuildFinding(rule, instance, system, rule.EntityType, key, name, row, evaluator, observedAt, evidence));
+                var evidence = rule.Evidence is not null ? Templates.Render(rule.Evidence, kept)
+                    : verdict.Value is null ? null
+                    : hide ? "the value is masked"
+                    : $"value {verdict.Value}{(verdict.Operand is null ? "" : $" (rule: {verdict.Operand})")}";
+                run.Finding(BuildFinding(rule, instance, system, rule.EntityType, key, name, kept, evaluator, observedAt, evidence, severityRow: row));
                 findings++;
             }
         }
@@ -496,15 +553,18 @@ public sealed class Scanner(RunnerRegistry registry, TimeProvider? clock = null)
         }
     }
 
+    /// <param name="row">The row as the scan keeps it (masked fields masked): what the finding shows.</param>
+    /// <param name="severityRow">The row as read, when it differs: a severity can depend on a masked value without showing it.</param>
     private static FindingRecord BuildFinding(Rule rule, string instance, string system, string entityType, string target, string? name,
-        JsonObject? row, Evaluator evaluator, string observedAt, string? evidence)
+        JsonObject? row, Evaluator evaluator, string observedAt, string? evidence, JsonObject? severityRow = null)
     {
         var emit = rule.Emit;
         var checkId = emit?.Check is { } template && row is not null ? Sanitize(Templates.Render(template, row)) : rule.Id;
         if (checkId.Length == 0)
             checkId = rule.Id;
-        var severity = emit?.Severity is { } emitSeverity ? evaluator.Severity(emitSeverity, row)
-            : rule.SeverityBy is { } map ? evaluator.Severity(map, row)
+        severityRow ??= row;
+        var severity = emit?.Severity is { } emitSeverity ? evaluator.Severity(emitSeverity, severityRow)
+            : rule.SeverityBy is { } map ? evaluator.Severity(map, severityRow)
             : rule.Severity;
         var kind = emit?.Kind ?? rule.Kind;
         var category = emit?.Category ?? rule.Category;
@@ -549,4 +609,6 @@ public sealed class Scanner(RunnerRegistry registry, TimeProvider? clock = null)
     }
 
     private static string? Truncate(string? text, int max = 500) => text is null || text.Length <= max ? text : text[..max] + "...";
+
+    private static string? Hidden(string? text) => text is null ? null : "(masked)";
 }

@@ -80,6 +80,7 @@ try
             TargetsIncomplete = inputs.TargetsIncomplete,
             // A connection test reads one rule once; comparing it with a full scan would only confuse the result.
             PreviousRows = test ? _ => null : item => previous.GetValueOrDefault(item),
+            LastCleanRows = test ? _ => new Dictionary<string, CleanRead>() : query => inputs.LastCleanRows(record.Id, systemName, query),
             Timeout = TimeSpan.FromSeconds(int.TryParse(cli.Get("timeout"), NumberStyles.None, CultureInfo.InvariantCulture, out var t) ? t : 60),
             Parallelism = int.TryParse(cli.Get("parallel"), NumberStyles.None, CultureInfo.InvariantCulture, out var p) ? p : 8,
             Log = message => Console.Error.WriteLine($"  {Redactor.Clean(message)}"),

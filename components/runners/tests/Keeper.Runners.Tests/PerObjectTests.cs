@@ -24,6 +24,12 @@ public sealed class PerObjectTests
             {
                 "/servicePrincipals" => RunnerResult.Ok([new() { ["id"] = "sp-1", ["name"] = "App one" }, new() { ["id"] = "sp-2" }, new() { ["id"] = "../../x" }]),
                 "/servicePrincipals/sp-1/jobs" => RunnerResult.Ok([new() { ["status"] = "Quarantine" }]),
+                "/sites" => RunnerResult.Ok([new() { ["id"] = "s1" }, new() { ["id"] = "s2" }]),
+                "/sites/s1/lists" => RunnerResult.Ok([new() { ["id"] = "l1" }]),
+                "/sites/s2/lists" => RunnerResult.Ok([new() { ["id"] = "l2" }, new() { ["id"] = "l3" }]),
+                "/sites/s1/lists/l1/items" => RunnerResult.Ok([new() { ["title"] = "a" }]),
+                "/sites/s2/lists/l2/items" => RunnerResult.Ok([new() { ["title"] = "b" }]),
+                "/sites/s2/lists/l3/items" => RunnerResult.Ok([]),
                 _ => RunnerResult.Failed($"{path}: 404"),
             });
         }
@@ -50,12 +56,38 @@ public sealed class PerObjectTests
     }
 
     [Fact]
-    public void A_path_without_the_placeholder_or_a_nested_for_each_is_refused()
+    public void A_path_without_the_placeholder_or_a_broken_inner_for_each_is_refused()
     {
         var runner = new PathRunner();
 
         Assert.NotEmpty(runner.Validate(Query("/servicePrincipals/jobs", new JsonObject { ["path"] = "/servicePrincipals", ["field"] = "id" })));
         Assert.NotEmpty(runner.Validate(Query("/x/{id}", new JsonObject { ["path"] = "/x", ["field"] = "id", ["for_each"] = new JsonObject() })));
+    }
+
+    private static JsonObject Lists(JsonObject? sites = null) =>
+        new() { ["path"] = "/sites/{id}/lists", ["field"] = "id", ["for_each"] = sites ?? new JsonObject { ["path"] = "/sites", ["field"] = "id" } };
+
+    [Fact]
+    public async Task Two_levels_name_the_object_two_levels_up_as_parent_parent()
+    {
+        var runner = new PathRunner();
+        var query = Query("/sites/{parent.id}/lists/{id}/items", Lists());
+
+        Assert.Empty(runner.Validate(query));
+        var result = await runner.RunAsync(query, Context.For(new FakeConnection("")), CancellationToken.None);
+
+        Assert.Equal("ok", result.State);
+        Assert.Equal(new[] { "a/l1/s1", "b/l2/s2" },
+            result.Rows.Select(r => $"{r["title"]}/{r["parent"]!["id"]}/{r["parent"]!["parent"]!["id"]}").Order(StringComparer.Ordinal));
+        Assert.Equal(1 + 2 + 3, runner.Paths.Count);   // the sites, each site's lists, each list's items
+    }
+
+    [Fact]
+    public void Three_levels_are_refused()
+    {
+        var three = Lists(new JsonObject { ["path"] = "/sites/{id}", ["field"] = "id", ["for_each"] = new JsonObject { ["path"] = "/hubs", ["field"] = "id" } });
+
+        Assert.Contains(new PathRunner().Validate(Query("/sites/{parent.id}/lists/{id}/items", three)), p => p.Contains("two levels", StringComparison.Ordinal));
     }
 
     [Fact]

@@ -108,8 +108,11 @@ public static class TodayBuilder
             SELECT 'licence' AS what, licence_id AS id, product AS title, expires_on AS due_on FROM licence WHERE expires_on IS NOT NULL
             UNION ALL SELECT 'contract', contract_id, title, end_on FROM contract WHERE end_on IS NOT NULL
             UNION ALL SELECT kind, key_date_id, title, due_on FROM key_date
-            UNION ALL SELECT 'finding', finding_key, title, deadline FROM active_finding WHERE deadline IS NOT NULL;
-            """)
+            UNION ALL SELECT 'finding', finding_key, title, deadline FROM active_finding WHERE deadline IS NOT NULL
+            UNION ALL SELECT CASE decision WHEN 'exception' THEN 'exception ends' WHEN 'disable' THEN 'rule comes back' ELSE 'threshold ends' END,
+                             override_id, check_id || CASE WHEN entity = '' THEN '' ELSE ' for ' || entity END, until
+                      FROM override WHERE active = 1 AND until IS NOT NULL AND until >= :today;
+            """, null, (":today", DateOnly.FromDateTime(now.UtcDateTime).ToString("yyyy-MM-dd", CultureInfo.InvariantCulture)))
             .Select(r => (What: (string)r["what"]!, Id: (string)r["id"]!, Title: (string)r["title"]!, Due: (string)r["due_on"]!))
             .Select(r => (r.What, r.Id, r.Title, r.Due,
                 Left: DateOnly.TryParse(r.Due, CultureInfo.InvariantCulture, out var d) ? d.DayNumber - DateOnly.FromDateTime(now.UtcDateTime).DayNumber : long.MaxValue))
