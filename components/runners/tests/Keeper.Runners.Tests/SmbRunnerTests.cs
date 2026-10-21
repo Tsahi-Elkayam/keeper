@@ -29,6 +29,19 @@ public sealed class SmbRunnerTests
         Assert.NotEmpty(runner.Validate(Context.Query("smb", "name", ("read", "write"))));
     }
 
+    [Theory]
+    [InlineData("all", null, true)]
+    [InlineData("user", null, true)]
+    [InlineData("every", null, false)]
+    [InlineData("all", "master", false)]   // one database, or all of them - not both
+    public void Sql_reads_one_database_or_every_one(string databases, string? database, bool valid)
+    {
+        var problems = new Keeper.Runners.Sql.SqlRunner().Validate(Context.Query("sql", "name",
+            ("text", "SELECT name FROM sys.database_principals"), ("databases", databases), ("database", database)));
+
+        Assert.Equal(valid, !problems.Any());
+    }
+
     [Fact]
     public async Task A_read_as_another_account_than_the_one_keeper_runs_as_is_refused()
     {

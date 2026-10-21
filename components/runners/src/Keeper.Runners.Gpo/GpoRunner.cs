@@ -47,21 +47,29 @@ public sealed partial class GpoRunner(Func<IConnection, string>? policiesRoot = 
         }
         else
         {
-            // The domain's own SYSVOL: \\example.org\SYSVOL\example.org\Policies, from the ldap integration's domain.
-            var domain = Domain(context.Connection.Endpoint);
+            // Read as the Windows user Keeper runs as: a stored credential is never used for SMB.
+            if (context.Connection.AuthKind != "negotiate")
+                return Task.FromResult(RunnerResult.Failed("gpo reads SYSVOL as the Windows user Keeper runs as: the integration's auth must be negotiate"));
+            // The domain's own SYSVOL: \\example.org\SYSVOL\example.org\Policies - named by the domain, never a DC.
+            var domain = Domain(context.Connection.Options["domain"]?.ToString() ?? context.Connection.Endpoint);
             if (domain is null)
-                return Task.FromResult(RunnerResult.Failed("the integration's endpoint does not name a domain (example.org) whose SYSVOL to read"));
+                return Task.FromResult(RunnerResult.Failed(
+                    "gpo needs the domain's name (example.org): the integration's endpoint is not one - set its option domain"));
             root = $@"\\{domain}\SYSVOL\{domain}\Policies";
         }
         return Task.Run(() => Read(root, query, cancellationToken), cancellationToken);
     }
 
-    /// <summary>A domain name from an ldap endpoint: example.org, ldap://example.org, ldaps://dc1.example.org:636 (its host).</summary>
+    /// <summary>
+    /// The domain's name from an ldap endpoint or the domain option: example.org, or ldap://example.org. An
+    /// endpoint with a port, or one that names a server rather than the domain, cannot be told apart from a
+    /// domain here, so a URL is taken only without a port; otherwise the option domain says it.
+    /// </summary>
     public static string? Domain(string endpoint)
     {
         var text = endpoint.Trim();
         if (text.Contains("://", StringComparison.Ordinal))
-            text = Uri.TryCreate(text, UriKind.Absolute, out var uri) ? uri.Host : "";
+            text = Uri.TryCreate(text, UriKind.Absolute, out var uri) && uri.IsDefaultPort && uri.AbsolutePath is "" or "/" ? uri.Host : "";
         return DomainName().IsMatch(text) ? text : null;
     }
 
@@ -109,11 +117,14 @@ public sealed partial class GpoRunner(Func<IConnection, string>? policiesRoot = 
     private static IEnumerable<JsonObject> Rows(string folder, string part, string scope)
     {
         var halves = scope switch { "machine" => new[] { "Machine" }, "user" => ["User"], _ => ["Machine", "User"] };
+        // Every GPO has a GPT.INI. One that cannot be opened is a GPO this account cannot read - never one
+        // without settings. (Windows says "not there" for "not allowed" too, so it is opened, not looked for.)
+        var gpt = ReadText(Path.Combine(folder, "GPT.INI"))
+                  ?? throw new InvalidDataException("no GPT.INI: the folder cannot be read, or is an orphan or still replicating - not a whole GPO");
         switch (part)
         {
             case "gpt":
-                if (ReadText(Path.Combine(folder, "GPT.INI")) is { } gpt)
-                    yield return Tagged(GpoFiles.Gpt(gpt), null, "GPT.INI");
+                yield return Tagged(GpoFiles.Gpt(gpt), null, "GPT.INI");
                 break;
             case "registry":
                 foreach (var half in halves)
@@ -139,10 +150,17 @@ public sealed partial class GpoRunner(Func<IConnection, string>? policiesRoot = 
             case "preferences":
                 foreach (var half in halves)
                 {
-                    var preferences = Path.Combine(folder, half, "Preferences");
-                    if (!Directory.Exists(preferences))
-                        continue;
-                    foreach (var file in Directory.EnumerateFiles(preferences, "*.xml", SearchOption.AllDirectories).Order(StringComparer.OrdinalIgnoreCase))
+                    List<string> files;
+                    try
+                    {
+                        files = [.. Directory.EnumerateFiles(Path.Combine(folder, half, "Preferences"), "*.xml", SearchOption.AllDirectories)
+                            .Order(StringComparer.OrdinalIgnoreCase)];
+                    }
+                    catch (DirectoryNotFoundException)
+                    {
+                        continue;   // no preferences in this half; a folder that is there but closed throws on
+                    }
+                    foreach (var file in files)
                     {
                         if (ReadText(file) is not { } xml)
                             continue;
@@ -175,6 +193,46 @@ public sealed partial class GpoRunner(Func<IConnection, string>? policiesRoot = 
     {
         SecretProperties.Mask(item);
         MaskCpassword(item);
+        if (item["Properties"] is not JsonObject properties)
+            return;
+        // A registry preference names its value: <Properties name="DefaultPassword" value="..."/>; an ini
+        // preference its property: <Properties property="Password" value="..."/>.
+        foreach (var label in new[] { "name", "property" })
+        {
+            if (Values.Text(properties[label]) is { } name && SecretProperties.LooksSecret(name) && Values.Text(properties["value"]) is { Length: > 0 }
+                && Values.Text(properties["type"]) is not ("REG_DWORD" or "REG_QWORD"))
+                properties["value"] = FieldPath.MaskedValue;
+        }
+        // A scheduled task's command line can carry a password - wherever the task keeps it (Arguments of an
+        // Exec action, deep in a v2 task, or the arguments of a v1 one).
+        MaskCommandLines(item);
+    }
+
+    // A password on a command line: -p secret, /p:secret, password=..., pwd ... Never "Bypass" or "-PassThru".
+    [GeneratedRegex(@"\bpass(w(or)?d|phrase)?\b|\bpwd\b|-p\s+\S|/p[:\s]\S|secret|token|credential", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)]
+    private static partial Regex PasswordArguments();
+
+    private static readonly string[] CommandLines = ["arguments", "args", "command", "commandLine"];
+
+    private static void MaskCommandLines(JsonNode? node)
+    {
+        switch (node)
+        {
+            case JsonObject o:
+                foreach (var name in o.Select(p => p.Key).ToList())
+                {
+                    if (CommandLines.Contains(name, StringComparer.OrdinalIgnoreCase) && Values.Text(o[name]) is { } line && o[name] is JsonValue
+                        && PasswordArguments().IsMatch(line))
+                        o[name] = FieldPath.MaskedValue;
+                    else
+                        MaskCommandLines(o[name]);
+                }
+                break;
+            case JsonArray a:
+                foreach (var child in a)
+                    MaskCommandLines(child);
+                break;
+        }
     }
 
     private static void MaskCpassword(JsonNode? node)
@@ -202,14 +260,26 @@ public sealed partial class GpoRunner(Func<IConnection, string>? policiesRoot = 
         }
     }
 
+    /// <summary>
+    /// The file's bytes, or null when it is not there. Opened, never looked for: Windows answers "not there"
+    /// to an existence check it may not make, so only "not found" is absence - "access denied" and any other
+    /// error stop the GPO's read.
+    /// </summary>
     private static byte[]? ReadBytes(string file)
     {
-        var info = new FileInfo(file);
-        if (!info.Exists)
+        try
+        {
+            using var stream = File.OpenRead(file);
+            if (stream.Length > MaxFileBytes)
+                throw new InvalidDataException($"{Path.GetFileName(file)} is larger than {MaxFileBytes / 1024 / 1024} MB");
+            var bytes = new byte[stream.Length];
+            stream.ReadExactly(bytes);
+            return bytes;
+        }
+        catch (Exception ex) when (ex is FileNotFoundException or DirectoryNotFoundException)
+        {
             return null;
-        if (info.Length > MaxFileBytes)
-            throw new InvalidDataException($"{info.Name} is larger than {MaxFileBytes / 1024 / 1024} MB");
-        return File.ReadAllBytes(file);
+        }
     }
 
     /// <summary>The file's text, by its BOM (GptTmpl.inf is UTF-16), or null when it is not there.</summary>

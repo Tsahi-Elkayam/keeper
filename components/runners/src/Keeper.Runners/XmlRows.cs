@@ -59,17 +59,20 @@ public static class XmlRows
             _ => null,
         };
 
+    // xsi:nil (its namespace already dropped) marks an empty element: no attribute of the data.
+    private static IEnumerable<XAttribute> Attributes(XElement element) => element.Attributes().Where(a => a.Name.LocalName != "nil");
+
     private static JsonObject ToJson(XElement element, int depth, int maxDepth)
     {
         var row = new JsonObject();
-        foreach (var attribute in element.Attributes())
+        foreach (var attribute in Attributes(element))
             row[attribute.Name.LocalName] = attribute.Value;
 
         foreach (var group in element.Elements().GroupBy(e => e.Name.LocalName))
         {
             // A child with attributes is an object too (<Properties cpassword="..."/>): as text alone its attributes
             // would be lost. A child with only text stays its text.
-            var values = group.Select(child => (child.HasElements || child.HasAttributes) && depth < maxDepth
+            var values = group.Select(child => (child.HasElements || Attributes(child).Any()) && depth < maxDepth
                     ? (JsonNode)ToJson(child, depth + 1, maxDepth)
                     : JsonValue.Create(child.Value.Trim()))
                 .ToList();

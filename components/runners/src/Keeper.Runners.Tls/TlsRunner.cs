@@ -13,7 +13,8 @@ namespace Keeper.Runners.Tls;
 /// validity, key, protocol, and whether the chain and name are valid. One row per target.
 /// The handshake accepts any certificate on purpose: nothing is sent over the connection, it is only
 /// inspected, so an invalid certificate is a finding rather than an error. Revocation is not fetched
-/// (no calls to the internet from a scan).
+/// (no calls to the internet from a scan). Behind HTTPS inspection, an endpoint whose certificate comes from
+/// one of the integration's inspectionIssuers is a failed read: the proxy's certificate is not the endpoint's.
 /// </summary>
 public sealed class TlsRunner : IRunner
 {
@@ -59,6 +60,10 @@ public sealed class TlsRunner : IRunner
                 return RunnerResult.Failed($"{host}:{port} sent no certificate");
 
             using var certificate = X509CertificateLoader.LoadCertificate(ssl.RemoteCertificate.GetRawCertData());
+            // Behind HTTPS inspection the certificate is the inspecting proxy's, minted for this host: judging it
+            // would report on the proxy, never the endpoint. Its issuer gives it away (option inspectionIssuers).
+            if (InspectedBy(certificate, context.Connection.Options) is { } proxy)
+                return RunnerResult.Failed($"{host}:{port} was seen through HTTPS inspection (issuer {proxy}): its own certificate is not visible from here");
             return RunnerResult.Ok([Row(host, port, certificate, ssl, errors, chainStatus, context.Now)]);
         }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
@@ -69,6 +74,22 @@ public sealed class TlsRunner : IRunner
         {
             return RunnerResult.Failed($"{host}:{port}: {ex.Message}");
         }
+    }
+
+    /// <summary>
+    /// The issuer that gives a certificate away as an inspecting proxy's: any of the integration's
+    /// inspectionIssuers (parts of an issuer name, such as the name of the firewall's inspection CA) that the
+    /// certificate's issuer contains, or null.
+    /// </summary>
+    public static string? InspectedBy(X509Certificate2 certificate, JsonObject options)
+    {
+        IEnumerable<string> issuers = options["inspectionIssuers"] switch
+        {
+            JsonArray list => list.Select(Values.Text).OfType<string>(),
+            JsonValue text => (Values.Text(text) ?? "").Split(',', StringSplitOptions.TrimEntries),
+            _ => [],
+        };
+        return issuers.Where(i => i.Length > 0).Any(i => certificate.Issuer.Contains(i, StringComparison.OrdinalIgnoreCase)) ? certificate.Issuer : null;
     }
 
     public static (string Host, int Port) Split(string target, int defaultPort)
@@ -82,45 +103,17 @@ public sealed class TlsRunner : IRunner
     public static JsonObject Row(string host, int port, X509Certificate2 certificate, SslStream ssl, SslPolicyErrors errors,
         IReadOnlyList<string> chainStatus, DateTimeOffset now)
     {
-        var notAfter = new DateTimeOffset(certificate.NotAfter.ToUniversalTime());
-        var sans = certificate.Extensions.OfType<X509SubjectAlternativeNameExtension>()
-            .SelectMany(e => e.EnumerateDnsNames())
-            .ToArray();
-        var keySize = certificate.GetRSAPublicKey()?.KeySize ?? certificate.GetECDsaPublicKey()?.KeySize;
-
-        return new JsonObject
-        {
-            ["endpoint"] = $"{host}:{port}",
-            ["host"] = host,
-            ["port"] = port,
-            ["subject"] = certificate.Subject,
-            ["issuer"] = certificate.Issuer,
-            ["notBefore"] = RowValues.Iso(new DateTimeOffset(certificate.NotBefore.ToUniversalTime())),
-            ["notAfter"] = RowValues.Iso(notAfter),
-            ["daysLeft"] = Math.Floor((notAfter - now).TotalDays),
-            ["serial"] = certificate.SerialNumber,
-            ["thumbprint"] = certificate.Thumbprint,
-            ["keyAlgorithm"] = certificate.PublicKey.Oid.FriendlyName,
-            ["keySize"] = keySize,
-            ["signatureAlgorithm"] = certificate.SignatureAlgorithm.FriendlyName,
-            ["protocol"] = ssl.SslProtocol.ToString(),
-            ["cipherSuite"] = ssl.NegotiatedCipherSuite.ToString(),
-            ["chainValid"] = (errors & SslPolicyErrors.RemoteCertificateChainErrors) == 0,
-            ["nameMatches"] = (errors & SslPolicyErrors.RemoteCertificateNameMismatch) == 0,
-            ["chainErrors"] = string.Join(", ", chainStatus.Distinct()),
-            ["selfSigned"] = certificate.Subject == certificate.Issuer,
-            ["sans"] = new JsonArray(sans.Select(s => (JsonNode)JsonValue.Create(s)).ToArray()),
-            ["eku"] = new JsonArray(Ekus(certificate).Select(s => (JsonNode)JsonValue.Create(s)).ToArray()),
-        };
+        var row = new JsonObject { ["endpoint"] = $"{host}:{port}", ["host"] = host, ["port"] = port };
+        foreach (var (name, value) in CertificateRows.Of(certificate, now).ToList())
+            row[name] = value?.DeepClone();
+        row["protocol"] = ssl.SslProtocol.ToString();
+        row["cipherSuite"] = ssl.NegotiatedCipherSuite.ToString();
+        row["chainValid"] = (errors & SslPolicyErrors.RemoteCertificateChainErrors) == 0;
+        row["nameMatches"] = (errors & SslPolicyErrors.RemoteCertificateNameMismatch) == 0;
+        row["chainErrors"] = string.Join(", ", chainStatus.Distinct());
+        return row;
     }
 
-    /// <summary>
-    /// The certificate's extended key usages as OIDs (1.3.6.1.5.5.7.3.1 server authentication,
-    /// 1.3.6.1.5.2.3.5 KDC authentication, ...). OIDs, not names: names differ by platform and language.
-    /// </summary>
-    public static IEnumerable<string> Ekus(X509Certificate2 certificate) =>
-        certificate.Extensions.OfType<X509EnhancedKeyUsageExtension>()
-            .SelectMany(e => e.EnhancedKeyUsages.Cast<System.Security.Cryptography.Oid>())
-            .Select(o => o.Value ?? "")
-            .Where(v => v.Length > 0);
+    /// <summary>The certificate's extended key usages as OIDs (see <see cref="CertificateRows.Ekus"/>).</summary>
+    public static IEnumerable<string> Ekus(X509Certificate2 certificate) => CertificateRows.Ekus(certificate);
 }

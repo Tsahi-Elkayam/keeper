@@ -60,9 +60,12 @@ public sealed partial class SmbRunner : IRunner
             return Task.FromResult(RunnerResult.Failed("smb reads need Windows"));
         if (context.Connection.AuthKind != "negotiate")
             return Task.FromResult(RunnerResult.Failed("smb reads run as the Windows user Keeper runs as: the integration's auth must be negotiate"));
+        // A plain host name only: host@SSL or host@8443 would go to the WebDAV redirector over HTTP, with this
+        // user's credentials, and %, # or ? are no part of a host.
         var host = context.Target;
-        if (string.IsNullOrWhiteSpace(host) || host.Any(c => c is '\\' or '/' or ':' or ' ') || host.Trim('.').Length == 0)
-            return Task.FromResult(RunnerResult.Failed("no target host"));
+        if (string.IsNullOrWhiteSpace(host) || host.Trim('.').Length == 0
+            || !host.All(c => char.IsAsciiLetterOrDigit(c) || c is '-' or '.' or '_'))
+            return Task.FromResult(RunnerResult.Failed("the target is not a plain host name"));
         return Task.Run(() => !OperatingSystem.IsWindows() ? RunnerResult.Failed("smb reads need Windows") : query.Text("read") switch
         {
             "shares" => Shares(host, query.Text("acl") == "true"),
@@ -157,7 +160,15 @@ public sealed partial class SmbRunner : IRunner
             var length = GetSecurityDescriptorLength(info.SecurityDescriptor);
             var bytes = new byte[length];
             Marshal.Copy(info.SecurityDescriptor, bytes, 0, length);
-            var descriptor = new RawSecurityDescriptor(bytes, 0);
+            RawSecurityDescriptor descriptor;
+            try
+            {
+                descriptor = new RawSecurityDescriptor(bytes, 0);
+            }
+            catch (ArgumentException)
+            {
+                return RunnerResult.Failed($"{host}\\{share}: its permissions could not be read (a malformed descriptor)");
+            }
             var rows = new List<JsonObject>();
             if (descriptor.DiscretionaryAcl is null)
             {
@@ -206,6 +217,13 @@ public sealed partial class SmbRunner : IRunner
             else
                 return RunnerResult.Failed($"{unc} is not there, or cannot be seen as this user");
             var owner = security.GetOwner(typeof(SecurityIdentifier))?.Value;
+            // A null DACL gives everyone every right, and lists no rule at all: said as itself, never as "nothing".
+            if (new RawSecurityDescriptor(security.GetSecurityDescriptorBinaryForm(), 0).DiscretionaryAcl is null)
+                return RunnerResult.Ok([new JsonObject
+                {
+                    ["host"] = host, ["path"] = path, ["owner"] = owner, ["identity"] = "S-1-1-0", ["account"] = "Everyone", ["type"] = "allow",
+                    ["rights"] = "FullControl", ["mask"] = (int)FileSystemRights.FullControl, ["inherited"] = false, ["noDescriptor"] = true,
+                }]);
             var rows = security.GetAccessRules(includeExplicit: true, includeInherited: true, typeof(SecurityIdentifier))
                 .OfType<FileSystemAccessRule>()
                 .Select(rule => new JsonObject
@@ -219,15 +237,20 @@ public sealed partial class SmbRunner : IRunner
                 .ToList();
             return RunnerResult.Ok(rows);
         }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or PrivilegeNotHeldException or System.ComponentModel.Win32Exception)
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or PrivilegeNotHeldException or System.ComponentModel.Win32Exception or ArgumentException)
         {
             return RunnerResult.Failed($"{unc}: its permissions could not be read ({ex.Message})");
         }
     }
 
-    /// <summary>The account's name where this machine can tell it (a domain account), else null: rules compare SIDs.</summary>
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, string?> Accounts = new(StringComparer.Ordinal);
+
+    /// <summary>
+    /// The account's name where this machine can tell it (a domain account), else null: rules compare SIDs.
+    /// Each SID is asked once per process - the same few groups appear on every share.
+    /// </summary>
     [System.Runtime.Versioning.SupportedOSPlatform("windows")]
-    private static string? Account(SecurityIdentifier sid)
+    private static string? Account(SecurityIdentifier sid) => Accounts.GetOrAdd(sid.Value, _ =>
     {
         try
         {
@@ -237,7 +260,7 @@ public sealed partial class SmbRunner : IRunner
         {
             return null;
         }
-    }
+    });
 
     private static string ShareType(uint type) => (type & 0xFF) switch
     {

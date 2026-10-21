@@ -44,7 +44,11 @@ public static class LdapValues
     /// UTF-8 as a string, so these are always asked for as bytes - a SID must never arrive as text noise.
     /// </summary>
     public static bool IsBinary(string attribute) =>
-        SidAttributes.Contains(attribute) || DescriptorAttributes.Contains(attribute) || attribute.Equals("objectGUID", StringComparison.OrdinalIgnoreCase);
+        SidAttributes.Contains(attribute) || DescriptorAttributes.Contains(attribute) || attribute.Equals("objectGUID", StringComparison.OrdinalIgnoreCase)
+        || attribute.Equals(SecurityDescriptor, StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>The object's own security descriptor: owner, group and DACL, each entry its own (see <see cref="Descriptors"/>).</summary>
+    public const string SecurityDescriptor = "nTSecurityDescriptor";
 
     public static JsonNode? Convert(string attribute, IReadOnlyList<object> values)
     {
@@ -68,6 +72,8 @@ public static class LdapValues
                 return Sid(bytes);
             if (DescriptorAttributes.Contains(attribute))
                 return AllowedTrustees(bytes) is { } trustees ? new JsonArray([.. trustees.Select(t => (JsonNode)JsonValue.Create(t))]) : null;
+            if (attribute.Equals(SecurityDescriptor, StringComparison.OrdinalIgnoreCase))
+                return Descriptors.Parse(bytes);
             if (attribute.Equals("objectGUID", StringComparison.OrdinalIgnoreCase) && bytes.Length == 16)
                 return new Guid(bytes).ToString();
             // Text arrives as bytes from some servers.

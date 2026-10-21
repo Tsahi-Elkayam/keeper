@@ -9,7 +9,10 @@ namespace Keeper.Runners.Cim;
 /// registry: values of one key on each target host, through WMI's StdRegProv over WinRM (CIM). Only the
 /// read methods are ever called - EnumKey, EnumValues and the Get*Value family; every method that writes
 /// (SetValue, CreateKey, DeleteKey, ...) is unreachable from a rule. Values that hold credentials (an
-/// automatic-logon password) come back as "set", never as the value.
+/// automatic-logon password) come back as "set", never as the value. Binary values come back as hex.
+/// certificates: true reads a certificate store key (SOFTWARE\Microsoft\SystemCertificates\Root, ...\MY,
+/// the policy stores under SOFTWARE\Policies\...) as one row per certificate - the certificate only: the
+/// registry holds no private key.
 /// </summary>
 public sealed partial class RegistryRunner : IRunner
 {
@@ -43,6 +46,12 @@ public sealed partial class RegistryRunner : IRunner
             if (value.Length is 0 or > 255 || value.Contains('\\', StringComparison.Ordinal))
                 yield return $"values: '{value}' is not a value name";
         }
+        if (query.Text("certificates") is not (null or "true" or "false"))
+            yield return "certificates must be true or false";
+        else if (query.Text("certificates") == "true" && (query.Fields["values"] is not null || query.Text("subkeys") == "true"))
+            yield return "certificates reads a store's certificates: it takes no values and no subkeys";
+        else if (query.Text("certificates") == "true" && !(query.Text("path") ?? "").Contains("Certificates", StringComparison.OrdinalIgnoreCase))
+            yield return @"certificates needs a certificate store key, such as SOFTWARE\Microsoft\SystemCertificates\Root";
     }
 
     public Task<RunnerResult> RunAsync(QuerySpec query, RunnerContext context, CancellationToken cancellationToken)
@@ -63,6 +72,9 @@ public sealed partial class RegistryRunner : IRunner
         try
         {
             using var session = CimSessions.Open(host, context);
+
+            if (query.Text("certificates") == "true")
+                return Certificates(session, host, hive, key, context.Now);
 
             if (query.Text("subkeys") == "true")
             {
@@ -85,19 +97,28 @@ public sealed partial class RegistryRunner : IRunner
             var names = Strings(listing, "sNames");
             var types = listing?.OutParameters["Types"]?.Value is int[] t ? t : [];
             var wanted = query.List("values");
+            var unread = new List<string>();
             for (var i = 0; i < names.Count; i++)
             {
                 var name = names[i].Length == 0 ? "(default)" : names[i];
                 if (wanted.Count > 0 && !wanted.Contains(name, StringComparer.OrdinalIgnoreCase))
                     continue;
-                if (SecretValues.Contains(name))
+                var type = i < types.Length ? types[i] : 1;
+                // A credential's value is never read: by its exact name, or - for text and bytes - by a name that
+                // says it is one (ControlPassword, ProxyPass). A number under such a name is a setting.
+                if (SecretValues.Contains(name) || (type is not (4 or 11) && SecretProperties.LooksSecret(name)))
                 {
                     row[name] = "set";
                     continue;
                 }
-                row[name] = Read(session, hive, key, names[i], i < types.Length ? types[i] : 1);
+                var value = Read(session, hive, key, names[i], type);
+                if (value is null)
+                    unread.Add(name);
+                row[name] = value;
             }
-            return RunnerResult.Ok([row]);
+            // A value that is there but could not be read is unknown, never absent.
+            return unread.Count == 0 ? RunnerResult.Ok([row])
+                : RunnerResult.Partial([row], $"{host}: {unread.Count} value(s) of {key} could not be read ({string.Join(", ", unread.Take(5))})");
         }
         catch (CimException ex)
         {
@@ -105,12 +126,47 @@ public sealed partial class RegistryRunner : IRunner
         }
     }
 
+    /// <summary>
+    /// One row per certificate of a store: store\Certificates\&lt;thumbprint&gt;\Blob. A store that is not there
+    /// has no certificates; one whose blob cannot be read makes the read partial, never a smaller store.
+    /// </summary>
+    [System.Runtime.Versioning.SupportedOSPlatform("windows")]
+    private static RunnerResult Certificates(CimSession session, string host, uint hive, string store, DateTimeOffset now)
+    {
+        var certificates = store.EndsWith(@"\Certificates", StringComparison.OrdinalIgnoreCase) ? store : store + @"\Certificates";
+        var (code, listing) = Call(session, "EnumKey", hive, certificates);
+        if (code == 2)
+            return RunnerResult.Ok([]);
+        if (code != 0)
+            return RunnerResult.Failed($"{host}: EnumKey {certificates} returned {code}");
+        var rows = new List<JsonObject>();
+        var unread = new List<string>();
+        foreach (var thumbprint in Strings(listing, "sNames"))
+        {
+            var (blobCode, blob) = Call(session, "GetBinaryValue", hive, $@"{certificates}\{thumbprint}", "Blob");
+            if (blobCode != 0 || blob?.OutParameters["uValue"]?.Value is not byte[] bytes
+                || CertificateRows.FromStoreBlob(bytes) is not { } parsed)
+            {
+                unread.Add(thumbprint);
+                continue;
+            }
+            using var certificate = parsed.Certificate;
+            var row = CertificateRows.Of(certificate, now);
+            row["host"] = host;
+            row["store"] = store;
+            row["friendlyName"] = parsed.FriendlyName;
+            rows.Add(row);
+        }
+        return unread.Count == 0 ? RunnerResult.Ok(rows)
+            : RunnerResult.Partial(rows, $"{host}: {unread.Count} certificate(s) of {store} could not be read ({string.Join(", ", unread.Take(3))})");
+    }
+
     /// <summary>Calls one of the read methods. Nothing else can be passed here.</summary>
     [System.Runtime.Versioning.SupportedOSPlatform("windows")]
     private static (uint Code, CimMethodResult? Result) Call(CimSession session, string method, uint hive, string key, string? value = null)
     {
         if (method is not ("EnumKey" or "EnumValues" or "GetStringValue" or "GetExpandedStringValue" or "GetDWORDValue"
-            or "GetQWORDValue" or "GetMultiStringValue"))
+            or "GetQWORDValue" or "GetMultiStringValue" or "GetBinaryValue"))
             throw new InvalidOperationException($"{method} is not a read method.");
 
         using var parameters = new CimMethodParametersCollection
@@ -140,14 +196,26 @@ public sealed partial class RegistryRunner : IRunner
             case 7:
                 var (code, result) = Call(session, "GetMultiStringValue", hive, key, name);
                 return code == 0 ? new JsonArray([.. Strings(result, "sValue").Select(s => (JsonNode)JsonValue.Create(s))]) : null;
+            case 3:
+                // Binary as hex; a large blob is said by its size (a rule judges whether it is there, not its bytes).
+                // Read, but empty: an empty value, not an unread one.
+                var (binaryCode, binary) = Call(session, "GetBinaryValue", hive, key, name);
+                if (binaryCode != 0)
+                    return null;
+                return binary?.OutParameters["uValue"]?.Value is byte[] bytes
+                    ? bytes.Length <= MaxBinaryBytes ? Convert.ToHexStringLower(bytes) : $"({bytes.Length} bytes)"
+                    : "";
             default:
-                return null;       // binary and other types: not read
+                return $"(type {type})";   // a type no rule reads (a link, a resource list): there, not read
         }
     }
 
+    private const int MaxBinaryBytes = 4096;
+
     [System.Runtime.Versioning.SupportedOSPlatform("windows")]
+    // Null only when the read failed: a value read as empty is "".
     private static JsonNode? Single((uint Code, CimMethodResult? Result) call, string parameter) =>
-        call.Code == 0 ? RowValues.From(call.Result?.OutParameters[parameter]?.Value) : null;
+        call.Code == 0 ? RowValues.From(call.Result?.OutParameters[parameter]?.Value) ?? JsonValue.Create("") : null;
 
     [System.Runtime.Versioning.SupportedOSPlatform("windows")]
     private static List<string> Strings(CimMethodResult? result, string parameter) =>

@@ -2,6 +2,7 @@ using System.Buffers.Binary;
 using System.Globalization;
 using System.Text;
 using System.Text.Json.Nodes;
+using Keeper.Rules;
 
 namespace Keeper.Runners.Gpo;
 
@@ -48,7 +49,9 @@ public static class GpoFiles
             if (!Expect(bytes, ref at, ']'))
                 return null;
 
-            var row = new JsonObject { ["key"] = key, ["value"] = value, ["type"] = TypeName(type), ["data"] = Data(type, data) };
+            // A text or binary value under a name like DefaultPassword is never kept: "set" says one is there.
+            var masked = type is not (4 or 5 or 11) && data.Length > 0 && SecretProperties.LooksSecret(value.TrimStart('*'));
+            var row = new JsonObject { ["key"] = key, ["value"] = value, ["type"] = TypeName(type), ["data"] = masked ? FieldPath.MaskedValue : Data(type, data) };
             if (value.StartsWith("**", StringComparison.Ordinal))
             {
                 // **del.Name: delete Name; **delvals.: delete every value; **DeleteValues / **DeleteKeys: lists.
@@ -129,9 +132,15 @@ public static class GpoFiles
                     .Select(v => (JsonNode?)v.TrimStart('*'))]);
             if (section == "Registry Values" && value.IndexOf(',', StringComparison.Ordinal) is var comma and > 0)
             {
-                // MACHINE\...\Name=4,1: the type, then the value.
-                row["type"] = value[..comma];
-                row["data"] = value[(comma + 1)..].Trim('"');
+                // MACHINE\...\Name=4,1: the type, then the value. Text under a secret's name (Winlogon's
+                // DefaultPassword) is never kept.
+                var type = value[..comma];
+                var name = key[(key.LastIndexOf('\\') + 1)..];
+                var secret = type is not ("4" or "11") && SecretProperties.LooksSecret(name);
+                row["type"] = type;
+                row["data"] = secret ? FieldPath.MaskedValue : value[(comma + 1)..].Trim('"');
+                if (secret)
+                    row["value"] = $"{type},{FieldPath.MaskedValue}";
             }
             rows.Add(row);
         }

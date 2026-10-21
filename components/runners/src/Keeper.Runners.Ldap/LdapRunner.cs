@@ -65,6 +65,10 @@ public sealed class LdapRunner : IRunner
             var request = new SearchRequest(baseDn, filter, scope, attributes);
             var paging = new PageResultRequestControl(query.Int("pageSize") ?? DefaultPageSize);
             request.Controls.Add(paging);
+            // The security descriptor without its SACL: owner, group and DACL are what any user may read. Asked
+            // for whole, the server would leave the attribute out for everyone but an auditor.
+            if (attributes.Contains(LdapValues.SecurityDescriptor, StringComparer.OrdinalIgnoreCase))
+                request.Controls.Add(new SecurityDescriptorFlagControl(SecurityMasks.Owner | SecurityMasks.Group | SecurityMasks.Dacl));
 
             var rows = new List<JsonObject>();
             while (true)
@@ -83,6 +87,13 @@ public sealed class LdapRunner : IRunner
                 paging.Cookie = cookie;
             }
             context.Log($"{rows.Count} entries");
+            // An object whose descriptor did not come back (no right to read it) or could not be read would pass
+            // every rule over its DACL by having none: the read is partial, never clean.
+            if (attributes.Contains(LdapValues.SecurityDescriptor, StringComparer.OrdinalIgnoreCase)
+                && rows.Where(r => FieldPath.First(r, LdapValues.SecurityDescriptor) is not JsonObject).ToList() is { Count: > 0 } unread)
+                return RunnerResult.Partial(rows, $"{unread.Count} of {rows.Count} entries came back without a readable security descriptor " +
+                    $"(as {WhoAmI(connection, context.Timeout) ?? "this account"}), such as " +
+                    string.Join("; ", unread.Take(3).Select(r => Keeper.Rules.Values.Text(r["distinguishedName"]))));
             return new RunnerResult(rows, "ok", Notes(WhoAmI(connection, context.Timeout), query.List("attributes"), rows));
         }
         catch (Exception ex) when (ex is LdapException or DirectoryOperationException or FormatException or TimeoutException)

@@ -40,6 +40,18 @@ public static class SecretProperties
 
     public static bool IsSecret(string property) => Names.Contains(property);
 
+    private static readonly System.Text.RegularExpressions.Regex SecretName = new(
+        @"passw(or)?d|pwd|passphrase|(?<!by)pass$|secret|credential|token|apikey|api_key|privatekey|sharedkey",
+        System.Text.RegularExpressions.RegexOptions.IgnoreCase | System.Text.RegularExpressions.RegexOptions.CultureInvariant,
+        TimeSpan.FromSeconds(1));
+
+    /// <summary>
+    /// Whether a name says the text it labels may be a secret - a registry or policy value named DefaultPassword,
+    /// ControlPassword, ProxyPass or SharedSecret (never ProxyBypass). For names that describe data (a value's name): a number under
+    /// such a name is a setting, not a secret, so callers mask text and bytes only.
+    /// </summary>
+    public static bool LooksSecret(string name) => IsSecret(name) || SecretName.IsMatch(name);
+
     // A URL that carries its own credential: a SAS or flow-trigger sig, an S3 presigned signature or token, an
     // Azure Functions code, a key in the query. The rest of the URL stays, so evidence can still name it.
     private static readonly System.Text.RegularExpressions.Regex SignedUrl = new(

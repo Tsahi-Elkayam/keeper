@@ -19,6 +19,10 @@ public sealed class GpoRunnerTests : IDisposable
         var path = Path.Combine(_root, gpo, relative);
         Directory.CreateDirectory(Path.GetDirectoryName(path)!);
         File.WriteAllBytes(path, bytes);
+        // Every GPO has its GPT.INI; a folder without one is a GPO that could not be read.
+        var gpt = Path.Combine(_root, gpo, "GPT.INI");
+        if (!File.Exists(gpt))
+            File.WriteAllText(gpt, "[General]\r\nVersion=65537\r\n");
     }
 
     private void Put(string gpo, string relative, string text, Encoding? encoding = null) =>
@@ -132,7 +136,7 @@ public sealed class GpoRunnerTests : IDisposable
         var missing = await new GpoRunner(_ => Path.Combine(_root, "absent")).RunAsync(Context.Query("gpo", "key", ("part", "gpt")),
             Context.For(new FakeConnection("example.org")), CancellationToken.None);
 
-        var versions = Assert.Single(gpt.Rows);
+        var versions = gpt.Rows.Single(r => r["gpo"]!.ToString() == Gpo1);
         Assert.Equal(("2", "2"), (versions["machineVersion"]!.ToString(), versions["userVersion"]!.ToString()));
         Assert.Equal("partial", registry.State);   // the one GPO with a Registry.pol has a corrupt one; the other has none
         Assert.Contains("1 of 2", registry.Reason, StringComparison.Ordinal);
@@ -141,8 +145,84 @@ public sealed class GpoRunnerTests : IDisposable
 
     [Theory]
     [InlineData("example.org", "example.org")]
-    [InlineData("ldaps://dc1.example.org:636", "dc1.example.org")]
+    [InlineData("ldap://example.org", "example.org")]
+    [InlineData("ldaps://dc1.example.org:636", null)]   // a domain controller, not the domain: say the domain
     [InlineData(@"\\evil\share", null)]
     [InlineData("example", null)]
+    [InlineData("exam ple.org", null)]
     public void The_domain_comes_from_the_ldap_endpoint(string endpoint, string? domain) => Assert.Equal(domain, GpoRunner.Domain(endpoint));
+
+    [Fact]
+    public async Task Ini_passwords_and_task_command_lines_with_a_password_are_masked_and_bypass_is_not()
+    {
+        Put(Gpo1, @"Machine\Preferences\IniFiles\IniFiles.xml", """
+            <IniFiles><Ini clsid="{EEFACE84-D3D8-4680-8D4B-BF103E759448}" name="Password">
+              <Properties path="C:\app\app.ini" section="db" value="Hunter2!" property="Password" action="U"/>
+            </Ini></IniFiles>
+            """);
+        Put(Gpo1, @"Machine\Preferences\ScheduledTasks\ScheduledTasks.xml", """
+            <ScheduledTasks>
+              <TaskV2 clsid="{D8896631-B747-47a7-84A6-C155337F3BC8}" name="Backup">
+                <Properties action="U" name="Backup"><Task><Actions><Exec>
+                  <Command>C:\tools\backup.exe</Command><Arguments>/u svc /p Hunter2!</Arguments>
+                </Exec></Actions></Task></Properties>
+              </TaskV2>
+              <TaskV2 clsid="{D8896631-B747-47a7-84A6-C155337F3BC8}" name="Inventory">
+                <Properties action="U" name="Inventory"><Task><Actions><Exec>
+                  <Command>powershell.exe</Command><Arguments>-ExecutionPolicy Bypass -File \\example.org\netlogon\inv.ps1</Arguments>
+                </Exec></Actions></Task></Properties>
+              </TaskV2>
+            </ScheduledTasks>
+            """);
+
+        var result = await Run(("part", "preferences"));
+
+        Assert.All(result.Rows, r => Assert.DoesNotContain("Hunter2", r.ToJsonString(), StringComparison.Ordinal));
+        Assert.Contains(result.Rows, r => r.ToJsonString().Contains("-ExecutionPolicy Bypass", StringComparison.Ordinal));   // what a rule needs to see
+    }
+
+    [Theory]
+    [InlineData("DefaultPassword", true)]
+    [InlineData("ProxyPass", true)]
+    [InlineData("ProxyBypass", false)]
+    [InlineData("SharedSecret", true)]
+    [InlineData("EnableSmartScreen", false)]
+    public void A_value_name_says_whether_its_text_may_be_a_secret(string name, bool secret) =>
+        Assert.Equal(secret, SecretProperties.LooksSecret(name));
+
+    [Fact]
+    public async Task A_gpo_folder_without_its_gpt_ini_is_one_that_could_not_be_read()
+    {
+        Put(Gpo1, "GPT.INI", "[General]\r\nVersion=1\r\n");
+        Directory.CreateDirectory(Path.Combine(_root, Gpo2, "Machine"));   // there, but nothing in it can be opened
+
+        var result = await Run(("part", "registry"));
+
+        Assert.Equal("partial", result.State);
+        Assert.Contains("GPT.INI", result.Reason, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task A_registry_setting_that_holds_a_password_is_never_kept()
+    {
+        Put(Gpo1, @"Machine\Registry.pol", Pol(
+            (@"Software\Microsoft\Windows NT\CurrentVersion\Winlogon", "DefaultPassword", 1, Encoding.Unicode.GetBytes("Hunter2!\0")),
+            (@"Software\Policies\Microsoft\Windows\CredentialsDelegation", "AllowDefaultCredentials", 4, Dword(1))));
+        Put(Gpo2, @"Machine\Microsoft\Windows NT\SecEdit\GptTmpl.inf",
+            "[Registry Values]\r\nMACHINE\\Software\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon\\DefaultPassword=1,\"Hunter2!\"\r\n", Encoding.Unicode);
+        Put(Gpo2, @"Machine\Preferences\Registry\Registry.xml", """
+            <RegistrySettings><Registry clsid="{9CD4B2F4-923D-47f5-A062-E897DD1DAD50}" name="DefaultPassword">
+              <Properties action="U" hive="HKEY_LOCAL_MACHINE" key="SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon" name="DefaultPassword" type="REG_SZ" value="Hunter2!"/>
+            </Registry></RegistrySettings>
+            """);
+
+        var registry = await Run(("part", "registry"));
+        var security = await Run(("part", "security"));
+        var preferences = await Run(("part", "preferences"));
+
+        Assert.Equal("set", registry.Rows.Single(r => r["value"]!.ToString() == "DefaultPassword")["data"]!.ToString());
+        Assert.Equal("1", registry.Rows.Single(r => r["value"]!.ToString() == "AllowDefaultCredentials")["data"]!.ToString());   // a setting, kept
+        foreach (var result in new[] { registry, security, preferences })
+            Assert.All(result.Rows, r => Assert.DoesNotContain("Hunter2", r.ToJsonString(), StringComparison.Ordinal));
+    }
 }
