@@ -30,7 +30,9 @@ modules). Each stage is built, reviewed independently and fixed until a review f
    JSON, REST-JSON and REST-XML (S3 bucket settings, never objects); accounts x regions; only reads, with
    an explicit deny list (GetObject, GetSecretValue, GetParameter(s), GetPasswordData, token issuers);
    billed APIs daily. Not yet: IAM Roles Anywhere (X.509 sign-in), S3 buckets in other regions than asked.
-5. **Windows reads** (~200): security descriptors (LDAP with the SD-flags control, NTFS and share ACLs);
+5. **Windows reads** (~200; begun: `gpo` reads SYSVOL - Registry.pol, GptTmpl.inf, audit.csv, preferences with
+   cpassword masked, GPT.INI - and `smb` reads shares, share permissions and NTFS permissions; both unreviewed
+   and never run against a domain): security descriptors (LDAP with the SD-flags control, NTFS and share ACLs);
    SMB/SYSVOL file reads and a GPO parser (registry.pol, GptTmpl.inf, audit.csv, GPP with cpassword
    masked); LDAP binary attributes and per-DC reads; registry binary values and the machine certificate
    store; SQL per-database loop and allow-listed read procedures; cim/eventlog extensions.

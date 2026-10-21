@@ -42,6 +42,8 @@
     <Project Path="components/runners/src/Keeper.Runners.Cim/Keeper.Runners.Cim.csproj" />
     <Project Path="components/runners/src/Keeper.Runners.Tls/Keeper.Runners.Tls.csproj" />
     <Project Path="components/runners/src/Keeper.Runners.Aws/Keeper.Runners.Aws.csproj" />
+    <Project Path="components/runners/src/Keeper.Runners.Gpo/Keeper.Runners.Gpo.csproj" />
+    <Project Path="components/runners/src/Keeper.Runners.Smb/Keeper.Runners.Smb.csproj" />
     <Project Path="components/runners/tests/Keeper.Runners.Tests/Keeper.Runners.Tests.csproj" />
   </Folder>
   <Folder Name="/scan/">

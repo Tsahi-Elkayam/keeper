@@ -67,7 +67,9 @@ public static class XmlRows
 
         foreach (var group in element.Elements().GroupBy(e => e.Name.LocalName))
         {
-            var values = group.Select(child => child.HasElements && depth < maxDepth
+            // A child with attributes is an object too (<Properties cpassword="..."/>): as text alone its attributes
+            // would be lost. A child with only text stays its text.
+            var values = group.Select(child => (child.HasElements || child.HasAttributes) && depth < maxDepth
                     ? (JsonNode)ToJson(child, depth + 1, maxDepth)
                     : JsonValue.Create(child.Value.Trim()))
                 .ToList();

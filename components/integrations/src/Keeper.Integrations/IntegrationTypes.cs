@@ -93,7 +93,7 @@ public static partial class IntegrationTypes
 
     public static readonly IReadOnlyList<IntegrationType> All =
     [
-        new("ldap", "Active Directory or another LDAP directory", ["ldap"], Windows, []),
+        new("ldap", "Active Directory or another LDAP directory, and its Group Policy objects in SYSVOL", ["ldap", "gpo"], Windows, []),
         new("graph", "Microsoft Graph: Entra ID, Intune, Microsoft 365", ["graph"], Entra,
             ["graph.microsoft.com", "graph.microsoft.us", "dod-graph.microsoft.us", "microsoftgraph.chinacloudapi.cn"], "https://graph.microsoft.com"),
         new("azure", "Azure Resource Manager", ["http"], Entra,
@@ -168,7 +168,7 @@ public static partial class IntegrationTypes
             ReadPosts = ["/web_api/show-*", "/web_api/v*/show-*"],
         },
         new("sccm", "SCCM AdminService (or the site database)", ["http", "sql"], [.. Windows, "basic"], []),
-        new("cim", "Windows hosts: WMI over WinRM, the registry (read-only) and event logs", ["cim", "registry", "eventlog"], Windows, []),
+        new("cim", "Windows hosts: WMI over WinRM, the registry (read-only), event logs, file shares and NTFS permissions", ["cim", "registry", "eventlog", "smb"], Windows, []),
         new("sql", "SQL Server instances", ["sql"], ["negotiate", "basic"], []),
         new("tls", "TLS endpoints", ["tls"], ["none"], []),
         new("vcenter", "VMware vCenter REST API", ["http"], ["vcenter-session"], []),

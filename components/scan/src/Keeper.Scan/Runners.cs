@@ -2,8 +2,10 @@ using Keeper.Runners;
 using Keeper.Runners.Aws;
 using Keeper.Runners.Cim;
 using Keeper.Runners.Files;
+using Keeper.Runners.Gpo;
 using Keeper.Runners.Http;
 using Keeper.Runners.Ldap;
+using Keeper.Runners.Smb;
 using Keeper.Runners.Sql;
 using Keeper.Runners.Tls;
 
@@ -24,6 +26,8 @@ public static class Runners
         new RegistryRunner(),
         new TlsRunner(),
         new AwsRunner(),
+        new GpoRunner(),
+        new SmbRunner(),
         new FileRunner(),
         new StoreRunner(),
     ]);
