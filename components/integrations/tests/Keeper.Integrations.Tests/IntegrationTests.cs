@@ -51,6 +51,74 @@ public sealed class IntegrationTests : IDisposable
             Assert.Contains("reads as admin@example.org", Assert.Throws<IntegrationException>(() => IntegrationConnection.SignedInAccount("entra", wanted, issuedTo)).Message, StringComparison.Ordinal);
     }
 
+    [Theory]
+    [InlineData("power-platform", "https://api.bap.microsoft.com", "https://service.powerapps.com//.default")]   // the resource's own name, slash and all
+    [InlineData("defender-endpoint", "https://api-eu.securitycenter.microsoft.com", "https://api.securitycenter.microsoft.com/.default")]
+    [InlineData("key-vault", "https://kv1.vault.azure.net", "https://vault.azure.net/.default")]
+    [InlineData("cloud-apps", "https://contoso.eu2.portal.cloudappsecurity.com", "05a65629-4c1b-48c1-a78b-804c4abdd4af/.default")]
+    [InlineData("dataverse", "https://org1.crm4.dynamics.com", "https://org1.crm4.dynamics.com/.default")]   // its own environment only
+    [InlineData("exchange-online", "https://outlook.office365.com/adminapi/beta/00000000-0000-0000-0000-000000000000", "https://outlook.office365.com/.default")]
+    public void Each_microsoft_api_gets_a_token_for_its_own_resource(string type, string endpoint, string scope)
+    {
+        Assert.Equal(scope, IntegrationConnection.DefaultScope(IntegrationTypes.Find(type)!.Resource, endpoint));
+    }
+
+    [Theory]
+    [InlineData("key-vault", "kv1.vault.azure.net", true)]
+    [InlineData("key-vault", "vault.azure.net.example.com", false)]
+    [InlineData("exchange-online", "outlook.office365.com", true)]
+    [InlineData("exchange-online", "outlook.office365.com.example.com", false)]
+    [InlineData("purview", "eur02b.ps.compliance.protection.outlook.com", true)]
+    [InlineData("dataverse", "org1.crm4.dynamics.com", true)]
+    [InlineData("dataverse", "dynamics.com.example.org", false)]
+    [InlineData("dataverse", "admin.dynamics.com", false)]                 // a Dynamics host, not a Dataverse environment
+    [InlineData("dataverse", "org1.crm11.dynamics.com", true)]
+    [InlineData("defender-endpoint", "api-eu.securitycenter.microsoft.com", true)]
+    [InlineData("defender-endpoint", "api.security.microsoft.com", false)]  // Defender XDR: another resource
+    public void A_microsoft_api_token_goes_only_to_its_own_hosts(string type, string host, bool allowed)
+    {
+        Assert.Equal(allowed, IntegrationTypes.Find(type)!.AllowsHost(host));
+    }
+
+    [Theory]
+    [InlineData("key-vault", "/", true)]
+    [InlineData("key-vault", "/secrets", false)]                                         // would shift the readable paths
+    [InlineData("exchange-online", "/adminapi/beta/00000000-0000-0000-0000-000000000000", true)]
+    [InlineData("exchange-online", "/adminapi/beta/example.onmicrosoft.com", true)]
+    [InlineData("exchange-online", "/adminapi/beta/x/y", false)]
+    [InlineData("exchange-online", "/", false)]
+    [InlineData("exchange-online", "/adminapi/beta/..", false)]
+    [InlineData("azure", "/", true)]
+    public void A_guarded_types_endpoint_has_its_own_path_and_no_other(string type, string path, bool allowed)
+    {
+        Assert.Equal(allowed, IntegrationTypes.Find(type)!.AllowsEndpointPath(path));
+    }
+
+    [Fact]
+    public void A_connection_offers_its_types_protocols_and_refuses_an_endpoint_saved_with_a_path_its_type_does_not_allow()
+    {
+        var vault = new IntegrationRecord("kv", "key-vault", "https://kv1.vault.azure.net/secrets", "entra-certificate", null, [], true, new Dictionary<string, StoredSecret>());
+        using var stored = new IntegrationConnection(vault, null);
+        using var clean = new IntegrationConnection(vault with { Endpoint = "https://kv1.vault.azure.net" }, null);
+        using var unknown = new IntegrationConnection(vault with { Type = "retired-type" }, null);
+
+        Assert.Equal(["http"], stored.Protocols);
+        Assert.Contains("/secrets", stored.EndpointProblem, StringComparison.Ordinal);
+        Assert.Null(clean.EndpointProblem);
+        Assert.Empty(unknown.Protocols!);   // a type Keeper no longer knows offers nothing
+    }
+
+    [Fact]
+    public void Key_vault_never_reads_a_secrets_value_and_exchange_runs_get_cmdlets_only()
+    {
+        var vault = IntegrationTypes.Find("key-vault")!;
+        var exchange = IntegrationTypes.Find("exchange-online")!;
+
+        Assert.DoesNotContain(vault.ReadPaths, p => p is "/secrets/*" or "/secrets/*/*");
+        Assert.Equal(["Get-*"], exchange.ReadCommand!.Allowed);
+        Assert.Equal(["/InvokeCommand"], exchange.ReadPosts);
+    }
+
     [Fact]
     public async Task A_refused_sign_in_is_refused_once_for_the_whole_scan_not_retried_per_query()
     {

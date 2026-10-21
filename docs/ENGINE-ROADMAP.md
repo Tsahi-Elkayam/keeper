@@ -21,9 +21,10 @@ modules). Each stage is built, reviewed independently and fixed until a review f
    epoch and named date formats (`format:` ole, unix, custom), `in-cidr`, `hour-in` on the organisation's
    clock, `sid-in` with well-known names and RIDs, `changed` against the last clean read (`_new`,
    `_previous`); constant deadline, masked fields, overrides with an end date; two-level `for_each`.
-3. **Microsoft APIs on other token audiences** (~330): Entra tokens per resource for Power Platform,
-   Dataverse, Defender for Endpoint, Cloud Apps, Key Vault (metadata only); then Exchange Online and
-   Purview through the REST endpoint the modules call, with a `Get-*` cmdlet allow-list.
+3. **Microsoft APIs on other token audiences** (~330; built, never run against a tenant): one integration
+   type per API with its own token resource and hosts - Power Platform (admin, Apps, Automate, API),
+   Dataverse, Power BI, Defender for Endpoint, Cloud Apps, Key Vault (a path allow-list: metadata only);
+   Exchange Online and Purview through the REST endpoint the modules call, `Get-*` cmdlets only.
 4. **AWS** (~377): SigV4 signed by hand (no SDK) with AWS's test vectors, STS AssumeRole / Roles Anywhere,
    JSON, Query/XML and REST-JSON, accounts x regions; only Describe/List/Get/Search/Lookup, with an
    explicit deny list (GetObject, GetSecretValue, GetParameter, Decrypt, StartQuery); billed APIs daily.

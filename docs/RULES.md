@@ -248,13 +248,29 @@ the attribute).
 ## Integration types
 
 A file's `integration:` names the kind of integration it reads through; the tenant binds an instance
-(for example two forests are two `ldap` integrations).
+(for example two forests are two `ldap` integrations). Each Microsoft API is its own type: its tokens
+are for that API's own resource, and they go to that API's own hosts only. One Entra app can serve all
+of them, with the permissions each API needs. A rule may read only with a protocol its integration's
+type offers, so a type's guards cannot be walked around through another runner. Power Platform's admin
+APIs take the resource `https://service.powerapps.com/` (scope `https://service.powerapps.com//.default`);
+if Entra refuses it, the integration's `scopes` option overrides it.
+
+Secrets in URLs are masked like secret fields: a signed URL's `sig=`, `X-Amz-Signature=`, `code=` or
+`key=` value becomes `set`, the rest of the URL stays. A request header that would change the method
+(`X-HTTP-Method-Override` and the like) is refused, in a rule and in an integration's fixed headers.
 
 | Type | Protocols | For |
 |---|---|---|
 | `ldap` | ldap | Active Directory, AD CS (configuration partition) |
 | `graph` | graph | Entra ID, Intune, Microsoft 365 |
-| `azure` | http | Azure Resource Manager |
+| `azure` | http | Azure Resource Manager (and Resource Graph's KQL as a POST) |
+| `power-platform`, `power-apps`, `power-automate`, `power-platform-api` | http | Power Platform admin APIs: environments, DLP policies, apps, connections, flows |
+| `dataverse` | http | One Dataverse environment's Web API; its token opens that environment only |
+| `power-bi` | http | Power BI admin REST API |
+| `defender-endpoint` | http | Defender for Endpoint (api.securitycenter.microsoft.com and its regional hosts): machines, vulnerabilities, advanced hunting (KQL as a POST). Not Defender XDR's own API |
+| `cloud-apps` | http | Defender for Cloud Apps: alerts, activities, entities, files, discovered apps (their list POSTs only) |
+| `key-vault` | http | One vault's metadata (endpoint `https://<vault>.vault.azure.net`, no path; not Managed HSM): lists, versions, dates, certificate policies. Every page's whole path is checked; the path that returns a secret's value is refused before anything is sent. Give the scanning identity the Key Vault Reader role, which cannot read values either |
+| `exchange-online`, `purview` | http | Exchange Online and Security & Compliance through the REST endpoint their PowerShell module calls (endpoint `.../adminapi/beta/<tenant id>`, exactly; `path: /InvokeCommand`, `body: { CmdletInput: { CmdletName: Get-Mailbox, Parameters: {...} } }`). Get- cmdlets only, the name checked before every page, and never a parameter that makes one do more than read (GetMailboxLog, NotificationEmailAddresses, IncludeCredential); nothing else is sent. Not yet run against a tenant |
 | `sccm` | http, sql | SCCM AdminService, or the site database read-only |
 | `cim` | cim | Windows servers and workstations |
 | `sql` | sql | SQL Server instances |

@@ -17,6 +17,36 @@ public sealed record IntegrationType(
     /// <summary>Paths (relative to the endpoint, '*' within a segment) where this type's API answers a POST as a read.</summary>
     public IReadOnlyList<string> ReadPosts { get; init; } = [];
 
+    /// <summary>When not empty, the only paths a rule may read at all, whole paths on the host (Key Vault: lists and metadata, never a value).</summary>
+    public IReadOnlyList<string> ReadPaths { get; init; } = [];
+
+    /// <summary>
+    /// The path an endpoint may have ('*' for one segment), for a type that limits what is read or POSTed: no
+    /// path (null), or Exchange's /adminapi/beta/&lt;tenant&gt;. Its read lists are relative to it, so it is fixed.
+    /// </summary>
+    public string? EndpointPath { get; init; }
+
+    /// <summary>Whether the type limits its reads, so its endpoint's path is held to <see cref="EndpointPath"/>.</summary>
+    public bool Guarded => ReadPosts.Count > 0 || ReadPaths.Count > 0 || ReadCommand is not null;
+
+    public bool AllowsEndpointPath(string path)
+    {
+        var segments = path.Trim('/').Split('/', StringSplitOptions.RemoveEmptyEntries);
+        var expected = (EndpointPath ?? "").Trim('/').Split('/', StringSplitOptions.RemoveEmptyEntries);
+        return segments.Length == expected.Length && segments.Zip(expected).All(p => p.Second == "*"
+            ? p.First.All(c => char.IsAsciiLetterOrDigit(c) || c is '-' or '.' or '_') && p.First.Trim('.').Length > 0
+            : p.First.Equals(p.Second, StringComparison.OrdinalIgnoreCase));
+    }
+
+    /// <summary>For an API whose POSTs run named commands: where the body names it, and the names allowed.</summary>
+    public Keeper.Runners.ReadCommand? ReadCommand { get; init; }
+
+    /// <summary>
+    /// The Entra resource its tokens are for, when that is not the endpoint's own host: Defender's regional
+    /// hosts share one, Key Vault's vaults share one, Power Platform's admin APIs use service.powerapps.com.
+    /// </summary>
+    public string? Resource { get; init; }
+
     public bool AllowsHost(string host) =>
         AllowedHosts.Count == 0 || AllowedHosts.Any(pattern =>
             pattern.StartsWith("*.", StringComparison.Ordinal)
@@ -47,6 +77,18 @@ public static partial class IntegrationTypes
     private static readonly string[] Windows = ["negotiate", "windows-credential"];
     private static readonly string[] Entra = ["entra-interactive", "entra-certificate"];
 
+    // Dataverse's regional hosts (crm, crm2 ... crm22): not every *.dynamics.com. The US government clouds sign in
+    // elsewhere than Entra's public cloud, which is all Keeper signs in to so far.
+    private static readonly string[] DataverseHosts = ["*.crm.dynamics.com", .. Enumerable.Range(2, 21).Select(n => $"*.crm{n}.dynamics.com")];
+
+    // Get- cmdlets read - except with a parameter that mails a log (Get-MobileDeviceStatistics -GetMailboxLog)
+    // or shows an export's credential (Get-ComplianceSearchAction -IncludeCredential).
+    private static readonly Keeper.Runners.ReadCommand GetCmdlets = new("CmdletInput.CmdletName", ["Get-*"])
+    {
+        ParametersField = "CmdletInput.Parameters",
+        DeniedParameters = ["GetMailboxLog", "NotificationEmailAddresses", "IncludeCredential"],
+    };
+
     public static readonly IReadOnlyList<IntegrationType> All =
     [
         new("ldap", "Active Directory or another LDAP directory", ["ldap"], Windows, []),
@@ -57,6 +99,64 @@ public static partial class IntegrationTypes
         {
             // Resource Graph takes its KQL as a POST; the query is the rule's own text, and Resource Graph only reads.
             ReadPosts = ["/providers/Microsoft.ResourceGraph/resources"],
+        },
+        // Microsoft APIs whose tokens are for another resource than Graph: one integration each, all through the
+        // same Entra app (its own permissions per API), each held to its own hosts.
+        new("power-platform", "Power Platform admin: environments, DLP policies (api.bap.microsoft.com)", ["http"], Entra,
+            ["api.bap.microsoft.com"], "https://api.bap.microsoft.com") { Resource = "https://service.powerapps.com/" },
+        new("power-apps", "Power Apps admin: apps and connections (api.powerapps.com)", ["http"], Entra,
+            ["api.powerapps.com"], "https://api.powerapps.com") { Resource = "https://service.powerapps.com/" },
+        new("power-automate", "Power Automate admin: flows (api.flow.microsoft.com)", ["http"], Entra,
+            ["api.flow.microsoft.com"], "https://api.flow.microsoft.com") { Resource = "https://service.flow.microsoft.com/" },
+        new("power-platform-api", "Power Platform API (api.powerplatform.com)", ["http"], Entra,
+            ["api.powerplatform.com"], "https://api.powerplatform.com") { Resource = "https://api.powerplatform.com" },
+        // The token is for the environment's own URL, so a token for one environment never opens another.
+        new("dataverse", "One Dataverse environment's Web API (https://<org>.crm<n>.dynamics.com)", ["http"], Entra, DataverseHosts),
+        new("power-bi", "Power BI admin REST API", ["http"], Entra,
+            ["api.powerbi.com"], "https://api.powerbi.com") { Resource = "https://analysis.windows.net/powerbi/api" },
+        new("defender-endpoint", "Microsoft Defender for Endpoint API (machines, vulnerabilities, advanced hunting)", ["http"], Entra,
+            // Its regional hosts (api-eu, api-us, ...) share the one resource. api.security.microsoft.com is
+            // Defender XDR's own API, with another resource: not this type.
+            ["api.securitycenter.microsoft.com", "*.securitycenter.microsoft.com"], "https://api.securitycenter.microsoft.com")
+        {
+            Resource = "https://api.securitycenter.microsoft.com",
+            // Advanced hunting takes its KQL as a POST; KQL only reads.
+            ReadPosts = ["/api/advancedqueries/run"],
+        },
+        new("cloud-apps", "Microsoft Defender for Cloud Apps API (https://<tenant>.<region>.portal.cloudappsecurity.com)", ["http"], Entra,
+            ["*.portal.cloudappsecurity.com"])
+        {
+            Resource = "05a65629-4c1b-48c1-a78b-804c4abdd4af",
+            // Its lists take their filters as a POST; closing or dismissing an alert is another path.
+            ReadPosts = ["/api/v1/alerts/", "/api/v1/activities/", "/api/v1/entities/", "/api/v1/files/", "/api/v1/discovery/discovered_apps/"],
+        },
+        new("key-vault", "One Azure Key Vault's metadata (https://<vault>.vault.azure.net; not Managed HSM): names, dates, policies - never a secret's value", ["http"], Entra,
+            ["*.vault.azure.net"])
+        {
+            Resource = "https://vault.azure.net",
+            // GET /secrets/<name> answers with the value: it is not here. Lists, versions, keys' public parts,
+            // certificates and their policies are.
+            ReadPaths =
+            [
+                "/secrets", "/secrets/*/versions", "/keys", "/keys/*", "/keys/*/versions", "/certificates", "/certificates/*",
+                "/certificates/*/versions", "/certificates/*/policy", "/deletedsecrets", "/deletedkeys", "/deletedcertificates",
+            ],
+        },
+        // The REST endpoint the Exchange Online module itself calls: one POST per cmdlet, Get- cmdlets only.
+        new("exchange-online", "Exchange Online through its module's REST endpoint (https://outlook.office365.com/adminapi/beta/<tenant id>), Get- cmdlets only", ["http"], Entra,
+            ["outlook.office365.com"], null)
+        {
+            EndpointPath = "/adminapi/beta/*",
+            ReadPosts = ["/InvokeCommand"],
+            ReadCommand = GetCmdlets,
+        },
+        new("purview", "Security & Compliance (Purview) through the same REST endpoint (https://<region>.ps.compliance.protection.outlook.com/adminapi/beta/<tenant id>), Get- cmdlets only", ["http"], Entra,
+            ["ps.compliance.protection.outlook.com", "*.ps.compliance.protection.outlook.com"], null)
+        {
+            Resource = "https://ps.compliance.protection.outlook.com",
+            EndpointPath = "/adminapi/beta/*",
+            ReadPosts = ["/InvokeCommand"],
+            ReadCommand = GetCmdlets,
         },
         new("checkpoint", "Check Point management API (show- commands only, on a read-only session)", ["http"], ["session-login"], [])
         {

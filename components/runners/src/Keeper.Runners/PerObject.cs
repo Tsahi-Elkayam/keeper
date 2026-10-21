@@ -95,7 +95,8 @@ public static partial class PerObject
     [GeneratedRegex(@"\{([A-Za-z_][A-Za-z0-9_.]{0,63})\}", RegexOptions.CultureInvariant)]
     private static partial Regex Placeholder();
 
-    [GeneratedRegex(@"^[A-Za-z0-9._:\-]{1,200}$", RegexOptions.CultureInvariant)]
+    // Never "." or "..": a path segment that is one is a step within the path, not an object.
+    [GeneratedRegex(@"^(?!\.{1,2}$)[A-Za-z0-9._:\-]{1,200}$", RegexOptions.CultureInvariant)]
     private static partial Regex PlainId();
 
     public static IEnumerable<string> Validate(QuerySpec query)

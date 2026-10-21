@@ -21,11 +21,13 @@ internal sealed class StubHandler(Func<HttpRequestMessage, HttpResponseMessage> 
 }
 
 internal sealed class FakeConnection(string endpoint, HttpMessageHandler? handler = null, JsonObject? options = null,
-    IReadOnlyList<string>? readPosts = null) : IConnection
+    IReadOnlyList<string>? readPosts = null, IReadOnlyList<string>? readPaths = null, ReadCommand? readCommand = null) : IConnection
 {
     public string Instance => "test";
     public string Type => "test";
     public IReadOnlyList<string> ReadPosts => readPosts ?? [];
+    public IReadOnlyList<string> ReadPaths => readPaths ?? [];
+    public ReadCommand? ReadCommand => readCommand;
     public string Endpoint => endpoint;
     public string AuthKind => "bearer";
     public string? Identity => "reader@example.org";

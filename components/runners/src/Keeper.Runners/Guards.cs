@@ -40,7 +40,32 @@ public static class SecretProperties
 
     public static bool IsSecret(string property) => Names.Contains(property);
 
-    /// <summary>Replaces every secret value in <paramref name="node"/>, at any depth, with "set". Changes the node in place.</summary>
+    // A URL that carries its own credential: a SAS or flow-trigger sig, an S3 presigned signature or token, an
+    // Azure Functions code, a key in the query. The rest of the URL stays, so evidence can still name it.
+    private static readonly System.Text.RegularExpressions.Regex SignedUrl = new(
+        @"([?&#;](?:sig|signature|x-amz-signature|x-amz-security-token|x-amz-credential|x-goog-signature|code|api[-_]?key|access_token|id_token|token|key|client_secret|secret|password|pwd)=)[^&#;\s""]+",
+        System.Text.RegularExpressions.RegexOptions.IgnoreCase | System.Text.RegularExpressions.RegexOptions.CultureInvariant,
+        TimeSpan.FromSeconds(1));
+
+    /// <summary>A text with the credentials of any URL in it replaced by "set".</summary>
+    public static string MaskUrls(string text)
+    {
+        if (!text.Contains('=', StringComparison.Ordinal) || !text.Contains("://", StringComparison.Ordinal))
+            return text;
+        try
+        {
+            return SignedUrl.Replace(text, "$1set");
+        }
+        catch (System.Text.RegularExpressions.RegexMatchTimeoutException)
+        {
+            return "set";   // too odd to read safely: hidden whole
+        }
+    }
+
+    /// <summary>
+    /// Replaces every secret value in <paramref name="node"/>, at any depth, with "set" - by name, and the
+    /// credential in any signed URL. Changes the node in place.
+    /// </summary>
     public static void Mask(JsonNode? node)
     {
         switch (node)
@@ -53,6 +78,10 @@ public static class SecretProperties
                         if (o[name] is not null && !(o[name] is JsonValue v && v.TryGetValue<string>(out var s) && s.Length == 0))
                             o[name] = "set";
                     }
+                    else if (o[name] is JsonValue value && value.TryGetValue<string>(out var text) && MaskUrls(text) is var masked && !string.Equals(masked, text, StringComparison.Ordinal))
+                    {
+                        o[name] = masked;
+                    }
                     else
                     {
                         Mask(o[name]);
@@ -60,8 +89,13 @@ public static class SecretProperties
                 }
                 break;
             case JsonArray a:
-                foreach (var item in a)
-                    Mask(item);
+                for (var i = 0; i < a.Count; i++)
+                {
+                    if (a[i] is JsonValue value && value.TryGetValue<string>(out var text) && MaskUrls(text) is var masked && !string.Equals(masked, text, StringComparison.Ordinal))
+                        a[i] = masked;
+                    else
+                        Mask(a[i]);
+                }
                 break;
         }
     }

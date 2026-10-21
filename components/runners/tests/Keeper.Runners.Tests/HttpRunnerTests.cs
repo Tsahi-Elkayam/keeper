@@ -30,8 +30,14 @@ public sealed class HttpRunnerTests
     }
 
     /// <summary>Runs an http query against a stub, recording each request's method, path and query, and body.</summary>
-    private static async Task<(RunnerResult Result, List<(string Method, string PathAndQuery, string? Body)> Sent)> RunPosting(
-        string endpoint, IReadOnlyList<string> readPosts, Func<string, JsonNode?, HttpResponseMessage> respond, params (string, JsonNode?)[] fields)
+    private static Task<(RunnerResult Result, List<(string Method, string PathAndQuery, string? Body)> Sent)> RunPosting(
+        string endpoint, IReadOnlyList<string> readPosts, Func<string, JsonNode?, HttpResponseMessage> respond, params (string, JsonNode?)[] fields) =>
+        RunGuarded((endpoint, readPosts, [], null), respond, fields);
+
+    /// <summary><see cref="RunPosting"/> through an integration type that also limits the paths it reads and the commands it runs.</summary>
+    private static async Task<(RunnerResult Result, List<(string Method, string PathAndQuery, string? Body)> Sent)> RunGuarded(
+        (string Endpoint, IReadOnlyList<string> ReadPosts, IReadOnlyList<string> ReadPaths, ReadCommand? Command) type,
+        Func<string, JsonNode?, HttpResponseMessage> respond, params (string, JsonNode?)[] fields)
     {
         var sent = new List<(string, string, string?)>();
         var stub = new StubHandler(request =>
@@ -41,8 +47,126 @@ public sealed class HttpRunnerTests
             return respond(request.RequestUri!.PathAndQuery, body is null ? null : JsonNode.Parse(body));
         });
         var result = await new HttpRunner().RunAsync(Context.Query("http", "uid", fields),
-            Context.For(new FakeConnection(endpoint, stub, null, readPosts)), CancellationToken.None);
+            Context.For(new FakeConnection(type.Endpoint, stub, null, type.ReadPosts, type.ReadPaths, type.Command)), CancellationToken.None);
         return (result, sent);
+    }
+
+    private static readonly (string, IReadOnlyList<string>, IReadOnlyList<string>, ReadCommand?) Vault =
+        ("https://kv1.vault.azure.net", [], ["/secrets", "/secrets/*/versions", "/certificates"], null);
+
+    private static readonly (string, IReadOnlyList<string>, IReadOnlyList<string>, ReadCommand?) Exchange =
+        ("https://outlook.office365.com/adminapi/beta/00000000-0000-0000-0000-000000000000", ["/InvokeCommand"], [],
+            new("CmdletInput.CmdletName", ["Get-*"]) { ParametersField = "CmdletInput.Parameters", DeniedParameters = ["GetMailboxLog", "NotificationEmailAddresses"] });
+
+    [Fact]
+    public async Task A_read_command_with_a_parameter_that_does_more_than_read_is_refused()
+    {
+        var body = new JsonObject
+        {
+            ["CmdletInput"] = new JsonObject { ["CmdletName"] = "Get-MobileDeviceStatistics", ["Parameters"] = new JsonObject { ["getmailboxlog"] = true } },
+        };
+
+        var (result, sent) = await RunGuarded(Exchange, (_, _) => StubHandler.Json("{}"), ("path", "/InvokeCommand"), ("method", "post"), ("body", body));
+
+        Assert.Equal("failed", result.State);
+        Assert.Contains("getmailboxlog", result.Reason, StringComparison.Ordinal);
+        Assert.Empty(sent);
+    }
+
+    [Fact]
+    public async Task Read_paths_are_whole_paths_so_an_endpoint_path_cannot_shift_them()
+    {
+        // /keys/x/versions is a readable path; under an endpoint of /secrets it would be the secret "keys", version x.
+        var shifted = ("https://kv1.vault.azure.net/secrets", (IReadOnlyList<string>)[], (IReadOnlyList<string>)["/keys/*/versions", "/secrets"], (ReadCommand?)null);
+
+        var (result, sent) = await RunGuarded(shifted, (_, _) => StubHandler.Json("""{ "value": "the secret" }"""), ("path", "/keys/x/versions"));
+
+        Assert.Equal("failed", result.State);
+        Assert.Empty(sent);
+    }
+
+    [Theory]
+    [InlineData("X-HTTP-Method-Override")]
+    [InlineData("X-Method-Override")]
+    [InlineData("x-http-method")]
+    public void A_header_or_param_that_changes_the_method_is_refused(string name)
+    {
+        var runner = new HttpRunner();
+
+        Assert.Contains(runner.Validate(Context.Query("http", "id", ("path", "/x"), ("headers", new JsonObject { [name] = "DELETE" }))),
+            p => p.Contains("method", StringComparison.Ordinal));
+        Assert.Contains(runner.Validate(Context.Query("http", "id", ("path", "/x"), ("params", new JsonObject { ["_method"] = "DELETE" }))),
+            p => p.Contains("method", StringComparison.Ordinal));
+    }
+
+    [Theory]
+    [InlineData("/secrets/db-password")]              // answers with the value
+    [InlineData("/secrets/db-password/0123abcd")]
+    [InlineData("/secrets/x/../db-password")]
+    [InlineData("/keys")]                             // not on this type's list
+    public async Task A_type_that_reads_only_some_paths_refuses_the_rest_before_sending(string path)
+    {
+        var (result, sent) = await RunGuarded(Vault, (_, _) => StubHandler.Json("""{ "value": [] }"""), ("path", path));
+
+        Assert.Equal("failed", result.State);
+        Assert.Empty(sent);
+    }
+
+    [Fact]
+    public async Task A_next_page_off_the_readable_paths_is_refused()
+    {
+        var (listed, _) = await RunGuarded(Vault, (pathAndQuery, _) => pathAndQuery.Contains("skiptoken", StringComparison.Ordinal)
+                ? StubHandler.Json("""{ "value": [ { "id": "b" } ] }""")
+                : StubHandler.Json("""{ "value": [ { "id": "a" } ], "nextLink": "https://kv1.vault.azure.net/secrets?api-version=7.4&$skiptoken=x" }"""),
+            ("path", "/secrets"), ("params", new JsonObject { ["api-version"] = "7.4" }));
+        var (diverted, sent) = await RunGuarded(Vault, (_, _) =>
+                StubHandler.Json("""{ "value": [ { "id": "a" } ], "nextLink": "https://kv1.vault.azure.net/secrets/db-password" }"""),
+            ("path", "/secrets"));
+
+        Assert.Equal(("ok", 2), (listed.State, listed.Rows.Count));
+        Assert.Equal("partial", diverted.State);
+        Assert.Single(sent);   // the diverted page was never asked for
+    }
+
+    [Theory]
+    [InlineData("Get-Mailbox", "ok")]
+    [InlineData("Set-Mailbox", "failed")]
+    [InlineData("get-mailbox", "failed")]                    // case included
+    [InlineData("Get-Mailbox; Remove-Mailbox", "failed")]
+    [InlineData("Get-Mailbox -Identity x", "failed")]
+    public async Task A_command_api_runs_only_the_commands_its_type_allows(string cmdlet, string state)
+    {
+        var (result, sent) = await RunGuarded(Exchange, (_, _) => StubHandler.Json("""{ "value": [ { "uid": "m1" } ] }"""),
+            ("path", "/InvokeCommand"), ("method", "post"),
+            ("body", new JsonObject { ["CmdletInput"] = new JsonObject { ["CmdletName"] = cmdlet, ["Parameters"] = new JsonObject { ["ResultSize"] = "Unlimited" } } }));
+
+        Assert.Equal(state, result.State);
+        Assert.Equal(state == "ok" ? 1 : 0, sent.Count);
+    }
+
+    [Fact]
+    public async Task A_command_named_twice_or_not_at_all_is_refused()
+    {
+        var twice = new JsonObject { ["CmdletInput"] = new JsonObject { ["CmdletName"] = "Get-Mailbox", ["cmdletName"] = "Set-Mailbox" } };
+        var (doubled, sentDoubled) = await RunGuarded(Exchange, (_, _) => StubHandler.Json("{}"), ("path", "/InvokeCommand"), ("method", "post"), ("body", twice));
+        var (none, sentNone) = await RunGuarded(Exchange, (_, _) => StubHandler.Json("{}"), ("path", "/InvokeCommand"), ("method", "post"), ("body", new JsonObject()));
+
+        Assert.Equal(("failed", "failed"), (doubled.State, none.State));
+        Assert.Empty(sentDoubled);
+        Assert.Empty(sentNone);
+    }
+
+    [Fact]
+    public async Task A_command_api_pages_with_the_same_command()
+    {
+        var (result, sent) = await RunGuarded(Exchange, (pathAndQuery, _) => pathAndQuery.Contains("skipToken", StringComparison.Ordinal)
+                ? StubHandler.Json("""{ "value": [ { "uid": "m2" } ] }""")
+                : StubHandler.Json("""{ "value": [ { "uid": "m1" } ], "@odata.nextLink": "https://outlook.office365.com/adminapi/beta/00000000-0000-0000-0000-000000000000/InvokeCommand?$skipToken=2" }"""),
+            ("path", "/InvokeCommand"), ("method", "post"),
+            ("body", new JsonObject { ["CmdletInput"] = new JsonObject { ["CmdletName"] = "Get-Mailbox" } }));
+
+        Assert.Equal(new[] { "m1", "m2" }, result.Rows.Select(r => r["uid"]!.ToString()));
+        Assert.All(sent, s => Assert.Equal(("POST", true), (s.Method, s.Body!.Contains("Get-Mailbox", StringComparison.Ordinal))));
     }
 
     [Theory]

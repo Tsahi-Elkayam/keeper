@@ -22,7 +22,7 @@ public sealed class PerObjectTests
                 Paths.Add(path);
             return Task.FromResult(path switch
             {
-                "/servicePrincipals" => RunnerResult.Ok([new() { ["id"] = "sp-1", ["name"] = "App one" }, new() { ["id"] = "sp-2" }, new() { ["id"] = "../../x" }]),
+                "/servicePrincipals" => RunnerResult.Ok([new() { ["id"] = "sp-1", ["name"] = "App one" }, new() { ["id"] = "sp-2" }, new() { ["id"] = "../../x" }, new() { ["id"] = ".." }]),
                 "/servicePrincipals/sp-1/jobs" => RunnerResult.Ok([new() { ["status"] = "Quarantine" }]),
                 "/sites" => RunnerResult.Ok([new() { ["id"] = "s1" }, new() { ["id"] = "s2" }]),
                 "/sites/s1/lists" => RunnerResult.Ok([new() { ["id"] = "l1" }]),
@@ -50,9 +50,9 @@ public sealed class PerObjectTests
         var row = Assert.Single(result.Rows);
         Assert.Equal("Quarantine", row["status"]!.ToString());
         Assert.Equal("App one", row["parent"]!["name"]!.ToString());
-        Assert.Equal("partial", result.State);                    // sp-2 failed, and one id was not a plain id
-        Assert.Contains("2 of 3 objects failed", result.Reason, StringComparison.Ordinal);
-        Assert.DoesNotContain(runner.Paths, p => p.Contains("..", StringComparison.Ordinal));
+        Assert.Equal("partial", result.State);                    // sp-2 failed, and two ids were not plain ids
+        Assert.Contains("3 of 4 objects failed", result.Reason, StringComparison.Ordinal);
+        Assert.DoesNotContain(runner.Paths, p => p.Contains("..", StringComparison.Ordinal) || p == "/servicePrincipals/jobs");
     }
 
     [Fact]

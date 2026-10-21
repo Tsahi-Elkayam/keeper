@@ -17,6 +17,19 @@ public sealed record RunnerResult(IReadOnlyList<JsonObject> Rows, string State, 
     public const string NotFound = "not found (404)";
 }
 
+/// <summary>The body field (dotted path) that names the command a POST runs, and the names allowed ('*' within a name).</summary>
+public sealed record ReadCommand(string Field, IReadOnlyList<string> Allowed)
+{
+    /// <summary>Where the body gives the command's parameters (dotted path), for <see cref="DeniedParameters"/>.</summary>
+    public string? ParametersField { get; init; }
+
+    /// <summary>
+    /// Parameters that make a read command do more than read - mail a log, show an export's credential - and so
+    /// are never sent, whatever the case.
+    /// </summary>
+    public IReadOnlyList<string> DeniedParameters { get; init; } = [];
+}
+
 /// <summary>
 /// What a runner may use to reach its system: one integration's endpoint and credentials - never
 /// another's. Secrets are decrypted on demand and must never be logged.
@@ -48,6 +61,27 @@ public interface IConnection
     /// as a read - Check Point's show- commands, Azure Resource Graph queries. Nowhere else does a rule POST.
     /// </summary>
     IReadOnlyList<string> ReadPosts => [];
+
+    /// <summary>
+    /// When not empty, the only paths (same patterns, the whole path on the host) a rule may read through this
+    /// integration at all - Key Vault's lists and metadata, never the path that returns a secret's value.
+    /// </summary>
+    IReadOnlyList<string> ReadPaths => [];
+
+    /// <summary>
+    /// For an API whose POSTs run named commands (Exchange Online's InvokeCommand): the body field that names
+    /// the command and the names it may be ('*' within the name) - Get-* only. Null: the type runs no commands.
+    /// </summary>
+    ReadCommand? ReadCommand => null;
+
+    /// <summary>The protocols the integration's type offers, or null when it says nothing (a test's fake).</summary>
+    IReadOnlyList<string>? Protocols => null;
+
+    /// <summary>
+    /// Why this integration's endpoint may not be used as it is stored, or null - a guarded type's endpoint with
+    /// a path its type does not allow, saved before the check existed or by another route.
+    /// </summary>
+    string? EndpointProblem => null;
 
     /// <summary>Non-secret options (scopes, header names, TLS mode, targets).</summary>
     JsonObject Options { get; }

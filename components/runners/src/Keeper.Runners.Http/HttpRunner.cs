@@ -64,6 +64,13 @@ public sealed class HttpRunner : IRunner
             yield return "params must be a mapping";
         if (query.Fields["headers"] is JsonObject headers && headers.Any(h => h.Key.Contains("auth", StringComparison.OrdinalIgnoreCase) || h.Key.Contains("cookie", StringComparison.OrdinalIgnoreCase)))
             yield return "headers must not carry credentials; the integration adds them";
+        // X-HTTP-Method-Override and its kin turn a GET or a read POST into a DELETE or a PATCH on servers that honour them.
+        if (query.Fields["headers"] is JsonObject named && named.Any(h => h.Key.Contains("method", StringComparison.OrdinalIgnoreCase) || h.Key.Contains("override", StringComparison.OrdinalIgnoreCase)))
+            yield return "headers must not change the request's method (X-HTTP-Method-Override and the like)";
+        if (query.Fields["params"] is JsonObject parameters && parameters.Select(p => p.Key).FirstOrDefault(k =>
+                k.Equals("_method", StringComparison.OrdinalIgnoreCase) || k.Equals("$method", StringComparison.OrdinalIgnoreCase)
+                || k.Contains("method-override", StringComparison.OrdinalIgnoreCase) || k.Equals("x-http-method", StringComparison.OrdinalIgnoreCase)) is { } overriding)
+            yield return $"param {overriding} would change the request's method; Keeper only reads";
         foreach (var perObject in PerObject.Validate(query))
             yield return perObject;
     }
@@ -102,6 +109,9 @@ public sealed class HttpRunner : IRunner
         if (method == HttpMethod.Post && !ReadPost.Allow(context.Connection.ReadPosts, path))
             return RunnerResult.Failed($"POST {path.Split('?')[0]} is not a read the {context.Connection.Type} integration type allows; nothing was sent");
         var body = query.Fields["body"] is JsonObject template ? (JsonObject)RequestMacros.ExpandAll(template.DeepClone(), context)! : null;
+        if (method == HttpMethod.Post && ReadPost.CommandProblem(context.Connection.ReadCommand, body) is { } refused)
+            return RunnerResult.Failed($"{refused}; nothing was sent");
+        var readPaths = context.Connection.ReadPaths;
 
         var offsetParam = query.Text("offsetParam") ?? "sysparm_offset";
         var limitParam = query.Text("limitParam") ?? "sysparm_limit";
@@ -130,6 +140,17 @@ public sealed class HttpRunner : IRunner
             // to a path its integration type does not read.
             if (method == HttpMethod.Post && (engine.Relative(next) is not { } relative || !ReadPost.Allow(context.Connection.ReadPosts, relative)))
                 return RunnerResult.Partial(rows, $"the next page POST {next.AbsolutePath} is not a read the {context.Connection.Type} integration type allows; refused");
+            // A type that reads only some paths (Key Vault: lists and metadata, never a value) is held to them
+            // on every page, as the request will actually go: the whole path on the host, built and normalised -
+            // an endpoint with a path of its own must not shift what the rule's path means.
+            if (readPaths.Count > 0 && !ReadPost.Allow(readPaths, next.AbsolutePath))
+            {
+                var refusedPath = $"{next.AbsolutePath} is not a path the {context.Connection.Type} integration type reads";
+                return page == 1 ? RunnerResult.Failed(refusedPath + "; nothing was sent") : RunnerResult.Partial(rows, refusedPath + "; the next page was refused");
+            }
+            // Body paging changes the body between pages: what it runs is checked before every one.
+            if (method == HttpMethod.Post && page > 1 && ReadPost.CommandProblem(context.Connection.ReadCommand, body) is { } changed)
+                return RunnerResult.Partial(rows, $"{changed}; the next page was refused");
 
             string text;
             IReadOnlyDictionary<string, string> responseHeaders;

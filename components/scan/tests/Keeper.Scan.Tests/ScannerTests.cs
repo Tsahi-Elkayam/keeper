@@ -7,6 +7,23 @@ using Keeper.Runners;
 
 namespace Keeper.Scan.Tests;
 
+/// <summary>A connection whose type offers some protocols, and whose endpoint may have been stored wrong.</summary>
+internal sealed class TypedConnection(IReadOnlyList<string> protocols, string? endpointProblem = null) : IConnection
+{
+    public string Instance => "typed";
+    public string Type => "typed";
+    public string Endpoint => "";
+    public string AuthKind => "none";
+    public string? Identity => null;
+    public JsonObject Options { get; } = [];
+    public IReadOnlyList<string>? Protocols => protocols;
+    public string? EndpointProblem => endpointProblem;
+    public string? Secret(string name) => null;
+    public NetworkCredential? WindowsCredential() => null;
+    public HttpMessageHandler CreateHttpHandler() => new HttpClientHandler();
+    public Task AuthorizeAsync(HttpRequestMessage request, CancellationToken cancellationToken) => Task.CompletedTask;
+}
+
 internal sealed class FilesConnection : IConnection
 {
     public string Instance => "files";
@@ -112,6 +129,22 @@ public sealed class ScannerTests : IDisposable
         }, CancellationToken.None);
 
     private string UsersQuery => Load().Rules.Single(r => r.Id == "EX-USER-STALE").Query.Id;
+
+    [Fact]
+    public async Task A_scan_refuses_rules_its_integration_type_cannot_read_and_an_endpoint_stored_wrong()
+    {
+        Task Through(IConnection connection) => new Scanner(Runners.Registry(), new Clock(Now)).RunAsync(new ScanRequest
+        {
+            Files = [Load()], Connection = connection, RunsDir = Runs, ImportsDir = Imports,
+        }, CancellationToken.None);
+
+        var protocol = await Assert.ThrowsAsync<ArgumentException>(() => Through(new TypedConnection(["graph"])));
+        var endpoint = await Assert.ThrowsAsync<ArgumentException>(() => Through(new TypedConnection(["file"], "the endpoint has a path")));
+
+        Assert.Contains("reads with file", protocol.Message, StringComparison.Ordinal);
+        Assert.Contains("the endpoint has a path", endpoint.Message, StringComparison.Ordinal);
+        Assert.False(Directory.Exists(Runs) && Directory.EnumerateDirectories(Runs).Any());   // nothing was read, no run was written
+    }
 
     /// <summary>A directory-like runner: returns the rows it is given, per host when per-target. Never fails.</summary>
     private sealed class FakeRunner(bool perTarget, Dictionary<string, int> rowsPerHost) : IRunner

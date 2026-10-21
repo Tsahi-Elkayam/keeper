@@ -42,6 +42,18 @@ public sealed partial class IntegrationConnection : IConnection, IDisposable
 
     public IReadOnlyList<string> ReadPosts => IntegrationTypes.Find(_record.Type)?.ReadPosts ?? [];
 
+    public IReadOnlyList<string> ReadPaths => IntegrationTypes.Find(_record.Type)?.ReadPaths ?? [];
+
+    public ReadCommand? ReadCommand => IntegrationTypes.Find(_record.Type)?.ReadCommand;
+
+    public IReadOnlyList<string>? Protocols => IntegrationTypes.Find(_record.Type)?.Protocols ?? [];
+
+    public string? EndpointProblem => IntegrationTypes.Find(_record.Type) is { Guarded: true } type
+        && Uri.TryCreate(_record.Endpoint, UriKind.Absolute, out var uri)
+        && (!type.AllowsEndpointPath(uri.AbsolutePath) || uri.Query.Length > 0)
+            ? $"the {type.Id} endpoint has a path its type does not allow ({uri.AbsolutePath}{uri.Query}); set it again: keeper integration set {_record.Id} --endpoint <url>"
+            : null;
+
     /// <summary>Sign in to Entra again even when a cached token is valid: right after a PIM activation, so the new role is in it.</summary>
     public bool FreshSignIn { get; init; }
 
@@ -304,8 +316,17 @@ public sealed partial class IntegrationConnection : IConnection, IDisposable
             return list.Select(s => s?.ToString() ?? "").Where(s => s.Length > 0).ToList();
         if (_record.Options["scopes"]?.ToString() is { Length: > 0 } text)
             return text.Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
-        var resource = Uri.TryCreate(_record.Endpoint, UriKind.Absolute, out var uri) ? $"{uri.Scheme}://{uri.Host}" : "https://graph.microsoft.com";
-        return [$"{resource}/.default"];
+        return [DefaultScope(IntegrationTypes.Find(_record.Type)?.Resource, _record.Endpoint)];
+    }
+
+    /// <summary>
+    /// The type's resource, or else the endpoint's own host, + /.default. A resource that ends in a slash keeps
+    /// it (https://service.powerapps.com//.default): that is the resource's name, and Entra wants it exact.
+    /// </summary>
+    public static string DefaultScope(string? resource, string endpoint)
+    {
+        resource ??= Uri.TryCreate(endpoint, UriKind.Absolute, out var uri) ? $"{uri.Scheme}://{uri.Host}" : "https://graph.microsoft.com";
+        return resource + "/.default";
     }
 
     private (string ClientId, string TenantId) EntraApp() =>

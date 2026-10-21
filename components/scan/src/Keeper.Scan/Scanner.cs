@@ -59,6 +59,13 @@ public sealed class Scanner(RunnerRegistry registry, TimeProvider? clock = null)
     {
         if (request.Files.Count == 0)
             throw new ArgumentException("No rule files to scan.");
+        // Every scan, whoever starts it: a type's guards (read paths, commands, hosts) are written for its own
+        // runners, and for its endpoint as the type allows it.
+        if (request.Connection.Protocols is { } offered
+            && request.Files.SelectMany(f => f.Rules).FirstOrDefault(r => !offered.Contains(r.Query.Protocol)) is { } stray)
+            throw new ArgumentException($"Rule {stray.Id} reads with {stray.Query.Protocol}, which the {request.Connection.Type} integration type does not offer ({string.Join(", ", offered)}).");
+        if (request.Connection.EndpointProblem is { } endpointProblem)
+            throw new ArgumentException($"Integration {request.Connection.Instance}: {endpointProblem}.");
         var system = request.Files[0].System;
         var instance = request.Connection.Instance;
         var started = _clock.GetUtcNow();

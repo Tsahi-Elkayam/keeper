@@ -54,6 +54,10 @@ public sealed class UpsertHandler : IRequestHandler
             throw new RequestException("Option tokenUrl must be an https URL.");
         if (options["cimProtocol"] is { } cimProtocol && cimProtocol.ToString() is not ("auto" or "wsman" or "dcom"))
             throw new RequestException("Option cimProtocol must be auto (WinRM, then DCOM), wsman or dcom.");
+        // A fixed header on every request must not turn a read into a write on a server that honours it.
+        if (options["headers"] is JsonObject fixedHeaders && fixedHeaders.Select(h => h.Key).FirstOrDefault(h =>
+                h.Contains("method", StringComparison.OrdinalIgnoreCase) || h.Contains("override", StringComparison.OrdinalIgnoreCase)) is { } methodHeader)
+            throw new RequestException($"Option headers.{methodHeader} would change the request's method; Keeper only reads.");
 
         var existing = context.Scalar("SELECT endpoint FROM integration WHERE integration_id = :id;", (":id", id)) as string;
         context.Execute(
@@ -88,6 +92,10 @@ public sealed class UpsertHandler : IRequestHandler
                 throw new RequestException("Plain http sends credentials in the clear; use https, or set the option allowHttp to true.");
             if (!type.AllowsHost(uri.Host))
                 throw new RequestException($"{type.Id} endpoints must be on: {string.Join(", ", type.AllowedHosts)}.");
+            if (type.Guarded && (!type.AllowsEndpointPath(uri.AbsolutePath) || uri.Query.Length > 0))
+                throw new RequestException(type.EndpointPath is null
+                    ? $"{type.Id} endpoints have no path: https://<host> (what it reads is checked against the host's own paths)."
+                    : $"{type.Id} endpoints have the path {type.EndpointPath}, and no query.");
         }
         else if (type.Id == "ldap" && endpoint.Length > 0 && endpoint.Contains("://", StringComparison.Ordinal)
                  && !endpoint.StartsWith("ldap://", StringComparison.OrdinalIgnoreCase) && !endpoint.StartsWith("ldaps://", StringComparison.OrdinalIgnoreCase))

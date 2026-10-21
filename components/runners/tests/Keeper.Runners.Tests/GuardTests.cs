@@ -7,6 +7,26 @@ namespace Keeper.Runners.Tests;
 public sealed class GuardTests
 {
     [Theory]
+    [InlineData("https://prod-12.westeurope.logic.azure.com/workflows/abc/triggers/manual/paths/invoke?api-version=2016-06-01&sp=%2Ftriggers&sv=1.0&sig=Zm9vYmFy",
+        "https://prod-12.westeurope.logic.azure.com/workflows/abc/triggers/manual/paths/invoke?api-version=2016-06-01&sp=%2Ftriggers&sv=1.0&sig=set")]
+    [InlineData("https://bucket.s3.amazonaws.com/a.csv?X-Amz-Credential=AKID%2F2026&X-Amz-Signature=abc123",
+        "https://bucket.s3.amazonaws.com/a.csv?X-Amz-Credential=set&X-Amz-Signature=set")]
+    [InlineData("https://fn.example.org/api/run?code=s3cr3t&name=x", "https://fn.example.org/api/run?code=set&name=x")]
+    [InlineData("https://app.example.org/cb#access_token=eyJabc&state=1", "https://app.example.org/cb#access_token=set&state=1")]
+    [InlineData("https://login.example.org/token?client_id=a&client_secret=s3cr3t", "https://login.example.org/token?client_id=a&client_secret=set")]
+    [InlineData("see https://example.org/page?id=7", "see https://example.org/page?id=7")]
+    [InlineData("key=value, not a URL", "key=value, not a URL")]
+    public void A_url_that_carries_its_own_credential_keeps_only_the_rest(string text, string masked)
+    {
+        Assert.Equal(masked, SecretProperties.MaskUrls(text));
+
+        var row = new System.Text.Json.Nodes.JsonObject { ["flowTriggerUri"] = text, ["links"] = new System.Text.Json.Nodes.JsonArray(text) };
+        SecretProperties.Mask(row);
+        Assert.Equal(masked, row["flowTriggerUri"]!.ToString());
+        Assert.Equal(masked, row["links"]![0]!.ToString());
+    }
+
+    [Theory]
     [InlineData("SELECT name FROM sys.databases")]
     [InlineData("WITH x AS (SELECT 1 AS n) SELECT n FROM x")]
     [InlineData("SELECT 'drop table x' AS text")]
