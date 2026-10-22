@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <AssemblyName>Keeper.Cli.Config</AssemblyName>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\Keeper.Review.Cli\Keeper.Review.Cli.csproj" />
+    <!-- The integration family reads the integration/integration_secret tables and queues integrations.upsert;
+         it needs the integration store's reader and schema, and the vault schema the integration schema depends on. -->
+    <ProjectReference Include="..\..\..\integrations\src\Keeper.Integrations\Keeper.Integrations.csproj" />
+    <ProjectReference Include="..\..\..\vault\src\Keeper.Vault\Keeper.Vault.csproj" />
+  </ItemGroup>
+</Project>

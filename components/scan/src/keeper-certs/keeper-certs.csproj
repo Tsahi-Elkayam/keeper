@@ -1,8 +1,6 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
-    <OutputType>Exe</OutputType>
-    <AssemblyName>keeper-certs</AssemblyName>
-    <RootNamespace>Keeper.Cli.Certs</RootNamespace>
+    <AssemblyName>Keeper.Cli.Certs</AssemblyName>
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="..\Keeper.Scan\Keeper.Scan.csproj" />

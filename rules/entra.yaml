@@ -30,6 +30,8 @@ integration: graph
 #   f2ef992c-3afb-46b9-b7cf-a126ee74c451 Global Reader
 # Tier 0 (threshold entra.tier0-role-ids) = the first eleven: each one is a path to full tenant takeover.
 # Privileged (threshold entra.privileged-role-ids) = all of the above.
+# Standing non-tier-0 (threshold entra.standing-privileged-role-ids) = Exchange, SharePoint, Teams, User,
+#   Authentication, Helpdesk, Password, Billing and Groups Administrator.
 #
 # The user inventory query (rules ENTRA-USER-INACTIVE and the sign-in rules) is shared with
 # m365.yaml and is the Entra side of the AD/Entra join on onPremisesSecurityIdentifier.
@@ -131,6 +133,32 @@ rules:
           op: in
           threshold: entra.tier0-role-ids
           value: [62e90394-69f5-4237-9190-012177145e10, e8611ab8-c189-46e8-94e1-60213ab1f814, 7be44c8a-adaf-4e2a-84d6-ab2649e08a13, 194ae4cb-b126-40b2-bd5b-6091b380977d, 8ac3fc64-6eca-42ea-9e69-59f4c7b60eb2, b1be1c3e-b65d-4f19-8427-f6fa0d97feb9, 9b895d92-2cd3-44c7-9d02-a6ac2d5ea5c3, 158c047a-c907-4556-b7ef-446551a6b5f7, be2f45a1-457d-42af-a067-6ec1fa63bc45, 8329153b-31d0-4727-b945-745eb3bc5f31, 3a2c62db-5318-420d-8d74-23affee5d9d5]
+        - { field: memberType, op: eq, value: Direct }
+        - { field: endDateTime, op: absent }
+    evidence: "{principal.displayName} {principal.userPrincipalName} holds role {roleDefinitionId} permanently (scope {directoryScopeId})"
+
+  - id: ENTRA-ROLE-PERMANENT-PRIVILEGED
+    title: Privileged (non-tier-0) role held permanently instead of through PIM
+    kind: misconfigured
+    category: IAM
+    severity: medium
+    entity: role-assignment
+    why: "Exchange, SharePoint, Teams, User, Authentication, Helpdesk, Password, Groups and Billing Administrators can reset other users' passwords or MFA methods, read or forward mail and files, or change licences and groups; a standing assignment keeps that power live at every moment for whoever controls the account. Tier-0 roles are judged by ENTRA-ROLE-PERMANENT-TIER0. Needs Entra ID P2 for PIM."
+    fix: "Convert the assignment to an eligible PIM assignment with an activation reason and, for the roles that touch credentials, approval. Service identities that need the role permanently are recorded as accepted exceptions."
+    refs: ["NIST-800-53:AC-6(5)", "NIST-800-53:AC-2(7)"]
+    query:
+      protocol: graph
+      path: /roleManagement/directory/roleAssignmentScheduleInstances
+      filter: "assignmentType eq 'Assigned'"
+      expand: principal
+      key: id
+      name: principal.displayName
+    each:
+      all:
+        - field: roleDefinitionId
+          op: in
+          threshold: entra.standing-privileged-role-ids
+          value: [29232cdf-9323-42fd-ade2-1d097af3e4de, f28a1f50-f6e7-4571-818b-6a12f2af6b6c, 69091246-20e8-4a56-aa4d-066075b2a7a8, fe930be7-5e62-47db-91af-98c3a49a38b1, c4e39bd9-1100-46d3-8c65-fb160da0071f, 729827e3-9c14-49f7-bb1b-9608f156bbb8, 966707d0-3269-4727-9be2-8c3a10f19b9d, b0f54661-2d74-4c50-afa3-1ec803f12efe, fdd7a751-b60b-444a-984c-02652fe8fa1c]
         - { field: memberType, op: eq, value: Direct }
         - { field: endDateTime, op: absent }
     evidence: "{principal.displayName} {principal.userPrincipalName} holds role {roleDefinitionId} permanently (scope {directoryScopeId})"
@@ -267,6 +295,67 @@ rules:
           value: [62e90394-69f5-4237-9190-012177145e10, e8611ab8-c189-46e8-94e1-60213ab1f814, 7be44c8a-adaf-4e2a-84d6-ab2649e08a13, 194ae4cb-b126-40b2-bd5b-6091b380977d, 8ac3fc64-6eca-42ea-9e69-59f4c7b60eb2, b1be1c3e-b65d-4f19-8427-f6fa0d97feb9, 9b895d92-2cd3-44c7-9d02-a6ac2d5ea5c3, 158c047a-c907-4556-b7ef-446551a6b5f7, be2f45a1-457d-42af-a067-6ec1fa63bc45, 8329153b-31d0-4727-b945-745eb3bc5f31, 3a2c62db-5318-420d-8d74-23affee5d9d5]
         - { field: principal.appId, op: exists }
     evidence: "service principal {principal.displayName} (appId {principal.appId}) holds role {roleDefinitionId}"
+
+  - id: ENTRA-ROLE-ELIGIBLE-GUEST-HOLDER
+    title: Guest account is eligible for a directory role
+    kind: misconfigured
+    category: IAM
+    severity: high
+    entity: role-eligibility
+    why: "A guest governed by another organisation's credentials and leaver process can activate a directory role in this tenant at will. ENTRA-ROLE-GUEST-HOLDER sees active assignments; this sees the standing PIM eligibility that an active-assignment scan misses. Needs Entra ID P2."
+    fix: "Remove the eligibility from the guest; if the person really administers this tenant, give them a member account here and make that account eligible instead."
+    refs: ["NIST-800-53:AC-6(5)", "NIST-800-53:AC-2(9)"]
+    query:
+      protocol: graph
+      path: /roleManagement/directory/roleEligibilityScheduleInstances
+      expand: principal
+      key: id
+      name: principal.displayName
+    each: { field: principal.userType, op: eq, value: Guest }
+    evidence: "guest {principal.userPrincipalName} is eligible for role {roleDefinitionId} (scope {directoryScopeId})"
+
+  - id: ENTRA-ROLE-ELIGIBLE-DISABLED-HOLDER
+    title: Disabled account is eligible for a directory role
+    kind: misconfigured
+    category: HYG
+    severity: medium
+    entity: role-eligibility
+    lens: both
+    why: "A disabled account kept eligible regains a path to the role the moment someone re-enables it, and it hides who really administers the tenant. The active-assignment leaver check (ENTRA-ROLE-DISABLED-HOLDER) does not see PIM eligibility. Needs Entra ID P2."
+    fix: "Remove role eligibility from disabled accounts as part of the leaver process."
+    refs: ["NIST-800-53:AC-2(3)"]
+    query:
+      protocol: graph
+      path: /roleManagement/directory/roleEligibilityScheduleInstances
+      expand: principal
+      key: id
+      name: principal.displayName
+    each: { field: principal.accountEnabled, op: eq, value: false }
+    evidence: "disabled {principal.userPrincipalName} is eligible for role {roleDefinitionId}"
+
+  - id: ENTRA-ROLE-ELIGIBLE-SYNCED-HOLDER
+    title: Account synchronised from on-premises AD is eligible for a privileged role
+    kind: misconfigured
+    category: IAM
+    severity: high
+    entity: role-eligibility
+    why: "Whoever compromises on-premises AD controls a synchronised account's password and attributes; a standing PIM eligibility for a privileged cloud role on such an account turns an AD breach into a cloud breach one activation later. ENTRA-ROLE-SYNCED-HOLDER sees active assignments only. Needs Entra ID P2."
+    fix: "Give administrators separate cloud-only accounts for Entra role eligibility and remove eligibility from synchronised accounts."
+    refs: [CIS-M365-1.1.1, "NIST-800-53:AC-6(5)"]
+    query:
+      protocol: graph
+      path: /roleManagement/directory/roleEligibilityScheduleInstances
+      expand: principal
+      key: id
+      name: principal.displayName
+    each:
+      all:
+        - field: roleDefinitionId
+          op: in
+          threshold: entra.privileged-role-ids
+          value: [62e90394-69f5-4237-9190-012177145e10, e8611ab8-c189-46e8-94e1-60213ab1f814, 7be44c8a-adaf-4e2a-84d6-ab2649e08a13, 194ae4cb-b126-40b2-bd5b-6091b380977d, 8ac3fc64-6eca-42ea-9e69-59f4c7b60eb2, b1be1c3e-b65d-4f19-8427-f6fa0d97feb9, 9b895d92-2cd3-44c7-9d02-a6ac2d5ea5c3, 158c047a-c907-4556-b7ef-446551a6b5f7, be2f45a1-457d-42af-a067-6ec1fa63bc45, 8329153b-31d0-4727-b945-745eb3bc5f31, 3a2c62db-5318-420d-8d74-23affee5d9d5, 29232cdf-9323-42fd-ade2-1d097af3e4de, f28a1f50-f6e7-4571-818b-6a12f2af6b6c, 69091246-20e8-4a56-aa4d-066075b2a7a8, fe930be7-5e62-47db-91af-98c3a49a38b1, c4e39bd9-1100-46d3-8c65-fb160da0071f, 729827e3-9c14-49f7-bb1b-9608f156bbb8, 966707d0-3269-4727-9be2-8c3a10f19b9d, b0f54661-2d74-4c50-afa3-1ec803f12efe, fdd7a751-b60b-444a-984c-02652fe8fa1c, f2ef992c-3afb-46b9-b7cf-a126ee74c451]
+        - { field: principal.onPremisesSyncEnabled, op: eq, value: true }
+    evidence: "synchronised account {principal.userPrincipalName} is eligible for role {roleDefinitionId}"
 
   - id: ENTRA-PIM-NO-APPROVAL
     title: Activating the most powerful roles needs no approval
@@ -3788,6 +3877,25 @@ rules:
     each: { field: isEnabled, op: eq, value: false }
     evidence: "adminConsentRequestPolicy isEnabled = {isEnabled}"
 
+  - id: ENTRA-CONSENT-ADMIN-REQUEST-NO-REVIEWERS
+    title: Admin consent request workflow is on but has no reviewers
+    kind: misconfigured
+    category: IAM
+    severity: medium
+    entity: policy
+    why: "The admin consent workflow is enabled (so ENTRA-CONSENT-WORKFLOW-OFF passes) but names no reviewers, so users' consent requests queue with nobody able to act on them; people then give up or an admin grants consent ad hoc, outside the workflow and its record."
+    fix: "Add named reviewers (a monitored group of application administrators) to the admin consent request policy, with notifications and reminders on."
+    refs: [CIS-M365-5.1.5.2, "NIST-800-53:AC-6"]
+    query:
+      protocol: graph
+      path: /policies/adminConsentRequestPolicy
+      key: id
+    each:
+      all:
+        - { field: isEnabled, op: eq, value: true }
+        - { field: reviewers, op: empty }
+    evidence: "adminConsentRequestPolicy isEnabled = {isEnabled}, reviewers {reviewers}"
+
   - id: ENTRA-APPPOLICY-OFF
     title: Tenant-wide app credential restrictions are off
     kind: missing
@@ -3994,6 +4102,25 @@ rules:
         - { field: b2bCollaborationOutbound.applications.accessType, op: eq, value: allowed }
     evidence: "default B2B collaboration: inbound users {b2bCollaborationInbound.usersAndGroups.accessType} ({b2bCollaborationInbound.usersAndGroups.targets[].target}), inbound apps {b2bCollaborationInbound.applications.accessType}, outbound users {b2bCollaborationOutbound.usersAndGroups.accessType}, outbound apps {b2bCollaborationOutbound.applications.accessType}"
 
+  - id: ENTRA-XTAP-AUTOMATIC-REDEMPTION
+    title: Inbound external users are redeemed automatically for every tenant by default
+    kind: misconfigured
+    category: IAM
+    severity: medium
+    entity: policy
+    why: "When the default cross-tenant settings allow automatic redemption inbound, a user from any other Entra organisation is added to this tenant (through cross-tenant synchronisation or B2B) without the consent prompt that would otherwise show who is being added and from where - a silent way in that no guest-invite review catches. Outbound automatic redemption lets this tenant's users be pulled into other organisations the same way."
+    fix: "Leave automatic redemption off in the default cross-tenant access settings; enable it per named partner organisation only, where a cross-tenant synchronisation relationship is agreed."
+    refs: ["NIST-800-53:AC-20", "NIST-800-53:AC-2(9)", "MITRE-ATTACK:T1199"]
+    query:
+      protocol: graph
+      path: /policies/crossTenantAccessPolicy/default
+      key: id
+    each:
+      any:
+        - { field: automaticUserConsentSettings.inboundAllowed, op: eq, value: true }
+        - { field: automaticUserConsentSettings.outboundAllowed, op: eq, value: true }
+    evidence: "default automatic redemption: inbound {automaticUserConsentSettings.inboundAllowed}, outbound {automaticUserConsentSettings.outboundAllowed}"
+
   - id: ENTRA-XTAP-PARTNER-PRESENT
     title: Partner-specific cross-tenant access settings exist
     kind: misconfigured
@@ -4077,6 +4204,22 @@ rules:
       key: id
     each: { field: localAdminPassword.isEnabled, op: eq, value: false }
     evidence: "localAdminPassword.isEnabled = {localAdminPassword.isEnabled}"
+
+  - id: ENTRA-DEVREG-NO-MFA
+    title: Joining or registering a device needs no multifactor authentication
+    kind: misconfigured
+    category: AUT
+    severity: medium
+    entity: policy
+    why: "When device registration does not require MFA, a stolen password alone can join or register a device, obtain a device-bound (primary refresh) token on it and inherit whatever device-based trust the tenant grants. MFA at join is the one check that ties a new device to a verified user."
+    fix: "Set 'Require Multifactor Authentication to register or join devices' to required, or (better) enforce it through a Conditional Access user-action policy for the register-or-join-device action."
+    refs: [CIS-M365-5.1.4.1, "NIST-800-53:IA-2(1)", "NIST-800-53:AC-19"]
+    query:
+      protocol: graph
+      path: /policies/deviceRegistrationPolicy
+      key: id
+    each: { field: multiFactorAuthConfiguration, op: eq, value: notRequired }
+    evidence: "multiFactorAuthConfiguration = {multiFactorAuthConfiguration}"
 
   # ======================================================================= groups ===
   - id: ENTRA-GROUP-DYNAMIC-PAUSED
@@ -4820,6 +4963,58 @@ rules:
         - { field: trustType, op: eq, value: Workplace }
     evidence: "{displayName} ({operatingSystem} {operatingSystemVersion}): registered {registrationDateTime}, managed {isManaged}, compliant {isCompliant}, last sign-in {approximateLastSignInDateTime}"
 
+  - id: ENTRA-DEVICE-DUAL-STATE
+    title: One device name has both a registered and a hybrid-joined object
+    kind: misconfigured
+    category: CFG
+    severity: medium
+    entity: device
+    lens: both
+    why: "A computer that was workplace-registered before it became hybrid-joined keeps both objects. Conditional Access may evaluate the registered one, which is not compliant or not hybrid, so the user is blocked or prompted, and the device count and compliance reports double it. The rule counts enabled Workplace and ServerAd objects per display name, so two hybrid objects with one name (a reimaged computer) also show here; display names are not unique, so look at the objects before deleting."
+    fix: "Delete the stale registered object, and stop it coming back: block workplace join on domain-joined computers (BlockAADWorkplaceJoin, see GPO-REG-WORKPLACE-JOIN-BLOCK-NONE) and run current Windows builds, which clean up the registration when the hybrid join completes."
+    refs: ["NIST-800-53:CM-8", "NIST-800-53:AC-19"]
+    query:
+      protocol: graph
+      path: /devices
+      select: [id, displayName, accountEnabled, operatingSystem, operatingSystemVersion, trustType, isManaged, isCompliant, approximateLastSignInDateTime, registrationDateTime]
+      top: 999
+      key: id
+      name: displayName
+    count:
+      op: gt
+      value: 1
+      by: displayName
+      where:
+        all:
+          - { field: accountEnabled, op: eq, value: true }
+          - { field: operatingSystem, op: match, value: '^Windows' }
+          - { field: trustType, op: in, value: [Workplace, ServerAd] }
+    evidence: "{group}: {count} enabled registered/hybrid device objects"
+
+  - id: ENTRA-DEVICE-HYBRID-PENDING
+    title: Hybrid-joined device object never completed registration
+    kind: broken
+    category: CFG
+    severity: medium
+    entity: device
+    lens: both
+    why: "A computer synchronised from AD as hybrid-joined (ServerAd) with no registration date is still 'pending': the computer never finished registering, so it holds no device identity, gets no device-based Conditional Access grant, and no Intune auto-enrolment. Common causes are a computer that cannot reach the registration endpoints, a missing service connection point, or a synced object for a computer that no longer exists."
+    fix: "On the computer, check the device registration state and the User Device Registration event log, fix the cause (network or proxy path to the registration service, service connection point, synchronisation scope), then let it register again; delete objects of computers that are gone in AD."
+    refs: ["NIST-800-53:CM-8", "NIST-800-53:IA-3"]
+    query:
+      protocol: graph
+      path: /devices
+      select: [id, displayName, accountEnabled, operatingSystem, operatingSystemVersion, trustType, isManaged, isCompliant, approximateLastSignInDateTime, registrationDateTime]
+      top: 999
+      key: id
+      name: displayName
+    each:
+      all:
+        - { field: accountEnabled, op: eq, value: true }
+        - { field: trustType, op: eq, value: ServerAd }
+        - { field: registrationDateTime, op: absent }
+    evidence: "{displayName} ({operatingSystem} {operatingSystemVersion}): hybrid-joined, no registration date, last sign-in {approximateLastSignInDateTime}"
+
   # BitLocker recovery keys: the list returns key metadata only (the key itself needs a separate read
   # with another permission, which no rule makes).
   - id: ENTRA-BITLOCKER-KEY-OLD
@@ -5453,6 +5648,29 @@ rules:
       name: userPrincipalName
     each: { field: status.errorCode, op: in, value: [53000, 53001, 530003] }
     evidence: "{userPrincipalName}: error {status.errorCode} on {deviceDetail.displayName} ({deviceDetail.operatingSystem}, managed {deviceDetail.isManaged}, compliant {deviceDetail.isCompliant}) to {appDisplayName} at {createdDateTime}"
+
+  - id: ENTRA-SIGNIN-SMART-LOCKOUT-SPIKE
+    title: Account repeatedly hit smart lockout in the last day
+    kind: broken
+    category: AUT
+    severity: high
+    entity: user
+    why: "Error 50053 means Entra smart lockout (or a block on a malicious IP) refused the sign-in. Many of them for one account in a day means someone keeps guessing its password - a spray or a brute-force attempt - or an old device keeps retrying a changed password; either way the user may be locked out and the attempts should be traced. One finding per account above the threshold; the read is capped, so a count from a capped read is a floor."
+    fix: "Look at the source IPs, countries and client apps of the attempts; if they are not the user's, confirm the password is strong and not leaked, require MFA (phishing-resistant for admins), block the sources with a named location, and check the account's recent successful sign-ins. If it is the user's own stale device or app, update its saved password."
+    refs: ["MITRE-ATTACK:T1110.001", "MITRE-ATTACK:T1110.003", "NIST-800-53:AC-7", "NIST-800-53:SI-4"]
+    query:
+      protocol: graph
+      path: /auditLogs/signIns
+      filter: "createdDateTime ge {DAYS_AGO:1} and status/errorCode eq 50053"
+      maxPages: 20
+      key: id
+      name: userPrincipalName
+    count:
+      op: gt
+      value: 10
+      threshold: entra.smart-lockout-daily-max
+      by: userPrincipalName
+    evidence: "{group}: {count} smart-lockout refusals (error 50053) in the last 24 hours"
 
   # Role grants: activityDisplayName covers direct assignments, scoped assignments and PIM assignments
   # (eligible and active); PIM requests and routine activations are left out by the pattern. The tier-0

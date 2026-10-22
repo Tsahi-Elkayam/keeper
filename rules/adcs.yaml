@@ -407,3 +407,238 @@ rules:
       name: displayName
     each: any
     evidence: "{sAMAccountName} - privileged, mapping {altSecurityIdentities}"
+
+  # ---------------------------------------------------------------- template and PKI ACLs (ESC4, ESC5, ESC7)
+  # nTSecurityDescriptor is read without its SACL; the owner, group and DACL are what any user may read.
+  # A null DACL (noDacl) means everyone holds every right, so it is a finding in its own right.
+
+  - id: ADCS-TPL-ACL-WRITE-BROAD
+    title: Certificate template can be rewritten by a broad or low-privileged principal (ESC4)
+    severity: high
+    why: Write access to a template lets the holder rewrite its settings - make a benign template behave like an ESC1 template, enroll, then revert it - so a broad or low-privileged principal with full control, modify-DACL, modify-owner or all-property write on a template owns every identity the template can issue (ESC4).
+    fix: Remove GenericAll, WriteDacl, WriteOwner, GenericWrite and all-property WriteProperty from broad or low-privileged principals on the template; keep template editing to Enterprise Admins or a named PKI administration group.
+    refs: [MITRE-ATTACK:T1649, NIST-800-53:AC-6, ADCS:ESC4]
+    query:
+      protocol: ldap
+      base: 'CN=Certificate Templates,CN=Public Key Services,CN=Services,{CONFIGDN}'
+      scope: onelevel
+      filter: '(objectClass=pKICertificateTemplate)'
+      attributes: [cn, displayName, nTSecurityDescriptor]
+      key: cn
+      name: displayName
+    each:
+      any:
+        - { field: nTSecurityDescriptor.noDacl, op: eq, value: true }
+        - element:
+            of: nTSecurityDescriptor.dacl
+            match: any
+            where:
+              all:
+                - { field: type, op: in, value: [allow, allow-object] }
+                - { field: trustee, op: sid-in, value: [everyone, anonymous, authenticated-users, domain-users, domain-computers, builtin-users] }
+                - any:
+                    - { field: rights, op: contains, value: GenericAll }
+                    - { field: rights, op: contains, value: WriteDacl }
+                    - { field: rights, op: contains, value: WriteOwner }
+                    - { field: rights, op: contains, value: GenericWrite }
+                    - all:
+                        - { field: type, op: eq, value: allow }
+                        - { field: rights, op: contains, value: WriteProperty }
+    evidence: "{displayName} ({cn}) - a broad principal can modify the template"
+
+  - id: ADCS-TPL-OWNER-BROAD
+    title: Certificate template is owned by a broad or low-privileged principal (ESC4)
+    severity: high
+    why: The owner of a template object can rewrite its DACL whatever the DACL says, so a template owned by a broad or low-privileged principal is one step from an ESC1 template even when the DACL looks clean (ESC4 through ownership).
+    fix: Reset the template owner to Enterprise Admins, Domain Admins or a named PKI administration group.
+    refs: [MITRE-ATTACK:T1649, NIST-800-53:AC-6, ADCS:ESC4]
+    query:
+      protocol: ldap
+      base: 'CN=Certificate Templates,CN=Public Key Services,CN=Services,{CONFIGDN}'
+      scope: onelevel
+      filter: '(objectClass=pKICertificateTemplate)'
+      attributes: [cn, displayName, nTSecurityDescriptor]
+      key: cn
+      name: displayName
+    each: { field: nTSecurityDescriptor.owner, op: sid-in, value: [everyone, anonymous, authenticated-users, domain-users, domain-computers, builtin-users] }
+    evidence: "{displayName} ({cn}) - owner {nTSecurityDescriptor.owner}"
+
+  - id: ADCS-TPL-AUTOENROLL-BROAD-AUTH
+    title: Authentication template auto-enrolls to a broad principal without approval
+    severity: high
+    why: The Autoenroll right lets its holder silently request and renew the certificate, and it implies Enroll; granted to a broad principal on an authentication template that needs no approval, every user or computer in that principal is issued a logon certificate without anyone asking (an ESC1-style path that the enrollment ACL, not just the enrollment flag, confirms).
+    fix: Remove Autoenroll (and Enroll) for broad principals from authentication templates, or require manager approval; scope auto-enrollment to the group that needs it.
+    refs: [MITRE-ATTACK:T1649, NIST-800-53:IA-5(2), NIST-800-53:AC-6, ADCS:ESC1]
+    query:
+      protocol: ldap
+      base: 'CN=Certificate Templates,CN=Public Key Services,CN=Services,{CONFIGDN}'
+      scope: onelevel
+      filter: '(objectClass=pKICertificateTemplate)'
+      attributes: [cn, displayName, msPKI-Enrollment-Flag, msPKI-RA-Signature, pKIExtendedKeyUsage, msPKI-Certificate-Application-Policy, nTSecurityDescriptor]
+      key: cn
+      name: displayName
+    each:
+      all:
+        - any:
+            - { field: msPKI-Enrollment-Flag, op: absent }
+            - { field: msPKI-Enrollment-Flag, op: noflag, value: 2 }
+        - any:
+            - { field: msPKI-RA-Signature, op: absent }
+            - { field: msPKI-RA-Signature, op: eq, value: 0 }
+        - any:
+            - { field: pKIExtendedKeyUsage, op: match, value: '^(1\.3\.6\.1\.5\.5\.7\.3\.2|1\.3\.6\.1\.5\.2\.3\.4|1\.3\.6\.1\.4\.1\.311\.20\.2\.2|2\.5\.29\.37\.0)$' }
+            - { field: msPKI-Certificate-Application-Policy, op: match, value: '^(1\.3\.6\.1\.5\.5\.7\.3\.2|1\.3\.6\.1\.5\.2\.3\.4|1\.3\.6\.1\.4\.1\.311\.20\.2\.2|2\.5\.29\.37\.0)$' }
+        - element:
+            of: nTSecurityDescriptor.dacl
+            match: any
+            where:
+              all:
+                - { field: type, op: in, value: [allow, allow-object] }
+                - { field: trustee, op: sid-in, value: [everyone, anonymous, authenticated-users, domain-users, domain-computers, builtin-users] }
+                - any:
+                    - { field: rights, op: contains, value: GenericAll }
+                    - all:
+                        - { field: rights, op: contains, value: ExtendedRight }
+                        - { field: objectTypeName, op: eq, value: Certificate-AutoEnrollment }
+    evidence: "{displayName} ({cn}) - broad autoenrollment on an authentication template"
+
+  - id: ADCS-CA-ACL-WRITE-BROAD
+    title: Enrollment service (CA) object can be rewritten by a broad or low-privileged principal (ESC7)
+    severity: high
+    entity: domain
+    why: Write access to the enrollment-service object in the directory lets the holder change which templates the CA publishes and the CA's own attributes; granted to a broad or low-privileged principal it is the directory-side of an ESC7 takeover, one change away from publishing a dangerous template. The CA's Manage CA and Issue and Manage Certificates rights live in the CA registry and are not readable here.
+    fix: Remove GenericAll, WriteDacl, WriteOwner and GenericWrite for broad or low-privileged principals from the enrollment-service object; keep it to Enterprise Admins or a named PKI administration group.
+    refs: [MITRE-ATTACK:T1649, NIST-800-53:AC-6, NIST-800-53:AC-5, ADCS:ESC7]
+    query:
+      protocol: ldap
+      base: 'CN=Enrollment Services,CN=Public Key Services,CN=Services,{CONFIGDN}'
+      scope: onelevel
+      filter: '(objectClass=pKIEnrollmentService)'
+      attributes: [cn, dNSHostName, nTSecurityDescriptor]
+      key: cn
+      name: dNSHostName
+    each:
+      any:
+        - { field: nTSecurityDescriptor.noDacl, op: eq, value: true }
+        - element:
+            of: nTSecurityDescriptor.dacl
+            match: any
+            where:
+              all:
+                - { field: type, op: in, value: [allow, allow-object] }
+                - { field: trustee, op: sid-in, value: [everyone, anonymous, authenticated-users, domain-users, domain-computers, builtin-users] }
+                - any:
+                    - { field: rights, op: contains, value: GenericAll }
+                    - { field: rights, op: contains, value: WriteDacl }
+                    - { field: rights, op: contains, value: WriteOwner }
+                    - { field: rights, op: contains, value: GenericWrite }
+    evidence: "{cn} on {dNSHostName} - a broad principal can modify the enrollment service object"
+
+  - id: ADCS-TEMPLATES-CONTAINER-ACL-WRITE-BROAD
+    title: Certificate Templates container can be written by a broad or low-privileged principal (ESC5)
+    severity: high
+    entity: domain
+    why: Create-child or write rights on the Certificate Templates container let the holder add a new template or re-permission the container, which is write access to every template that will ever live under it - an ESC5 foothold in the PKI configuration (ESC5).
+    fix: Remove CreateChild, GenericAll, WriteDacl and WriteOwner for broad or low-privileged principals from the Certificate Templates container; keep it to Enterprise Admins or a named PKI administration group.
+    refs: [MITRE-ATTACK:T1649, NIST-800-53:AC-6, ADCS:ESC5]
+    query:
+      protocol: ldap
+      base: 'CN=Certificate Templates,CN=Public Key Services,CN=Services,{CONFIGDN}'
+      scope: base
+      filter: '(objectClass=container)'
+      attributes: [cn, nTSecurityDescriptor]
+      key: cn
+    each:
+      any:
+        - { field: nTSecurityDescriptor.noDacl, op: eq, value: true }
+        - element:
+            of: nTSecurityDescriptor.dacl
+            match: any
+            where:
+              all:
+                - { field: type, op: in, value: [allow, allow-object] }
+                - { field: trustee, op: sid-in, value: [everyone, anonymous, authenticated-users, domain-users, domain-computers, builtin-users] }
+                - any:
+                    - { field: rights, op: contains, value: GenericAll }
+                    - { field: rights, op: contains, value: WriteDacl }
+                    - { field: rights, op: contains, value: WriteOwner }
+                    - { field: rights, op: contains, value: GenericWrite }
+                    - { field: rights, op: contains, value: CreateChild }
+    evidence: "{cn} - a broad principal can write the Certificate Templates container"
+
+  # ---------------------------------------------------------------- more template flags (ESC1 for servers, ESC15 at the template)
+
+  - id: ADCS-TPL-SERVER-SUPPLY-SUBJECT
+    title: Server template lets the requester name the subject and SAN without approval
+    severity: high
+    why: A server-authentication template where the requester supplies the subject (and so the SAN) and no approval or signature is required lets anyone allowed to enroll obtain a trusted TLS certificate for any internal name, so they can impersonate or intercept that service. Default templates with administrator-only enrollment are left to the CA rules.
+    fix: Build the subject from the directory instead, or require manager approval or an authorised signature; restrict enrollment to the accounts that need server certificates.
+    refs: [MITRE-ATTACK:T1649, NIST-800-53:IA-5(2), NIST-800-53:SC-8, ADCS:ESC1]
+    query:
+      protocol: ldap
+      base: 'CN=Certificate Templates,CN=Public Key Services,CN=Services,{CONFIGDN}'
+      scope: onelevel
+      filter: '(objectClass=pKICertificateTemplate)'
+      attributes: [cn, displayName, msPKI-Certificate-Name-Flag, msPKI-Enrollment-Flag, msPKI-RA-Signature, pKIExtendedKeyUsage, msPKI-Certificate-Application-Policy]
+      key: cn
+      name: displayName
+    each:
+      all:
+        - { field: cn, op: notin, value: [CA, SubCA, CrossCA, OfflineRouter, CEPEncryption, EnrollmentAgent, EnrollmentAgentOffline, MachineEnrollmentAgent, IPSECIntermediateOffline, WebServer] }
+        - { field: msPKI-Certificate-Name-Flag, op: flag, value: 1 }
+        - any:
+            - { field: msPKI-Enrollment-Flag, op: absent }
+            - { field: msPKI-Enrollment-Flag, op: noflag, value: 2 }
+        - any:
+            - { field: msPKI-RA-Signature, op: absent }
+            - { field: msPKI-RA-Signature, op: eq, value: 0 }
+        - any:
+            - { field: pKIExtendedKeyUsage, op: match, value: '^1\.3\.6\.1\.5\.5\.7\.3\.1$' }
+            - { field: msPKI-Certificate-Application-Policy, op: match, value: '^1\.3\.6\.1\.5\.5\.7\.3\.1$' }
+    evidence: "{displayName} ({cn}) - name flag {msPKI-Certificate-Name-Flag}, server-auth EKU"
+
+  - id: ADCS-TPL-SCHEMA-V1-SUPPLY-SUBJECT
+    title: Schema version 1 template accepts a requester-supplied subject
+    severity: low
+    why: A schema-version-1 template cannot be edited and, when it lets the requester supply the subject, accepts the application policies the request carries, so on a CA without the November 2024 fix a server certificate becomes a logon certificate (EKUwu, ESC15). Default templates are left to the CA rules.
+    fix: Duplicate the template to schema version 2 or later, supersede and unpublish the version-1 template, and patch the CA; restrict who may enroll.
+    refs: [CVE-2024-49019, MITRE-ATTACK:T1649, ADCS:ESC15]
+    query:
+      protocol: ldap
+      base: 'CN=Certificate Templates,CN=Public Key Services,CN=Services,{CONFIGDN}'
+      scope: onelevel
+      filter: '(objectClass=pKICertificateTemplate)'
+      attributes: [cn, displayName, msPKI-Certificate-Name-Flag, msPKI-Enrollment-Flag, msPKI-Template-Schema-Version]
+      key: cn
+      name: displayName
+    each:
+      all:
+        - { field: cn, op: notin, value: [CA, SubCA, CrossCA, OfflineRouter, CEPEncryption, EnrollmentAgent, EnrollmentAgentOffline, MachineEnrollmentAgent, IPSECIntermediateOffline, WebServer] }
+        - { field: msPKI-Certificate-Name-Flag, op: flag, value: 1 }
+        - any:
+            - { field: msPKI-Template-Schema-Version, op: absent }
+            - { field: msPKI-Template-Schema-Version, op: eq, value: 1 }
+        - any:
+            - { field: msPKI-Enrollment-Flag, op: absent }
+            - { field: msPKI-Enrollment-Flag, op: noflag, value: 2 }
+    evidence: "{displayName} ({cn}) - schema version {msPKI-Template-Schema-Version}, enrollee supplies subject"
+
+  # ---------------------------------------------------------------- trust anchors in the directory (NTAuth, root store)
+
+  - id: ADCS-TRUST-ANCHOR-RECENTLY-CHANGED
+    title: A certification authority object in the directory changed in the last week
+    category: MON
+    severity: high
+    entity: domain
+    why: The certificationAuthority objects under Public Key Services (Certification Authorities, AIA and NTAuthCertificates) are pushed to every domain member as trust; adding one to the root store makes every PC trust a new issuer, and adding one to NTAuthCertificates lets certificates it issues be used for smart-card and PKINIT logon across the forest. The query looks back 30 days at most, so adcs.pki-change-days above 30 has no effect. The certificate bytes themselves (cACertificate) are binary and dropped, so validity and key strength are a separate, out-of-band check.
+    fix: Match the change against the PKI change log; if nobody added or renewed a CA, treat it as an incident and confirm which issuer was trusted and for what.
+    refs: [MITRE-ATTACK:T1649, NIST-800-53:CM-3, NIST-800-53:AU-12, NIST-800-53:SC-17]
+    query:
+      protocol: ldap
+      base: 'CN=Public Key Services,CN=Services,{CONFIGDN}'
+      filter: '(&(objectClass=certificationAuthority)(whenChanged>={GT:30}))'
+      attributes: [cn, objectClass, whenChanged]
+      key: distinguishedName
+      name: cn
+    each: { field: whenChanged, op: age-lt, value: 7, threshold: adcs.pki-change-days }
+    evidence: "{cn} - trust anchor object changed {whenChanged}"

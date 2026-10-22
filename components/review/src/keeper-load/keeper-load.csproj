@@ -1,8 +1,6 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
-    <OutputType>Exe</OutputType>
-    <AssemblyName>keeper-load</AssemblyName>
-    <RootNamespace>Keeper.Cli.Load</RootNamespace>
+    <AssemblyName>Keeper.Cli.Load</AssemblyName>
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="..\Keeper.Review\Keeper.Review.csproj" />

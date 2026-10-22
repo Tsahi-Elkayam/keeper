@@ -122,6 +122,31 @@ rules:
         - { field: userPrincipalName, op: empty }
     evidence: "{deviceName} ({operatingSystem}, serial {serialNumber}): no primary user"
 
+  - id: INTUNE-DEVICE-DUPLICATE-SERIAL
+    title: More than one managed-device record for one serial number
+    kind: misconfigured
+    category: HYG
+    severity: medium
+    entity: managed-device
+    why: "A device that was reset, re-enrolled or reimaged without its old record being retired appears twice: the stale record keeps its last compliance state, primary user and licence, inflates device counts, and can be the one an admin wipes or trusts by mistake. Placeholder serials that firmware or virtual machines report (empty, zeros, 'Default string', 'To be filled by O.E.M.', 'System Serial Number') are left out."
+    fix: "Compare the records' last sync dates, retire or delete the stale one, and set a device clean-up rule so records that stop syncing are removed automatically."
+    refs: ["NIST-800-53:CM-8", "NIST-800-53:CM-8(3)"]
+    query:
+      protocol: graph
+      path: /deviceManagement/managedDevices
+      select: [id, deviceName, operatingSystem, osVersion, complianceState, lastSyncDateTime, enrolledDateTime, jailBroken, isEncrypted, managedDeviceOwnerType, managementAgent, userPrincipalName, managementCertificateExpirationDate, partnerReportedThreatState, androidSecurityPatchLevel, complianceGracePeriodExpirationDateTime, serialNumber, model, isSupervised]
+      key: id
+      name: deviceName
+    count:
+      op: gt
+      value: 1
+      by: serialNumber
+      where:
+        all:
+          - { field: serialNumber, op: notempty }
+          - { field: serialNumber, op: notmatch, value: '^\s*(0+|none|n/?a|unknown|default string|to be filled by o\.e\.m\.|system serial number|chassis serial number)\s*$' }
+    evidence: "serial {group}: {count} managed-device records"
+
   - id: INTUNE-DEVICE-ANDROID-DEVICE-ADMIN
     title: Android device is managed through legacy device administrator
     kind: misconfigured

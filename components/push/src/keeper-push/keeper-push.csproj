@@ -1,8 +1,6 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
-    <OutputType>Exe</OutputType>
-    <AssemblyName>keeper-push</AssemblyName>
-    <RootNamespace>Keeper.Cli.Push</RootNamespace>
+    <AssemblyName>Keeper.Cli.Push</AssemblyName>
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="..\Keeper.Push\Keeper.Push.csproj" />

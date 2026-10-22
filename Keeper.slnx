@@ -26,6 +26,7 @@
     <Project Path="components/review/src/Keeper.Review.Cli/Keeper.Review.Cli.csproj" />
     <Project Path="components/review/src/keeper-decide/keeper-decide.csproj" />
     <Project Path="components/review/src/keeper-system/keeper-system.csproj" />
+    <Project Path="components/review/src/keeper-config/keeper-config.csproj" />
     <Project Path="components/review/src/keeper-register/keeper-register.csproj" />
     <Project Path="components/review/tests/Keeper.Review.Tests/Keeper.Review.Tests.csproj" />
   </Folder>

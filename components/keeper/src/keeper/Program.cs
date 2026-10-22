@@ -4,28 +4,32 @@ using System.Text.RegularExpressions;
 using Keeper.Common;
 using Keeper.Home;
 
-// keeper <verb> ...: the front door. Each verb is its own binary beside this one (keeper-<verb>);
-// a word that is not a verb is taken as a question for keeper-query. setup and help live here.
-var verbs = new Dictionary<string, string>(StringComparer.Ordinal)
+// keeper <verb> ...: the one binary. Every verb runs in this process; a word that is not a verb is
+// taken as a question (keeper broken == keeper query broken). setup and help live here.
+var verbs = new (string Name, string What, Func<string[], int> Run)[]
 {
-    ["run"] = "the daily pipeline: scan, load, track, rank, then today's list",
-    ["today"] = "what to do today",
-    ["scan"] = "scan one system through its integration (read-only towards it)",
-    ["certs"] = "which certificates a server presents, valid or not, until when (you start it)",
-    ["load"] = "queue the scans the store has not taken in",
-    ["track"] = "turn the newest scans into the findings register",
-    ["rank"] = "order the open findings into today's list",
-    ["qm"] = "the queue manager, the only writer of the store",
-    ["query"] = "answer a named question (keeper query list)",
-    ["report"] = "summary, security, expiring, changes, trends, finance and evidence reports",
-    ["decide"] = "snooze, delegate, accept or disable a finding; set a threshold",
-    ["system"] = "the systems Keeper knows and what maps to them",
-    ["register"] = "vendors, contracts, licences, key dates, initiatives",
-    ["integration"] = "how Keeper reaches each system, and its encrypted secrets",
-    ["rules"] = "validate, list and explain rule files",
-    ["push"] = "open tickets for delegated findings (plan, apply, sync)",
-    ["db"] = "the store: status, init, migrate, backup",
+    ("run", "the daily pipeline: scan, load, track, rank, then today's list", RunVerb.Run),
+    ("today", "what to do today", TodayVerb.Run),
+    ("scan", "scan one system through its integration (read-only towards it)", ScanVerb.Run),
+    ("certs", "which certificates a server presents, valid or not, until when (you start it)", CertsVerb.Run),
+    ("load", "queue the scans the store has not taken in", LoadVerb.Run),
+    ("track", "turn the newest scans into the findings register", TrackVerb.Run),
+    ("rank", "order the open findings into today's list", RankVerb.Run),
+    ("qm", "the queue manager, the only writer of the store", QmVerb.Run),
+    ("query", "answer a named question (keeper query list)", QueryVerb.Run),
+    ("report", "posture, summary, security, expiring, changes, trends, finance and evidence reports", ReportVerb.Run),
+    ("ui", "the interactive page: everything Keeper knows, in one file you open in a browser", args => ReportVerb.Run(["ui", .. args])),
+    ("decide", "snooze, delegate, accept or disable a finding; set a threshold", DecideVerb.Run),
+    ("system", "the systems Keeper knows and what maps to them", SystemVerb.Run),
+    ("register", "vendors, contracts, licences, key dates, initiatives", RegisterVerb.Run),
+    ("integration", "how Keeper reaches each system, and its encrypted secrets", IntegrationVerb.Run),
+    ("config", "export and import the client configuration as files (systems, settings, overrides, registers, integrations)", ConfigVerb.Run),
+    ("rules", "validate, list and explain rule files", RulesVerb.Run),
+    ("push", "open tickets for delegated findings (plan, apply, sync)", PushVerb.Run),
+    ("db", "the store: status, init, migrate, backup", DbVerb.Run),
 };
+foreach (var (name, _, run) in verbs)
+    Commands.Add(name, run);
 
 try
 {
@@ -47,13 +51,9 @@ try
         Console.Error.WriteLine($"'{verb}' is not a keeper verb. 'keeper help' lists them.");
         return ExitCodes.Usage;
     }
-    if (Siblings.Exists("keeper-" + verb))
-        return Siblings.Run("keeper-" + verb, rest);
-    if (Siblings.Exists("keeper-query"))
-        return Siblings.Run("keeper-query", args);   // a question: keeper broken == keeper query broken
-
-    Console.Error.WriteLine($"No keeper-{verb} beside keeper in {Siblings.Folder}. 'keeper help' lists the verbs.");
-    return ExitCodes.Usage;
+    return Commands.Exists(verb)
+        ? Commands.Run(verb, rest)
+        : Commands.Run("query", args);   // a question: keeper broken == keeper query broken
 }
 catch (Exception ex) when (ex is SettingsException or ArgumentException)
 {
@@ -66,23 +66,21 @@ catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
     return ExitCodes.Failed;
 }
 
-static int Help(Dictionary<string, string> verbs)
+static int Help((string Name, string What, Func<string[], int> Run)[] verbs)
 {
     Console.WriteLine("""
         keeper - tells you what to do today
 
           keeper setup --tenant <name> [--apply]   create the Keeper home and the store (dry run without --apply)
         """);
-    foreach (var (verb, what) in verbs)
-    {
-        var present = Siblings.Exists("keeper-" + verb) ? "" : "  (not in this build)";
-        Console.WriteLine($"  keeper {verb,-12} {what}{present}");
-    }
+    foreach (var (verb, what, _) in verbs)
+        Console.WriteLine($"  keeper {verb,-12} {what}");
     Console.WriteLine("""
 
           keeper <question>      any question from 'keeper query list', e.g. keeper broken, keeper expiring
+          keeper <verb> --help   the verb's own flags
 
-        Every binary reads the Keeper home: KEEPER_HOME, else the keeper folder's home\ (git ignores it).
+        Every verb reads the Keeper home: KEEPER_HOME, else the keeper folder's home\ (git ignores it).
         --settings <file> points one command at another home's settings.json.
         """);
     return ExitCodes.Ok;
@@ -168,11 +166,6 @@ static int Setup(CliArgs cli)
         Console.WriteLine($"Wrote {denyList} - add your identifiers.");
     }
 
-    if (!Siblings.Exists("keeper-db"))
-    {
-        Console.WriteLine("keeper-db is not in this build: run 'keeper-db init --apply' from a full build.");
-        return ExitCodes.NoData;
-    }
     var settingsArgs = new[] { "--settings", settingsFile };
-    return Siblings.Run("keeper-db", [File.Exists(Path.Combine(home, "data", "keeper.db")) ? "migrate" : "init", "--apply", .. settingsArgs]);
+    return Commands.Run("db", [File.Exists(Path.Combine(home, "data", "keeper.db")) ? "migrate" : "init", "--apply", .. settingsArgs]);
 }

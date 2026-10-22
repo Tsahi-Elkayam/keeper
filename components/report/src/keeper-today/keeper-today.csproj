@@ -1,8 +1,6 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
-    <OutputType>Exe</OutputType>
-    <AssemblyName>keeper-today</AssemblyName>
-    <RootNamespace>Keeper.Cli.Today</RootNamespace>
+    <AssemblyName>Keeper.Cli.Today</AssemblyName>
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="..\Keeper.Report\Keeper.Report.csproj" />

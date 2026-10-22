@@ -1,0 +1,2191 @@
+schema: keeper.rules/1
+system: group-policy
+name: Group Policy (SYSVOL content)
+integration: ldap
+
+# What Group Policy objects configure, read from the domain's SYSVOL by the gpo runner: Registry.pol,
+# GptTmpl.inf, audit.csv, Group Policy Preferences XML and GPT.INI. The directory side of each GPO
+# (flags, links, ACLs, extension lists) is in rules/active-directory.yaml (AD-GPO-*); host state is in
+# windows-baseline.yaml. A finding says a GPO SETS something; where it is linked is not known here
+# (docs/backlog/group-policy.md). Findings name the GPO by GUID; AD-GPO-* rows give its display name.
+#
+# Conditions first match the setting (_file / key / section, present on every row) so rows about other
+# settings pass cleanly; optional fields are guarded with exists. Principals are matched as text
+# (well-known SIDs and English names) so a member written by name is still judged.
+
+defaults:
+  kind: misconfigured
+  lens: security
+  refresh: 1d
+  entity: gpo-preference
+
+rules:
+
+  # ================================================================ 1. stored credentials in preferences
+
+  - id: GPO-GPP-CPASSWORD-LOCAL-USER
+    title: Local user preference stores a password
+    category: IAM
+    severity: critical
+    why: A preference password (cpassword) is readable by every domain user and protected only by a publicly known key, so the local account it sets is effectively disclosed on every computer in scope.
+    fix: Remove the password from the item, change that account's password on the affected computers, and manage local administrator passwords with Windows LAPS.
+    refs: [MITRE-ATTACK:T1552.006, MS-KB:2962486, NIST-800-53:IA-5(7)]
+    query: { protocol: gpo, part: preferences, scope: both, key: '{gpo}|{_file}|{uid}|{name}', name: gpo }
+    each:
+      all:
+        - { field: _file, op: match, value: '\\Preferences\\Groups\\' }
+        - { field: Properties.cpassword, op: exists }
+        - { field: Properties.cpassword, op: eq, value: set }
+    evidence: '{gpo} {_file}: item "{name}" (account {Properties.userName}) has a stored password'
+
+  - id: GPO-GPP-CPASSWORD-DRIVE-MAP
+    title: Drive map preference stores a password
+    category: IAM
+    severity: critical
+    why: The drive map's account password is stored in SYSVOL where every domain user can read it.
+    fix: Remove the account and password from the item, change the password, and grant users access to the share directly.
+    refs: [MITRE-ATTACK:T1552.006, MS-KB:2962486, NIST-800-53:IA-5(7)]
+    query: { protocol: gpo, part: preferences, scope: both, key: '{gpo}|{_file}|{uid}|{name}', name: gpo }
+    each:
+      all:
+        - { field: _file, op: match, value: '\\Preferences\\Drives\\' }
+        - { field: Properties.cpassword, op: exists }
+        - { field: Properties.cpassword, op: eq, value: set }
+    evidence: '{gpo} {_file}: drive "{name}" connects as {Properties.userName} with a stored password'
+
+  - id: GPO-GPP-CPASSWORD-SCHEDULED-TASK
+    title: Scheduled task preference stores a password
+    category: IAM
+    severity: critical
+    why: The task account's password is stored in SYSVOL where every domain user can read it; such accounts often hold more rights than the task needs.
+    fix: Remove the password from the item, change it, and run the task as SYSTEM or a group managed service account.
+    refs: [MITRE-ATTACK:T1552.006, MS-KB:2962486, NIST-800-53:IA-5(7)]
+    query: { protocol: gpo, part: preferences, scope: both, key: '{gpo}|{_file}|{uid}|{name}', name: gpo }
+    each:
+      all:
+        - { field: _file, op: match, value: '\\Preferences\\ScheduledTasks\\' }
+        - { field: Properties.cpassword, op: exists }
+        - { field: Properties.cpassword, op: eq, value: set }
+    evidence: '{gpo} {_file}: task "{name}" runs as {Properties.runAs} with a stored password'
+
+  - id: GPO-GPP-CPASSWORD-SERVICE
+    title: Service preference stores a password
+    category: IAM
+    severity: critical
+    why: The service logon account's password is stored in SYSVOL where every domain user can read it.
+    fix: Remove the password from the item, change it, and move the service to a group managed service account or a virtual account.
+    refs: [MITRE-ATTACK:T1552.006, MS-KB:2962486, NIST-800-53:IA-5(7)]
+    query: { protocol: gpo, part: preferences, scope: both, key: '{gpo}|{_file}|{uid}|{name}', name: gpo }
+    each:
+      all:
+        - { field: _file, op: match, value: '\\Preferences\\Services\\' }
+        - { field: Properties.cpassword, op: exists }
+        - { field: Properties.cpassword, op: eq, value: set }
+    evidence: '{gpo} {_file}: service "{name}" logs on as {Properties.accountName} with a stored password'
+
+  - id: GPO-GPP-CPASSWORD-DATA-SOURCE
+    title: Data source preference stores a password
+    category: IAM
+    severity: critical
+    why: The database login's password is stored in SYSVOL where every domain user can read it.
+    fix: Remove the login from the item, change the database password, and use integrated authentication.
+    refs: [MITRE-ATTACK:T1552.006, MS-KB:2962486, NIST-800-53:IA-5(7)]
+    query: { protocol: gpo, part: preferences, scope: both, key: '{gpo}|{_file}|{uid}|{name}', name: gpo }
+    each:
+      all:
+        - { field: _file, op: match, value: '\\Preferences\\DataSources\\' }
+        - { field: Properties.cpassword, op: exists }
+        - { field: Properties.cpassword, op: eq, value: set }
+    evidence: '{gpo} {_file}: data source "{name}" logs in as {Properties.username} with a stored password'
+
+  - id: GPO-GPP-CPASSWORD-PRINTER
+    title: Printer preference stores a password
+    category: IAM
+    severity: critical
+    why: The printer connection account's password is stored in SYSVOL where every domain user can read it.
+    fix: Remove the account and password from the item, change the password, and let users connect as themselves.
+    refs: [MITRE-ATTACK:T1552.006, MS-KB:2962486, NIST-800-53:IA-5(7)]
+    query: { protocol: gpo, part: preferences, scope: both, key: '{gpo}|{_file}|{uid}|{name}', name: gpo }
+    each:
+      all:
+        - { field: _file, op: match, value: '\\Preferences\\Printers\\' }
+        - { field: Properties.cpassword, op: exists }
+        - { field: Properties.cpassword, op: eq, value: set }
+    evidence: '{gpo} {_file}: printer "{name}" connects as {Properties.username} with a stored password'
+
+  - id: GPO-GPP-CPASSWORD-OTHER
+    title: Other preference item stores a password
+    category: IAM
+    severity: critical
+    why: A stored preference password in any other file (network options, a copied or hand-edited XML) is just as readable by every domain user.
+    fix: Remove the password from the item, change it, and delete stray XML copies from the GPO folder.
+    refs: [MITRE-ATTACK:T1552.006, MS-KB:2962486, NIST-800-53:IA-5(7)]
+    query: { protocol: gpo, part: preferences, scope: both, key: '{gpo}|{_file}|{uid}|{name}', name: gpo }
+    each:
+      all:
+        - { field: _file, op: notmatch, value: '\\Preferences\\(Groups|Drives|ScheduledTasks|Services|DataSources|Printers)\\' }
+        - { field: Properties.cpassword, op: exists }
+        - { field: Properties.cpassword, op: eq, value: set }
+    evidence: '{gpo} {_file}: item "{name}" has a stored password'
+
+  - id: GPO-GPP-REGISTRY-SECRET-VALUE
+    title: Registry preference writes a secret-named text value
+    category: IAM
+    severity: high
+    why: Text written under a name such as DefaultPassword or a shared secret is stored in clear in SYSVOL, readable by every domain user. Keeper keeps only "set".
+    fix: Remove the item, change the secret it carried, and deliver it through a protected store instead of Group Policy.
+    refs: [MITRE-ATTACK:T1552.006, NIST-800-53:IA-5(7)]
+    query: { protocol: gpo, part: preferences, scope: both, key: '{gpo}|{_file}|{uid}|{name}', name: gpo }
+    each:
+      all:
+        - { field: _file, op: match, value: '\\Preferences\\Registry\\' }
+        - { field: Properties.value, op: exists }
+        - { field: Properties.value, op: eq, value: set }
+    evidence: '{gpo} {_file}: {Properties.hive}\{Properties.key}\{Properties.name} is written with a secret value'
+
+  - id: GPO-GPP-REGISTRY-AUTOLOGON
+    title: Registry preference turns on automatic logon
+    category: IAM
+    severity: high
+    why: Automatic logon keeps an account's password on the computer and opens a session for anyone at the console.
+    fix: Remove the item; use assigned access or a kiosk profile for unattended devices.
+    refs: [MITRE-ATTACK:T1552.002, CIS-Microsoft-Windows:18.5.1]
+    query: { protocol: gpo, part: preferences, scope: both, key: '{gpo}|{_file}|{uid}|{name}', name: gpo }
+    each:
+      all:
+        - { field: _file, op: match, value: '\\Preferences\\Registry\\' }
+        - { field: Properties.key, op: match, value: '\\Windows NT\\CurrentVersion\\Winlogon$' }
+        - { field: Properties.name, op: eq, value: AutoAdminLogon }
+        - { field: Properties.value, op: match, value: '^0*1$' }
+    evidence: '{gpo} {_file}: Winlogon AutoAdminLogon = {Properties.value}'
+
+  - id: GPO-GPP-ENV-SECRET-VALUE
+    title: Environment variable preference carries a secret
+    category: IAM
+    severity: high
+    why: A secret-named environment variable is stored in clear in SYSVOL and exposed to every process on the computers in scope.
+    fix: Remove the variable, change the secret, and give the application its credential through a protected store.
+    refs: [MITRE-ATTACK:T1552.001, NIST-800-53:IA-5(7)]
+    query: { protocol: gpo, part: preferences, scope: both, key: '{gpo}|{_file}|{uid}|{name}', name: gpo }
+    each:
+      all:
+        - { field: _file, op: match, value: '\\Preferences\\EnvironmentVariables\\' }
+        - { field: Properties.value, op: exists }
+        - { field: Properties.value, op: eq, value: set }
+    evidence: '{gpo} {_file}: variable {Properties.name} carries a secret value'
+
+  - id: GPO-GPP-INI-SECRET-VALUE
+    title: INI file preference writes a secret
+    category: IAM
+    severity: high
+    why: A password-like INI property is stored in clear in SYSVOL and in a file on every computer in scope.
+    fix: Remove the item, change the secret, and let the application read it from a protected store.
+    refs: [MITRE-ATTACK:T1552.001, NIST-800-53:IA-5(7)]
+    query: { protocol: gpo, part: preferences, scope: both, key: '{gpo}|{_file}|{uid}|{name}', name: gpo }
+    each:
+      all:
+        - { field: _file, op: match, value: '\\Preferences\\IniFiles\\' }
+        - { field: Properties.value, op: exists }
+        - { field: Properties.value, op: eq, value: set }
+    evidence: '{gpo} {_file}: {Properties.path} [{Properties.section}] {Properties.property} carries a secret value'
+
+  - id: GPO-GPP-TASK-ARGS-CREDENTIAL
+    title: Scheduled task arguments may carry a credential
+    category: IAM
+    severity: medium
+    why: The task's arguments look like they contain a password, token or secret (Keeper masks them as "set"; the pattern is broad, so some are false matches). A real credential there is stored in clear in SYSVOL and shows in process lists and logs.
+    fix: Review the arguments; if they hold a credential, remove it, change it, and let the task authenticate as its own identity.
+    refs: [MITRE-ATTACK:T1552.006, NIST-800-53:IA-5(7)]
+    query: { protocol: gpo, part: preferences, scope: both, key: '{gpo}|{_file}|{uid}|{name}', name: gpo }
+    each:
+      all:
+        - { field: _file, op: match, value: '\\Preferences\\ScheduledTasks\\' }
+        - any:
+            - all: [ { field: Properties.args, op: exists }, { field: Properties.args, op: eq, value: set } ]
+            - all: [ { field: Properties.Task.Actions.Exec.Arguments, op: exists }, { field: Properties.Task.Actions.Exec.Arguments, op: eq, value: set } ]
+            - all: [ { field: 'Properties.Task.Actions.Exec[].Arguments', op: exists }, { field: 'Properties.Task.Actions.Exec[].Arguments', op: eq, value: set } ]
+    evidence: '{gpo} {_file}: task "{name}" arguments may carry a credential'
+
+  - id: GPO-GPP-DRIVE-FIXED-ACCOUNT
+    title: Drive map preference connects as a fixed account
+    category: IAM
+    severity: low
+    why: A shared connection account means access to the share is not tied to the person using it.
+    fix: Clear the user name and grant the users or their group rights on the share.
+    refs: [NIST-800-53:AC-2, NIST-800-53:IA-2]
+    query: { protocol: gpo, part: preferences, scope: both, key: '{gpo}|{_file}|{uid}|{name}', name: gpo }
+    each:
+      all:
+        - { field: _file, op: match, value: '\\Preferences\\Drives\\' }
+        - { field: Properties.userName, op: notempty }
+        - any:
+            - { field: Properties.cpassword, op: absent }
+            - { field: Properties.cpassword, op: ne, value: set }
+    evidence: '{gpo} {_file}: drive "{name}" connects as {Properties.userName}'
+
+  # ================================================================ 2. local group membership pushed by GPO
+
+  - id: GPO-GPP-ADMINS-BROAD-MEMBER
+    title: Preference adds a broad group to local Administrators
+    category: IAM
+    severity: critical
+    why: Every account in Everyone, Authenticated Users, Domain Users, Users or a similar group becomes an administrator of every computer in scope.
+    fix: Remove the member and grant local administration to a small, reviewed admin group; use LAPS for break-glass access.
+    refs: [MITRE-ATTACK:T1098, NIST-800-53:AC-6(5), CIS-Controls-v8:5.4]
+    query: { protocol: gpo, part: preferences, scope: both, key: '{gpo}|{_file}|{uid}|{name}', name: gpo }
+    each:
+      all:
+        - { field: _file, op: match, value: '\\Preferences\\Groups\\' }
+        - any:
+            - all: [ { field: Properties.groupSid, op: exists }, { field: Properties.groupSid, op: eq, value: S-1-5-32-544 } ]
+            - { field: name, op: match, value: '^(BUILTIN\\)?Administrators( \(built-in\))?$' }
+            - all: [ { field: Properties.groupName, op: exists }, { field: Properties.groupName, op: match, value: '^(BUILTIN\\)?Administrators( \(built-in\))?$' } ]
+        - { field: Properties.Members.Member, op: exists }
+        - element:
+            of: Properties.Members.Member
+            where:
+              all:
+                - { field: action, op: eq, value: ADD }
+                - any:
+                    - all: [ { field: sid, op: exists }, { field: sid, op: match, value: '^(S-1-1-0|S-1-5-11|S-1-5-4|S-1-5-32-545|S-1-5-21-\d+-\d+-\d+-(513|515))$' } ]
+                    - { field: name, op: match, value: '^(.*\\)?(Everyone|Authenticated Users|Domain Users|Users|Domain Computers|INTERACTIVE)$' }
+    evidence: '{gpo} {_file}: "{name}" adds {Properties.Members.Member.name}{Properties.Members.Member[].name}'
+
+  - id: GPO-GPP-ADMINS-LOGON-USER
+    title: Preference adds the logged-on user to local Administrators
+    category: IAM
+    severity: high
+    why: A member written as %LogonUser% makes every user who signs in an administrator of that computer.
+    fix: Remove the member; grant administration only to named support groups and provide elevation on request.
+    refs: [MITRE-ATTACK:T1098, NIST-800-53:AC-6(5), CIS-Controls-v8:5.4]
+    query: { protocol: gpo, part: preferences, scope: both, key: '{gpo}|{_file}|{uid}|{name}', name: gpo }
+    each:
+      all:
+        - { field: _file, op: match, value: '\\Preferences\\Groups\\' }
+        - any:
+            - all: [ { field: Properties.groupSid, op: exists }, { field: Properties.groupSid, op: eq, value: S-1-5-32-544 } ]
+            - { field: name, op: match, value: '^(BUILTIN\\)?Administrators( \(built-in\))?$' }
+            - all: [ { field: Properties.groupName, op: exists }, { field: Properties.groupName, op: match, value: '^(BUILTIN\\)?Administrators( \(built-in\))?$' } ]
+        - { field: Properties.Members.Member, op: exists }
+        - element:
+            of: Properties.Members.Member
+            where:
+              all:
+                - { field: action, op: eq, value: ADD }
+                - { field: name, op: match, value: '%LogonUser%|%USERNAME%' }
+    evidence: '{gpo} {_file}: "{name}" adds the logged-on user'
+
+  - id: GPO-GPP-REMOTE-GROUP-BROAD-MEMBER
+    title: Preference adds a broad group to Remote Desktop or Remote Management Users
+    category: IAM
+    severity: high
+    why: Every account in the broad group can then sign in remotely to the computers in scope.
+    fix: Remove the member and grant remote access to a reviewed group per server role.
+    refs: [MITRE-ATTACK:T1021.001, MITRE-ATTACK:T1021.006, NIST-800-53:AC-17]
+    query: { protocol: gpo, part: preferences, scope: both, key: '{gpo}|{_file}|{uid}|{name}', name: gpo }
+    each:
+      all:
+        - { field: _file, op: match, value: '\\Preferences\\Groups\\' }
+        - any:
+            - all: [ { field: Properties.groupSid, op: exists }, { field: Properties.groupSid, op: in, value: [S-1-5-32-555, S-1-5-32-580] } ]
+            - { field: name, op: match, value: '^(BUILTIN\\)?(Remote Desktop Users|Remote Management Users)( \(built-in\))?$' }
+            - all: [ { field: Properties.groupName, op: exists }, { field: Properties.groupName, op: match, value: '^(BUILTIN\\)?(Remote Desktop Users|Remote Management Users)( \(built-in\))?$' } ]
+        - { field: Properties.Members.Member, op: exists }
+        - element:
+            of: Properties.Members.Member
+            where:
+              all:
+                - { field: action, op: eq, value: ADD }
+                - any:
+                    - all: [ { field: sid, op: exists }, { field: sid, op: match, value: '^(S-1-1-0|S-1-5-11|S-1-5-4|S-1-5-32-545|S-1-5-21-\d+-\d+-\d+-(513|515))$' } ]
+                    - { field: name, op: match, value: '^(.*\\)?(Everyone|Authenticated Users|Domain Users|Users|Domain Computers|INTERACTIVE)$' }
+    evidence: '{gpo} {_file}: "{name}" adds {Properties.Members.Member.name}{Properties.Members.Member[].name}'
+
+  - id: GPO-GPP-BACKUP-OPS-BROAD-MEMBER
+    title: Preference adds a broad group to Backup Operators
+    category: IAM
+    severity: high
+    why: Backup Operators can read every file on the computer regardless of permissions, so a broad member gives that to every user.
+    fix: Remove the member; keep Backup Operators empty or limited to the backup service identity.
+    refs: [MITRE-ATTACK:T1098, NIST-800-53:AC-6]
+    query: { protocol: gpo, part: preferences, scope: both, key: '{gpo}|{_file}|{uid}|{name}', name: gpo }
+    each:
+      all:
+        - { field: _file, op: match, value: '\\Preferences\\Groups\\' }
+        - any:
+            - all: [ { field: Properties.groupSid, op: exists }, { field: Properties.groupSid, op: eq, value: S-1-5-32-551 } ]
+            - { field: name, op: match, value: '^(BUILTIN\\)?Backup Operators( \(built-in\))?$' }
+            - all: [ { field: Properties.groupName, op: exists }, { field: Properties.groupName, op: match, value: '^(BUILTIN\\)?Backup Operators( \(built-in\))?$' } ]
+        - { field: Properties.Members.Member, op: exists }
+        - element:
+            of: Properties.Members.Member
+            where:
+              all:
+                - { field: action, op: eq, value: ADD }
+                - any:
+                    - all: [ { field: sid, op: exists }, { field: sid, op: match, value: '^(S-1-1-0|S-1-5-11|S-1-5-4|S-1-5-32-545|S-1-5-21-\d+-\d+-\d+-(513|515))$' } ]
+                    - { field: name, op: match, value: '^(.*\\)?(Everyone|Authenticated Users|Domain Users|Users|Domain Computers|INTERACTIVE)$' }
+    evidence: '{gpo} {_file}: "{name}" adds {Properties.Members.Member.name}{Properties.Members.Member[].name}'
+
+  - id: GPO-GPP-LOCAL-USER-CREATED
+    title: Preference creates a local user account
+    category: IAM
+    severity: medium
+    why: A policy-created local account exists with the same name on every computer in scope and is rarely reviewed.
+    fix: Delete the item and the account unless there is a documented need; manage any required local account with LAPS.
+    refs: [MITRE-ATTACK:T1136.001, NIST-800-53:AC-2]
+    query: { protocol: gpo, part: preferences, scope: both, key: '{gpo}|{_file}|{uid}|{name}', name: gpo }
+    each:
+      all:
+        - { field: _file, op: match, value: '\\Preferences\\Groups\\' }
+        - { field: Properties.userName, op: exists }
+        - { field: Properties.action, op: in, value: [C, R] }
+    evidence: '{gpo} {_file}: creates local user {Properties.userName} (action {Properties.action})'
+
+  - id: GPO-GPP-GROUPS-IN-USER-SCOPE
+    title: Local group membership changed from the User half of a GPO
+    lens: both
+    category: IAM
+    severity: medium
+    why: User-scope group items apply on whatever computer the user signs in to, so the membership follows the user and is easy to miss in computer policy reviews.
+    fix: Move the item to Computer Configuration in a GPO scoped to the computers that need it, or remove it.
+    refs: [NIST-800-53:AC-6, NIST-800-53:CM-6]
+    query: { protocol: gpo, part: preferences, scope: both, key: '{gpo}|{_file}|{uid}|{name}', name: gpo }
+    each:
+      all:
+        - { field: scope, op: eq, value: user }
+        - { field: _file, op: match, value: '\\Preferences\\Groups\\' }
+        - { field: Properties.groupName, op: exists }
+    evidence: '{gpo} {_file}: user-scope item changes local group "{name}"'
+
+  - id: GPO-RESTRICTED-ADMINS-BROAD-MEMBER
+    title: Restricted Groups puts a broad group in Administrators
+    category: IAM
+    severity: critical
+    entity: gpo-setting
+    why: Every account in the broad group becomes an administrator wherever this GPO applies; on a domain controller policy that means the domain.
+    fix: Remove the broad group from the restricted membership and list only reviewed admin groups.
+    refs: [MITRE-ATTACK:T1098, NIST-800-53:AC-6(5), CIS-Controls-v8:5.4]
+    query: { protocol: gpo, part: security, scope: machine, key: '{gpo}|{section}|{key}', name: gpo, min_rows: 1 }
+    each:
+      all:
+        - { field: section, op: eq, value: Group Membership }
+        - { field: key, op: match, value: '^\*?(S-1-5-32-544|Administrators|S-1-5-21-\d+-\d+-\d+-(512|518|519)|Domain Admins|Enterprise Admins|Schema Admins)__Members$' }
+        - { field: values, op: notempty }
+        - { field: values, op: match, value: '^(S-1-1-0|S-1-5-11|S-1-5-4|S-1-5-32-545|S-1-5-21-\d+-\d+-\d+-(513|515)|(.*\\)?(Everyone|Authenticated Users|Domain Users|Users|Domain Computers|INTERACTIVE))$' }
+    evidence: '{gpo}: {key} = {value}'
+
+  - id: GPO-RESTRICTED-REMOTE-GROUP-BROAD-MEMBER
+    title: Restricted Groups puts a broad group in Remote Desktop or Remote Management Users
+    category: IAM
+    severity: high
+    entity: gpo-setting
+    why: Every account in the broad group can then sign in remotely wherever this GPO applies.
+    fix: Remove the broad group and list only reviewed groups per server role.
+    refs: [MITRE-ATTACK:T1021.001, MITRE-ATTACK:T1021.006, NIST-800-53:AC-17]
+    query: { protocol: gpo, part: security, scope: machine, key: '{gpo}|{section}|{key}', name: gpo, min_rows: 1 }
+    each:
+      all:
+        - { field: section, op: eq, value: Group Membership }
+        - { field: key, op: match, value: '^\*?(S-1-5-32-555|S-1-5-32-580|Remote Desktop Users|Remote Management Users)__Members$' }
+        - { field: values, op: notempty }
+        - { field: values, op: match, value: '^(S-1-1-0|S-1-5-11|S-1-5-4|S-1-5-32-545|S-1-5-21-\d+-\d+-\d+-(513|515)|(.*\\)?(Everyone|Authenticated Users|Domain Users|Users|Domain Computers|INTERACTIVE))$' }
+    evidence: '{gpo}: {key} = {value}'
+
+  - id: GPO-RESTRICTED-BACKUP-OPS-BROAD-MEMBER
+    title: Restricted Groups puts a broad group in Backup Operators
+    category: IAM
+    severity: high
+    entity: gpo-setting
+    why: Backup Operators can read every file regardless of permissions, so a broad member gives that to every user.
+    fix: Remove the broad group; keep Backup Operators empty or limited to the backup service identity.
+    refs: [MITRE-ATTACK:T1098, NIST-800-53:AC-6]
+    query: { protocol: gpo, part: security, scope: machine, key: '{gpo}|{section}|{key}', name: gpo, min_rows: 1 }
+    each:
+      all:
+        - { field: section, op: eq, value: Group Membership }
+        - { field: key, op: match, value: '^\*?(S-1-5-32-551|Backup Operators)__Members$' }
+        - { field: values, op: notempty }
+        - { field: values, op: match, value: '^(S-1-1-0|S-1-5-11|S-1-5-4|S-1-5-32-545|S-1-5-21-\d+-\d+-\d+-(513|515)|(.*\\)?(Everyone|Authenticated Users|Domain Users|Users|Domain Computers|INTERACTIVE))$' }
+    evidence: '{gpo}: {key} = {value}'
+
+  - id: GPO-RESTRICTED-BROAD-MEMBEROF-PRIVILEGED
+    title: Restricted Groups makes a broad group a member of a privileged group
+    category: IAM
+    severity: critical
+    entity: gpo-setting
+    why: A "member of" entry for Everyone, Authenticated Users, Domain Users or Users places all those accounts in an admin or remote-access group wherever the GPO applies.
+    fix: Remove the entry and grant the privileged group to reviewed admin groups only.
+    refs: [MITRE-ATTACK:T1098, NIST-800-53:AC-6(5)]
+    query: { protocol: gpo, part: security, scope: machine, key: '{gpo}|{section}|{key}', name: gpo, min_rows: 1 }
+    each:
+      all:
+        - { field: section, op: eq, value: Group Membership }
+        - { field: key, op: match, value: '^\*?(S-1-1-0|S-1-5-11|S-1-5-4|S-1-5-32-545|S-1-5-21-\d+-\d+-\d+-(513|515)|Everyone|Authenticated Users|Domain Users|Users|Domain Computers|INTERACTIVE)__Memberof$' }
+        - { field: values, op: notempty }
+        - { field: values, op: match, value: '^(S-1-5-32-(544|551|555|580)|S-1-5-21-\d+-\d+-\d+-(512|518|519)|(.*\\)?(Administrators|Backup Operators|Remote Desktop Users|Remote Management Users|Domain Admins|Enterprise Admins|Schema Admins))$' }
+    evidence: '{gpo}: {key} = {value}'
+
+  - id: GPO-RESTRICTED-ADMINS-EMPTIED
+    title: Restricted Groups sets local Administrators to no members
+    kind: broken
+    lens: both
+    category: IAM
+    severity: medium
+    entity: gpo-setting
+    why: An empty restricted membership removes every member, including the domain admin groups, from local Administrators wherever the GPO applies, which can cut off central administration.
+    fix: List the intended admin groups in the restricted membership, or remove the entry if it was not meant to clear the group.
+    refs: [NIST-800-53:AC-6, NIST-800-53:CM-6]
+    query: { protocol: gpo, part: security, scope: machine, key: '{gpo}|{section}|{key}', name: gpo, min_rows: 1 }
+    each:
+      all:
+        - { field: section, op: eq, value: Group Membership }
+        - { field: key, op: match, value: '^\*?(S-1-5-32-544|Administrators)__Members$' }
+        - { field: value, op: eq, value: '' }
+    evidence: '{gpo}: {key} is empty'
+
+  # ================================================================ 3. user rights assignments (GptTmpl.inf [Privilege Rights])
+
+  - id: GPO-URA-DEBUG-BROAD
+    title: Debug programs right granted to a broad group
+    category: IAM
+    severity: critical
+    entity: gpo-setting
+    why: The debug right gives access to the memory of any process, including the one that holds signed-in users' credentials. Only Administrators should have it.
+    fix: Limit "Debug programs" to Administrators, or leave it undefined.
+    refs: [MITRE-ATTACK:T1134, NIST-800-53:AC-6(10)]
+    query: { protocol: gpo, part: security, scope: machine, key: '{gpo}|{section}|{key}', name: gpo, min_rows: 1 }
+    each:
+      all:
+        - { field: section, op: eq, value: Privilege Rights }
+        - { field: key, op: eq, value: SeDebugPrivilege }
+        - { field: values, op: notempty }
+        - { field: values, op: match, value: '^(S-1-1-0|S-1-5-7|S-1-5-11|S-1-5-2|S-1-5-4|S-1-5-32-545|S-1-5-32-546|S-1-5-21-\d+-\d+-\d+-(501|513|514|515)|(.*\\)?(Everyone|Authenticated Users|Domain Users|Users|Domain Computers|Guests|Domain Guests|Guest|ANONYMOUS LOGON|INTERACTIVE|NETWORK))$' }
+    evidence: '{gpo}: {key} = {value}'
+
+  - id: GPO-URA-BACKUP-RESTORE-BROAD
+    title: Back up or restore files right granted to a broad group
+    category: IAM
+    severity: critical
+    entity: gpo-setting
+    why: These rights read or replace any file regardless of its permissions, including system and directory database files.
+    fix: Limit "Back up files and directories" and "Restore files and directories" to Administrators and Backup Operators (or the backup service identity).
+    refs: [MITRE-ATTACK:T1003.003, NIST-800-53:AC-6(10)]
+    query: { protocol: gpo, part: security, scope: machine, key: '{gpo}|{section}|{key}', name: gpo, min_rows: 1 }
+    each:
+      all:
+        - { field: section, op: eq, value: Privilege Rights }
+        - { field: key, op: in, value: [SeBackupPrivilege, SeRestorePrivilege] }
+        - { field: values, op: notempty }
+        - { field: values, op: match, value: '^(S-1-1-0|S-1-5-7|S-1-5-11|S-1-5-2|S-1-5-4|S-1-5-32-545|S-1-5-32-546|S-1-5-21-\d+-\d+-\d+-(501|513|514|515)|(.*\\)?(Everyone|Authenticated Users|Domain Users|Users|Domain Computers|Guests|Domain Guests|Guest|ANONYMOUS LOGON|INTERACTIVE|NETWORK))$' }
+    evidence: '{gpo}: {key} = {value}'
+
+  # The two rules below flag any holder outside the defaults - a named service account or user, an extra
+  # group. The broad groups are left to the -BROAD rules above (no double finding). The threshold is the
+  # whole pattern of allowed holders, so a tenant that adds its own SIDs keeps the defaults in it.
+
+  - id: GPO-URA-DEBUG-UNEXPECTED-HOLDER
+    title: Debug programs right granted to an account other than Administrators
+    category: IAM
+    severity: high
+    entity: gpo-setting
+    why: Whoever holds the debug right can read and change the memory of any process, including the one that holds signed-in users' credentials, so a service account or user with it is as powerful as a local administrator and is rarely watched as one. Software that genuinely needs it is uncommon; most grants are left over from troubleshooting.
+    fix: Remove the extra holders from "Debug programs" so only Administrators remain (or leave the right undefined). If a product truly needs it, record the account in the threshold gpo.debug-allowed-pattern (a pattern that still includes S-1-5-32-544) and treat the account as privileged.
+    refs: [MITRE-ATTACK:T1134, MITRE-ATTACK:T1003.001, NIST-800-53:AC-6(10)]
+    query: { protocol: gpo, part: security, scope: machine, key: '{gpo}|{section}|{key}', name: gpo, min_rows: 1 }
+    each:
+      all:
+        - { field: section, op: eq, value: Privilege Rights }
+        - { field: key, op: eq, value: SeDebugPrivilege }
+        - { field: values, op: notempty }
+        - { field: values, op: notmatch, value: '^S-1-5-32-544$', threshold: gpo.debug-allowed-pattern }
+        - not: { field: values, op: match, value: '^(S-1-1-0|S-1-5-7|S-1-5-11|S-1-5-2|S-1-5-4|S-1-5-32-545|S-1-5-32-546|S-1-5-21-\d+-\d+-\d+-(501|513|514|515)|(.*\\)?(Everyone|Authenticated Users|Domain Users|Users|Domain Computers|Guests|Domain Guests|Guest|ANONYMOUS LOGON|INTERACTIVE|NETWORK))$' }
+    evidence: '{gpo}: {key} = {value}'
+
+  - id: GPO-URA-BACKUP-RESTORE-UNEXPECTED-HOLDER
+    title: Back up or restore files right granted to an account outside the expected groups
+    category: IAM
+    severity: medium
+    entity: gpo-setting
+    why: The backup and restore rights read or replace any file whatever its permissions - on a domain controller that includes the directory database and its secrets - so a named service account or user holding them is effectively an administrator of every computer in scope. Administrators, Backup Operators and, on domain controllers, Server Operators are the defaults and are not flagged.
+    fix: Remove the extra holders. If a backup product's service account needs the rights, keep them to the servers it backs up, record the account in the threshold gpo.backup-allowed-pattern (a pattern that still includes the default SIDs) and protect the account as tier 0 where it covers domain controllers.
+    refs: [MITRE-ATTACK:T1003.003, NIST-800-53:AC-6(10)]
+    query: { protocol: gpo, part: security, scope: machine, key: '{gpo}|{section}|{key}', name: gpo, min_rows: 1 }
+    each:
+      all:
+        - { field: section, op: eq, value: Privilege Rights }
+        - { field: key, op: in, value: [SeBackupPrivilege, SeRestorePrivilege] }
+        - { field: values, op: notempty }
+        - { field: values, op: notmatch, value: '^S-1-5-32-(544|549|551)$', threshold: gpo.backup-allowed-pattern }
+        - not: { field: values, op: match, value: '^(S-1-1-0|S-1-5-7|S-1-5-11|S-1-5-2|S-1-5-4|S-1-5-32-545|S-1-5-32-546|S-1-5-21-\d+-\d+-\d+-(501|513|514|515)|(.*\\)?(Everyone|Authenticated Users|Domain Users|Users|Domain Computers|Guests|Domain Guests|Guest|ANONYMOUS LOGON|INTERACTIVE|NETWORK))$' }
+    evidence: '{gpo}: {key} = {value}'
+
+  - id: GPO-URA-TAKE-OWNERSHIP-BROAD
+    title: Take ownership right granted to a broad group
+    category: IAM
+    severity: critical
+    entity: gpo-setting
+    why: An owner can rewrite an object's permissions, so this right lets its holders take control of any file, key or object.
+    fix: Limit "Take ownership of files or other objects" to Administrators.
+    refs: [MITRE-ATTACK:T1222, NIST-800-53:AC-6(10)]
+    query: { protocol: gpo, part: security, scope: machine, key: '{gpo}|{section}|{key}', name: gpo, min_rows: 1 }
+    each:
+      all:
+        - { field: section, op: eq, value: Privilege Rights }
+        - { field: key, op: eq, value: SeTakeOwnershipPrivilege }
+        - { field: values, op: notempty }
+        - { field: values, op: match, value: '^(S-1-1-0|S-1-5-7|S-1-5-11|S-1-5-2|S-1-5-4|S-1-5-32-545|S-1-5-32-546|S-1-5-21-\d+-\d+-\d+-(501|513|514|515)|(.*\\)?(Everyone|Authenticated Users|Domain Users|Users|Domain Computers|Guests|Domain Guests|Guest|ANONYMOUS LOGON|INTERACTIVE|NETWORK))$' }
+    evidence: '{gpo}: {key} = {value}'
+
+  - id: GPO-URA-LOAD-DRIVER-BROAD
+    title: Load and unload device drivers right granted to a broad group
+    category: IAM
+    severity: critical
+    entity: gpo-setting
+    why: A driver runs in the kernel, so this right is equivalent to full control of the computer.
+    fix: Limit "Load and unload device drivers" to Administrators.
+    refs: [MITRE-ATTACK:T1068, NIST-800-53:AC-6(10)]
+    query: { protocol: gpo, part: security, scope: machine, key: '{gpo}|{section}|{key}', name: gpo, min_rows: 1 }
+    each:
+      all:
+        - { field: section, op: eq, value: Privilege Rights }
+        - { field: key, op: eq, value: SeLoadDriverPrivilege }
+        - { field: values, op: notempty }
+        - { field: values, op: match, value: '^(S-1-1-0|S-1-5-7|S-1-5-11|S-1-5-2|S-1-5-4|S-1-5-32-545|S-1-5-32-546|S-1-5-21-\d+-\d+-\d+-(501|513|514|515)|(.*\\)?(Everyone|Authenticated Users|Domain Users|Users|Domain Computers|Guests|Domain Guests|Guest|ANONYMOUS LOGON|INTERACTIVE|NETWORK))$' }
+    evidence: '{gpo}: {key} = {value}'
+
+  - id: GPO-URA-IMPERSONATE-TOKEN-BROAD
+    title: Impersonate or replace a process token right granted to a broad group
+    category: IAM
+    severity: high
+    entity: gpo-setting
+    why: These rights are meant for services; held by ordinary users they allow running code under another, more privileged identity.
+    fix: Limit "Impersonate a client after authentication" and "Replace a process level token" to Administrators and the built-in service accounts.
+    refs: [MITRE-ATTACK:T1134.001, NIST-800-53:AC-6(10)]
+    query: { protocol: gpo, part: security, scope: machine, key: '{gpo}|{section}|{key}', name: gpo, min_rows: 1 }
+    each:
+      all:
+        - { field: section, op: eq, value: Privilege Rights }
+        - { field: key, op: in, value: [SeImpersonatePrivilege, SeAssignPrimaryTokenPrivilege] }
+        - { field: values, op: notempty }
+        - { field: values, op: match, value: '^(S-1-1-0|S-1-5-7|S-1-5-11|S-1-5-2|S-1-5-4|S-1-5-32-545|S-1-5-32-546|S-1-5-21-\d+-\d+-\d+-(501|513|514|515)|(.*\\)?(Everyone|Authenticated Users|Domain Users|Users|Domain Computers|Guests|Domain Guests|Guest|ANONYMOUS LOGON|INTERACTIVE|NETWORK))$' }
+    evidence: '{gpo}: {key} = {value}'
+
+  - id: GPO-URA-TCB-OR-TOKEN-GRANTED
+    title: Act as part of the operating system or create a token object right granted
+    category: IAM
+    severity: critical
+    entity: gpo-setting
+    why: These rights let the holder act with the operating system's full authority; no account needs them assigned, because the system already has them.
+    fix: Leave "Act as part of the operating system" and "Create a token object" with no accounts.
+    refs: [MITRE-ATTACK:T1134, NIST-800-53:AC-6(10)]
+    query: { protocol: gpo, part: security, scope: machine, key: '{gpo}|{section}|{key}', name: gpo, min_rows: 1 }
+    each:
+      all:
+        - { field: section, op: eq, value: Privilege Rights }
+        - { field: key, op: in, value: [SeTcbPrivilege, SeCreateTokenPrivilege] }
+        - { field: values, op: notempty }
+        - { field: values, op: match, value: '^(?!S-1-5-18$)' }
+    evidence: '{gpo}: {key} = {value}'
+
+  - id: GPO-URA-ENABLE-DELEGATION-BROAD
+    title: Enable delegation right granted to a broad group
+    category: IAM
+    severity: critical
+    entity: gpo-setting
+    why: On domain controllers this right lets its holders mark accounts as trusted for delegation, which can expose other users' credentials to those accounts.
+    fix: Limit "Enable computer and user accounts to be trusted for delegation" to Administrators on domain controllers and leave it empty elsewhere.
+    refs: [MITRE-ATTACK:T1558, NIST-800-53:AC-6(10)]
+    query: { protocol: gpo, part: security, scope: machine, key: '{gpo}|{section}|{key}', name: gpo, min_rows: 1 }
+    each:
+      all:
+        - { field: section, op: eq, value: Privilege Rights }
+        - { field: key, op: eq, value: SeEnableDelegationPrivilege }
+        - { field: values, op: notempty }
+        - { field: values, op: match, value: '^(S-1-1-0|S-1-5-7|S-1-5-11|S-1-5-2|S-1-5-4|S-1-5-32-545|S-1-5-32-546|S-1-5-21-\d+-\d+-\d+-(501|513|514|515)|(.*\\)?(Everyone|Authenticated Users|Domain Users|Users|Domain Computers|Guests|Domain Guests|Guest|ANONYMOUS LOGON|INTERACTIVE|NETWORK))$' }
+    evidence: '{gpo}: {key} = {value}'
+
+  - id: GPO-URA-SYSTEM-RIGHTS-BROAD
+    title: Security log, firmware or volume maintenance right granted to a broad group
+    category: IAM
+    severity: high
+    entity: gpo-setting
+    why: Managing the security log, changing firmware variables or raw volume access bypass normal controls and audit; ordinary users should hold none of them.
+    fix: Limit "Manage auditing and security log", "Modify firmware environment values" and "Perform volume maintenance tasks" to Administrators.
+    refs: [MITRE-ATTACK:T1070.001, MITRE-ATTACK:T1006, NIST-800-53:AC-6(10)]
+    query: { protocol: gpo, part: security, scope: machine, key: '{gpo}|{section}|{key}', name: gpo, min_rows: 1 }
+    each:
+      all:
+        - { field: section, op: eq, value: Privilege Rights }
+        - { field: key, op: in, value: [SeSecurityPrivilege, SeSystemEnvironmentPrivilege, SeManageVolumePrivilege, SeTrustedCredManAccessPrivilege, SeRelabelPrivilege] }
+        - { field: values, op: notempty }
+        - { field: values, op: match, value: '^(S-1-1-0|S-1-5-7|S-1-5-11|S-1-5-2|S-1-5-4|S-1-5-32-545|S-1-5-32-546|S-1-5-21-\d+-\d+-\d+-(501|513|514|515)|(.*\\)?(Everyone|Authenticated Users|Domain Users|Users|Domain Computers|Guests|Domain Guests|Guest|ANONYMOUS LOGON|INTERACTIVE|NETWORK))$' }
+    evidence: '{gpo}: {key} = {value}'
+
+  - id: GPO-URA-MACHINE-ACCOUNT-BROAD
+    title: Add workstations to domain right granted to a broad group
+    category: IAM
+    severity: medium
+    entity: gpo-setting
+    why: Granted to Everyone, Domain Users or another broad group, any of those accounts can create computer accounts in the domain. Authenticated Users, the domain controller default, is not flagged here; the machine account quota is judged in active-directory.yaml.
+    fix: Grant "Add workstations to domain" to a dedicated join group only, and set the domain's machine account quota to 0.
+    refs: [MITRE-ATTACK:T1136.002, NIST-800-53:AC-2]
+    query: { protocol: gpo, part: security, scope: machine, key: '{gpo}|{section}|{key}', name: gpo, min_rows: 1 }
+    each:
+      all:
+        - { field: section, op: eq, value: Privilege Rights }
+        - { field: key, op: eq, value: SeMachineAccountPrivilege }
+        - { field: values, op: notempty }
+        - { field: values, op: match, value: '^(S-1-1-0|S-1-5-7|S-1-5-2|S-1-5-4|S-1-5-32-545|S-1-5-32-546|S-1-5-21-\d+-\d+-\d+-(501|513|514|515)|(.*\\)?(Everyone|Domain Users|Users|Domain Computers|Guests|Domain Guests|Guest|ANONYMOUS LOGON|INTERACTIVE|NETWORK))$' }
+    evidence: '{gpo}: {key} = {value}'
+
+  - id: GPO-URA-RDP-LOGON-BROAD
+    title: Log on through Remote Desktop right granted to a broad group
+    category: IAM
+    severity: medium
+    entity: gpo-setting
+    why: Every account in the broad group may then sign in remotely to the computers in scope. Remote Desktop session hosts serving all users are a legitimate case; elsewhere it is rarely needed.
+    fix: Limit "Allow log on through Remote Desktop Services" to Administrators and a reviewed Remote Desktop Users membership, or accept the finding for session hosts.
+    refs: [MITRE-ATTACK:T1021.001, NIST-800-53:AC-17]
+    query: { protocol: gpo, part: security, scope: machine, key: '{gpo}|{section}|{key}', name: gpo, min_rows: 1 }
+    each:
+      all:
+        - { field: section, op: eq, value: Privilege Rights }
+        - { field: key, op: eq, value: SeRemoteInteractiveLogonRight }
+        - { field: values, op: notempty }
+        - { field: values, op: match, value: '^(S-1-1-0|S-1-5-7|S-1-5-11|S-1-5-2|S-1-5-4|S-1-5-32-545|S-1-5-32-546|S-1-5-21-\d+-\d+-\d+-(501|513|514|515)|(.*\\)?(Everyone|Authenticated Users|Domain Users|Users|Domain Computers|Guests|Domain Guests|Guest|ANONYMOUS LOGON|INTERACTIVE|NETWORK))$' }
+    evidence: '{gpo}: {key} = {value}'
+
+  - id: GPO-URA-LOCAL-LOGON-BROAD
+    title: Log on locally right granted to a broad group
+    category: IAM
+    severity: high
+    entity: gpo-setting
+    why: '"Allow log on locally" also governs console and some remote-tool sign-ins. In a GPO for domain controllers or servers, granting it to Everyone, Authenticated Users, Domain Users or Users lets any account sign in interactively there - on a domain controller that is a step from any user to the domain''s most sensitive host. Workstation GPOs normally grant Users this right (the Windows default there), so a finding on a GPO that only applies to workstations can be accepted.'
+    fix: Limit "Allow log on locally" on domain controllers and servers to Administrators (plus Backup Operators where used); on workstations keep Users only if the GPO applies to workstations alone.
+    refs: [MITRE-ATTACK:T1078.002, NIST-800-53:AC-6, NIST-800-53:AC-3]
+    query: { protocol: gpo, part: security, scope: machine, key: '{gpo}|{section}|{key}', name: gpo, min_rows: 1 }
+    each:
+      all:
+        - { field: section, op: eq, value: Privilege Rights }
+        - { field: key, op: eq, value: SeInteractiveLogonRight }
+        - { field: values, op: notempty }
+        - { field: values, op: match, value: '^(S-1-1-0|S-1-5-11|S-1-5-32-545|S-1-5-21-\d+-\d+-\d+-513|(.*\\)?(Everyone|Authenticated Users|Domain Users|Users))$' }
+    evidence: '{gpo}: {key} = {value}'
+
+  - id: GPO-URA-BATCH-SERVICE-LOGON-BROAD
+    title: Log on as a batch job or service right granted to a broad group
+    category: IAM
+    severity: medium
+    entity: gpo-setting
+    why: These logon rights are for task and service identities; granted broadly they let any user's credentials be used for unattended logons.
+    fix: Limit "Log on as a batch job" and "Log on as a service" to Administrators and named service identities.
+    refs: [NIST-800-53:AC-6, NIST-800-53:IA-2]
+    query: { protocol: gpo, part: security, scope: machine, key: '{gpo}|{section}|{key}', name: gpo, min_rows: 1 }
+    each:
+      all:
+        - { field: section, op: eq, value: Privilege Rights }
+        - { field: key, op: in, value: [SeBatchLogonRight, SeServiceLogonRight] }
+        - { field: values, op: notempty }
+        - { field: values, op: match, value: '^(S-1-1-0|S-1-5-7|S-1-5-11|S-1-5-2|S-1-5-4|S-1-5-32-545|S-1-5-32-546|S-1-5-21-\d+-\d+-\d+-(501|513|514|515)|(.*\\)?(Everyone|Authenticated Users|Domain Users|Users|Domain Computers|Guests|Domain Guests|Guest|ANONYMOUS LOGON|INTERACTIVE|NETWORK))$' }
+    evidence: '{gpo}: {key} = {value}'
+
+  - id: GPO-URA-NETWORK-LOGON-ANONYMOUS
+    title: Access from the network right granted to anonymous or guest accounts
+    category: IAM
+    severity: medium
+    entity: gpo-setting
+    why: Anonymous or guest network access lets unauthenticated clients reach shares and services on the computers in scope.
+    fix: Remove ANONYMOUS LOGON and the guest accounts and groups from "Access this computer from the network".
+    refs: [MITRE-ATTACK:T1087.002, NIST-800-53:AC-14]
+    query: { protocol: gpo, part: security, scope: machine, key: '{gpo}|{section}|{key}', name: gpo, min_rows: 1 }
+    each:
+      all:
+        - { field: section, op: eq, value: Privilege Rights }
+        - { field: key, op: eq, value: SeNetworkLogonRight }
+        - { field: values, op: notempty }
+        - { field: values, op: match, value: '^(S-1-5-7|S-1-5-32-546|S-1-5-21-\d+-\d+-\d+-(501|514)|(.*\\)?(Guests|Domain Guests|Guest|ANONYMOUS LOGON))$' }
+    evidence: '{gpo}: {key} = {value}'
+
+  - id: GPO-URA-DENY-LOCKS-OUT-EVERYONE
+    title: Deny logon right assigned to everyone
+    kind: broken
+    lens: both
+    category: AVL
+    severity: high
+    entity: gpo-setting
+    why: A deny right for Everyone, Authenticated Users, Users, Domain Users or Domain Computers blocks normal sign-ins or machine access wherever the GPO applies; on domain controllers it can stop the domain working.
+    fix: Remove the broad group from the deny right and deny only the specific accounts or groups intended.
+    refs: [NIST-800-53:CM-6, NIST-800-53:AC-3]
+    query: { protocol: gpo, part: security, scope: machine, key: '{gpo}|{section}|{key}', name: gpo, min_rows: 1 }
+    each:
+      all:
+        - { field: section, op: eq, value: Privilege Rights }
+        - { field: key, op: in, value: [SeDenyNetworkLogonRight, SeDenyInteractiveLogonRight, SeDenyRemoteInteractiveLogonRight, SeDenyBatchLogonRight, SeDenyServiceLogonRight] }
+        - { field: values, op: notempty }
+        - { field: values, op: match, value: '^(S-1-1-0|S-1-5-11|S-1-5-32-545|S-1-5-21-\d+-\d+-\d+-(513|515|516)|(.*\\)?(Everyone|Authenticated Users|Users|Domain Users|Domain Computers|Domain Controllers))$' }
+    evidence: '{gpo}: {key} = {value}'
+
+  - id: GPO-URA-DENY-NETWORK-LOCAL-ACCOUNTS-NONE
+    title: No GPO denies network logon to local accounts
+    kind: missing
+    category: IAM
+    severity: medium
+    entity: domain
+    why: Without this deny, a local account password reused across computers works over the network from one to the next.
+    fix: In a member-server and workstation baseline GPO, add "Local account" (or "Local account and member of Administrators group") to "Deny access to this computer from the network".
+    refs: [MITRE-ATTACK:T1550.002, NIST-800-53:AC-17, CIS-Controls-v8:4.7]
+    query: { protocol: gpo, part: security, scope: machine, key: '{gpo}|{section}|{key}', name: gpo, min_rows: 1 }
+    count:
+      op: lt
+      value: 1
+      where:
+        all:
+          - { field: section, op: eq, value: Privilege Rights }
+          - { field: key, op: eq, value: SeDenyNetworkLogonRight }
+          - { field: values, op: notempty }
+          - { field: values, op: match, value: '^S-1-5-11[34]$' }
+    evidence: 'No GPO denies network logon to local accounts ({count} found)'
+
+  - id: GPO-URA-DENY-RDP-LOCAL-ACCOUNTS-NONE
+    title: No GPO denies Remote Desktop logon to local accounts
+    kind: missing
+    category: IAM
+    severity: low
+    entity: domain
+    why: Without this deny, local accounts can sign in over Remote Desktop, which bypasses domain account controls.
+    fix: In a member-server and workstation baseline GPO, add "Local account" to "Deny log on through Remote Desktop Services".
+    refs: [NIST-800-53:AC-17, CIS-Controls-v8:4.7]
+    query: { protocol: gpo, part: security, scope: machine, key: '{gpo}|{section}|{key}', name: gpo, min_rows: 1 }
+    count:
+      op: lt
+      value: 1
+      where:
+        all:
+          - { field: section, op: eq, value: Privilege Rights }
+          - { field: key, op: eq, value: SeDenyRemoteInteractiveLogonRight }
+          - { field: values, op: notempty }
+          - { field: values, op: match, value: '^S-1-5-11[34]$' }
+    evidence: 'No GPO denies Remote Desktop logon to local accounts ({count} found)'
+
+  - id: GPO-URA-UNRESOLVED-NAME
+    title: User right assigned to a name instead of a SID
+    kind: broken
+    lens: maintenance
+    category: HYG
+    severity: low
+    entity: gpo-setting
+    why: An entry saved as a name usually means the account could not be resolved when the GPO was edited - deleted, renamed or mistyped - so the right may not apply as intended.
+    fix: Re-select the intended account or group in the GPO editor so it is saved by SID, or remove the stale entry.
+    refs: [NIST-800-53:CM-6]
+    query: { protocol: gpo, part: security, scope: machine, key: '{gpo}|{section}|{key}', name: gpo, min_rows: 1 }
+    each:
+      all:
+        - { field: section, op: eq, value: Privilege Rights }
+        - { field: values, op: notempty }
+        - { field: values, op: match, value: '^(?!S-1-\d)' }
+    evidence: '{gpo}: {key} = {value}'
+
+  # ================================================================ 4a. security options (GptTmpl.inf [Registry Values])
+
+  - id: GPO-SEC-LMCOMPAT-WEAK
+    title: LAN Manager authentication level below NTLMv2-only
+    category: AUT
+    severity:
+      field: data
+      ranges: [ { max: 2, value: high } ]
+      default: medium
+    entity: gpo-setting
+    why: Levels below 5 let computers send or accept LM and NTLMv1 responses, which are weak and easy to crack; levels 0-2 send them.
+    fix: Set "Network security - LAN Manager authentication level" to send NTLMv2 only and refuse LM and NTLM (5), after checking for legacy dependencies.
+    refs: [CIS-Microsoft-Windows:2.3.11.7, NIST-800-53:IA-2, MITRE-ATTACK:T1557]
+    query: { protocol: gpo, part: security, scope: machine, key: '{gpo}|{section}|{key}', name: gpo, min_rows: 1 }
+    each:
+      all:
+        - { field: section, op: eq, value: Registry Values }
+        - { field: key, op: match, value: '\\Control\\Lsa\\LmCompatibilityLevel$' }
+        - { field: data, op: lt, value: 5 }
+    evidence: '{gpo}: LmCompatibilityLevel = {data}'
+
+  - id: GPO-SEC-LM-HASH-STORED
+    title: GPO allows storing LAN Manager password hashes
+    category: AUT
+    severity: high
+    entity: gpo-setting
+    why: The LM hash is weak and quick to reverse, so storing it exposes passwords if the account database is read.
+    fix: Enable "Do not store LAN Manager hash value on next password change" (NoLMHash = 1).
+    refs: [CIS-Microsoft-Windows:2.3.11.5, NIST-800-53:IA-5(1)]
+    query: { protocol: gpo, part: security, scope: machine, key: '{gpo}|{section}|{key}', name: gpo, min_rows: 1 }
+    each:
+      all:
+        - { field: section, op: eq, value: Registry Values }
+        - { field: key, op: match, value: '\\Control\\Lsa\\NoLMHash$' }
+        - { field: data, op: eq, value: 0 }
+    evidence: '{gpo}: NoLMHash = {data}'
+
+  - id: GPO-SEC-ANONYMOUS-ENUMERATION
+    title: GPO allows anonymous enumeration of accounts or shares
+    category: IAM
+    severity: medium
+    entity: gpo-setting
+    why: Unauthenticated clients can list accounts, groups or shares, which maps the environment for anyone on the network.
+    fix: Set RestrictAnonymousSAM and RestrictAnonymous to 1 and EveryoneIncludesAnonymous to 0.
+    refs: [CIS-Microsoft-Windows:2.3.10.2, CIS-Microsoft-Windows:2.3.10.3, CIS-Microsoft-Windows:2.3.10.5, MITRE-ATTACK:T1087.002]
+    query: { protocol: gpo, part: security, scope: machine, key: '{gpo}|{section}|{key}', name: gpo, min_rows: 1 }
+    each:
+      all:
+        - { field: section, op: eq, value: Registry Values }
+        - any:
+            - all: [ { field: key, op: match, value: '\\Control\\Lsa\\RestrictAnonymous(SAM)?$' }, { field: data, op: eq, value: 0 } ]
+            - all: [ { field: key, op: match, value: '\\Control\\Lsa\\EveryoneIncludesAnonymous$' }, { field: data, op: eq, value: 1 } ]
+    evidence: '{gpo}: {key} = {data}'
+
+  - id: GPO-SEC-NULL-SESSION-ACCESS
+    title: GPO opens shares or pipes to anonymous sessions
+    category: IAM
+    severity: high
+    entity: gpo-setting
+    why: Null sessions reach the listed shares and named pipes without any credentials.
+    fix: Set "Restrict anonymous access to Named Pipes and Shares" (RestrictNullSessAccess = 1) and leave NullSessionShares empty.
+    refs: [CIS-Microsoft-Windows:2.3.10.9, CIS-Microsoft-Windows:2.3.10.11, NIST-800-53:AC-14]
+    query: { protocol: gpo, part: security, scope: machine, key: '{gpo}|{section}|{key}', name: gpo, min_rows: 1 }
+    each:
+      all:
+        - { field: section, op: eq, value: Registry Values }
+        - any:
+            - all: [ { field: key, op: match, value: '\\LanManServer\\Parameters\\RestrictNullSessAccess$' }, { field: data, op: eq, value: 0 } ]
+            - all: [ { field: key, op: match, value: '\\LanManServer\\Parameters\\NullSessionShares$' }, { field: data, op: notempty } ]
+    evidence: '{gpo}: {key} = {data}'
+
+  - id: GPO-SEC-REMOTE-SAM-BROAD
+    title: Remote calls to the account database allowed for a broad group
+    category: IAM
+    severity: medium
+    entity: gpo-setting
+    why: Granting remote SAM queries to Everyone, Authenticated Users, Users or Domain Users lets any account list local users and group memberships on every computer in scope.
+    fix: Limit "Restrict clients allowed to make remote calls to SAM" to Administrators.
+    refs: [CIS-Microsoft-Windows:2.3.10.10, MITRE-ATTACK:T1087.001]
+    query: { protocol: gpo, part: security, scope: machine, key: '{gpo}|{section}|{key}', name: gpo, min_rows: 1 }
+    each:
+      all:
+        - { field: section, op: eq, value: Registry Values }
+        - { field: key, op: match, value: '\\Control\\Lsa\\RestrictRemoteSAM$' }
+        - { field: data, op: match, value: '\(A;[^;]*;[^;]*;[^;]*;[^;]*;(WD|AU|BU|DU|AN|IU)\)' }
+    evidence: '{gpo}: RestrictRemoteSAM = {data}'
+
+  - id: GPO-SEC-SMB-SIGNING-OFF
+    title: GPO turns off required SMB signing
+    category: AUT
+    severity: medium
+    entity: gpo-setting
+    why: Without required signing, SMB sessions can be tampered with or relayed by anyone on the network path.
+    fix: Set "Digitally sign communications (always)" to enabled for both the SMB client and server.
+    refs: [CIS-Microsoft-Windows:2.3.8.1, CIS-Microsoft-Windows:2.3.9.2, MITRE-ATTACK:T1557]
+    query: { protocol: gpo, part: security, scope: machine, key: '{gpo}|{section}|{key}', name: gpo, min_rows: 1 }
+    each:
+      all:
+        - { field: section, op: eq, value: Registry Values }
+        - { field: key, op: match, value: '\\(LanManServer|LanmanWorkstation)\\Parameters\\RequireSecuritySignature$' }
+        - { field: data, op: eq, value: 0 }
+    evidence: '{gpo}: {key} = {data}'
+
+  - id: GPO-SEC-SMB-PLAINTEXT-PASSWORD
+    title: GPO lets the SMB client send unencrypted passwords
+    category: AUT
+    severity: high
+    entity: gpo-setting
+    why: Clear-text passwords sent to third-party SMB servers can be read by anyone on the network path.
+    fix: Disable "Send unencrypted password to third-party SMB servers" (EnablePlainTextPassword = 0).
+    refs: [CIS-Microsoft-Windows:2.3.8.3, NIST-800-53:SC-8]
+    query: { protocol: gpo, part: security, scope: machine, key: '{gpo}|{section}|{key}', name: gpo, min_rows: 1 }
+    each:
+      all:
+        - { field: section, op: eq, value: Registry Values }
+        - { field: key, op: match, value: '\\LanmanWorkstation\\Parameters\\EnablePlainTextPassword$' }
+        - { field: data, op: eq, value: 1 }
+    evidence: '{gpo}: EnablePlainTextPassword = {data}'
+
+  - id: GPO-SEC-LDAP-SIGNING-WEAK
+    title: GPO does not require LDAP signing or channel binding
+    category: AUT
+    severity: medium
+    entity: gpo-setting
+    why: Unsigned LDAP or LDAP without channel binding lets directory sessions be tampered with or relayed. Many domains still carry the default (server signing 1 = none, client signing 0, channel binding 0 = never); requiring signing and binding is the hardening.
+    fix: Set the domain controller LDAP signing requirement to Require signing (2), channel binding to Always (2) or at least When supported (1), and client signing to at least Negotiate (1).
+    refs: [CIS-Microsoft-Windows:2.3.5.4, CIS-Microsoft-Windows:2.3.5.3, CIS-Microsoft-Windows:2.3.11.9, MITRE-ATTACK:T1557]
+    query: { protocol: gpo, part: security, scope: machine, key: '{gpo}|{section}|{key}', name: gpo, min_rows: 1 }
+    each:
+      all:
+        - { field: section, op: eq, value: Registry Values }
+        - any:
+            - all: [ { field: key, op: match, value: '\\NTDS\\Parameters\\LDAPServerIntegrity$' }, { field: data, op: lt, value: 2 } ]
+            - all: [ { field: key, op: match, value: '\\NTDS\\Parameters\\LdapEnforceChannelBinding$' }, { field: data, op: eq, value: 0 } ]
+            - all: [ { field: key, op: match, value: '\\Services\\LDAP\\LDAPClientIntegrity$' }, { field: data, op: eq, value: 0 } ]
+    evidence: '{gpo}: {key} = {data}'
+
+  - id: GPO-SEC-NETLOGON-CHANNEL-WEAK
+    title: GPO weakens the domain secure channel
+    category: AUT
+    severity: high
+    entity: gpo-setting
+    why: Turning off signing, sealing or strong keys for the computer's secure channel to the domain controllers exposes that traffic to tampering.
+    fix: Enable RequireSignOrSeal, SealSecureChannel, SignSecureChannel and RequireStrongKey (all = 1).
+    refs: [CIS-Microsoft-Windows:2.3.6.1, CIS-Microsoft-Windows:2.3.6.2, NIST-800-53:SC-8]
+    query: { protocol: gpo, part: security, scope: machine, key: '{gpo}|{section}|{key}', name: gpo, min_rows: 1 }
+    each:
+      all:
+        - { field: section, op: eq, value: Registry Values }
+        - { field: key, op: match, value: '\\Netlogon\\Parameters\\(RequireSignOrSeal|SealSecureChannel|SignSecureChannel|RequireStrongKey)$' }
+        - { field: data, op: eq, value: 0 }
+    evidence: '{gpo}: {key} = {data}'
+
+  - id: GPO-SEC-MACHINE-PASSWORD-CHANGE-OFF
+    title: GPO stops computer account password changes
+    category: IAM
+    severity: medium
+    entity: gpo-setting
+    why: A computer password that never changes stays valid indefinitely if it is ever exposed.
+    fix: Disable "Disable machine account password changes" (DisablePasswordChange = 0) and keep the maximum age at 30 days.
+    refs: [CIS-Microsoft-Windows:2.3.6.4, NIST-800-53:IA-5]
+    query: { protocol: gpo, part: security, scope: machine, key: '{gpo}|{section}|{key}', name: gpo, min_rows: 1 }
+    each:
+      all:
+        - { field: section, op: eq, value: Registry Values }
+        - { field: key, op: match, value: '\\Netlogon\\Parameters\\DisablePasswordChange$' }
+        - { field: data, op: eq, value: 1 }
+    evidence: '{gpo}: DisablePasswordChange = {data}'
+
+  - id: GPO-SEC-NTLM-SESSION-SECURITY-WEAK
+    title: NTLM minimum session security does not require NTLMv2 and 128-bit
+    category: AUT
+    severity: medium
+    entity: gpo-setting
+    why: Without both flags, NTLM sessions may fall back to weaker protection.
+    fix: Set the minimum session security for NTLM SSP clients and servers to require NTLMv2 session security and 128-bit encryption (537395200).
+    refs: [CIS-Microsoft-Windows:2.3.11.10, NIST-800-53:SC-13]
+    query: { protocol: gpo, part: security, scope: machine, key: '{gpo}|{section}|{key}', name: gpo, min_rows: 1 }
+    each:
+      all:
+        - { field: section, op: eq, value: Registry Values }
+        - { field: key, op: match, value: '\\Lsa\\MSV1_0\\NTLMMin(Client|Server)Sec$' }
+        - any:
+            - { field: data, op: noflag, value: 524288 }
+            - { field: data, op: noflag, value: 536870912 }
+    evidence: '{gpo}: {key} = {data}'
+
+  - id: GPO-SEC-KERBEROS-WEAK-ETYPES
+    title: GPO allows DES or RC4 for Kerberos
+    category: AUT
+    severity:
+      field: data
+      ranges: [ { max: 3, value: high } ]
+      default: medium
+    entity: gpo-setting
+    why: DES and RC4 Kerberos keys are weak; tickets encrypted with them are far easier to break than AES.
+    fix: Set "Configure encryption types allowed for Kerberos" to AES128, AES256 and future types only, after confirming no account depends on RC4.
+    refs: [CIS-Microsoft-Windows:2.3.11.4, MITRE-ATTACK:T1558.003, MS-KB:5021131]
+    query: { protocol: gpo, part: security, scope: machine, key: '{gpo}|{section}|{key}', name: gpo, min_rows: 1 }
+    each:
+      all:
+        - { field: section, op: eq, value: Registry Values }
+        - { field: key, op: match, value: '\\Kerberos\\Parameters\\SupportedEncryptionTypes$' }
+        - any:
+            - { field: data, op: flag, value: 1 }
+            - { field: data, op: flag, value: 2 }
+            - { field: data, op: flag, value: 4 }
+    evidence: '{gpo}: SupportedEncryptionTypes = {data}'
+
+  - id: GPO-SEC-CACHED-LOGONS-HIGH
+    title: GPO caches many domain logons
+    category: IAM
+    severity: low
+    entity: gpo-setting
+    why: Each cached logon keeps a password verifier on the computer; the more are kept, the more accounts are exposed if the computer is compromised.
+    fix: Set "Number of previous logons to cache" to 4 or fewer (0-1 on servers), keeping enough for laptops that work offline.
+    refs: [CIS-Microsoft-Windows:2.3.7.7, MITRE-ATTACK:T1003.005]
+    query: { protocol: gpo, part: security, scope: machine, key: '{gpo}|{section}|{key}', name: gpo, min_rows: 1 }
+    each:
+      all:
+        - { field: section, op: eq, value: Registry Values }
+        - { field: key, op: match, value: '\\Winlogon\\CachedLogonsCount$' }
+        - { field: data, op: gt, value: 4, threshold: gpo.cached-logons-max }
+    evidence: '{gpo}: CachedLogonsCount = {data}'
+
+  - id: GPO-SEC-UAC-DISABLED
+    title: GPO turns off User Account Control
+    category: AUT
+    severity: high
+    entity: gpo-setting
+    why: With UAC off every administrator runs with full rights all the time, so any program they start can change the system.
+    fix: Enable "Run all administrators in Admin Approval Mode" (EnableLUA = 1).
+    refs: [CIS-Microsoft-Windows:2.3.17.6, MITRE-ATTACK:T1548.002]
+    query: { protocol: gpo, part: security, scope: machine, key: '{gpo}|{section}|{key}', name: gpo, min_rows: 1 }
+    each:
+      all:
+        - { field: section, op: eq, value: Registry Values }
+        - { field: key, op: match, value: '\\Policies\\System\\EnableLUA$' }
+        - { field: data, op: eq, value: 0 }
+    evidence: '{gpo}: EnableLUA = {data}'
+
+  - id: GPO-SEC-UAC-WEAKENED
+    title: GPO weakens User Account Control prompts
+    category: AUT
+    severity: medium
+    entity: gpo-setting
+    why: Elevating without a prompt, prompting outside the secure desktop, or skipping installer detection lets programs gain admin rights without the user's informed consent.
+    fix: Set the admin prompt to consent or credentials on the secure desktop (ConsentPromptBehaviorAdmin 1 or 2), PromptOnSecureDesktop = 1 and EnableInstallerDetection = 1.
+    refs: [CIS-Microsoft-Windows:2.3.17.2, CIS-Microsoft-Windows:2.3.17.7, MITRE-ATTACK:T1548.002]
+    query: { protocol: gpo, part: security, scope: machine, key: '{gpo}|{section}|{key}', name: gpo, min_rows: 1 }
+    each:
+      all:
+        - { field: section, op: eq, value: Registry Values }
+        - { field: key, op: match, value: '\\Policies\\System\\(ConsentPromptBehaviorAdmin|PromptOnSecureDesktop|EnableInstallerDetection)$' }
+        - { field: data, op: eq, value: 0 }
+    evidence: '{gpo}: {key} = {data}'
+
+  - id: GPO-SEC-BLANK-PASSWORD-NETWORK
+    title: GPO allows network logon with blank passwords
+    category: IAM
+    severity: high
+    entity: gpo-setting
+    why: Local accounts with no password become usable over the network, not only at the console.
+    fix: Enable "Limit local account use of blank passwords to console logon only" (LimitBlankPasswordUse = 1).
+    refs: [CIS-Microsoft-Windows:2.3.1.2, NIST-800-53:IA-5]
+    query: { protocol: gpo, part: security, scope: machine, key: '{gpo}|{section}|{key}', name: gpo, min_rows: 1 }
+    each:
+      all:
+        - { field: section, op: eq, value: Registry Values }
+        - { field: key, op: match, value: '\\Control\\Lsa\\LimitBlankPasswordUse$' }
+        - { field: data, op: eq, value: 0 }
+    evidence: '{gpo}: LimitBlankPasswordUse = {data}'
+
+  - id: GPO-SEC-WINLOGON-PASSWORD-STORED
+    title: Security template writes a Winlogon DefaultPassword value
+    category: IAM
+    severity: critical
+    entity: gpo-setting
+    why: A value is present for Winlogon DefaultPassword in a security template; any password there is stored in clear in SYSVOL and on every computer in scope. Keeper keeps only "set", so an empty value also shows as present.
+    fix: Remove the entry, change the account's password, and use a kiosk profile instead of automatic logon.
+    refs: [MITRE-ATTACK:T1552.002, NIST-800-53:IA-5(7)]
+    query: { protocol: gpo, part: security, scope: machine, key: '{gpo}|{section}|{key}', name: gpo, min_rows: 1 }
+    each:
+      all:
+        - { field: section, op: eq, value: Registry Values }
+        - { field: key, op: match, value: '\\Winlogon\\DefaultPassword$' }
+        - { field: data, op: eq, value: set }
+    evidence: '{gpo}: {key} is set'
+
+  - id: GPO-SEC-NTLM-AUDIT-NONE
+    title: No GPO audits or restricts NTLM
+    kind: missing
+    category: AUT
+    severity: high
+    entity: domain
+    why: NTLM is the protocol relay and pass-the-hash attacks rely on. Without NTLM auditing nobody knows which servers and applications still use it, so it can never be restricted; without restriction it stays available to every attacker on the network. Only security options in GPO security templates are counted.
+    fix: In the domain controller GPO enable "Network security - Restrict NTLM - Audit NTLM authentication in this domain" (AuditNTLMInDomain, all accounts), and in the baseline GPOs "Audit incoming NTLM traffic" (AuditReceivingNTLMTraffic) and "Outgoing NTLM traffic to remote servers" set to Audit all (RestrictSendingNTLMTraffic = 1). Review the NTLM operational logs, then move to the deny settings server by server.
+    refs: [MITRE-ATTACK:T1557.001, MITRE-ATTACK:T1550.002, NIST-800-53:IA-2, NIST-800-53:AU-2]
+    query: { protocol: gpo, part: security, scope: machine, key: '{gpo}|{section}|{key}', name: gpo, min_rows: 1 }
+    count:
+      op: lt
+      value: 1
+      where:
+        all:
+          - { field: section, op: eq, value: Registry Values }
+          - { field: key, op: match, value: '\\(Lsa\\MSV1_0\\(AuditReceivingNTLMTraffic|RestrictReceivingNTLMTraffic|RestrictSendingNTLMTraffic)|Netlogon\\Parameters\\(AuditNTLMInDomain|RestrictNTLMInDomain))$' }
+          - { field: data, op: gt, value: 0 }
+    evidence: 'No GPO audits or restricts NTLM ({count} found)'
+
+  # ================================================================ 4b. administrative templates (Registry.pol)
+
+  - id: GPO-REG-WDIGEST-ON
+    title: GPO turns on WDigest credential caching
+    category: AUT
+    severity: critical
+    entity: gpo-setting
+    why: With WDigest on, signed-in users' passwords are kept in memory in recoverable form.
+    fix: Set WDigest Authentication to Disabled (UseLogonCredential = 0).
+    refs: [CIS-Microsoft-Windows:18.4.7, MITRE-ATTACK:T1003.001]
+    query: { protocol: gpo, part: registry, scope: both, key: '{gpo}|{scope}|{key}|{value}|{action}', name: gpo }
+    each:
+      all:
+        - { field: key, op: match, value: '\\SecurityProviders\\WDigest$' }
+        - { field: value, op: eq, value: UseLogonCredential }
+        - { field: data, op: eq, value: 1 }
+    evidence: '{gpo} ({scope}): {key}\{value} = {data}'
+
+  - id: GPO-REG-LSA-PROTECTION-OFF
+    title: GPO turns off LSA protection
+    category: AUT
+    severity: high
+    entity: gpo-setting
+    why: Without LSA protection, administrator-level processes can read the credentials held in memory.
+    fix: Configure LSASS to run as a protected process (RunAsPPL = 1 or 2).
+    refs: [CIS-Microsoft-Windows:18.9.26.2, MITRE-ATTACK:T1003.001]
+    query: { protocol: gpo, part: registry, scope: both, key: '{gpo}|{scope}|{key}|{value}|{action}', name: gpo }
+    each:
+      all:
+        - { field: key, op: match, value: '\\Control\\Lsa$' }
+        - { field: value, op: eq, value: RunAsPPL }
+        - { field: data, op: eq, value: 0 }
+    evidence: '{gpo} ({scope}): {key}\{value} = {data}'
+
+  - id: GPO-REG-LSA-PROTECTION-NONE
+    title: No GPO turns on LSA protection
+    kind: missing
+    category: AUT
+    severity: medium
+    entity: domain
+    why: LSA protection keeps credentials in memory out of reach of other processes; without a policy for it, computers rely on their own defaults. A setting delivered by other means (a preference item, an MDM profile) is not seen here.
+    fix: Enable "Configure LSASS to run as a protected process" in a baseline GPO after testing third-party LSA plug-ins.
+    refs: [CIS-Microsoft-Windows:18.9.26.2, MITRE-ATTACK:T1003.001]
+    query: { protocol: gpo, part: registry, scope: both, key: '{gpo}|{scope}|{key}|{value}|{action}', name: gpo }
+    count:
+      op: lt
+      value: 1
+      where:
+        all:
+          - { field: scope, op: eq, value: machine }
+          - { field: key, op: match, value: '\\Control\\Lsa$' }
+          - { field: value, op: eq, value: RunAsPPL }
+          - { field: data, op: in, value: [1, 2] }
+    evidence: 'No GPO sets RunAsPPL ({count} found)'
+
+  - id: GPO-REG-REMOTE-UAC-OFF
+    title: GPO lifts UAC network restrictions for local accounts
+    category: AUT
+    severity: high
+    entity: gpo-setting
+    why: Local administrator accounts then get full rights over the network, so a shared local password works from computer to computer.
+    fix: Enable "Apply UAC restrictions to local accounts on network logons" (LocalAccountTokenFilterPolicy = 0) and use LAPS.
+    refs: [CIS-Microsoft-Windows:18.4.1, MITRE-ATTACK:T1550.002]
+    query: { protocol: gpo, part: registry, scope: both, key: '{gpo}|{scope}|{key}|{value}|{action}', name: gpo }
+    each:
+      all:
+        - { field: key, op: match, value: '\\CurrentVersion\\Policies\\System$' }
+        - { field: value, op: eq, value: LocalAccountTokenFilterPolicy }
+        - { field: data, op: eq, value: 1 }
+    evidence: '{gpo} ({scope}): {key}\{value} = {data}'
+
+  - id: GPO-REG-AUTORUN-ON
+    title: GPO lets AutoRun commands execute
+    category: CFG
+    severity: high
+    entity: gpo-setting
+    why: AutoRun runs commands from inserted media without the user choosing to, which spreads malware from removable drives.
+    fix: Set "Set the default behavior for AutoRun" to Do not execute any autorun commands (NoAutorun = 1) and turn off AutoPlay on all drives.
+    refs: [CIS-Microsoft-Windows:18.10.8.2, MITRE-ATTACK:T1091]
+    query: { protocol: gpo, part: registry, scope: both, key: '{gpo}|{scope}|{key}|{value}|{action}', name: gpo }
+    each:
+      all:
+        - { field: key, op: match, value: '\\CurrentVersion\\Policies\\Explorer$' }
+        - { field: value, op: eq, value: NoAutorun }
+        - { field: data, op: eq, value: 0 }
+    evidence: '{gpo} ({scope}): {key}\{value} = {data}'
+
+  - id: GPO-REG-WINRM-SERVICE-WEAK
+    title: GPO allows Basic or unencrypted WinRM on the service
+    category: AUT
+    severity: high
+    entity: gpo-setting
+    why: Basic authentication and unencrypted traffic let remote management credentials and commands travel in readable form.
+    fix: Set "Allow Basic authentication" and "Allow unencrypted traffic" for the WinRM service to Disabled.
+    refs: [CIS-Microsoft-Windows:18.10.89.2.1, CIS-Microsoft-Windows:18.10.89.2.3, MITRE-ATTACK:T1021.006]
+    query: { protocol: gpo, part: registry, scope: both, key: '{gpo}|{scope}|{key}|{value}|{action}', name: gpo }
+    each:
+      all:
+        - { field: key, op: match, value: '\\Windows\\WinRM\\Service$' }
+        - { field: value, op: in, value: [AllowBasic, AllowUnencryptedTraffic] }
+        - { field: data, op: eq, value: 1 }
+    evidence: '{gpo} ({scope}): {key}\{value} = {data}'
+
+  - id: GPO-REG-WINRM-CLIENT-WEAK
+    title: GPO allows Basic, Digest or unencrypted WinRM on the client
+    category: AUT
+    severity: medium
+    entity: gpo-setting
+    why: The client will then send credentials with weak protection to any WinRM endpoint it is pointed at.
+    fix: Set "Allow Basic authentication", "Allow Digest authentication" and "Allow unencrypted traffic" for the WinRM client to Disabled.
+    refs: [CIS-Microsoft-Windows:18.10.89.1.1, CIS-Microsoft-Windows:18.10.89.1.2, CIS-Microsoft-Windows:18.10.89.1.3]
+    query: { protocol: gpo, part: registry, scope: both, key: '{gpo}|{scope}|{key}|{value}|{action}', name: gpo }
+    each:
+      all:
+        - { field: key, op: match, value: '\\Windows\\WinRM\\Client$' }
+        - { field: value, op: in, value: [AllowBasic, AllowDigest, AllowUnencryptedTraffic] }
+        - { field: data, op: eq, value: 1 }
+    evidence: '{gpo} ({scope}): {key}\{value} = {data}'
+
+  - id: GPO-REG-RDP-WEAK
+    title: GPO weakens Remote Desktop security
+    category: AUT
+    severity: high
+    entity: gpo-setting
+    why: The legacy RDP security layer, no Network Level Authentication, low encryption or unencrypted RPC expose remote desktop sessions and their logon to interception.
+    fix: Require the SSL/TLS security layer (SecurityLayer = 2), Network Level Authentication (UserAuthentication = 1), High encryption (MinEncryptionLevel = 3) and secure RPC (fEncryptRPCTraffic = 1).
+    refs: [CIS-Microsoft-Windows:18.10.57.3.9.3, CIS-Microsoft-Windows:18.10.57.3.9.4, CIS-Microsoft-Windows:18.10.57.3.9.5, CIS-Microsoft-Windows:18.10.57.3.9.2]
+    query: { protocol: gpo, part: registry, scope: both, key: '{gpo}|{scope}|{key}|{value}|{action}', name: gpo }
+    each:
+      all:
+        - { field: key, op: match, value: '\\Windows NT\\Terminal Services$' }
+        - { field: action, op: absent }
+        - any:
+            - all: [ { field: value, op: eq, value: SecurityLayer }, { field: data, op: eq, value: 0 } ]
+            - all: [ { field: value, op: eq, value: UserAuthentication }, { field: data, op: eq, value: 0 } ]
+            - all: [ { field: value, op: eq, value: MinEncryptionLevel }, { field: data, op: lt, value: 3 } ]
+            - all: [ { field: value, op: eq, value: fEncryptRPCTraffic }, { field: data, op: eq, value: 0 } ]
+    evidence: '{gpo} ({scope}): {key}\{value} = {data}'
+
+  - id: GPO-REG-PS-LOGGING-OFF
+    title: GPO turns off PowerShell logging
+    category: LOG
+    severity: medium
+    entity: gpo-setting
+    why: Script block, module and transcription logging are the main record of what PowerShell ran; turning them off removes that evidence.
+    fix: Enable "Turn on PowerShell Script Block Logging" (and module logging where log volume allows).
+    refs: [CIS-Microsoft-Windows:18.10.87.1, MITRE-ATTACK:T1562.002, NIST-800-53:AU-12]
+    query: { protocol: gpo, part: registry, scope: both, key: '{gpo}|{scope}|{key}|{value}|{action}', name: gpo }
+    each:
+      all:
+        - { field: key, op: match, value: '\\Windows\\PowerShell\\(ScriptBlockLogging|ModuleLogging|Transcription)$' }
+        - { field: value, op: in, value: [EnableScriptBlockLogging, EnableModuleLogging, EnableTranscripting] }
+        - { field: data, op: eq, value: 0 }
+    evidence: '{gpo} ({scope}): {key}\{value} = {data}'
+
+  - id: GPO-REG-PS-SCRIPTBLOCK-NONE
+    title: No GPO turns on PowerShell script block logging
+    kind: missing
+    category: LOG
+    severity: medium
+    entity: domain
+    why: Without a policy, script block logging is off on most computers, so there is little record of what PowerShell ran. A setting delivered by MDM is not seen here.
+    fix: Enable "Turn on PowerShell Script Block Logging" in a baseline GPO and forward the PowerShell operational log.
+    refs: [CIS-Microsoft-Windows:18.10.87.1, NIST-800-53:AU-12]
+    query: { protocol: gpo, part: registry, scope: both, key: '{gpo}|{scope}|{key}|{value}|{action}', name: gpo }
+    count:
+      op: lt
+      value: 1
+      where:
+        all:
+          - { field: key, op: match, value: '\\Windows\\PowerShell\\ScriptBlockLogging$' }
+          - { field: value, op: eq, value: EnableScriptBlockLogging }
+          - { field: data, op: eq, value: 1 }
+    evidence: 'No GPO enables script block logging ({count} found)'
+
+  - id: GPO-REG-ALWAYS-INSTALL-ELEVATED
+    title: GPO makes Windows Installer always install with elevated rights
+    category: AUT
+    severity: critical
+    entity: gpo-setting
+    why: Any user can then install any package with system rights, which amounts to giving every user administrator access.
+    fix: Set "Always install with elevated privileges" to Disabled in both computer and user configuration.
+    refs: [CIS-Microsoft-Windows:18.10.81.2, MITRE-ATTACK:T1548]
+    query: { protocol: gpo, part: registry, scope: both, key: '{gpo}|{scope}|{key}|{value}|{action}', name: gpo }
+    each:
+      all:
+        - { field: key, op: match, value: '\\Policies\\Microsoft\\Windows\\Installer$' }
+        - { field: value, op: eq, value: AlwaysInstallElevated }
+        - { field: data, op: eq, value: 1 }
+    evidence: '{gpo} ({scope}): {key}\{value} = {data}'
+
+  - id: GPO-REG-DEFENDER-OFF
+    title: GPO turns off Microsoft Defender Antivirus or its real-time protection
+    category: CFG
+    severity: high
+    entity: gpo-setting
+    why: Computers in scope lose Defender's malware protection. Turning Defender off is common where a third-party antivirus is the standard; then the finding is to confirm that product runs everywhere in scope.
+    fix: Remove the setting (or set it to Disabled/Not configured); if another antivirus is the standard, record that and confirm it runs.
+    refs: [MITRE-ATTACK:T1562.001, NIST-800-53:SI-3, CIS-Microsoft-Windows:18.10.43.10.3]
+    query: { protocol: gpo, part: registry, scope: both, key: '{gpo}|{scope}|{key}|{value}|{action}', name: gpo }
+    each:
+      all:
+        - { field: key, op: match, value: '\\Policies\\Microsoft\\Windows Defender(\\Real-Time Protection)?$' }
+        - { field: value, op: in, value: [DisableAntiSpyware, DisableAntiVirus, DisableRealtimeMonitoring, DisableBehaviorMonitoring, DisableIOAVProtection, DisableOnAccessProtection, DisableScriptScanning] }
+        - { field: data, op: eq, value: 1 }
+    evidence: '{gpo} ({scope}): {key}\{value} = {data}'
+
+  - id: GPO-REG-DEFENDER-EXCLUSION-BROAD
+    title: GPO adds a broad Microsoft Defender exclusion
+    category: CFG
+    severity: high
+    entity: gpo-setting
+    why: Excluding a whole drive, a temp or user folder, a script or executable extension, or a script host process leaves the places malware usually runs from unscanned.
+    fix: Remove the broad exclusion and replace it with the narrowest path or process that the application vendor documents.
+    refs: [MITRE-ATTACK:T1562.001, NIST-800-53:SI-3]
+    query: { protocol: gpo, part: registry, scope: both, key: '{gpo}|{scope}|{key}|{value}|{action}', name: gpo }
+    each:
+      all:
+        - { field: action, op: absent }
+        - any:
+            - all:
+                - { field: key, op: match, value: '\\Windows Defender\\Exclusions\\Paths$' }
+                - { field: value, op: match, value: '^([A-Z]:\\?|\*|%(TEMP|TMP|USERPROFILE|APPDATA|LOCALAPPDATA)%.*|[A-Z]:\\(Users|Temp|Windows\\Temp)\\?|.*\\Downloads\\?)$' }
+            - all:
+                - { field: key, op: match, value: '\\Windows Defender\\Exclusions\\Extensions$' }
+                - { field: value, op: match, value: '^\.?(exe|dll|ps1|bat|cmd|vbs|js|scr|msi|hta|com)$' }
+            - all:
+                - { field: key, op: match, value: '\\Windows Defender\\Exclusions\\Processes$' }
+                - { field: value, op: match, value: '(^|\\)(powershell|pwsh|cmd|wscript|cscript|mshta|rundll32|regsvr32)\.exe$' }
+    evidence: '{gpo} ({scope}): {key} excludes {value}'
+
+  - id: GPO-REG-FIREWALL-OFF
+    title: GPO turns off Windows Firewall or allows all inbound traffic
+    category: CFG
+    severity: high
+    entity: gpo-setting
+    why: A disabled profile or a default inbound action of Allow exposes every listening service on the computers in scope.
+    fix: Set each firewall profile to On (EnableFirewall = 1) with inbound connections blocked by default (DefaultInboundAction = 1).
+    refs: [CIS-Microsoft-Windows:9.1.1, CIS-Microsoft-Windows:9.1.2, CIS-Microsoft-Windows:9.3.1, MITRE-ATTACK:T1562.004]
+    query: { protocol: gpo, part: registry, scope: both, key: '{gpo}|{scope}|{key}|{value}|{action}', name: gpo }
+    each:
+      all:
+        - { field: key, op: match, value: '\\WindowsFirewall\\(DomainProfile|StandardProfile|PrivateProfile|PublicProfile)$' }
+        - { field: value, op: in, value: [EnableFirewall, DefaultInboundAction] }
+        - { field: data, op: eq, value: 0 }
+    evidence: '{gpo} ({scope}): {key}\{value} = {data}'
+
+  - id: GPO-REG-SMB1-OR-GUEST
+    title: GPO turns on SMBv1 or insecure guest logons
+    category: AUT
+    severity: high
+    entity: gpo-setting
+    why: SMBv1 lacks modern protections, and insecure guest logons connect to shares without authenticating the server or the user.
+    fix: Disable the SMBv1 server and client driver, and set "Enable insecure guest logons" to Disabled.
+    refs: [CIS-Microsoft-Windows:18.4.3, CIS-Microsoft-Windows:18.6.8.4, NIST-800-53:CM-7]
+    query: { protocol: gpo, part: registry, scope: both, key: '{gpo}|{scope}|{key}|{value}|{action}', name: gpo }
+    each:
+      any:
+        - all: [ { field: key, op: match, value: '\\LanmanServer\\Parameters$' }, { field: value, op: eq, value: SMB1 }, { field: data, op: eq, value: 1 } ]
+        - all: [ { field: key, op: match, value: '\\Services\\mrxsmb10$' }, { field: value, op: eq, value: Start }, { field: data, op: in, value: [2, 3] } ]
+        - all: [ { field: key, op: match, value: '\\Windows\\LanmanWorkstation$' }, { field: value, op: eq, value: AllowInsecureGuestAuth }, { field: data, op: eq, value: 1 } ]
+    evidence: '{gpo} ({scope}): {key}\{value} = {data}'
+
+  - id: GPO-REG-LLMNR-NOT-DISABLED
+    title: No GPO turns off multicast name resolution (LLMNR)
+    kind: missing
+    category: AUT
+    severity: medium
+    entity: domain
+    why: With LLMNR on, a computer that cannot resolve a name asks the local network, and any device there can answer and receive its authentication attempt.
+    fix: Enable "Turn off multicast name resolution" (EnableMulticast = 0) in a baseline GPO.
+    refs: [CIS-Microsoft-Windows:18.6.4.4, MITRE-ATTACK:T1557.001]
+    query: { protocol: gpo, part: registry, scope: both, key: '{gpo}|{scope}|{key}|{value}|{action}', name: gpo }
+    count:
+      op: lt
+      value: 1
+      where:
+        all:
+          - { field: scope, op: eq, value: machine }
+          - { field: key, op: match, value: '\\Windows NT\\DNSClient$' }
+          - { field: value, op: eq, value: EnableMulticast }
+          - { field: data, op: eq, value: 0 }
+    evidence: 'No GPO turns off LLMNR ({count} found)'
+
+  - id: GPO-REG-POINT-AND-PRINT-WEAK
+    title: GPO lets non-administrators install printer drivers without a prompt
+    category: CFG
+    severity: high
+    entity: gpo-setting
+    why: Printer drivers run with system rights; installing them without elevation lets any user add driver code to the computer.
+    fix: Set RestrictDriverInstallationToAdministrators = 1 and show the warning and elevation prompt for Point and Print installs and updates.
+    refs: [CIS-Microsoft-Windows:18.7.10, CIS-Microsoft-Windows:18.7.12, MS-KB:5005652]
+    query: { protocol: gpo, part: registry, scope: both, key: '{gpo}|{scope}|{key}|{value}|{action}', name: gpo }
+    each:
+      all:
+        - { field: key, op: match, value: '\\Windows NT\\Printers\\PointAndPrint$' }
+        - any:
+            - all: [ { field: value, op: eq, value: RestrictDriverInstallationToAdministrators }, { field: data, op: eq, value: 0 } ]
+            - all: [ { field: value, op: eq, value: NoWarningNoElevationOnInstall }, { field: data, op: eq, value: 1 } ]
+            - all: [ { field: value, op: eq, value: UpdatePromptSettings }, { field: data, op: eq, value: 2 } ]
+    evidence: '{gpo} ({scope}): {key}\{value} = {data}'
+
+  - id: GPO-REG-CREDSSP-WEAK
+    title: GPO weakens credential delegation (CredSSP)
+    category: AUT
+    severity: high
+    entity: gpo-setting
+    why: Delegating default or saved credentials to any server ("*" or "TERMSRV/*"), or allowing unpatched CredSSP peers, sends reusable credentials further than intended.
+    fix: List only specific server names for credential delegation, and set Encryption Oracle Remediation to Force Updated Clients (0) or Mitigated (1).
+    refs: [CIS-Microsoft-Windows:18.9.4.1, NIST-800-53:IA-5]
+    query: { protocol: gpo, part: registry, scope: both, key: '{gpo}|{scope}|{key}|{value}|{action}', name: gpo }
+    each:
+      any:
+        - all:
+            - { field: key, op: match, value: '\\CredentialsDelegation\\Allow(Default|Fresh|Saved)Credentials(WhenNTLMOnly)?$' }
+            - { field: data, op: match, value: '^\*$|^[^/]+/\*$' }
+        - all:
+            - { field: key, op: match, value: '\\CredSSP\\Parameters$' }
+            - { field: value, op: eq, value: AllowEncryptionOracle }
+            - { field: data, op: eq, value: 2 }
+    evidence: '{gpo} ({scope}): {key}\{value} = {data}'
+
+  - id: GPO-REG-WSUS-HTTP
+    title: GPO points Windows Update at a server over plain HTTP
+    category: LCM
+    severity: high
+    lens: both
+    entity: gpo-setting
+    why: Update metadata fetched over HTTP can be altered on the network path, and updates are installed with system rights.
+    fix: Publish the update server over HTTPS and change WUServer and WUStatusServer to https:// addresses.
+    refs: [NIST-800-53:SI-2, NIST-800-53:SC-8]
+    query: { protocol: gpo, part: registry, scope: both, key: '{gpo}|{scope}|{key}|{value}|{action}', name: gpo }
+    each:
+      all:
+        - { field: key, op: match, value: '\\Windows\\WindowsUpdate$' }
+        - { field: value, op: in, value: [WUServer, WUStatusServer] }
+        - { field: data, op: match, value: '^http://' }
+    evidence: '{gpo} ({scope}): {key}\{value} = {data}'
+
+  - id: GPO-REG-AUTOLOGON
+    title: GPO turns on automatic logon or stores its password
+    category: IAM
+    severity:
+      field: value
+      map: { DefaultPassword: critical }
+      default: high
+    entity: gpo-setting
+    why: Automatic logon opens a session for anyone at the console and keeps the account's password on the computer; a password set here is also readable in SYSVOL. Keeper keeps only "set".
+    fix: Remove the Winlogon settings, change the account's password, and use a kiosk profile for unattended devices.
+    refs: [MITRE-ATTACK:T1552.002, CIS-Microsoft-Windows:18.5.1]
+    query: { protocol: gpo, part: registry, scope: both, key: '{gpo}|{scope}|{key}|{value}|{action}', name: gpo }
+    each:
+      all:
+        - { field: key, op: match, value: '\\Windows NT\\CurrentVersion\\Winlogon$' }
+        - any:
+            - all: [ { field: value, op: eq, value: AutoAdminLogon }, { field: data, op: eq, value: 1 } ]
+            - all: [ { field: value, op: eq, value: DefaultPassword }, { field: data, op: eq, value: set } ]
+    evidence: '{gpo} ({scope}): {key}\{value} = {data}'
+
+  - id: GPO-REG-OFFICE-MACROS-ALLOWED
+    title: GPO enables all Office macros or allows macros from the internet
+    category: CFG
+    severity: high
+    entity: gpo-setting
+    why: Running all macros, or not blocking macros in files from the internet, lets a document received by mail run code as the user.
+    fix: Set macro notification to disable unsigned macros (VBAWarnings 2-4) and enable "Block macros from running in Office files from the Internet".
+    refs: [MITRE-ATTACK:T1204.002, NIST-800-53:SI-3]
+    query: { protocol: gpo, part: registry, scope: both, key: '{gpo}|{scope}|{key}|{value}|{action}', name: gpo }
+    each:
+      all:
+        - { field: key, op: match, value: '\\Office\\\d+\.0\\[^\\]+\\Security$' }
+        - any:
+            - all: [ { field: value, op: eq, value: VBAWarnings }, { field: data, op: eq, value: 1 } ]
+            - all: [ { field: value, op: eq, value: blockcontentexecutionfrominternet }, { field: data, op: eq, value: 0 } ]
+    evidence: '{gpo} ({scope}): {key}\{value} = {data}'
+
+  - id: GPO-REG-HARDENED-UNC-WEAKENED
+    title: GPO turns off hardening for SYSVOL or NETLOGON paths
+    category: AUT
+    severity: high
+    entity: gpo-setting
+    why: Computers fetch policy and scripts from SYSVOL and NETLOGON; without mutual authentication and integrity they can be served altered content.
+    fix: Set the hardened UNC paths for \\*\SYSVOL and \\*\NETLOGON to RequireMutualAuthentication=1, RequireIntegrity=1.
+    refs: [MS-KB:3000483, NIST-800-53:SC-8]
+    query: { protocol: gpo, part: registry, scope: both, key: '{gpo}|{scope}|{key}|{value}|{action}', name: gpo }
+    each:
+      all:
+        - { field: key, op: match, value: '\\NetworkProvider\\HardenedPaths$' }
+        - { field: value, op: match, value: '\\(SYSVOL|NETLOGON)$' }
+        - { field: data, op: match, value: 'Require(MutualAuthentication|Integrity)\s*=\s*0' }
+    evidence: '{gpo} ({scope}): {value} = {data}'
+
+  - id: GPO-REG-SECURITY-LOG-SMALL
+    title: GPO keeps the Security event log small
+    category: LOG
+    severity: low
+    entity: gpo-setting
+    why: A small Security log overwrites events quickly, so the record of sign-ins and changes may be gone before anyone looks.
+    fix: Set the Security log maximum size to at least 196,608 KB, or forward events to a central collector.
+    refs: [CIS-Microsoft-Windows:18.10.26.2.2, NIST-800-53:AU-4]
+    query: { protocol: gpo, part: registry, scope: both, key: '{gpo}|{scope}|{key}|{value}|{action}', name: gpo }
+    each:
+      all:
+        - { field: key, op: match, value: '\\Windows\\EventLog\\Security$' }
+        - { field: value, op: eq, value: MaxSize }
+        - { field: action, op: absent }
+        - { field: data, op: lt, value: 196608, threshold: gpo.security-log-min-kb }
+    evidence: '{gpo} ({scope}): Security log MaxSize = {data} KB'
+
+  - id: GPO-REG-MACHINE-KEY-IN-USER-HALF
+    title: Computer-only setting placed in the User half of a GPO
+    kind: broken
+    lens: maintenance
+    category: CFG
+    severity: low
+    entity: gpo-setting
+    why: User settings are written to the user's own registry, where computer-only settings such as Defender, firewall, LAPS or system keys have no effect - the intended protection is not applied.
+    fix: Move the setting to Computer Configuration.
+    refs: [NIST-800-53:CM-6]
+    query: { protocol: gpo, part: registry, scope: both, key: '{gpo}|{scope}|{key}|{value}|{action}', name: gpo }
+    each:
+      all:
+        - { field: scope, op: eq, value: user }
+        - { field: key, op: match, value: '^(SYSTEM\\|Software\\Policies\\Microsoft\\(Windows Defender|WindowsFirewall|FVE)\\?|Software\\Policies\\Microsoft\\Windows\\(WinRM|DeviceGuard)\\?|Software\\Policies\\Microsoft Services\\AdmPwd|Software\\Microsoft\\Policies\\LAPS)' }
+    evidence: '{gpo} (user): {key}\{value}'
+
+  - id: GPO-REG-REMOTE-ASSISTANCE-UNSOLICITED
+    title: GPO turns on unsolicited (offered) Remote Assistance
+    category: AUT
+    severity: high
+    entity: gpo-setting
+    why: With "Offer Remote Assistance" on, the helpers it lists can open a session to a computer without the user having asked for help, and with full control they can operate it as the signed-in user; a helper account that is compromised reaches every computer in scope this way.
+    fix: Set "Configure Offer Remote Assistance" to Disabled (fAllowUnsolicited = 0) unless a help desk depends on it; if it does, allow view-only (fAllowUnsolicitedFullControl = 0), keep the helper list to one reviewed group, and scope the GPO to the computers that need it.
+    refs: [MITRE-ATTACK:T1219, NIST-800-53:AC-17]
+    query: { protocol: gpo, part: registry, scope: both, key: '{gpo}|{scope}|{key}|{value}|{action}', name: gpo }
+    each:
+      all:
+        - { field: key, op: match, value: '\\Windows NT\\Terminal Services$' }
+        - { field: action, op: absent }
+        - { field: value, op: in, value: [fAllowUnsolicited, fAllowUnsolicitedFullControl] }
+        - { field: data, op: eq, value: 1 }
+    evidence: '{gpo} ({scope}): {key}\{value} = {data}'
+
+  # ---- "No GPO hardens X": a must-exist count over the computer half of every GPO. A setting delivered by
+  # other means (MDM, Intune, Defender for Endpoint, a preference item, the OS default) is not seen here,
+  # so each why says what the default is and the finding can be accepted where another channel covers it.
+
+  - id: GPO-REG-DEFENDER-POLICY-NONE
+    title: No GPO configures Microsoft Defender Antivirus
+    kind: missing
+    category: CFG
+    severity: medium
+    entity: domain
+    why: With no Defender policy at all, each computer runs whatever its local defaults and local administrators decide - no enforced cloud protection, tamper-resistant settings, scan schedule or exclusion control. Where Defender is managed through Intune or Defender for Endpoint, or another antivirus is the standard, record that instead.
+    fix: Manage Defender centrally - a baseline GPO under Computer Configuration > Administrative Templates > Microsoft Defender Antivirus (real-time protection, cloud protection, PUA blocking), or the equivalent Intune endpoint security policy.
+    refs: [NIST-800-53:SI-3, NIST-800-53:CM-6, CIS-Controls-v8:10.1]
+    query: { protocol: gpo, part: registry, scope: both, key: '{gpo}|{scope}|{key}|{value}|{action}', name: gpo }
+    count:
+      op: lt
+      value: 1
+      where:
+        all:
+          - { field: scope, op: eq, value: machine }
+          - { field: key, op: match, value: '\\Policies\\Microsoft\\Windows Defender(\\|$)' }
+          - { field: action, op: absent }
+    evidence: 'No GPO sets a Microsoft Defender Antivirus policy ({count} found)'
+
+  - id: GPO-REG-ASR-NONE
+    title: No GPO turns on attack surface reduction rules
+    kind: missing
+    category: CFG
+    severity: medium
+    entity: domain
+    why: Attack surface reduction rules block common malware behaviours - Office apps starting child processes, credential theft from LSASS, scripts launching downloaded content - and they are off until a policy turns them on. Only the Group Policy switch is seen; rules deployed through Intune or Defender for Endpoint are not.
+    fix: Enable "Configure Attack Surface Reduction rules" (ExploitGuard_ASR_Rules = 1) in a baseline GPO with the standard rule set in audit mode first, review the events, then switch the rules to block.
+    refs: [MITRE-ATTACK:T1204.002, MITRE-ATTACK:T1003.001, NIST-800-53:SI-3]
+    query: { protocol: gpo, part: registry, scope: both, key: '{gpo}|{scope}|{key}|{value}|{action}', name: gpo }
+    count:
+      op: lt
+      value: 1
+      where:
+        all:
+          - { field: scope, op: eq, value: machine }
+          - { field: key, op: match, value: '\\Windows Defender\\Windows Defender Exploit Guard\\ASR$' }
+          - { field: value, op: eq, value: ExploitGuard_ASR_Rules }
+          - { field: data, op: eq, value: 1 }
+    evidence: 'No GPO enables attack surface reduction rules ({count} found)'
+
+  - id: GPO-REG-BITLOCKER-NONE
+    title: No GPO configures BitLocker drive encryption
+    kind: missing
+    category: CFG
+    severity: medium
+    entity: domain
+    why: Without a BitLocker policy nothing requires encryption, a cipher strength, a startup authentication method or recovery-key backup to the directory, so a lost or stolen laptop's disk may be readable and its recovery key may exist nowhere. Encryption enforced through Intune is not seen here.
+    fix: Configure BitLocker in a baseline GPO (Computer Configuration > Administrative Templates > Windows Components > BitLocker Drive Encryption) with XTS-AES 128 or 256, recovery information stored in AD DS before encryption is enabled, and the startup authentication the organisation requires; or enforce it through Intune.
+    refs: [NIST-800-53:SC-28, NIST-800-53:SC-28(1), CIS-Controls-v8:3.6]
+    query: { protocol: gpo, part: registry, scope: both, key: '{gpo}|{scope}|{key}|{value}|{action}', name: gpo }
+    count:
+      op: lt
+      value: 1
+      where:
+        all:
+          - { field: scope, op: eq, value: machine }
+          - { field: key, op: match, value: '\\Policies\\Microsoft\\FVE$' }
+          - { field: action, op: absent }
+    evidence: 'No GPO sets a BitLocker policy ({count} found)'
+
+  - id: GPO-REG-STANDBY-NOT-DISABLED-NONE
+    title: No GPO turns off sleep (standby) states
+    kind: missing
+    category: CFG
+    severity: low
+    entity: domain
+    why: In sleep (S1-S3) the disk encryption key stays in memory, so a sleeping laptop's BitLocker protection can be bypassed by someone holding it; hibernation or shutdown does not keep the key. This matters most where BitLocker uses TPM-only startup. Windows allows sleep by default.
+    fix: Set "Allow standby states (S1-S3) when sleeping (plugged in)" and "(on battery)" to Disabled for laptops (ACSettingIndex / DCSettingIndex = 0 under the standby-states power setting), or require a startup PIN instead.
+    refs: [NIST-800-53:SC-28, MITRE-ATTACK:T1006]
+    query: { protocol: gpo, part: registry, scope: both, key: '{gpo}|{scope}|{key}|{value}|{action}', name: gpo }
+    count:
+      op: lt
+      value: 1
+      where:
+        all:
+          - { field: scope, op: eq, value: machine }
+          - { field: key, op: match, value: '\\Policies\\Microsoft\\Power\\PowerSettings\\abfc2519-3608-4c2a-94ea-171b0ed546ab$' }
+          - { field: value, op: in, value: [ACSettingIndex, DCSettingIndex] }
+          - { field: data, op: eq, value: 0 }
+    evidence: 'No GPO turns off standby states ({count} found)'
+
+  - id: GPO-REG-WORKPLACE-JOIN-BLOCK-NONE
+    title: No GPO blocks workplace registration of domain-joined computers
+    kind: missing
+    category: CFG
+    severity: low
+    entity: domain
+    lens: both
+    why: A domain-joined computer that a user also workplace-registers (for example by signing in to an Office app and accepting "allow my organisation to manage this device") gets a second Entra device object; that dual state confuses device-based Conditional Access and device reports (ENTRA-DEVICE-DUAL-STATE).
+    fix: Enable "Block workplace join" (BlockAADWorkplaceJoin = 1) in a GPO for hybrid-joined computers, then delete the leftover registered objects.
+    refs: [NIST-800-53:CM-8, NIST-800-53:AC-19]
+    query: { protocol: gpo, part: registry, scope: both, key: '{gpo}|{scope}|{key}|{value}|{action}', name: gpo }
+    count:
+      op: lt
+      value: 1
+      where:
+        all:
+          - { field: scope, op: eq, value: machine }
+          - { field: key, op: match, value: '\\Policies\\Microsoft\\Windows\\WorkplaceJoin$' }
+          - { field: value, op: eq, value: BlockAADWorkplaceJoin }
+          - { field: data, op: eq, value: 1 }
+    evidence: 'No GPO sets BlockAADWorkplaceJoin ({count} found)'
+
+  - id: GPO-REG-CREDENTIAL-GUARD-NONE
+    title: No GPO turns on Credential Guard
+    kind: missing
+    category: AUT
+    severity: medium
+    entity: domain
+    why: Credential Guard keeps NTLM hashes and Kerberos tickets in an isolated, virtualisation-protected process, so tools that read LSASS memory on a compromised computer find nothing to reuse. Recent Windows 11 Enterprise releases turn it on by default on capable hardware, but servers, older builds and other editions rely on policy.
+    fix: Enable "Turn On Virtualization Based Security" with Credential Guard configured (EnableVirtualizationBasedSecurity = 1, LsaCfgFlags = 1 with UEFI lock or 2 without) in a baseline GPO for capable computers, after checking for software that needs NTLMv1, unconstrained delegation or saved credentials.
+    refs: [MITRE-ATTACK:T1003.001, MITRE-ATTACK:T1550.002, NIST-800-53:SC-39]
+    query: { protocol: gpo, part: registry, scope: both, key: '{gpo}|{scope}|{key}|{value}|{action}', name: gpo }
+    count:
+      op: lt
+      value: 1
+      where:
+        all:
+          - { field: scope, op: eq, value: machine }
+          - { field: key, op: match, value: '\\Policies\\Microsoft\\Windows\\DeviceGuard$' }
+          - { field: value, op: eq, value: LsaCfgFlags }
+          - { field: data, op: in, value: [1, 2] }
+    evidence: 'No GPO sets LsaCfgFlags to turn on Credential Guard ({count} found)'
+
+  - id: GPO-REG-SMB1-DISABLE-NONE
+    title: No GPO turns off SMBv1
+    kind: missing
+    category: AUT
+    severity: low
+    entity: domain
+    why: SMBv1 has no pre-authentication integrity or encryption and was the path of several wormable exploits. New Windows installs leave it out, but upgraded and older systems may still run it; GPO-REG-SMB1-OR-GUEST only fires when a GPO turns it on. Counted here are the MS Security Guide settings (SMB1 = 0 on the server, mrxsmb10 Start = 4 for the client driver).
+    fix: Import the Microsoft security baseline templates and set "Configure SMB v1 server" to Disabled and "Configure SMB v1 client driver" to Disable driver in a baseline GPO, after checking the SMB1 access audit for remaining clients.
+    refs: [CIS-Microsoft-Windows:18.4.3, NIST-800-53:CM-7]
+    query: { protocol: gpo, part: registry, scope: both, key: '{gpo}|{scope}|{key}|{value}|{action}', name: gpo }
+    count:
+      op: lt
+      value: 1
+      where:
+        all:
+          - { field: scope, op: eq, value: machine }
+          - any:
+              - all: [ { field: key, op: match, value: '\\LanmanServer\\Parameters$' }, { field: value, op: eq, value: SMB1 }, { field: data, op: eq, value: 0 } ]
+              - all: [ { field: key, op: match, value: '\\Services\\mrxsmb10$' }, { field: value, op: eq, value: Start }, { field: data, op: eq, value: 4 } ]
+    evidence: 'No GPO turns off SMBv1 ({count} found)'
+
+  - id: GPO-REG-AUTORUN-DISABLE-NONE
+    title: No GPO turns off AutoRun
+    kind: missing
+    category: CFG
+    severity: low
+    entity: domain
+    why: AutoRun and AutoPlay act on inserted media without the user choosing to, a long-standing way for malware to spread from removable drives. GPO-REG-AUTORUN-ON only fires when a GPO turns it on; without any policy, users and their media decide.
+    fix: In a baseline GPO set "Set the default behavior for AutoRun" to Do not execute any autorun commands (NoAutorun = 1) and "Turn off Autoplay" to All drives (NoDriveTypeAutoRun = 255).
+    refs: [CIS-Microsoft-Windows:18.10.8.2, MITRE-ATTACK:T1091]
+    query: { protocol: gpo, part: registry, scope: both, key: '{gpo}|{scope}|{key}|{value}|{action}', name: gpo }
+    count:
+      op: lt
+      value: 1
+      where:
+        all:
+          - { field: scope, op: eq, value: machine }
+          - { field: key, op: match, value: '\\CurrentVersion\\Policies\\Explorer$' }
+          - any:
+              - all: [ { field: value, op: eq, value: NoAutorun }, { field: data, op: eq, value: 1 } ]
+              - all: [ { field: value, op: eq, value: NoDriveTypeAutoRun }, { field: data, op: eq, value: 255 } ]
+    evidence: 'No GPO turns off AutoRun or AutoPlay ({count} found)'
+
+  - id: GPO-REG-POINT-AND-PRINT-RESTRICT-NONE
+    title: No GPO restricts printer driver installation to administrators
+    kind: missing
+    category: CFG
+    severity: low
+    entity: domain
+    why: Printer drivers run with system rights. Since the 2021 PrintNightmare updates Windows limits Point and Print driver installs to administrators by default, but nothing stops a local change or a later GPO from undoing that; GPO-REG-POINT-AND-PRINT-WEAK only fires when a GPO weakens it.
+    fix: Set "Limits print driver installation to Administrators" to Enabled (RestrictDriverInstallationToAdministrators = 1) in a baseline GPO, and use Package Point and Print approved servers for the print servers users need.
+    refs: [MS-KB:5005652, CIS-Microsoft-Windows:18.7.10, NIST-800-53:CM-11]
+    query: { protocol: gpo, part: registry, scope: both, key: '{gpo}|{scope}|{key}|{value}|{action}', name: gpo }
+    count:
+      op: lt
+      value: 1
+      where:
+        all:
+          - { field: scope, op: eq, value: machine }
+          - { field: key, op: match, value: '\\Windows NT\\Printers\\PointAndPrint$' }
+          - { field: value, op: eq, value: RestrictDriverInstallationToAdministrators }
+          - { field: data, op: eq, value: 1 }
+    evidence: 'No GPO restricts printer driver installation to administrators ({count} found)'
+
+  # ================================================================ 5a. account and Kerberos policy outside the default policy
+  # The domain's own policy is judged from the domain object in active-directory.yaml; these rules look at
+  # other GPOs, which set policy for local accounts where they are linked, or compete with the default
+  # when linked at the domain root. The Default Domain Policy GUID is fixed by Windows.
+
+  - id: GPO-SEC-ACCOUNT-POLICY-OUTSIDE-DEFAULT
+    title: Password or lockout policy defined in a GPO other than the Default Domain Policy
+    lens: both
+    category: CFG
+    severity: low
+    entity: gpo
+    why: Domain account policy comes only from GPOs linked at the domain root; elsewhere these settings govern local accounts. Policy spread across several GPOs is easy to misread and can override the intended domain policy.
+    fix: Keep domain password and lockout policy in the Default Domain Policy (or fine-grained password policies); remove it from other GPOs unless it is deliberately for local accounts.
+    refs: [NIST-800-53:IA-5(1), NIST-800-53:AC-7, NIST-800-53:CM-6]
+    query: { protocol: gpo, part: security, scope: machine, key: '{gpo}|{section}|{key}', name: gpo, min_rows: 1 }
+    count:
+      op: gt
+      value: 0
+      by: gpo
+      where:
+        all:
+          - { field: section, op: eq, value: System Access }
+          - { field: key, op: in, value: [MinimumPasswordLength, PasswordComplexity, MaximumPasswordAge, MinimumPasswordAge, PasswordHistorySize, LockoutBadCount, ResetLockoutCount, LockoutDuration, ClearTextPassword] }
+          - { field: gpo, op: ne, value: '{31B2F340-016D-11D2-945F-00C04FB984F9}' }
+    evidence: '{group} defines {count} password or lockout settings'
+
+  - id: GPO-SEC-LOCAL-ACCOUNT-POLICY-WEAK
+    title: Non-default GPO sets a weak password or lockout policy
+    category: IAM
+    severity:
+      field: key
+      map: { ClearTextPassword: high }
+      default: medium
+    entity: gpo-setting
+    why: Where this GPO applies, local accounts (or the domain, if it is linked at the root and wins) get short or simple passwords, reversible password storage, or no lockout.
+    fix: Raise the minimum length to 14, enable complexity, disable reversible encryption and set a lockout threshold - or remove the settings from this GPO.
+    refs: [NIST-800-53:IA-5(1), NIST-800-53:AC-7, CIS-Controls-v8:5.2]
+    query: { protocol: gpo, part: security, scope: machine, key: '{gpo}|{section}|{key}', name: gpo, min_rows: 1 }
+    each:
+      all:
+        - { field: section, op: eq, value: System Access }
+        - { field: gpo, op: ne, value: '{31B2F340-016D-11D2-945F-00C04FB984F9}' }
+        - any:
+            - all: [ { field: key, op: eq, value: MinimumPasswordLength }, { field: value, op: lt, value: 14, threshold: gpo.min-password-length } ]
+            - all: [ { field: key, op: eq, value: PasswordComplexity }, { field: value, op: eq, value: 0 } ]
+            - all: [ { field: key, op: eq, value: ClearTextPassword }, { field: value, op: eq, value: 1 } ]
+            - all: [ { field: key, op: eq, value: LockoutBadCount }, { field: value, op: eq, value: 0 } ]
+    evidence: '{gpo}: {key} = {value}'
+
+  - id: GPO-SEC-GUEST-OR-ANON-LOOKUP
+    title: GPO enables the Guest account or anonymous name lookup
+    category: IAM
+    severity: high
+    entity: gpo-setting
+    why: An enabled Guest account allows access without a personal identity, and anonymous SID/name translation lets unauthenticated clients look up account names.
+    fix: Set "Accounts - Guest account status" to Disabled (EnableGuestAccount = 0) and "Allow anonymous SID/Name translation" to Disabled (LSAAnonymousNameLookup = 0).
+    refs: [NIST-800-53:AC-2, NIST-800-53:AC-14]
+    query: { protocol: gpo, part: security, scope: machine, key: '{gpo}|{section}|{key}', name: gpo, min_rows: 1 }
+    each:
+      all:
+        - { field: section, op: eq, value: System Access }
+        - { field: key, op: in, value: [EnableGuestAccount, LSAAnonymousNameLookup] }
+        - { field: value, op: eq, value: 1 }
+    evidence: '{gpo}: {key} = {value}'
+
+  - id: GPO-KRB-POLICY-WEAK
+    title: Kerberos policy has long ticket lifetimes or no logon restrictions
+    category: AUT
+    severity: low
+    entity: gpo-setting
+    why: Longer ticket lifetimes keep a stolen ticket useful for longer, a wide clock skew widens the replay window, and turning off user logon restrictions skips account checks when service tickets are issued.
+    fix: Keep the defaults - user tickets 10 hours, renewal 7 days, service tickets 600 minutes, clock skew 5 minutes, logon restrictions enforced.
+    refs: [NIST-800-53:IA-5, NIST-800-53:AC-12, MITRE-ATTACK:T1558]
+    query: { protocol: gpo, part: security, scope: machine, key: '{gpo}|{section}|{key}', name: gpo, min_rows: 1 }
+    each:
+      all:
+        - { field: section, op: eq, value: Kerberos Policy }
+        - any:
+            - all: [ { field: key, op: eq, value: MaxTicketAge }, { field: value, op: gt, value: 10 } ]
+            - all: [ { field: key, op: eq, value: MaxRenewAge }, { field: value, op: gt, value: 7 } ]
+            - all: [ { field: key, op: eq, value: MaxServiceAge }, { field: value, op: gt, value: 600 } ]
+            - all: [ { field: key, op: eq, value: MaxClockSkew }, { field: value, op: gt, value: 5 } ]
+            - all: [ { field: key, op: eq, value: TicketValidateClient }, { field: value, op: eq, value: 0 } ]
+    evidence: '{gpo}: {key} = {value}'
+
+  - id: GPO-KRB-POLICY-OUTSIDE-DEFAULT
+    title: Kerberos policy defined in a GPO other than the Default Domain Policy
+    lens: maintenance
+    category: CFG
+    severity: info
+    entity: gpo
+    why: Kerberos policy only takes effect from GPOs linked at the domain root; anywhere else it does nothing, and at the root it competes with the default policy.
+    fix: Keep Kerberos policy in the Default Domain Policy and remove it from other GPOs.
+    refs: [NIST-800-53:CM-6]
+    query: { protocol: gpo, part: security, scope: machine, key: '{gpo}|{section}|{key}', name: gpo, min_rows: 1 }
+    count:
+      op: gt
+      value: 0
+      by: gpo
+      where:
+        all:
+          - { field: section, op: eq, value: Kerberos Policy }
+          - { field: gpo, op: ne, value: '{31B2F340-016D-11D2-945F-00C04FB984F9}' }
+    evidence: '{group} defines {count} Kerberos policy settings'
+
+  # ================================================================ 5b. audit policy
+
+  - id: GPO-SEC-LEGACY-AUDIT-OFF
+    title: GPO sets a legacy audit category to No auditing
+    category: LOG
+    severity: medium
+    entity: gpo-setting
+    why: A legacy audit category set to 0 turns off auditing for that whole area wherever the GPO wins, unless advanced audit policy is forced to override it.
+    fix: Remove the legacy audit settings and configure advanced audit policy instead, with "Force audit policy subcategory settings" enabled.
+    refs: [MITRE-ATTACK:T1562.002, NIST-800-53:AU-2]
+    query: { protocol: gpo, part: security, scope: machine, key: '{gpo}|{section}|{key}', name: gpo, min_rows: 1 }
+    each:
+      all:
+        - { field: section, op: eq, value: Event Audit }
+        - { field: key, op: match, value: '^Audit' }
+        - { field: value, op: eq, value: 0 }
+    evidence: '{gpo}: {key} = {value}'
+
+  - id: GPO-SEC-LEGACY-AUDIT-OVERRIDES
+    title: GPO lets legacy audit categories override advanced audit policy
+    category: LOG
+    severity: medium
+    entity: gpo-setting
+    why: With the override disabled, legacy category settings replace the advanced subcategory policy and auditing may not be what audit.csv says.
+    fix: Enable "Force audit policy subcategory settings to override audit policy category settings" (SCENoApplyLegacyAuditPolicy = 1).
+    refs: [CIS-Microsoft-Windows:2.3.2.1, NIST-800-53:AU-2]
+    query: { protocol: gpo, part: security, scope: machine, key: '{gpo}|{section}|{key}', name: gpo, min_rows: 1 }
+    each:
+      all:
+        - { field: section, op: eq, value: Registry Values }
+        - { field: key, op: match, value: '\\Control\\Lsa\\SCENoApplyLegacyAuditPolicy$' }
+        - { field: data, op: eq, value: 0 }
+    evidence: '{gpo}: SCENoApplyLegacyAuditPolicy = {data}'
+
+  - id: GPO-AUD-KEY-SUBCATEGORY-OFF
+    title: GPO turns off an important audit subcategory
+    category: LOG
+    severity: medium
+    entity: gpo-setting
+    why: Setting a key subcategory to No Auditing removes the record of sign-ins, account and group changes, privilege use or policy changes wherever this GPO wins.
+    fix: Set the subcategory to the recommended Success and/or Failure, or remove the entry so a baseline GPO's setting applies.
+    refs: [MITRE-ATTACK:T1562.002, NIST-800-53:AU-2, NIST-800-53:AU-12]
+    query: { protocol: gpo, part: audit, scope: machine, key: '{gpo}|{Subcategory}', name: gpo }
+    each:
+      all:
+        - { field: Subcategory, op: match, value: '^(Audit )?(Credential Validation|Kerberos Authentication Service|Kerberos Service Ticket Operations|Computer Account Management|Security Group Management|User Account Management|Process Creation|Logon|Special Logon|Account Lockout|Directory Service Changes|Audit Policy Change|Authentication Policy Change|Sensitive Privilege Use|Security System Extension)$' }
+        - { field: 'Setting Value', op: eq, value: 0 }
+    evidence: '{gpo}: {Subcategory} = No Auditing'
+
+  - id: GPO-AUD-CREDENTIAL-VALIDATION-NONE
+    title: No GPO audits Credential Validation for success and failure
+    kind: missing
+    category: LOG
+    severity: low
+    entity: domain
+    why: Credential validation events record password checks against domain and local accounts, including failed guesses. Only advanced audit policy (audit.csv) is counted; legacy audit categories in security templates are not.
+    fix: In the domain controller and member baseline GPOs, set "Audit Credential Validation" to Success and Failure.
+    refs: [NIST-800-53:AU-2, NIST-800-53:AU-12, MITRE-ATTACK:T1110]
+    query: { protocol: gpo, part: audit, scope: machine, key: '{gpo}|{Subcategory}', name: gpo }
+    count:
+      op: lt
+      value: 1
+      where:
+        all:
+          - { field: Subcategory, op: match, value: '^(Audit )?Credential Validation$' }
+          - { field: 'Setting Value', op: flag, value: 3 }
+    evidence: 'No GPO audits Credential Validation for success and failure ({count} found)'
+
+  - id: GPO-AUD-KERBEROS-NONE
+    title: No GPO audits Kerberos ticket requests
+    kind: missing
+    category: LOG
+    severity: low
+    entity: domain
+    why: Kerberos authentication and service ticket events on domain controllers show which accounts request access to which services. Only advanced audit policy (audit.csv) is counted; legacy audit categories in security templates are not.
+    fix: In the domain controller GPO, set "Audit Kerberos Authentication Service" and "Audit Kerberos Service Ticket Operations" to Success and Failure.
+    refs: [NIST-800-53:AU-2, MITRE-ATTACK:T1558]
+    query: { protocol: gpo, part: audit, scope: machine, key: '{gpo}|{Subcategory}', name: gpo }
+    count:
+      op: lt
+      value: 1
+      where:
+        all:
+          - { field: Subcategory, op: match, value: '^(Audit )?Kerberos (Authentication Service|Service Ticket Operations)$' }
+          - { field: 'Setting Value', op: flag, value: 3 }
+    evidence: 'No GPO audits Kerberos ticket requests ({count} found)'
+
+  - id: GPO-AUD-LOGON-NONE
+    title: No GPO audits Logon for success and failure
+    kind: missing
+    category: LOG
+    severity: low
+    entity: domain
+    why: Logon events are the basic record of who signed in where, and how. Only advanced audit policy (audit.csv) is counted; legacy audit categories in security templates are not.
+    fix: In the baseline GPOs, set "Audit Logon" to Success and Failure and "Audit Special Logon" to Success.
+    refs: [NIST-800-53:AU-2, NIST-800-53:AU-12]
+    query: { protocol: gpo, part: audit, scope: machine, key: '{gpo}|{Subcategory}', name: gpo }
+    count:
+      op: lt
+      value: 1
+      where:
+        all:
+          - { field: Subcategory, op: match, value: '^(Audit )?Logon$' }
+          - { field: 'Setting Value', op: flag, value: 3 }
+    evidence: 'No GPO audits Logon for success and failure ({count} found)'
+
+  - id: GPO-AUD-ACCOUNT-MANAGEMENT-NONE
+    title: No GPO audits user or group management
+    kind: missing
+    category: LOG
+    severity: low
+    entity: domain
+    why: Without these events, account creation, password resets and group membership changes leave no record. Only advanced audit policy (audit.csv) is counted; legacy audit categories in security templates are not.
+    fix: In the domain controller and member baseline GPOs, set "Audit User Account Management" and "Audit Security Group Management" to Success (or Success and Failure).
+    refs: [NIST-800-53:AU-2, NIST-800-53:AC-2(4), MITRE-ATTACK:T1098]
+    query: { protocol: gpo, part: audit, scope: machine, key: '{gpo}|{Subcategory}', name: gpo }
+    count:
+      op: lt
+      value: 1
+      where:
+        all:
+          - { field: Subcategory, op: match, value: '^(Audit )?(User Account Management|Security Group Management)$' }
+          - { field: 'Setting Value', op: flag, value: 1 }
+    evidence: 'No GPO audits user or group management ({count} found)'
+
+  - id: GPO-AUD-PROCESS-CREATION-NONE
+    title: No GPO audits Process Creation
+    kind: missing
+    category: LOG
+    severity: low
+    entity: domain
+    why: Process creation events show which programs ran, and are the main source for investigating activity on a computer. Only advanced audit policy (audit.csv) is counted; legacy audit categories in security templates are not.
+    fix: In the baseline GPOs, set "Audit Process Creation" to Success and include command lines in the events.
+    refs: [NIST-800-53:AU-2, NIST-800-53:AU-12]
+    query: { protocol: gpo, part: audit, scope: machine, key: '{gpo}|{Subcategory}', name: gpo }
+    count:
+      op: lt
+      value: 1
+      where:
+        all:
+          - { field: Subcategory, op: match, value: '^(Audit )?Process Creation$' }
+          - { field: 'Setting Value', op: flag, value: 1 }
+    evidence: 'No GPO audits Process Creation ({count} found)'
+
+  - id: GPO-AUD-DIRECTORY-CHANGES-NONE
+    title: No GPO audits Directory Service Changes
+    kind: missing
+    category: LOG
+    severity: low
+    entity: domain
+    why: Directory change events record what was changed on directory objects, including permissions and attributes that control access. Only advanced audit policy (audit.csv) is counted; legacy audit categories in security templates are not.
+    fix: In the domain controller GPO, set "Audit Directory Service Changes" to Success.
+    refs: [NIST-800-53:AU-2, NIST-800-53:CM-3]
+    query: { protocol: gpo, part: audit, scope: machine, key: '{gpo}|{Subcategory}', name: gpo }
+    count:
+      op: lt
+      value: 1
+      where:
+        all:
+          - { field: Subcategory, op: match, value: '^(Audit )?Directory Service Changes$' }
+          - { field: 'Setting Value', op: flag, value: 1 }
+    evidence: 'No GPO audits Directory Service Changes ({count} found)'
+
+  - id: GPO-AUD-POLICY-CHANGE-NONE
+    title: No GPO audits Audit Policy Change
+    kind: missing
+    category: LOG
+    severity: low
+    entity: domain
+    why: Without it, a change that turns auditing off is itself not recorded. Only advanced audit policy (audit.csv) is counted; legacy audit categories in security templates are not.
+    fix: In the baseline GPOs, set "Audit Audit Policy Change" to Success.
+    refs: [NIST-800-53:AU-2, NIST-800-53:AU-9]
+    query: { protocol: gpo, part: audit, scope: machine, key: '{gpo}|{Subcategory}', name: gpo }
+    count:
+      op: lt
+      value: 1
+      where:
+        all:
+          - { field: Subcategory, op: match, value: '^(Audit )?Audit Policy Change$' }
+          - { field: 'Setting Value', op: flag, value: 1 }
+    evidence: 'No GPO audits Audit Policy Change ({count} found)'
+
+  - id: GPO-AUD-SENSITIVE-PRIVILEGE-NONE
+    title: No GPO audits Sensitive Privilege Use
+    kind: missing
+    category: LOG
+    severity: low
+    entity: domain
+    why: These events record use of powerful rights such as debug, backup and take ownership. Only advanced audit policy (audit.csv) is counted; legacy audit categories in security templates are not.
+    fix: In the baseline GPOs, set "Audit Sensitive Privilege Use" to Success and Failure.
+    refs: [NIST-800-53:AU-2, NIST-800-53:AC-6(9)]
+    query: { protocol: gpo, part: audit, scope: machine, key: '{gpo}|{Subcategory}', name: gpo }
+    count:
+      op: lt
+      value: 1
+      where:
+        all:
+          - { field: Subcategory, op: match, value: '^(Audit )?Sensitive Privilege Use$' }
+          - { field: 'Setting Value', op: flag, value: 3 }
+    evidence: 'No GPO audits Sensitive Privilege Use ({count} found)'
+
+  - id: GPO-AUD-ACCOUNT-LOCKOUT-NONE
+    title: No GPO audits Account Lockout failures
+    kind: missing
+    category: LOG
+    severity: low
+    entity: domain
+    why: Lockout events show where repeated failed sign-ins are coming from. Only advanced audit policy (audit.csv) is counted; legacy audit categories in security templates are not.
+    fix: In the baseline GPOs, set "Audit Account Lockout" to Failure.
+    refs: [NIST-800-53:AU-2, NIST-800-53:AC-7]
+    query: { protocol: gpo, part: audit, scope: machine, key: '{gpo}|{Subcategory}', name: gpo }
+    count:
+      op: lt
+      value: 1
+      where:
+        all:
+          - { field: Subcategory, op: match, value: '^(Audit )?Account Lockout$' }
+          - { field: 'Setting Value', op: flag, value: 2 }
+    evidence: 'No GPO audits Account Lockout failures ({count} found)'
+
+  - id: GPO-AUD-SECURITY-SYSTEM-EXTENSION-NONE
+    title: No GPO audits Security System Extension
+    kind: missing
+    category: LOG
+    severity: low
+    entity: domain
+    why: These events record new services and security packages being loaded, which are changes worth seeing. Only advanced audit policy (audit.csv) is counted; legacy audit categories in security templates are not.
+    fix: In the baseline GPOs, set "Audit Security System Extension" to Success.
+    refs: [NIST-800-53:AU-2, NIST-800-53:CM-3]
+    query: { protocol: gpo, part: audit, scope: machine, key: '{gpo}|{Subcategory}', name: gpo }
+    count:
+      op: lt
+      value: 1
+      where:
+        all:
+          - { field: Subcategory, op: match, value: '^(Audit )?Security System Extension$' }
+          - { field: 'Setting Value', op: flag, value: 1 }
+    evidence: 'No GPO audits Security System Extension ({count} found)'
+
+  - id: GPO-REG-PROCESS-CMDLINE-NONE
+    title: No GPO includes command lines in process creation events
+    kind: missing
+    category: LOG
+    severity: low
+    entity: domain
+    why: Without the command line, a process creation event shows which program ran but not what it was asked to do.
+    fix: Enable "Include command line in process creation events" in a baseline GPO.
+    refs: [CIS-Microsoft-Windows:18.9.3.1, NIST-800-53:AU-3]
+    query: { protocol: gpo, part: registry, scope: both, key: '{gpo}|{scope}|{key}|{value}|{action}', name: gpo }
+    count:
+      op: lt
+      value: 1
+      where:
+        all:
+          - { field: scope, op: eq, value: machine }
+          - { field: key, op: match, value: '\\Policies\\System\\Audit$' }
+          - { field: value, op: eq, value: ProcessCreationIncludeCmdLine_Enabled }
+          - { field: data, op: eq, value: 1 }
+    evidence: 'No GPO includes command lines in process events ({count} found)'
+
+  # ================================================================ 6. tasks and services in preferences; unedited GPOs
+
+  - id: GPO-GPP-TASK-SYSTEM-UNC
+    title: Scheduled task runs as SYSTEM from a network path
+    category: CFG
+    severity: high
+    why: The task runs whatever is at the network path with full rights on every computer in scope, so the share's write permissions decide the security of those computers. Keeper cannot read those permissions.
+    fix: Copy the program to a local admin-only folder, or confirm that only tier-0 administrators can write to the share and the file.
+    refs: [MITRE-ATTACK:T1053.005, MITRE-ATTACK:T1484.001, NIST-800-53:CM-5]
+    query: { protocol: gpo, part: preferences, scope: both, key: '{gpo}|{_file}|{uid}|{name}', name: gpo }
+    each:
+      all:
+        - { field: _file, op: match, value: '\\Preferences\\ScheduledTasks\\' }
+        - any:
+            - all: [ { field: Properties.runAs, op: exists }, { field: Properties.runAs, op: match, value: '^((NT AUTHORITY\\)?SYSTEM|S-1-5-18)$' } ]
+            - all: [ { field: Properties.Task.Principals.Principal.UserId, op: exists }, { field: Properties.Task.Principals.Principal.UserId, op: match, value: '^((NT AUTHORITY\\)?SYSTEM|S-1-5-18)$' } ]
+            # An old-format task in the computer half with no runAs runs as SYSTEM.
+            - all: [ { field: scope, op: eq, value: machine }, { field: Properties.appName, op: exists }, { field: Properties.runAs, op: absent } ]
+        - any:
+            - all: [ { field: Properties.appName, op: exists }, { field: Properties.appName, op: match, value: '^"?\\\\' } ]
+            - all: [ { field: Properties.args, op: exists }, { field: Properties.args, op: match, value: '(^|[\s"=])\\\\[^\\\s]+\\' } ]
+            - all: [ { field: Properties.Task.Actions.Exec.Command, op: exists }, { field: Properties.Task.Actions.Exec.Command, op: match, value: '^"?\\\\' } ]
+            - all: [ { field: Properties.Task.Actions.Exec.Arguments, op: exists }, { field: Properties.Task.Actions.Exec.Arguments, op: match, value: '(^|[\s"=])\\\\[^\\\s]+\\' } ]
+            - all: [ { field: 'Properties.Task.Actions.Exec[].Command', op: exists }, { field: 'Properties.Task.Actions.Exec[].Command', op: match, value: '^"?\\\\' } ]
+            - all: [ { field: 'Properties.Task.Actions.Exec[].Arguments', op: exists }, { field: 'Properties.Task.Actions.Exec[].Arguments', op: match, value: '(^|[\s"=])\\\\[^\\\s]+\\' } ]
+    evidence: '{gpo} {_file}: SYSTEM task "{name}" runs {Properties.appName}{Properties.Task.Actions.Exec.Command}{Properties.Task.Actions.Exec[].Command} {Properties.args}{Properties.Task.Actions.Exec.Arguments}{Properties.Task.Actions.Exec[].Arguments}'
+
+  - id: GPO-GPP-TASK-WRITABLE-PATH
+    title: SYSTEM scheduled task runs a program from a user-writable folder
+    category: CFG
+    severity: high
+    why: Temp folders, user profiles, C:\Temp and ProgramData can be written by ordinary users, so the program a SYSTEM task starts there can be replaced and then runs with full rights.
+    fix: Install the program under Program Files (or another admin-only folder) and point the task there.
+    refs: [MITRE-ATTACK:T1053.005, NIST-800-53:CM-7]
+    query: { protocol: gpo, part: preferences, scope: both, key: '{gpo}|{_file}|{uid}|{name}', name: gpo }
+    each:
+      all:
+        - { field: _file, op: match, value: '\\Preferences\\ScheduledTasks\\' }
+        - any:
+            - all: [ { field: Properties.runAs, op: exists }, { field: Properties.runAs, op: match, value: '^((NT AUTHORITY\\)?SYSTEM|S-1-5-18)$' } ]
+            - all: [ { field: Properties.Task.Principals.Principal.UserId, op: exists }, { field: Properties.Task.Principals.Principal.UserId, op: match, value: '^((NT AUTHORITY\\)?SYSTEM|S-1-5-18)$' } ]
+            - all: [ { field: scope, op: eq, value: machine }, { field: Properties.appName, op: exists }, { field: Properties.runAs, op: absent } ]
+        - any:
+            - all: [ { field: Properties.appName, op: exists }, { field: Properties.appName, op: match, value: '^"?(%(TEMP|TMP|USERPROFILE|APPDATA|LOCALAPPDATA|PUBLIC|ProgramData)%|[A-Z]:\\(Temp|Tmp|Users|ProgramData)\\)' } ]
+            - all: [ { field: Properties.Task.Actions.Exec.Command, op: exists }, { field: Properties.Task.Actions.Exec.Command, op: match, value: '^"?(%(TEMP|TMP|USERPROFILE|APPDATA|LOCALAPPDATA|PUBLIC|ProgramData)%|[A-Z]:\\(Temp|Tmp|Users|ProgramData)\\)' } ]
+            - all: [ { field: 'Properties.Task.Actions.Exec[].Command', op: exists }, { field: 'Properties.Task.Actions.Exec[].Command', op: match, value: '^"?(%(TEMP|TMP|USERPROFILE|APPDATA|LOCALAPPDATA|PUBLIC|ProgramData)%|[A-Z]:\\(Temp|Tmp|Users|ProgramData)\\)' } ]
+    evidence: '{gpo} {_file}: task "{name}" runs {Properties.appName}{Properties.Task.Actions.Exec.Command}{Properties.Task.Actions.Exec[].Command}'
+
+  - id: GPO-GPP-SERVICE-SECURITY-DISABLED
+    title: Service preference disables a security or logging service
+    category: CFG
+    severity: high
+    why: Disabling Defender, the firewall, the event log or Windows Update by policy removes protection or visibility from every computer in scope.
+    fix: Remove the item or set the service back to Automatic, and confirm on a computer that it runs.
+    refs: [MITRE-ATTACK:T1562.001, MITRE-ATTACK:T1562.002, NIST-800-53:SI-3]
+    query: { protocol: gpo, part: preferences, scope: both, key: '{gpo}|{_file}|{uid}|{name}', name: gpo }
+    each:
+      all:
+        - { field: _file, op: match, value: '\\Preferences\\Services\\' }
+        - { field: Properties.serviceName, op: in, value: [WinDefend, WdNisSvc, Sense, MpsSvc, BFE, EventLog, wuauserv, SecurityHealthService, wscsvc] }
+        - { field: Properties.startupType, op: eq, value: DISABLED }
+    evidence: '{gpo} {_file}: service {Properties.serviceName} set to {Properties.startupType}'
+
+  - id: GPO-GPP-SERVICE-REMOTE-AUTOSTART
+    title: Service preference starts a remote-access or legacy service automatically
+    category: CFG
+    severity: medium
+    why: Remote Registry, WebClient, Telnet, SNMP and UPnP enlarge what can be reached over the network on every computer in scope.
+    fix: Remove the item or set the service to Manual, unless a documented tool needs it on specific servers.
+    refs: [NIST-800-53:CM-7]
+    query: { protocol: gpo, part: preferences, scope: both, key: '{gpo}|{_file}|{uid}|{name}', name: gpo }
+    each:
+      all:
+        - { field: _file, op: match, value: '\\Preferences\\Services\\' }
+        - { field: Properties.serviceName, op: in, value: [RemoteRegistry, WebClient, TlntSvr, SNMP, upnphost, SSDPSRV] }
+        - { field: Properties.startupType, op: eq, value: AUTOMATIC }
+    evidence: '{gpo} {_file}: service {Properties.serviceName} set to {Properties.startupType}'
+
+  - id: GPO-GPT-VERSION-ZERO
+    title: GPO folder in SYSVOL has never been edited (version 0)
+    lens: maintenance
+    category: HYG
+    severity: low
+    entity: gpo
+    why: A GPO whose GPT.INI is at version 0 holds no settings. AD-GPO-EMPTY reads the same from the directory; if only one of the two fires, the directory and SYSVOL copies disagree.
+    fix: Delete the GPO if it has no purpose, or finish configuring it; if the directory shows a different version, check SYSVOL replication.
+    refs: [NIST-800-53:CM-6]
+    query: { protocol: gpo, part: gpt, key: gpo, min_rows: 2 }
+    each:
+      all:
+        - { field: machineVersion, op: eq, value: 0 }
+        - { field: userVersion, op: eq, value: 0 }
+    evidence: '{gpo}: GPT.INI Version = {Version}'

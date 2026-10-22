@@ -122,7 +122,7 @@ AEU in "EKU" lists means the authentication EKU set the existing ADCS rules use:
 - **Catches**: the Default Domain Policy or Default Domain Controllers Policy with its computer settings disabled (flags bit 2). Password, lockout and Kerberos policy are computer settings of the root-linked policy; DC user rights and audit come from the DC policy. Disabled, the domain silently runs on built-in defaults.
 - **Severity**: high. Category CFG, entity gpo, refresh 7d.
 - **Data**: reuses Q-GPO.
-- **Condition**: cn in [`{31B2F340-016F-11D2-945F-00C04FB984F9}`, `{6AC1786C-016F-11D2-945F-00C04FB984F9}`] AND flags has bit 2.
+- **Condition**: cn in [`{31B2F340-016D-11D2-945F-00C04FB984F9}`, `{6AC1786C-016F-11D2-945F-00C04FB984F9}`] AND flags has bit 2.
 - **Refs**: NIST-800-53:CM-6, NIST-800-53:AC-7, CIS-Controls-v8:4.1.
 - **Fix**: re-enable the computer half (or confirm another root-linked GPO carries the password policy and the DC OU has a baseline, then document why the default is disabled).
 - **Confidence**: verified - flags https://learn.microsoft.com/en-us/windows/win32/adschema/a-flags ; GPO flag values and the two well-known GUIDs https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-gpol/ (section 2.2.4 and 3.2.1)

@@ -1,8 +1,6 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
-    <OutputType>Exe</OutputType>
-    <AssemblyName>keeper-qm</AssemblyName>
-    <RootNamespace>Keeper.Cli.Qm</RootNamespace>
+    <AssemblyName>Keeper.Cli.Qm</AssemblyName>
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="..\Keeper.Composition\Keeper.Composition.csproj" />

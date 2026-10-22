@@ -1,5 +1,9 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <ItemGroup>
+    <!-- The engine's YAML library (used by Keeper.Rules too); config files are parsed with it, no new dependency. -->
+    <PackageReference Include="YamlDotNet" />
+  </ItemGroup>
+  <ItemGroup>
     <ProjectReference Include="..\..\..\common\src\Keeper.Common\Keeper.Common.csproj" />
     <ProjectReference Include="..\..\..\contracts\src\Keeper.Contracts\Keeper.Contracts.csproj" />
     <ProjectReference Include="..\..\..\store\src\Keeper.Store\Keeper.Store.csproj" />

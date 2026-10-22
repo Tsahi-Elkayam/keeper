@@ -384,3 +384,360 @@ rules:
       name: sensor
     count: none
     evidence: "the sensor table is empty"
+
+  # ---- more sensor states (acknowledged / paused / warning duration) -------------------------
+
+  - id: PRTG-SENSOR-DOWN-ACK-LONG
+    title: Sensor down and acknowledged for more than a week
+    kind: broken
+    category: HYG
+    severity: medium
+    why: An alarm acknowledged a week ago and still down was never fixed, only silenced - the acknowledgement hides it from every PRTG view that drops acknowledged alarms.
+    fix: Fix the monitored service, or delete the sensor if the thing it watched is gone; do not leave an acknowledgement standing for weeks.
+    refs: [NIST-800-53:SI-4]
+    query:
+      protocol: http
+      path: /api/table.json
+      params: { content: sensors, columns: "objid,device,group,probe,sensor,status,message,downtimesince,priority,lastcheck" }
+      paging: offset
+      offsetParam: start
+      limitParam: count
+      pageSize: 5000
+      items: sensors
+      key: objid
+      name: sensor
+    each:
+      all:
+        - { field: status_raw, op: eq, value: 13 }
+        - { field: downtimesince_raw, op: gt, value: 604800, threshold: prtg.down-ack-max-seconds }
+    evidence: "{device} / {sensor}: acknowledged and down for {downtimesince} - {message}"
+
+  - id: PRTG-SENSOR-PAUSED-BY-SCHEDULE
+    title: Sensor paused by a schedule
+    kind: misconfigured
+    severity: low
+    why: A schedule can pause a sensor during a window that no longer matches the service, so the thing is unmonitored at exactly the hours someone once decided it did not matter.
+    fix: Check the schedule attached to the sensor or its parent; narrow or remove it if the quiet window is no longer wanted.
+    query:
+      protocol: http
+      path: /api/table.json
+      params: { content: sensors, columns: "objid,device,group,probe,sensor,status,message,downtimesince,priority,lastcheck" }
+      paging: offset
+      offsetParam: start
+      limitParam: count
+      pageSize: 5000
+      items: sensors
+      key: objid
+      name: sensor
+    each: { field: status_raw, op: eq, value: 9 }
+    evidence: "{device} / {sensor}: {status}"
+
+  - id: PRTG-SENSOR-PAUSED-UNTIL
+    title: Sensor paused until a set time
+    kind: misconfigured
+    severity: low
+    why: A timed pause comes back on its own, but one set far ahead is the same silent blind spot as an open-ended pause until that date arrives.
+    fix: Check the pause-until date; shorten it, or resume the sensor if the maintenance is over.
+    query:
+      protocol: http
+      path: /api/table.json
+      params: { content: sensors, columns: "objid,device,group,probe,sensor,status,message,downtimesince,priority,lastcheck" }
+      paging: offset
+      offsetParam: start
+      limitParam: count
+      pageSize: 5000
+      items: sensors
+      key: objid
+      name: sensor
+    each: { field: status_raw, op: eq, value: 12 }
+    evidence: "{device} / {sensor}: {status} - {message}"
+
+  - id: PRTG-SENSOR-PAUSED-LONG
+    title: Sensor paused for more than a week
+    kind: misconfigured
+    category: HYG
+    severity: medium
+    why: A sensor paused at 02:00 for maintenance stays paused for a year - a pause by a user, a schedule or a pause-until that nobody came back to lift raises no alert for the whole time.
+    fix: Resume the sensor, or delete it if the device is gone; use a short timed pause for real maintenance.
+    refs: [NIST-800-53:SI-4]
+    query:
+      protocol: http
+      path: /api/table.json
+      params: { content: sensors, columns: "objid,device,group,probe,sensor,status,message,downtimesince,priority,lastcheck" }
+      paging: offset
+      offsetParam: start
+      limitParam: count
+      pageSize: 5000
+      items: sensors
+      key: objid
+      name: sensor
+    each:
+      all:
+        - { field: status_raw, op: in, value: [7, 9, 12] }
+        - { field: downtimesince_raw, op: gt, value: 604800, threshold: prtg.paused-max-seconds }
+    evidence: "{device} / {sensor}: {status} for {downtimesince}"
+
+  - id: PRTG-SENSOR-PAUSED-BY-DEPENDENCY-LONG
+    title: Sensor paused by a dependency for more than a day
+    kind: broken
+    category: AVL
+    severity: medium
+    why: A dependency that has held a subtree paused for over a day is either a parent outage nobody is working or a dependency pointed at the wrong object - a whole branch silenced either way.
+    fix: Fix the parent object so the subtree resumes, or correct the dependency if the parent is not really the thing these sensors depend on.
+    refs: [NIST-800-53:SI-4]
+    query:
+      protocol: http
+      path: /api/table.json
+      params: { content: sensors, columns: "objid,device,group,probe,sensor,status,message,downtimesince,priority,lastcheck" }
+      paging: offset
+      offsetParam: start
+      limitParam: count
+      pageSize: 5000
+      items: sensors
+      key: objid
+      name: sensor
+    each:
+      all:
+        - { field: status_raw, op: eq, value: 8 }
+        - { field: downtimesince_raw, op: gt, value: 86400, threshold: prtg.dependency-paused-max-seconds }
+    evidence: "{device} / {sensor}: {status} for {downtimesince}"
+
+  - id: PRTG-SENSOR-WARNING-LONG
+    title: Sensor in a warning state for more than a month
+    kind: broken
+    category: HYG
+    severity: low
+    why: A warning that never clears trains everyone to ignore warnings; it is usually a limit set too tight or a slow problem nobody owns.
+    fix: Fix the cause, or adjust the limit with a reason; a warning no one acts on should not stand for a month.
+    refs: [NIST-800-53:SI-4]
+    query:
+      protocol: http
+      path: /api/table.json
+      params: { content: sensors, columns: "objid,device,group,probe,sensor,status,message,downtimesince,priority,lastcheck" }
+      paging: offset
+      offsetParam: start
+      limitParam: count
+      pageSize: 5000
+      items: sensors
+      key: objid
+      name: sensor
+    each:
+      all:
+        - { field: status_raw, op: eq, value: 4 }
+        - { field: downtimesince_raw, op: gt, value: 2592000, threshold: prtg.warning-max-seconds }
+    evidence: "{device} / {sensor}: {status} for {downtimesince} - {message}"
+
+  # ---- scanning interval -----------------------------------------------------------------------
+
+  - id: PRTG-SENSOR-INTERVAL-TOO-SHORT
+    title: Sensor scans more often than once a minute
+    kind: misconfigured
+    category: HYG
+    severity: low
+    why: Very short intervals multiply the load on the probe and the core for little gain, and are usually left over from a test rather than chosen on purpose.
+    fix: Raise the interval to the standard for the sensor type, unless a sub-minute interval is genuinely needed and recorded.
+    query:
+      protocol: http
+      path: /api/table.json
+      params: { content: sensors, columns: "objid,device,group,probe,sensor,status,interval" }
+      paging: offset
+      offsetParam: start
+      limitParam: count
+      pageSize: 5000
+      items: sensors
+      key: objid
+      name: sensor
+    each: { field: interval_raw, op: lt, value: 60, threshold: prtg.min-interval-seconds }
+    evidence: "{device} / {sensor}: scans every {interval}"
+
+  - id: PRTG-SENSOR-INTERVAL-TOO-LONG
+    title: Sensor scans less than once a day
+    kind: misconfigured
+    severity: low
+    why: A sensor that scans only every few days detects an outage days late; on a service that matters that is as good as not monitoring it.
+    fix: Shorten the interval to match how quickly a problem on this thing needs to be seen.
+    query:
+      protocol: http
+      path: /api/table.json
+      params: { content: sensors, columns: "objid,device,group,probe,sensor,status,interval" }
+      paging: offset
+      offsetParam: start
+      limitParam: count
+      pageSize: 5000
+      items: sensors
+      key: objid
+      name: sensor
+    each: { field: interval_raw, op: gt, value: 86400, threshold: prtg.max-interval-seconds }
+    evidence: "{device} / {sensor}: scans every {interval}"
+
+  # ---- alerting coverage (notification triggers) ----------------------------------------------
+
+  - id: PRTG-SENSOR-NO-NOTIFICATION
+    title: Sensor has no notification trigger, own or inherited
+    kind: missing
+    category: MON
+    severity: low
+    why: A sensor with no trigger above it goes red on the screen and tells nobody; monitoring that cannot send is monitoring for the dashboard only.
+    fix: Add a state trigger on the sensor, or on a parent group or device so it inherits one, pointing at a monitored recipient.
+    refs: [NIST-800-53:SI-4]
+    query:
+      protocol: http
+      path: /api/table.json
+      params: { content: sensors, columns: "objid,device,group,probe,sensor,status,notifiesx" }
+      paging: offset
+      offsetParam: start
+      limitParam: count
+      pageSize: 5000
+      items: sensors
+      key: objid
+      name: sensor
+    each:
+      any:
+        - { field: notifiesx, op: eq, value: 'None' }
+        - { field: notifiesx, op: empty }
+    evidence: "{device} / {sensor}: notification triggers {notifiesx}"
+
+  - id: PRTG-DEVICE-NO-NOTIFICATION-TRIGGER
+    title: Device has no notification trigger, own or inherited
+    kind: missing
+    category: MON
+    severity: medium
+    entity: device
+    why: With no trigger on a device or anything above it, every sensor on that device can go down without an alert - a whole host that alarms nobody.
+    fix: Add a state trigger at the device or group level pointing at a monitored recipient, so all the device's sensors are covered.
+    refs: [NIST-800-53:SI-4, CIS-Controls-v8:8.2]
+    query:
+      protocol: http
+      path: /api/table.json
+      params: { content: devices, columns: "objid,device,host,group,probe,status,notifiesx" }
+      paging: offset
+      offsetParam: start
+      limitParam: count
+      pageSize: 5000
+      items: devices
+      key: objid
+      name: device
+    each:
+      any:
+        - { field: notifiesx, op: eq, value: 'None' }
+        - { field: notifiesx, op: empty }
+    evidence: "{probe} / {group} / {device}: notification triggers {notifiesx}"
+
+  # ---- devices and groups (coverage and paused subtrees) --------------------------------------
+
+  - id: PRTG-DEVICE-UNKNOWN
+    title: Device is in an unknown state
+    kind: broken
+    category: AVL
+    severity: medium
+    entity: device
+    why: A device PRTG reports as Unknown is one it cannot place up or down - usually its parent probe or the device's own reachability is lost, and no down alarm fires for it.
+    fix: Check the probe that owns the device and the device's address and credentials; recreate monitoring that never returned a state.
+    refs: [NIST-800-53:SI-4]
+    query:
+      protocol: http
+      path: /api/table.json
+      params: { content: devices, columns: "objid,device,host,group,probe,status,message,totalsens,upsens,downsens,downacksens,partialdownsens,warnsens,pausedsens,unusualsens,undefinedsens" }
+      paging: offset
+      offsetParam: start
+      limitParam: count
+      pageSize: 5000
+      items: devices
+      key: objid
+      name: device
+    each: { field: status_raw, op: eq, value: 1 }
+    evidence: "{probe} / {group} / {device}: {status} - {message}"
+
+  - id: PRTG-GROUP-NO-SENSORS
+    title: Group contains no sensors
+    kind: missing
+    category: MON
+    severity: low
+    entity: group
+    refresh: 1d
+    why: A group with no sensors under it is a labelled but empty branch of the tree - it looks like coverage and watches nothing.
+    fix: Add devices and sensors under the group, or delete it if it is a leftover of a reorganisation.
+    refs: [NIST-800-53:SI-4, CIS-Controls-v8:1.1]
+    query:
+      protocol: http
+      path: /api/table.json
+      params: { content: groups, columns: "objid,group,probe,status,totalsens" }
+      paging: offset
+      offsetParam: start
+      limitParam: count
+      pageSize: 5000
+      items: groups
+      key: objid
+      name: group
+    each: { field: totalsens_raw, op: eq, value: 0 }
+    evidence: "{probe} / {group}: no sensors"
+
+  - id: PRTG-GROUP-PAUSED
+    title: Whole group paused by a user
+    kind: misconfigured
+    category: MON
+    severity: medium
+    entity: group
+    why: Pausing a group silences every device and sensor beneath it - the widest blind spot a single pause can make, and the one most easily forgotten after maintenance.
+    fix: Resume the group, or use a short timed pause so it comes back by itself.
+    refs: [NIST-800-53:SI-4]
+    query:
+      protocol: http
+      path: /api/table.json
+      params: { content: groups, columns: "objid,group,probe,status,message,totalsens" }
+      paging: offset
+      offsetParam: start
+      limitParam: count
+      pageSize: 5000
+      items: groups
+      key: objid
+      name: group
+    each: { field: status_raw, op: eq, value: 7 }
+    evidence: "{probe} / {group}: {status} - {message}"
+
+  # ---- instance: version and sensor-count headroom --------------------------------------------
+  # Every table.json answer carries "prtg-version" and "treesize" at its root, beside the items array.
+  # With items left out, the whole answer object is one row, so these read those two header fields.
+  # Both compare with a tenant setting that has no safe default (the supported build, the licence-based
+  # warning level), so until it is set the rule is not configured - never a pass that compared nothing.
+
+  - id: PRTG-VERSION-OUTDATED
+    title: PRTG core is below the supported version
+    kind: misconfigured
+    lens: security
+    category: LCM
+    severity: high
+    entity: instance
+    refresh: 7d
+    why: The monitoring server holds credentials for much of the estate and has had authenticated remote-code-execution flaws; a build below the one the organisation has settled on is missing those fixes.
+    fix: Update the core in a window after a configuration backup, then let the remote probes auto-update to match.
+    refs: [NIST-800-53:SI-2, CIS-Controls-v8:7.3]
+    query:
+      protocol: http
+      path: /api/table.json
+      params: { content: probes, columns: "objid,name,condition", filter_parentid: "0" }
+      paging: none
+      key: prtg-version
+      name: prtg-version
+    each: { field: prtg-version, op: version-lt, value: '0.0.0', threshold: prtg.min-version, required: true }
+    evidence: "PRTG core version {prtg-version} is below the supported minimum"
+
+  - id: PRTG-SENSOR-COUNT-NEAR-LIMIT
+    title: Sensor count near the configured warning level
+    kind: misconfigured
+    category: CST
+    severity: high
+    entity: instance
+    refresh: 1d
+    why: At the licensed sensor limit PRTG silently refuses or pauses new sensors with no alarm - the estate keeps growing while monitoring quietly stops. The licence figure is not in the API, so the warning level is a tenant setting.
+    fix: Reclaim sensors on dead or duplicate monitoring, or extend the licence, before the limit is reached.
+    refs: [NIST-800-53:SI-4]
+    query:
+      protocol: http
+      path: /api/table.json
+      params: { content: sensors, columns: "objid,sensor,status" }
+      paging: none
+      key: prtg-version
+      name: prtg-version
+    each: { field: treesize, op: gt, value: 0, threshold: prtg.sensor-count-warn, required: true }
+    evidence: "the sensor tree holds {treesize} sensors, at or above the configured warning level"

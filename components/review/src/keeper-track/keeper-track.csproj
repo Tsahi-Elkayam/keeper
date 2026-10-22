@@ -1,8 +1,6 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
-    <OutputType>Exe</OutputType>
-    <AssemblyName>keeper-track</AssemblyName>
-    <RootNamespace>Keeper.Cli.Track</RootNamespace>
+    <AssemblyName>Keeper.Cli.Track</AssemblyName>
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="..\Keeper.Review\Keeper.Review.csproj" />

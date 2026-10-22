@@ -25,7 +25,7 @@ operand `ref: <field path>` and simple arithmetic (`ratio`, `sum`, `difference`)
 - Thin-provisioning over-commit per datastore (sum of VM provisioned space / capacity) - also needs aggregation across VMs and per-VM storage detail. Source: rgcheck VM07; signals (free space only means something together with over-commit).
 - Repository free space as a percentage (freeGB / capacityGB). Source: rgcheck BK05. Partial: VEEAM-REPOSITORY-FREE-SPACE (absolute GB), VEEAM-STORAGE-SPACE-WARNING-OFF (the server's own percentage alarm).
 - Used versus licensed instances on the backup licence (instanceLicenseSummary.usedInstancesNumber > licensedInstancesNumber). Source: rgcheck BK11; signals (instance creep has no date). Partial: VEEAM-LICENSE-SOCKETS-EXHAUSTED for socket licences.
-- PRTG sensor count against the licensed sensor count - the licence figure is also not in the public API reference (`/api/getstatus.htm` fields are undocumented). Source: rgcheck MO02; signals. Partial: PRTG-SENSOR-PAUSED-BY-LICENSE (the effect, once the limit is hit).
+- PRTG sensor count against the licensed sensor count - the licence figure is also not in the public API reference (`/api/getstatus.htm` fields are undocumented). Source: rgcheck MO02; signals. Partial: PRTG-SENSOR-PAUSED-BY-LICENSE (the effect, once the limit is hit), and PRTG-SENSOR-COUNT-NEAR-LIMIT (the `treesize` header of the sensor table against a tenant warning level, since the licence number itself is still not in the API).
 - Dynatrace host-unit or platform-subscription consumption against entitlement - the entitlement is not in the environment API and billing metric names differ by licensing model. Source: rgcheck MO06; signals. Partial: DT-AGENT-UNLICENSED.
 - Azure budget consumption percentage (currentSpend.amount / amount). Source: rgcheck AZ12.
 - Health-event lead time (start of the maintenance minus the first notice time) - "notices that arrive too late to plan for". Source: field (most cloud maintenance notices in a quarter gave no usable lead time). Applies to AWS Health and Azure Service Health.
@@ -143,6 +143,43 @@ environment endpoint that `rules/dynatrace.yaml` binds. Needs a second integrati
 - Break-glass / account-admin user outside the organisation's domains (vendor-held). Source: field.
 - SCIM token and SAML signing certificate expiry. Source: field.
 
+### Dynatrace environment API - still open (legacy checks-DYNATRACE.csv)
+
+This pass expanded `rules/dynatrace.yaml` with the environment-API checks the `http` runner can read:
+runtime vulnerabilities of high/critical risk and its page-limit warning (DT-SECURITY-PROBLEM-OPEN,
+DT-SECURITY-PROBLEM-LIST-TRUNCATED), a disabled private synthetic location and a disabled synthetic
+monitor (DT-SYNTHETIC-LOCATION-DISABLED, DT-SYNTHETIC-MONITOR-DISABLED), must-exist management zones,
+auto-tagging rules and an alerting profile (DT-MANAGEMENT-ZONE-NONE, DT-AUTO-TAG-NONE,
+DT-ALERTING-PROFILE-NONE), a notification posting over cleartext HTTP (DT-NOTIFICATION-WEBHOOK-CLEARTEXT),
+a maintenance window that stops detection and low-disk-space detection switched off
+(DT-MAINTENANCE-WINDOW-DETECTION-OFF, DT-DISK-LOW-SPACE-DETECTION-OFF), a contextless credential-vault
+entry (DT-CREDENTIAL-CONTEXTLESS), and API tokens with a configuration-write scope or an old personal
+access token (DT-TOKEN-WRITE-SCOPE, DT-TOKEN-PERSONAL-ACCESS-OLD). These join the problem, OneAgent,
+ActiveGate, notification, anomaly-detection and token rules already in the pack. Still open:
+
+- Tenant reachability and the review token's own scopes (status/latency self-check). DYNATRACE-HLT-001. Belongs to integration_status, not a rule.
+- Private synthetic location node health and spare capacity. DYNATRACE-HLT-005. Needs `/api/v2/synthetic/locations/{id}/status` per location (for_each) with unconfirmed fields. Partial: DT-SYNTHETIC-LOCATION-DISABLED (the disabled state).
+- Extensions 2.0 monitoring-configuration status in error. DYNATRACE-HLT-007. Needs `/api/v2/extensions` then `/monitoringConfigurations/{id}/status` per extension (nested for_each) with unconfirmed fields.
+- Self-monitoring: ingest throttling, dropped data, cost-limit events. DYNATRACE-HLT-008. Needs `/api/v2/metrics/query` (dsfm:*) or event-type filters; metric-query shape not read by the http runner yet.
+- Audit log attributable to named users and reviewed. DYNATRACE-LOG-001. `/api/v2/auditlogs` is readable, but the value is a per-user grouping/trend, not a per-row state.
+- Log ingestion scope and sensitive-data masking per source. DYNATRACE-LOG-002. Settings schemas are per-source with nested matcher/masking arrays (element-wise, field-heavy).
+- Grail bucket retention. DYNATRACE-LOG-003. A platform token on a different host/path (`/platform/storage/...`), outside the environment integration.
+- RUM / session-replay privacy masking per web application. DYNATRACE-LOG-004. Settings per application entity; field names unconfirmed.
+- Captured request attributes that collect credentials or identifiers. DYNATRACE-LOG-005. Needs `/api/config/v1/service/requestAttributes` and name-pattern matching across data-source arrays.
+- Audit-log export to the SIEM. DYNATRACE-LOG-006. Attestation / a Coralogix-side read.
+- Process-monitoring rules that exclude application processes. DYNATRACE-MON-003. The exclusion only matters against a tenant process list, and the rule-schema field names are unconfirmed.
+- Open problems older than 24 h without a comment or linked incident. DYNATRACE-MON-004. Needs `/problems/{id}/comments` per problem (for_each) and a ServiceNow join.
+- Notification delivery failures. DYNATRACE-MON-005. Audit/event filtering whose field names are unconfirmed.
+- Synthetic monitors failing for more than 24 h. DYNATRACE-MON-008. Needs `/api/v2/synthetic/execution/...` per monitor (for_each). Partial: DT-SYNTHETIC-MONITOR-DISABLED.
+- Alert noise: problems per day and entities with recurring problems. DYNATRACE-MON-010. A per-entity aggregate over a window.
+- Service and host anomaly-detection toggles off. DYNATRACE-CFG-006. Services have no single master enabled flag (per-signal modes). Partial: DT-DISK-LOW-SPACE-DETECTION-OFF, DT-HOST-CONNECTION-LOST-DETECTION-OFF.
+- Dashboards shared by public link or owned by inactive users. DYNATRACE-CFG-010. Documents platform API on a different host; classic dashboards via `/api/config/v1/dashboards`.
+- ActiveGate redundancy: at least two per network zone. DYNATRACE-AVL-003. A per-zone (`by`) count, which `count` cannot group per parent yet.
+- Configuration exported to source control and a tested restore. DYNATRACE-BCK-001, DYNATRACE-BCK-002. Attestation / a DevOps read.
+- ActiveGate custom-certificate validity. DYNATRACE-PKI-002. Belongs to the tls protocol / `rules/certificates.yaml`.
+- Stale hosts and monitors not seen for 30 days. DYNATRACE-HYG-005. Needs epoch-ms `lastSeenTms` as a date (see Dates the engine does not read).
+- Consumption, forecast, cost drivers, host-mode cost, cost guardrails, invoice routing, renewal. DYNATRACE-CST-001..006. The account/subscription API is on a different host (`api.dynatrace.com`, account UUID, OAuth client), and the entitlement is not in the environment API. See also DT-AGENT-UNLICENSED (the effect once a licence runs out).
+
 ### Keepit (SaaS backup) - XML API
 
 The Keepit API answers XML, and several of its list calls are PUT requests with a query body, so
@@ -189,6 +226,26 @@ generically):
 - Security groups attached to nothing, especially temporary groups a backup product creates and never deletes. Source: field.
 - Support cases auto-closed without a customer reply while the problem recurs (Support API, needs a paid support plan). Source: field.
 
+### PRTG - needs WinRM to the core/probe host, the configuration file, or an endpoint the http runner cannot read
+
+Most of the legacy PRTG checks that `rules/prtg.yaml` does not express read the core's `PRTG
+Configuration.dat`, log files or service state over WinRM, or an endpoint that is not a table of
+objects. The `prtg` integration is http only, so these stay out of the pack; one line each, grouped,
+with the legacy CheckIds.
+
+- Core and probe host health - services Running, OS supported and patched, data-path volume free space, probe-host CPU/memory/disk. Needs WinRM to the core and probe hosts (the http integration cannot reach them). Source: rgcheck PRTG-HLT-002, HLT-006, HLT-007, LCM-002, LCM-004.
+- Core Health and Probe Health channel values (health %, CPU, memory, interval delay, lost messages) and per-channel capacity limits. `content=channels` needs a sensor id per call and the engine has no per-channel fan-out. Source: rgcheck PRTG-HLT-004, HLT-005, CFG-007.
+- Background / correlation / auto-discovery task backlog, low core memory, and single-core resilience / cluster state. These live in `/api/getstatus.htm` (undocumented field names - see Unverified details). Source: rgcheck PRTG-HLT-008, AVL-001.
+- Notification triggers, escalation steps, dependencies, maintenance windows, auto-discovery scope, public maps, scheduled-report recipients, SMTP delivery, SNMP security, probe-connection restrictions, web-server TLS mode, Entra SSO / MFA. All read from `PRTG Configuration.dat` over WinRM, not the API. Source: rgcheck PRTG-AVL-003, AVL-004, CFG-002, CFG-003, CFG-004, CFG-006, CFG-008, CFG-009, CFG-010, AUT-001, AUT-002, AUT-003, AUT-004. Partial via the API: whether any trigger exists (PRTG-SENSOR-NO-NOTIFICATION, PRTG-DEVICE-NO-NOTIFICATION-TRIGGER, from the `notifiesx` column), the effect of a dependency (PRTG-SENSOR-PAUSED-BY-DEPENDENCY, -LONG), scanning-interval anomalies (PRTG-SENSOR-INTERVAL-TOO-SHORT, -TOO-LONG).
+- Users, roles, local vs directory accounts, leavers, stored device credentials, API-token inventory. No documented user/credential list API (the local-authentication item is below). Source: rgcheck PRTG-IAM-001..006, LOG-003, LOG-005.
+- Custom EXE/Script/Python sensor and notification files, inventory, hashes and folder ACLs. WinRM file and ACL reads on the core and each probe. Source: rgcheck PRTG-CFG-005.
+- Core-log and web-server-log error signatures, notification-delivery failures, data-retention settings, configuration audit. `content=messages` carries the messages but their localized / OLE-date timestamps are not read by the engine (see the Dates note), and the log files themselves need WinRM. Source: rgcheck PRTG-LOG-001, LOG-002, LOG-004, LOG-005, LOG-006.
+- Configuration auto-backups present and off-host, core-host backup, restore test, rebuild kit. WinRM, a Veeam/AWS backup join and attestation. Source: rgcheck PRTG-BCK-001..004.
+- Ownership and documentation, unidentified consoles, host identity in AD/DNS, orphan devices, tool overlap, unused maps/reports/tickets. Attestation and cross-system joins (AD, DNS, the other monitoring tools). Source: rgcheck PRTG-HYG-001..007.
+- Deprecated or discontinued sensor types in use. `/api/sensortypesinuse.json` compared with a vendor list - not a table of objects and not a generic condition. Source: rgcheck PRTG-LCM-005.
+- Device-tree hygiene: devices addressed by IP rather than name, and ping-only devices. The `host` column is available (so the IP-named part is close), but "ping-only" needs the sensor type per device, a per-device join the engine has no form for. Source: rgcheck PRTG-CFG-001.
+- PRTG software-maintenance (update-entitlement) end date and monitoring-tool cost consolidation. The maintenance date is in the undocumented getstatus endpoint (see Unverified details); cost is attestation. Source: rgcheck PRTG-CST-002, CST-004.
+
 ### Other systems and other packs
 
 - vCenter SSO identity sources and local-only administrators (vsphere.local accounts in use): not in the Automation API (SSO admin interface only). Source: request (admins without SSO).
@@ -211,6 +268,13 @@ generically):
 - Veeam backup copy job missing: the REST 1.2 job type list has no VM backup-copy type (only FileBackupCopy); 1.3 adds BackupCopy and LegacyBackupCopy but renames Backup to VSphereBackup, so the rule needs the file (or a second file) pinned to 1.3 on version 13 servers. Source: proposal (VEEAM-COPY-JOB-MISSING); rgcheck BK07.
 - Veeam failed-session detail per object (`/api/v1/sessions/{id}/taskSessions`, now readable with for_each over failed sessions): the published sample shows only scan fields; the result fields (`result.result`, `result.message`) are not confirmed. Source: rgcheck BK02.
 - Veeam session states WaitingRepository / WaitingSlot as filters: listed from revision 1.2-rev1, while the rules pin 1.2-rev0. Source: request.
+- Veeam malware-detection settings (inline entropy scan, suspicious-file detection, guest index scan on/off, signature age): no confirmed GET for the detection settings in REST 1.2-rev0 - only the events route is read (VEEAM-MALWARE-INFECTED/SUSPICIOUS). Source: rgcheck VEEAM-BCK-022.
+- Veeam backup health check / recheck (storage-level corruption guard) enabled and last result 0 errors, per job: the job model's health-check sub-object is not confirmed in 1.2-rev0 (only encryption, gfsPolicy and retentionPolicy are used). Source: rgcheck VEEAM-CFG-008, VEEAM-BCK-015.
+- Veeam SOBR performance-tier extents in maintenance / sealed / evacuating, and capacity-tier copy/move policy and immutability period: the scaleOutRepositories extent and capacity-tier sub-objects are not confirmed in 1.2-rev0. Source: rgcheck VEEAM-AVL-004, VEEAM-CFG-016.
+- Veeam failed restore / recovery sessions in N days, and restore-test recency (a manual full-VM restore logged within 90 days): the restore session-type filter values (Restore / FileLevelRestore / ApplicationItemRestore / InstantRecovery) are unconfirmed on 1.2-rev0, and a manual test is attestation-backed; SureBackup (VEEAM-SUREBACKUP-NO-RECENT-RUN) is the automated proxy. Source: rgcheck VEEAM-LOG-009, VEEAM-BCK-020.
+- Veeam encryption-password escrow / Enterprise Manager loss-protection presence: an attestation join, not an API state. Source: rgcheck VEEAM-CFG-018, VEEAM-BCK-036. Partial: VEEAM-ENCRYPTION-PASSWORD-OLD (rotation age only).
+- Veeam cloud (object-storage) credential description and age: the `/api/v1/cloudCredentials` object shape is unconfirmed. Source: rgcheck VEEAM-IAM-011. Partial for on-box credentials: VEEAM-CREDENTIAL-NO-DESCRIPTION.
+- Veeam proxy `server.isDisabled` (used by VEEAM-PROXY-DISABLED), the `generalOptions` recipient field spelling `emailSettings.to` (used by VEEAM-EMAIL-NO-RECIPIENT), and the `serverInfo.buildVersion` / `license.edition` values (VEEAM-BUILD-UNSUPPORTED, VEEAM-LICENSE-COMMUNITY-EDITION) are CSV/community-sourced, not yet confirmed on a live 1.2-rev0 sample (see To confirm). Proxy / managed-server component-upgrade state (isOutOfDate) is confirmed only on repositories/states (VEEAM-REPOSITORY-OUT-OF-DATE). Source: rgcheck VEEAM-AVL-002, VEEAM-LCM-002.
 - vCenter pending-update list (`/api/appliance/update/pending`): undocumented whether an up-to-date appliance answers an empty list or 404. Partial: VMW-VCSA-HEALTH-PACKAGES, VMW-VCSA-UPDATE-*.
 - PRTG core status (`/api/getstatus.htm?id=0`): maintenance days left, update available, low memory. The field names are undocumented (MaintExpiryDays appears in no vendor page; a community sample shows PRTGUpdateAvailable as "yes", not true). Source: proposal (PRTG-MAINTENANCE-EXPIRING, PRTG-UPDATE-AVAILABLE, PRTG-LOW-MEMORY).
 - Dynatrace host entities' monitoring mode through `/api/v2/entities` (property names community-sourced only); the OneAgent API covers it with documented fields. Source: rgcheck MO06.
@@ -248,10 +312,22 @@ Set as `threshold.<name>` in the Keeper home; the value in the rule applies when
 | veeam.malware-window-days | 30 | VEEAM-MALWARE-INFECTED, VEEAM-MALWARE-SUSPICIOUS |
 | veeam.analyzer-max-age-days | 30 | VEEAM-ANALYZER-STALE |
 | veeam.min-restore-points | 2 | VEEAM-OBJECT-FEW-RESTORE-POINTS |
+| veeam.min-build | (none - tenant sets; `required`) | VEEAM-BUILD-UNSUPPORTED |
+| veeam.encryption-password-max-age-days | 365 | VEEAM-ENCRYPTION-PASSWORD-OLD |
+| veeam.config-backup-min-restore-points | 10 | VEEAM-CONFIG-BACKUP-RETENTION-LOW |
 | prtg.down-max-seconds | 604800 (7 days) | PRTG-SENSOR-DOWN-LONG |
 | prtg.high-priority-down-max-seconds | 86400 (1 day) | PRTG-SENSOR-DOWN-HIGH-PRIORITY-DAY |
+| prtg.down-ack-max-seconds | 604800 (7 days) | PRTG-SENSOR-DOWN-ACK-LONG |
+| prtg.paused-max-seconds | 604800 (7 days) | PRTG-SENSOR-PAUSED-LONG |
+| prtg.dependency-paused-max-seconds | 86400 (1 day) | PRTG-SENSOR-PAUSED-BY-DEPENDENCY-LONG |
+| prtg.warning-max-seconds | 2592000 (30 days) | PRTG-SENSOR-WARNING-LONG |
+| prtg.min-interval-seconds | 60 | PRTG-SENSOR-INTERVAL-TOO-SHORT |
+| prtg.max-interval-seconds | 86400 (1 day) | PRTG-SENSOR-INTERVAL-TOO-LONG |
+| prtg.min-version | (none - tenant sets; `required`) | PRTG-VERSION-OUTDATED |
+| prtg.sensor-count-warn | (none - tenant sets; `required`) | PRTG-SENSOR-COUNT-NEAR-LIMIT |
 | dynatrace.token-unused-days | 90 | DT-TOKEN-UNUSED |
 | dynatrace.token-notice-days | 14 | DT-TOKEN-EXPIRING |
+| dynatrace.token-max-age-days | 365 | DT-TOKEN-PERSONAL-ACCESS-OLD |
 | azure.reservation-notice-days | 60 | AZ-RESERVATION-EXPIRY |
 | azure.savings-plan-notice-days | 60 | AZ-SAVINGS-PLAN-EXPIRY |
 | azure.enrollment-notice-days | 90 | AZ-BILLING-ENROLLMENT-ENDING |
@@ -285,8 +361,10 @@ Set as `threshold.<name>` in the Keeper home; the value in the rule applies when
 - vCenter: `/rest/vcenter/services` and `/rest/vcenter/vm/{vm}` render their maps as `[{key, value}]` like the backup routes; `standalone=true` is honoured on the host list (if it is ignored, every host is reported as standalone - visible at once); the `/rest/appliance/health/system/lastcheck` value is a date the engine reads (otherwise VMW-VCSA-HEALTH-CHECK-STALE is n/a); `power_states=POWERED_ON` filters the VM list for the for_each rules; more than 2000 powered-on VMs makes the per-VM rules partial.
 - Veeam: x-api-version 1.2-rev0 is accepted by the server (12.2 or later) and the integration does not add its own x-api-version header; the Security & Compliance Analyzer status words (Ok, Violation, UnableToCheck, Suppressed) match the REST enum.
 - Veeam: `/api/v1/jobs` carries the encryption, application-aware, schedule, retry and retention paths for the job types present (seen in the 1.2-rev1 sample); `typeFilter=SureBackup` on sessions is accepted by 1.2-rev0 (seen in 1.2-rev1; a refusal makes the rule unknown) and the rows carry `sessionType` SureBackup; licence `type` spellings Evaluation / NFR / Subscription / Rental and `autoUpdateEnabled` (seen in the 1.2-rev1 sample) are returned by 1.2-rev0; `jobId` is absent or empty on imported or orphaned backups (if it keeps the deleted job's id, VEEAM-BACKUP-ORPHANED sees only imported ones); the `generalOptions` paths read on 1.1 are unchanged.
+- Veeam (this pass): `/api/v1/serverInfo` returns `buildVersion` (dotted, e.g. 12.3.1.1139) for VEEAM-BUILD-UNSUPPORTED; `/api/v1/license` `edition` includes `Community`/`Free` for VEEAM-LICENSE-COMMUNITY-EDITION; `/api/v1/backupInfrastructure/proxies` carries `server.isDisabled` (CSV-sourced) for VEEAM-PROXY-DISABLED; `/api/v1/encryptionPasswords` carries `modificationTime` and `hint` for VEEAM-ENCRYPTION-PASSWORD-OLD; `/api/v1/credentials` carries `description`, `username`, `type` for VEEAM-CREDENTIAL-NO-DESCRIPTION; `generalOptions.emailSettings.to` is the recipient field (vs `recipients`) for VEEAM-EMAIL-NO-RECIPIENT; `/api/v1/configBackup` carries `restorePointsToKeep` for VEEAM-CONFIG-BACKUP-RETENTION-LOW; and `/api/v1/backupInfrastructure/repositories` and `/api/v1/backupObjects` return an empty `data` array (not a 404) when the estate truly has none, so VEEAM-REPOSITORY-NONE / VEEAM-OBJECT-NONE fire on empty rather than on a lost permission (a failed read stays unknown).
 - PRTG: `start` in the table API is zero-based (otherwise each page repeats one row, which only duplicates a result); `content=probes&filter_parentid=0` answers `{"probes": [...]}` with `condition_raw` (a support answer suggests `filter_type=probenode` instead - an empty list shows up as PRTG-PROBE-NONE); `content=devices` answers `{"devices": [...]}` with the `*sens_raw` columns; a paused device reports `status_raw` 7.
 - Dynatrace: the OneAgent list fits one page; problems older than the 90-day window are not open; the token has `apiTokens.read` and `settings.read`; API token rows carry `enabled` (or the sample's `disabled`); `scopes` omitted on settings objects returns the host and host-group overrides as well as the environment object.
+- Dynatrace (this pass): `/api/v2/securityProblems` returns `riskLevel` and `securityProblemId` (needs `securityProblems.read`; empty when Application Security is unlicensed, which is unknown not a pass); `/api/v2/synthetic/locations` returns `type`/`status` (PRIVATE/DISABLED) and `/api/v1/synthetic/monitors` returns `monitors[].enabled` (needs `ReadSyntheticData`); `/api/v2/credentials` returns `allowContextlessRequests` (needs `credentialVault.read`); the write-scope list (`settings.write`, `entities.write`, `credentialVault.write`, `extensions.write`, `WriteConfig`) matches this tenant's scope spellings. Settings value paths used by the new rules - `builtin:problem.notifications` `value.url`, `builtin:alerting.maintenance-window` `value.generalProperties.suppression`/`.name` with the enum value `DONT_DETECT_PROBLEMS`, and `builtin:anomaly-detection.infrastructure-disks` `value.diskLowSpace.enabled` - are schema-sourced; a wrong path reads as n/a (never a false pass), so confirm them against a live settings export. The must-exist rules (DT-MANAGEMENT-ZONE-NONE, DT-AUTO-TAG-NONE, DT-ALERTING-PROFILE-NONE) assume the settings API does not return the implicit built-in defaults; if it does, they simply never fire.
 - Azure: the review identity has root-scope read for AZ-ROOT-SCOPE-ROLE-ASSIGNMENT and the custom-role rules, Reservations Reader for the reservation and savings-plan rules, and Billing Reader for the billing rules; without them those rules are unknown or (billing) report no account. An untagged subscription returns `tags: {}` or no key (both are covered). `statusOnly=true` on the VM list returns `properties.instanceView.statuses[].code`; the Defender plan names in the default pattern match the subscription's pricings list; disks expose `LastOwnershipUpdateTime` on API 2024-03-02.
 - ServiceNow: `sysparm_display_value=all` returns `{display_value, value}` per field as assumed by the SLA and approval rules; risk codes 1/2 are very high/high; `sysapproval_approver.state` stores `requested`; `reopen_count` and `hold_reason` exist on incident; `cmdb_ci_server` is the right class (some estates use `cmdb_ci_computer` or `cmdb_ci_win_server` only); the integration account may call the Aggregate API (`/api/now/stats/sys_user_has_role`); `last_login_time` is set by single sign-on logins too.
 - Wiz: `issuesV2` and `vulnerabilityFindings` accept `first: 500`; the vulnerability queries can be large (hundreds of pages on a big estate) and stop at `maxPages` as partial; `hasExploit: false` is accepted as a filter; `projects { archived }` and `serviceAccounts { createdAt lastRotatedAt }` exist with those names, and the service account can read them.

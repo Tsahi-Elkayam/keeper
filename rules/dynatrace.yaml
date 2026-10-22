@@ -5,6 +5,10 @@ integration: dynatrace
 # Endpoint: the environment URL (https://<environment-id>.live.dynatrace.com, or an ActiveGate's
 # https://<activegate>:9999/e/<environment-id>). The integration adds "Authorization: Api-Token ...";
 # the token needs problems.read, oneAgents.read, activeGates.read, apiTokens.read and settings.read.
+# Rules added later read a few more scopes: securityProblems.read (runtime vulnerabilities),
+# syntheticLocations.read (private locations), ReadSyntheticData (the classic synthetic-monitor list)
+# and credentialVault.read (the credential vault's metadata). A token without a scope makes that rule's
+# read fail, which is unknown, never a pass.
 # The API token list documents the flag as "enabled" while the vendor's sample shows "disabled"; the
 # token rules accept either spelling.
 # Dynatrace pages with nextPageKey, which the runner does not follow, so each query asks for the
@@ -609,3 +613,309 @@ rules:
             - { field: disabled, op: eq, value: false }
         - { field: scopes, op: contains, value: apiTokens.write }
     evidence: "{name} (owner {owner}) holds apiTokens.write among {scopes}"
+
+  - id: DT-TOKEN-WRITE-SCOPE
+    title: Enabled API token holds a configuration-write scope
+    kind: misconfigured
+    lens: security
+    category: IAM
+    severity: medium
+    entity: api-token
+    why: A read token for a review or a sync cannot change anything; one that also carries a write scope (settings, entities, extensions, the credential vault) can reconfigure monitoring or read secrets if it leaks, so write scopes belong only on the few tokens that genuinely automate changes.
+    fix: Reissue the token with only the read scopes its consumer uses; keep write scopes on named, expiring automation tokens.
+    refs: [NIST-800-53:AC-6, CIS-Controls-v8:5.4, MITRE-ATTACK:T1098]
+    query:
+      protocol: http
+      path: /api/v2/apiTokens
+      params: { pageSize: "10000", fields: "+expirationDate,+lastUsedDate,+scopes,+personalAccessToken" }
+      paging: none
+      items: apiTokens
+      key: id
+      name: name
+    each:
+      all:
+        - any:
+            - { field: enabled, op: eq, value: true }
+            - { field: disabled, op: eq, value: false }
+        - any:
+            - { field: scopes, op: contains, value: settings.write }
+            - { field: scopes, op: contains, value: entities.write }
+            - { field: scopes, op: contains, value: credentialVault.write }
+            - { field: scopes, op: contains, value: extensions.write }
+            - { field: scopes, op: contains, value: WriteConfig }
+    evidence: "{name} (owner {owner}) holds a configuration-write scope among {scopes}"
+
+  - id: DT-TOKEN-PERSONAL-ACCESS-OLD
+    title: Personal access token is old
+    kind: misconfigured
+    lens: security
+    category: AUT
+    severity: low
+    entity: api-token
+    refresh: 7d
+    why: A personal access token is tied to one person and inherits their permissions; left in a pipeline it keeps working after they change role or leave, and an old one has usually outlived whatever it was made for.
+    fix: Replace personal access tokens used by automation with a dedicated service token with an expiry, and have people re-create their own when they need them.
+    refs: [NIST-800-53:IA-5, NIST-800-53:AC-2, CIS-Controls-v8:5.3]
+    query:
+      protocol: http
+      path: /api/v2/apiTokens
+      params: { pageSize: "10000", fields: "+expirationDate,+lastUsedDate,+scopes,+personalAccessToken" }
+      paging: none
+      items: apiTokens
+      key: id
+      name: name
+    each:
+      all:
+        - any:
+            - { field: enabled, op: eq, value: true }
+            - { field: disabled, op: eq, value: false }
+        - { field: personalAccessToken, op: eq, value: true }
+        - { field: creationDate, op: age-gt, value: 365, threshold: dynatrace.token-max-age-days }
+    evidence: "{name} (owner {owner}) is a personal access token created {creationDate}, last used {lastUsedDate}"
+
+  # ---- credential vault (environment API v2) -------------------------------------------------
+  # Metadata only (credentialVault.read); the values are never returned.
+
+  - id: DT-CREDENTIAL-CONTEXTLESS
+    title: Credential-vault entry can be used by any configuration
+    kind: misconfigured
+    lens: security
+    category: IAM
+    severity: medium
+    entity: credential
+    why: A vault entry that allows contextless requests can be referenced by any synthetic monitor or extension in the tenant, not only the ones it was meant for, so a municipal account or certificate stored for one job is reachable by every job.
+    fix: Turn off contextless use on the entry and scope it to the monitors or extensions that need it.
+    refs: [NIST-800-53:IA-5, NIST-800-53:AC-6, CIS-Controls-v8:5.4]
+    query:
+      protocol: http
+      path: /api/v2/credentials
+      paging: none
+      items: credentials
+      key: id
+      name: name
+    each: { field: allowContextlessRequests, op: eq, value: true }
+    evidence: "{name} ({type}, owner {owner}) allows contextless use by any configuration"
+
+  # ---- runtime vulnerabilities (environment API v2) ------------------------------------------
+  # securityProblems.read; only returned when Application Security is licensed.
+
+  - id: DT-SECURITY-PROBLEM-OPEN
+    title: Open runtime vulnerability of high or critical risk
+    kind: broken
+    lens: both
+    category: LCM
+    severity:
+      field: riskLevel
+      map: { CRITICAL: critical, HIGH: high }
+      default: high
+    entity: security-problem
+    why: Dynatrace sees the libraries actually loaded by monitored processes, so a critical or high finding here is a vulnerable component running in production right now, not a theoretical one on disk.
+    fix: Patch or remove the affected component with the application owner; if it cannot be reached, mitigate the exposure and record the risk acceptance.
+    refs: [NIST-800-53:RA-5, NIST-800-53:SI-2, CIS-Controls-v8:7.5]
+    query:
+      protocol: http
+      path: /api/v2/securityProblems
+      params: { securityProblemSelector: 'status("OPEN")', fields: "+riskAssessment", pageSize: "500" }
+      paging: none
+      items: securityProblems
+      key: securityProblemId
+      name: title
+    each: { field: riskLevel, op: in, value: [CRITICAL, HIGH] }
+    evidence: "{displayId} {title} ({riskLevel}) in {technology} on {affectedEntities[].name}"
+
+  - id: DT-SECURITY-PROBLEM-LIST-TRUNCATED
+    title: Open runtime-vulnerability list reached the page limit
+    kind: broken
+    category: MON
+    severity: medium
+    entity: instance
+    why: The API returns at most 500 security problems per page and the engine reads one page; at the limit the vulnerability rule judges only part of what is open.
+    fix: Work the open vulnerabilities down, or split the review with a selector per management zone.
+    query:
+      protocol: http
+      path: /api/v2/securityProblems
+      params: { securityProblemSelector: 'status("OPEN")', fields: "+riskAssessment", pageSize: "500" }
+      paging: none
+      items: securityProblems
+      key: securityProblemId
+      name: title
+    count: { op: ge, value: 500 }
+    evidence: "{count} open security problems returned - the list is probably cut off"
+
+  # ---- synthetic monitoring (environment API v1/v2) ------------------------------------------
+
+  - id: DT-SYNTHETIC-LOCATION-DISABLED
+    title: Private synthetic location is disabled
+    kind: broken
+    category: AVL
+    severity: medium
+    entity: synthetic-location
+    why: Every browser and HTTP monitor assigned to a private location stops executing when that location is disabled, so the availability tests look configured while nothing runs them.
+    fix: Re-enable the location and check its node, or move its monitors to a healthy location.
+    refs: [NIST-800-53:SI-4]
+    query:
+      protocol: http
+      path: /api/v2/synthetic/locations
+      paging: none
+      items: locations
+      key: entityId
+      name: name
+    each:
+      all:
+        - { field: type, op: eq, value: PRIVATE }
+        - { field: status, op: eq, value: DISABLED }
+    evidence: "{name}: private synthetic location is {status}"
+
+  - id: DT-SYNTHETIC-MONITOR-DISABLED
+    title: Synthetic monitor is disabled
+    kind: misconfigured
+    category: AVL
+    severity: low
+    entity: synthetic-monitor
+    refresh: 1d
+    why: A disabled synthetic monitor is an outside-in availability test that someone switched off; the baseline that depends on it then passes while nothing is actually checking the application from the user's side.
+    fix: Re-enable the monitor, or record why the test is no longer needed and remove it.
+    refs: [NIST-800-53:SI-4]
+    query:
+      protocol: http
+      path: /api/v1/synthetic/monitors
+      paging: none
+      items: monitors
+      key: entityId
+      name: name
+    each: { field: enabled, op: eq, value: false }
+    evidence: "{name} ({type}): synthetic monitor is disabled"
+
+  # ---- monitoring configuration (settings 2.0) ----------------------------------------------
+
+  - id: DT-MANAGEMENT-ZONE-NONE
+    title: No management zones are defined
+    kind: missing
+    category: CFG
+    severity: low
+    entity: instance
+    refresh: 1d
+    why: Without management zones, anomaly and alerting settings cannot differ per system and problems cannot be scoped or routed to the team that owns the affected hosts; everything shares one global configuration.
+    fix: Define a management zone per system or environment, with rules that place hosts and services into it.
+    refs: [NIST-800-53:CM-8]
+    query:
+      protocol: http
+      path: /api/v2/settings/objects
+      params: { schemaIds: "builtin:management-zones", scopes: environment, fields: "objectId,value", pageSize: "500" }
+      paging: none
+      items: items
+      key: objectId
+      name: value.name
+    count: none
+    evidence: "no management zones defined"
+
+  - id: DT-AUTO-TAG-NONE
+    title: No automatic tagging rules are defined
+    kind: missing
+    category: CFG
+    severity: low
+    entity: instance
+    refresh: 1d
+    why: Auto-tags are how entities become grouped by system, environment and owner; with none, problems cannot be filtered to a system and dashboards cannot be built per service, so routing and ownership rest on host names alone.
+    fix: Add auto-tagging rules that attach system, environment and owner tags from host-group names or metadata.
+    refs: [NIST-800-53:CM-8]
+    query:
+      protocol: http
+      path: /api/v2/settings/objects
+      params: { schemaIds: "builtin:tags.auto-tagging", scopes: environment, fields: "objectId,value", pageSize: "500" }
+      paging: none
+      items: items
+      key: objectId
+      name: value.name
+    count: none
+    evidence: "no automatic tagging rules defined"
+
+  - id: DT-ALERTING-PROFILE-NONE
+    title: No alerting profile is defined
+    kind: missing
+    category: MON
+    severity: low
+    entity: instance
+    refresh: 1d
+    why: An alerting profile decides which problems reach which notification with what delay; with only the implicit default, every slowdown and every real outage go to the same place with the same urgency, which trains people to ignore them.
+    fix: Create an alerting profile per critical system or zone, with severity and delay rules, and bind notifications to it.
+    refs: [NIST-800-53:IR-6, NIST-800-53:SI-4, CIS-Controls-v8:13.1]
+    query:
+      protocol: http
+      path: /api/v2/settings/objects
+      params: { schemaIds: "builtin:alerting.profile", scopes: environment, fields: "objectId,value", pageSize: "500" }
+      paging: none
+      items: items
+      key: objectId
+      name: value.name
+    count: none
+    evidence: "no alerting profile defined"
+
+  - id: DT-NOTIFICATION-WEBHOOK-CLEARTEXT
+    title: Problem notification posts over cleartext HTTP
+    kind: misconfigured
+    lens: security
+    category: AUT
+    severity: medium
+    entity: setting
+    why: A webhook or integration notification whose URL is plain http sends the problem payload - host names, topology, sometimes a token in a header - across the network in clear, where anything on the path can read or alter it.
+    fix: Change the notification target to https, and rotate any shared secret that was sent in clear.
+    refs: [NIST-800-53:SC-8, NIST-800-53:IR-6]
+    query:
+      protocol: http
+      path: /api/v2/settings/objects
+      params: { schemaIds: "builtin:problem.notifications", scopes: environment, fields: "objectId,value", pageSize: "500" }
+      paging: none
+      items: items
+      key: objectId
+      name: value.displayName
+    each:
+      all:
+        - { field: value.enabled, op: eq, value: true }
+        - { field: value.url, op: match, value: '^http://' }
+    evidence: "{value.displayName}: notification posts to {value.url} over cleartext HTTP"
+
+  - id: DT-MAINTENANCE-WINDOW-DETECTION-OFF
+    title: Maintenance window stops problem detection
+    kind: misconfigured
+    category: MON
+    severity: medium
+    entity: maintenance-window
+    refresh: 1d
+    why: A maintenance window set to disable problem detection (not merely to mute alerting) means Dynatrace opens no problem at all for the entities it scopes while it is active; a window left recurring or without an end then hides real faults indefinitely.
+    fix: Change the window to detect problems but not alert, or narrow its schedule and scope to the actual change and let it end.
+    refs: [NIST-800-53:SI-4]
+    query:
+      protocol: http
+      path: /api/v2/settings/objects
+      params: { schemaIds: "builtin:alerting.maintenance-window", scopes: environment, fields: "objectId,value", pageSize: "500" }
+      paging: none
+      items: items
+      key: objectId
+      name: value.generalProperties.name
+    each: { field: value.generalProperties.suppression, op: eq, value: DONT_DETECT_PROBLEMS }
+    evidence: "{value.generalProperties.name}: maintenance window disables problem detection (suppression {value.generalProperties.suppression})"
+
+  - id: DT-DISK-LOW-SPACE-DETECTION-OFF
+    title: Low-disk-space detection is switched off for the environment
+    kind: misconfigured
+    category: MON
+    severity: medium
+    entity: setting
+    refresh: 1d
+    why: With low-disk-space detection off at the environment level, a disk filling up on any monitored host raises no problem, and a full disk is one of the most common ways a service stops. An environment that never changed the setting returns no object and keeps the vendor default (on), which is a pass here.
+    fix: Turn low-disk-space anomaly detection back on for the environment; override it per host group only with a documented reason.
+    refs: [NIST-800-53:SI-4]
+    query:
+      protocol: http
+      path: /api/v2/settings/objects
+      params: { schemaIds: "builtin:anomaly-detection.infrastructure-disks", fields: "objectId,scope,value", pageSize: "500" }
+      paging: none
+      items: items
+      key: objectId
+      name: scope
+    each:
+      all:
+        - { field: scope, op: eq, value: environment }
+        - { field: value.diskLowSpace.enabled, op: eq, value: false }
+    evidence: "low-disk-space detection disabled at {scope}"

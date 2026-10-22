@@ -1,8 +1,6 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
-    <OutputType>Exe</OutputType>
-    <AssemblyName>keeper-report</AssemblyName>
-    <RootNamespace>Keeper.Cli.Report</RootNamespace>
+    <AssemblyName>Keeper.Cli.Report</AssemblyName>
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="..\Keeper.Report\Keeper.Report.csproj" />

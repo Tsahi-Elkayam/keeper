@@ -36,9 +36,26 @@ public static class SecretProperties
         "preSharedKey", "wpaPreSharedKey", "privateKey", "apiKey", "api_key", "token", "accessToken", "access_token",
         "refreshToken", "refresh_token", "connectionString", "scriptContent", "detectionScriptContent",
         "remediationScriptContent", "recoveryKey", "bitLockerRecoveryKey",
+        // Google Cloud resources: a function's or build's environment.
+        "environmentVariables", "buildEnvironmentVariables", "secretEnvironmentVariables",
     };
 
     public static bool IsSecret(string property) => Names.Contains(property);
+
+    // A name/value pair whose name says the value is code or a credential: a Compute Engine instance's metadata
+    // item (startup-script, sysprep-specialize-script-ps1, user-data), an environment entry (DB_PASSWORD).
+    private static readonly System.Text.RegularExpressions.Regex ScriptName = new(
+        @"(startup|shutdown|specialize)-script|^user-data$",
+        System.Text.RegularExpressions.RegexOptions.IgnoreCase | System.Text.RegularExpressions.RegexOptions.CultureInvariant,
+        TimeSpan.FromSeconds(1));
+
+    // A number or true/false under a secret-sounding name is a setting (EnableBannedPasswordCheck: True), not a secret.
+    private static bool SecretPair(JsonObject o) =>
+        o["value"] is JsonValue v && v.TryGetValue<string>(out var text) && text.Length > 0
+        && (o["key"] ?? o["name"]) is JsonValue n && n.TryGetValue<string>(out var name)
+        && (ScriptName.IsMatch(name)
+            || (LooksSecret(name) && !bool.TryParse(text, out _)
+                && !double.TryParse(text, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out _)));
 
     private static readonly System.Text.RegularExpressions.Regex SecretName = new(
         @"passw(or)?d|pwd|passphrase|(?<!by)pass$|secret|credential|token|apikey|api_key|privatekey|sharedkey",
@@ -83,6 +100,8 @@ public static class SecretProperties
         switch (node)
         {
             case JsonObject o:
+                if (SecretPair(o))
+                    o["value"] = "set";
                 foreach (var name in o.Select(p => p.Key).ToList())
                 {
                     if (IsSecret(name))

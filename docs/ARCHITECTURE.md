@@ -7,25 +7,27 @@ own folder, project, tests and tables; no component reaches into another's inter
 
 ```
 rules/*.yaml ─┐
-              ├─ keeper-scan <system> ──> data\runs\<run>\   rows, results, findings, coverage
+              ├─ keeper scan <system> ──> data\runs\<run>\   rows, results, findings, coverage
 integrations ─┘                              │
-                                    keeper-load ──> queue ──> store
+                                    keeper load ──> queue ──> store
                                              │
-              keeper-scan <store system> ────┘   rules over the store: registers, obligations,
-                                    keeper-load ──> queue ──> store   cross-system joins, Keeper's health
+              keeper scan <store system> ────┘   rules over the store: registers, obligations,
+                                    keeper load ──> queue ──> store   cross-system joins, Keeper's health
                                              │
-                                    keeper-track ──> queue ──> store   lifecycle, history, systems
+                                    keeper track ──> queue ──> store   lifecycle, history, systems
                                              │
-                                    keeper-rank  ──> queue ──> store   today's order, one task per check
+                                    keeper rank  ──> queue ──> store   today's order, one task per check
                                              │
-                          keeper-today / keeper-report / keeper-query  (read-only)
+                          keeper today / keeper report / keeper query  (read-only)
                                              │
-                                    keeper-push ──> trackers (plan is a dry run; apply asks)
+                                    keeper push ──> trackers (plan is a dry run; apply asks)
 ```
 
-`keeper-run` runs the stages in order, each in its own process. `keeper <verb>` dispatches to
-`keeper-<verb>` in its own folder. People change the store through `keeper-decide`, `keeper-system`,
-`keeper-register` and `keeper-integration`, which only queue requests.
+There is one binary, `keeper`. Each verb is a library in its component's `keeper-<verb>\` folder
+(`<Verb>Verb.Run(args)`); `keeper` registers them in `Commands` and runs them in its own process -
+nothing is started as a child process. `keeper run` calls the stages in order. A verb that throws
+past its own handlers fails alone with an exit code, as a separate process did. People change the
+store through `keeper decide`, `system`, `register`, `config` and `integration`, which only queue requests.
 
 Rules over the store (integration type `keeper`) run after the other scans are loaded, so a rule can
 join what two systems saw the same day - `hybrid-identity.yaml` joins Active Directory and Entra on
@@ -47,13 +49,13 @@ its time counted once, shown as one line with its number of targets.
 | `components/integrations` | Keeper.Integrations | Endpoints, identities, encrypted secrets, allowed hosts |
 | `components/rules` | Keeper.Rules | Rule files: model, loader, validation, condition evaluator |
 | `components/runners` | Keeper.Runners + one project per protocol | Read-only runners: ldap, graph, http, graphql, sql, cim, tls, file, store |
-| `components/scan` | Keeper.Scan, keeper-scan, keeper-rules | Runs a system's rules through its runner; writes a run folder; validates rule files |
-| `components/review` | Keeper.Review + bins | The domain: schema, handlers, questions, load, track; decide, system, register |
-| `components/rank` | Keeper.Rank + bin | What to do today |
-| `components/report` | Keeper.Report + bins | The daily list and audience reports |
-| `components/push` | Keeper.Push + bin | Tickets in ServiceNow / monday |
+| `components/scan` | Keeper.Scan + verbs scan, rules, certs | Runs a system's rules through its runner; writes a run folder; validates rule files |
+| `components/review` | Keeper.Review + verbs | The domain: schema, handlers, questions, load, track; decide, system, register, config |
+| `components/rank` | Keeper.Rank + verb | What to do today |
+| `components/report` | Keeper.Report + verbs | The daily list and audience reports |
+| `components/push` | Keeper.Push + verb | Tickets in ServiceNow / monday |
 | `components/home` | Keeper.Home | The Keeper home: where a tenant's settings and data live |
-| `components/keeper` | Keeper.Composition, keeper, keeper-run, keeper-db, keeper-qm, keeper-query | The wrapper: dispatch, setup, the daily run, and the bins composed over every component |
+| `components/keeper` | Keeper.Composition, keeper + verbs run, db, qm, query | The one binary: dispatch, setup, the daily run, and the verbs composed over every component |
 
 Each component owns its tables and ships its own migrations (`schema_version` keeps one version per
 component). Request kinds are namespaced: `review.override`, `integrations.set-secret`.
@@ -70,19 +72,21 @@ Every file a stage writes is JSON Lines - one record per line, a `schema` field 
 | `keeper.coverage/1` | scan | source, system, scope (rule, query, target), item, state (ok, partial, failed, not-applicable), reason, count, observedAt |
 | `keeper.run/1` (run.json) | scan | runId, source, system, integration, identity, startedAt, finishedAt, status, files with SHA-256 |
 
-A run folder is written as `<run>.tmp` and renamed when complete. `keeper-load` verifies every
+A run folder is written as `<run>.tmp` and renamed when complete. `keeper load` verifies every
 file's hash before it submits the run, and the handler verifies them again before applying.
 
 ## Security
 
-- **One writer.** Only `keeper-qm` writes the store; every write is a request with a reason, applied
+- **One writer.** Only `keeper qm` writes the store; every write is a request with a reason, applied
   in a transaction with its audit row. Request payloads that point at files carry their hash.
-- **Least capability per binary.** Query and report binaries open the store read-only and never
-  reference the vault. Only `keeper-scan` and `keeper-push` decrypt a credential, and only the one
-  integration they were started for.
+- **Least capability per verb.** Query and report verbs open the store read-only and never
+  reference the vault. Only `keeper scan` and `keeper push` decrypt a credential, and only the one
+  integration they were called for. This is enforced by code path, not by process: since verbs share
+  one process, `keeper run` scans its systems one after another in the same memory, where separate
+  binaries used to isolate each credential in its own process.
 - **No plaintext secrets at rest.** Secrets are encrypted before they reach the queue; the AAD binds
   each to its integration and endpoint, so a changed endpoint cannot receive the old secret.
-- **Static composition.** Handlers, migrations and question packs are compiled into the binaries;
+- **Static composition.** Handlers, migrations and question packs are compiled into the binary;
   nothing is loaded from a folder at runtime.
 - **Runners are read-only by construction** and refuse secret attributes - see RULES.md.
 - **Tenant data never in the repo.** The Keeper home is outside every source tree; binaries refuse

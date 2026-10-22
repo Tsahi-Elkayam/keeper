@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Builds Keeper into .\build\<runtime>: every keeper binary, side by side, with the rules.
+    Builds Keeper into .\build\<runtime>: the one keeper binary, with the rules.
 
 .DESCRIPTION
     Everything stays in this one folder. Git tracks the source; it ignores the three folders that
@@ -21,9 +21,10 @@
        expression after 're:' (e.g. re:\b10\.\d+\.\d+\.\d+\b).
     3. Validates every rule file in rules\.
     4. With -Test, runs the unit tests.
-    5. Publishes every binary (components\*\src\keeper and keeper-*) into .\build\<runtime>
-       (framework-dependent: needs the .NET 10 runtime where it runs), and replaces
-       .\build\<runtime>\rules with the repo's rules\.
+    5. Publishes keeper (components\keeper\src\keeper; every verb is a library it runs in-process)
+       into .\build\<runtime> (framework-dependent: needs the .NET 10 runtime where it runs), removes
+       the keeper-* binaries an older build left there, and replaces .\build\<runtime>\rules with the
+       repo's rules\.
 
     Writes only to .\build\<runtime>. Never touches the Keeper home: 'keeper setup --apply' creates it.
     Runs on Windows PowerShell 5.1.
@@ -94,7 +95,7 @@ if (Test-Path $denyList) {
         Where-Object { $_ -and -not $_.StartsWith('#') })
     $plain   = @($terms | Where-Object { -not $_.StartsWith('re:') })
     $regexes = @($terms | Where-Object { $_.StartsWith('re:') } | ForEach-Object { $_.Substring(3) })
-    $skip  = '^\\(build|home|demo)\\|\\(bin|obj|artifacts|\.git|\.vs|TestResults)\\'
+    $skip  = '^\\(build|home|demo|clients)\\|\\(bin|obj|artifacts|\.git|\.vs|TestResults)\\'
     $files = @(Get-ChildItem $repo -Recurse -File -Force |
         Where-Object { $_.FullName.Substring($repo.Length) -notmatch $skip } |
         ForEach-Object { $_.FullName })
@@ -119,9 +120,9 @@ else {
 }
 
 # 3. Every rule file loads, and ids are unique across them
-$validator = Join-Path $repo 'components\scan\src\keeper-rules\keeper-rules.csproj'
+$keeperProject = Join-Path $repo 'components\keeper\src\keeper\keeper.csproj'
 # No --nologo here: dotnet run hands options it does not know to the program, which would read it as its own.
-& dotnet run --project $validator -c $Configuration -- validate (Join-Path $repo 'rules')
+& dotnet run --project $keeperProject -c $Configuration -- rules validate (Join-Path $repo 'rules')
 if ($LASTEXITCODE -ne 0) { throw "Rule validation failed (exit $LASTEXITCODE): fix the file:line:col above." }
 
 # 4. Tests
@@ -130,16 +131,14 @@ if ($Test) {
     if ($LASTEXITCODE -ne 0) { throw "Tests failed (exit $LASTEXITCODE)." }
 }
 
-# 5. Publish - every components\<c>\src\keeper or keeper-<name> folder is one binary
-$bins = @(Get-ChildItem (Join-Path $repo 'components') -Directory |
-    ForEach-Object { Get-ChildItem (Join-Path $_.FullName 'src') -Directory -ErrorAction SilentlyContinue } |
-    Where-Object { ($_.Name -eq 'keeper' -or $_.Name -like 'keeper-*') -and (Test-Path (Join-Path $_.FullName "$($_.Name).csproj")) } |
-    Sort-Object Name)
-foreach ($bin in $bins) {
-    & dotnet publish (Join-Path $bin.FullName "$($bin.Name).csproj") -c $Configuration -r $Runtime --self-contained false -o $out --nologo -v q
-    if ($LASTEXITCODE -ne 0) {
-        throw "dotnet publish of $($bin.Name) for $Runtime failed (exit $LASTEXITCODE). Needs the .NET 10 SDK."
-    }
+# 5. Publish - one binary; the verbs (components\<c>\src\keeper-<verb>) are libraries inside it
+# An older build published every verb as its own keeper-<verb> binary: gone now, so they go from here too.
+if (Test-Path $out) {
+    Get-ChildItem $out -File -Filter 'keeper-*' | Remove-Item
+}
+& dotnet publish $keeperProject -c $Configuration -r $Runtime --self-contained false -o $out --nologo -v q
+if ($LASTEXITCODE -ne 0) {
+    throw "dotnet publish of keeper for $Runtime failed (exit $LASTEXITCODE). Needs the .NET 10 SDK."
 }
 
 # The build output is disposable: its rules\ is replaced, so a rule removed from the repo is gone here too.
@@ -147,7 +146,7 @@ $rulesOut = Join-Path $out 'rules'
 if (Test-Path $rulesOut) { Remove-Item $rulesOut -Recurse }
 Copy-Item (Join-Path $repo 'rules') $rulesOut -Recurse
 
-Write-Host "Built into ${out}: $(($bins | ForEach-Object { $_.Name }) -join ', ')"
+Write-Host "Built into ${out}: keeper"
 Write-Host "Keeper home: $keeperHome"
 if (-not (Test-Path (Join-Path (Join-Path $keeperHome 'settings') 'settings.json'))) {
     Write-Host "No Keeper home yet. Next: & '$out\keeper.exe' setup --tenant <name>   (dry run; add --apply)"

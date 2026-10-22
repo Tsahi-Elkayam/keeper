@@ -1031,3 +1031,223 @@ rules:
         - { field: value.status, op: in, value: [RUNNING, BLOCKED, PENDING] }
         - { field: value.start_time, op: age-gt, value: 0.5, threshold: vmware.backup-max-run-days }
     evidence: "backup {key} {value.status} since {value.start_time}"
+
+  # ---- virtual machine hardware and devices --------------------------------------------------
+  # These per-VM rules read the VM's own configuration, which the host can return whether the VM is
+  # powered on or off, so their for_each walks the whole VM list (no power_states filter) - a legacy
+  # NIC or an old hardware version matters on a VM that is off now but will run later. Still capped at
+  # 2000: beyond that the result is partial. /rest is used for the device collections because /api
+  # returns them as a map keyed by device id and /rest renders that map as [{key, value}] (the same
+  # reason, and the same any-element caveat, as VMW-VM-ISO-CONNECTED).
+
+  - id: VMW-VM-HARDWARE-VERSION-OLD
+    title: VM runs on an old virtual hardware version
+    kind: misconfigured
+    lens: both
+    category: LCM
+    severity: low
+    entity: vm
+    refresh: 7d
+    why: Virtual hardware below vmx-15 cannot offer a vTPM, UEFI Secure Boot, larger limits or the current paravirtual devices, and it lags the host it runs on; vmx-7/8 VMs are 2010-era compatibility nobody chose to keep.
+    fix: Upgrade the VM compatibility (hardware version) in a maintenance window, after a Tools upgrade and a snapshot, aligning every VM to one version.
+    refs: [NIST-800-53:CM-6]
+    query:
+      protocol: http
+      path: /api/vcenter/vm/{vm}/hardware
+      for_each: { path: /api/vcenter/vm, paging: none, field: vm, max: 2000 }
+      paging: none
+      key: "{parent.vm}"
+      name: parent.name
+    each: { field: version, op: match, value: '^VMX_(0[0-9]|1[0-4])$', threshold: vmware.vm-hardware-old-pattern }
+    evidence: "{parent.name}: virtual hardware {version}, upgrade policy {upgrade_policy}"
+
+  - id: VMW-VM-HARDWARE-UPGRADE-FAILED
+    title: VM virtual-hardware upgrade failed
+    kind: broken
+    category: LCM
+    severity: medium
+    entity: vm
+    refresh: 7d
+    why: A scheduled virtual-hardware upgrade that failed leaves the VM on its old compatibility and can block the next clean power cycle; the failure is recorded on the VM and otherwise goes unnoticed.
+    fix: Read the upgrade error, make VMware Tools current first, resolve the cause, and reschedule the compatibility upgrade.
+    refs: [NIST-800-53:CM-6]
+    query:
+      protocol: http
+      path: /api/vcenter/vm/{vm}/hardware
+      for_each: { path: /api/vcenter/vm, paging: none, field: vm, max: 2000 }
+      paging: none
+      key: "{parent.vm}"
+      name: parent.name
+    each: { field: upgrade_status, op: eq, value: FAILED }
+    evidence: "{parent.name}: hardware upgrade to {upgrade_version} failed ({upgrade_error})"
+
+  - id: VMW-VM-FIRMWARE-BIOS
+    title: VM boots with legacy BIOS firmware
+    kind: misconfigured
+    lens: both
+    category: LCM
+    severity: low
+    entity: vm
+    refresh: 7d
+    why: A VM that still boots with legacy BIOS firmware cannot use UEFI Secure Boot or a vTPM, so guest protections such as Credential Guard and measured boot are unavailable; EFI is the modern default and some current guest editions need it.
+    fix: Convert the guest to UEFI and enable Secure Boot in a maintenance window where the guest OS supports the conversion, after a snapshot.
+    refs: [NIST-800-53:SI-7]
+    query:
+      protocol: http
+      path: /api/vcenter/vm/{vm}/hardware/boot
+      for_each: { path: /api/vcenter/vm, paging: none, field: vm, max: 2000 }
+      paging: none
+      key: "{parent.vm}"
+      name: parent.name
+    each: { field: type, op: eq, value: BIOS }
+    evidence: "{parent.name}: firmware {type}"
+
+  - id: VMW-VM-LEGACY-NIC
+    title: VM uses an emulated or legacy network adapter
+    kind: misconfigured
+    lens: both
+    category: LCM
+    severity: low
+    entity: vm
+    refresh: 7d
+    why: The emulated E1000/E1000e and the older PCNet/VMXNET/VMXNET2 adapters drop packets under load and have had guest-to-host escape vulnerabilities; VMXNET3 is the supported paravirtual adapter for performance and for current drivers.
+    fix: Replace the adapter with VMXNET3 after installing the driver in the guest (VMware Tools), in a maintenance window with a short network interruption.
+    refs: [NIST-800-53:SI-2, NIST-800-53:CM-7]
+    query:
+      protocol: http
+      path: /rest/vcenter/vm/{vm}
+      for_each: { path: /api/vcenter/vm, paging: none, field: vm, max: 2000 }
+      paging: none
+      items: value
+      key: "{parent.vm}"
+      name: parent.name
+    each: { field: "nics[].value.type", op: in, value: [E1000, E1000E, PCNET32, VMXNET, VMXNET2] }
+    evidence: "{parent.name}: network adapter type {nics[].value.type}"
+
+  - id: VMW-VM-LEGACY-SCSI
+    title: VM uses a legacy SCSI controller
+    kind: misconfigured
+    category: LCM
+    severity: low
+    entity: vm
+    refresh: 7d
+    why: BusLogic and parallel LSI Logic are legacy storage controllers kept only for very old guests; the paravirtual controller (PVSCSI) gives lower CPU cost and higher throughput and is the supported choice for current workloads.
+    fix: Migrate the disks to a PVSCSI controller (or at least LSI Logic SAS) after preparing the guest driver, in a maintenance window.
+    refs: [NIST-800-53:CM-6]
+    query:
+      protocol: http
+      path: /rest/vcenter/vm/{vm}
+      for_each: { path: /api/vcenter/vm, paging: none, field: vm, max: 2000 }
+      paging: none
+      items: value
+      key: "{parent.vm}"
+      name: parent.name
+    each: { field: "scsi_adapters[].value.type", op: in, value: [BUSLOGIC, LSILOGIC] }
+    evidence: "{parent.name}: SCSI controller type {scsi_adapters[].value.type}"
+
+  - id: VMW-VM-FLOPPY-PRESENT
+    title: VM has a virtual floppy device
+    kind: misconfigured
+    lens: security
+    category: CFG
+    severity: low
+    entity: vm
+    refresh: 7d
+    why: A virtual floppy drive is an unnecessary device that serves no purpose on a modern server and only widens the VM's attack surface; hardening guidance removes it.
+    fix: Remove the floppy device from the VM (it can be removed while powered off).
+    refs: [NIST-800-53:CM-7]
+    query:
+      protocol: http
+      path: /rest/vcenter/vm/{vm}
+      for_each: { path: /api/vcenter/vm, paging: none, field: vm, max: 2000 }
+      paging: none
+      items: value
+      key: "{parent.vm}"
+      name: parent.name
+    each: { field: floppies, op: size-gt, value: 0 }
+    evidence: "{parent.name}: a virtual floppy device is attached"
+
+  - id: VMW-VM-LEGACY-IO-PORT
+    title: VM has a virtual serial or parallel port attached
+    kind: misconfigured
+    lens: security
+    category: HYG
+    severity: low
+    entity: vm
+    refresh: 7d
+    why: Virtual serial and parallel ports are legacy I/O channels that most servers never use; left attached they are extra device surface and can move data to the host, so hardening guidance removes the ones that are not required.
+    fix: Remove unused serial and parallel ports from the VM, or record the application that needs them.
+    refs: [NIST-800-53:CM-7]
+    query:
+      protocol: http
+      path: /rest/vcenter/vm/{vm}
+      for_each: { path: /api/vcenter/vm, paging: none, field: vm, max: 2000 }
+      paging: none
+      items: value
+      key: "{parent.vm}"
+      name: parent.name
+    each:
+      any:
+        - { field: serial_ports, op: size-gt, value: 0 }
+        - { field: parallel_ports, op: size-gt, value: 0 }
+    evidence: "{parent.name}: a legacy serial or parallel port is attached"
+
+  - id: VMW-VM-CPU-HOTADD-ENABLED
+    title: VM has CPU hot-add enabled
+    kind: misconfigured
+    category: HYG
+    severity: low
+    entity: vm
+    refresh: 7d
+    why: CPU hot-add disables virtual NUMA for the VM, which can slow memory-latency-sensitive workloads such as databases and telephony in a way nobody attributes to this setting; it is usually left on by a template default rather than chosen.
+    fix: Turn off CPU hot-add on VMs that do not need online vCPU changes (a power cycle applies it), and fix the template that sets it.
+    refs: [NIST-800-53:CM-6]
+    query:
+      protocol: http
+      path: /rest/vcenter/vm/{vm}
+      for_each: { path: /api/vcenter/vm, paging: none, field: vm, max: 2000 }
+      paging: none
+      items: value
+      key: "{parent.vm}"
+      name: parent.name
+    each: { field: cpu.hot_add_enabled, op: eq, value: true }
+    evidence: "{parent.name}: CPU hot-add enabled, {cpu.count} vCPU"
+
+  # ---- datastores (storage type and coverage) ------------------------------------------------
+
+  - id: VMW-DATASTORE-NFS-V3
+    title: Datastore is on NFS version 3
+    kind: misconfigured
+    lens: both
+    category: LCM
+    severity: low
+    entity: datastore
+    why: NFS version 3 datastores carry no in-band authentication or encryption and offer only client-side path failover, so a datastore on NFSv3 is both less secure and less resilient than one on NFS 4.1; it is usually a leftover from an older array setup.
+    fix: Migrate the VMs and re-mount the export as NFS 4.1 (with Kerberos where the array supports it), or record why NFSv3 is required.
+    refs: [NIST-800-53:SC-8]
+    query:
+      protocol: http
+      path: /api/vcenter/datastore
+      paging: none
+      key: datastore
+      name: name
+    each: { field: type, op: eq, value: NFS }
+    evidence: "{name}: datastore type {type}"
+
+  - id: VMW-DATASTORE-NONE
+    title: vCenter returned no datastores
+    kind: missing
+    category: MON
+    severity: medium
+    entity: instance
+    why: An empty datastore list means the review account cannot read the storage inventory, or this vCenter presents no datastores; either way the datastore capacity and health rules stay silent and the result looks clean.
+    fix: Give the review account the read-only role on the vCenter root object with propagation, then rerun the scan.
+    refs: [NIST-800-53:CA-7]
+    query:
+      protocol: http
+      path: /api/vcenter/datastore
+      paging: none
+      key: datastore
+      name: name
+    count: none
+    evidence: "the datastore list is empty"

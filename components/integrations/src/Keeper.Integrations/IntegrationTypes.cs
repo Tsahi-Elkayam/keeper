@@ -74,6 +74,7 @@ public static partial class IntegrationTypes
         ["entra-certificate"] = [],
         ["aws-access-key"] = ["secretAccessKey"],
         ["aws-assume-role"] = ["secretAccessKey"],
+        ["gcp-service-account"] = ["privateKey"],
     };
 
     private static readonly string[] Windows = ["negotiate", "windows-credential"];
@@ -163,6 +164,15 @@ public static partial class IntegrationTypes
         // The endpoint is the home region. Hosts are never configured: the runner builds them under amazonaws.com.
         new("aws", "Amazon Web Services: read-only actions, signed in-process; every account through its read-only role", ["aws"],
             ["aws-access-key", "aws-assume-role"], []),
+        // Google Cloud through Cloud Asset Inventory: every resource's configuration, IAM policies and organisation
+        // policies, from one host and one read (ListAssets). The endpoint names the scope - an organisation, a folder
+        // or a project - and its token has the read-only scope, so it cannot change anything whatever its roles.
+        new("gcp", "Google Cloud: Cloud Asset Inventory over an organisation, folder or project (https://cloudasset.googleapis.com/v1/organizations/<n>), read-only token", ["http"],
+            ["gcp-service-account"], ["cloudasset.googleapis.com"], null)
+        {
+            EndpointPath = "/v1/*/*",
+            ReadPaths = ["/v1/*/*/assets"],
+        },
         new("checkpoint", "Check Point management API (show- commands only, on a read-only session)", ["http"], ["session-login"], [])
         {
             ReadPosts = ["/web_api/show-*", "/web_api/v*/show-*"],

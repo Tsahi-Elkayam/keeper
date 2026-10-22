@@ -1,8 +1,6 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
-    <OutputType>Exe</OutputType>
-    <AssemblyName>keeper-decide</AssemblyName>
-    <RootNamespace>Keeper.Cli.Decide</RootNamespace>
+    <AssemblyName>Keeper.Cli.Decide</AssemblyName>
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="..\Keeper.Review.Cli\Keeper.Review.Cli.csproj" />

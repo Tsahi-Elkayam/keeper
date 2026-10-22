@@ -1,8 +1,6 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
-    <OutputType>Exe</OutputType>
-    <AssemblyName>keeper-rules</AssemblyName>
-    <RootNamespace>Keeper.Cli.Rules</RootNamespace>
+    <AssemblyName>Keeper.Cli.Rules</AssemblyName>
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="..\Keeper.Scan\Keeper.Scan.csproj" />

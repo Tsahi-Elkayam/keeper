@@ -8,7 +8,20 @@ namespace Keeper.Report;
 /// A report as sections of lines, so one model renders as text, Markdown or HTML. Everything that came
 /// from a scanned system is untrusted: HTML output encodes all of it, Markdown escapes what would format.
 /// </summary>
-public sealed record Section(string Title, IReadOnlyList<string> Lines, string? Empty = null);
+public sealed record Section(string Title, IReadOnlyList<string> Lines, string? Empty = null)
+{
+    /// <summary>A paragraph before the lines.</summary>
+    public string? Intro { get; init; }
+
+    /// <summary>Findings told in full, after the lines.</summary>
+    public IReadOnlyList<Card> Cards { get; init; } = [];
+}
+
+/// <summary>
+/// One finding as a reader wants it: what was found, on which objects (with what was seen on each), why it
+/// matters and what to do. Items may be fewer than Total; the rest are one question away.
+/// </summary>
+public sealed record Card(string Severity, string Headline, string? Why, string? Fix, IReadOnlyList<string> Items, int Total, string? More = null);
 
 public sealed record Document(string Title, string Subtitle, IReadOnlyList<Section> Sections);
 
@@ -21,10 +34,24 @@ public static class Render
         foreach (var section in document.Sections)
         {
             output.AppendLine(section.Title).AppendLine(new string('-', section.Title.Length));
-            if (section.Lines.Count == 0 && section.Empty is not null)
+            if (section.Intro is not null)
+                output.AppendLine("  " + section.Intro).AppendLine();
+            if (section.Lines.Count == 0 && section.Cards.Count == 0 && section.Empty is not null)
                 output.AppendLine("  " + section.Empty);
             foreach (var line in section.Lines)
                 output.AppendLine("  " + line);
+            foreach (var card in section.Cards)
+            {
+                output.AppendLine().AppendLine($"  [{card.Severity}] {card.Headline}");
+                if (card.Why is not null)
+                    output.AppendLine($"    Why: {card.Why}");
+                if (card.Fix is not null)
+                    output.AppendLine($"    Fix: {card.Fix}");
+                foreach (var item in card.Items)
+                    output.AppendLine($"      - {item}");
+                if (card.Total > card.Items.Count)
+                    output.AppendLine($"      ... and {card.Total - card.Items.Count} more{(card.More is null ? "" : $" ({card.More})")}");
+            }
             output.AppendLine();
         }
         return output.ToString();
@@ -37,10 +64,24 @@ public static class Render
         foreach (var section in document.Sections)
         {
             output.AppendLine($"## {Md(section.Title)}").AppendLine();
-            if (section.Lines.Count == 0 && section.Empty is not null)
+            if (section.Intro is not null)
+                output.AppendLine(Md(section.Intro)).AppendLine();
+            if (section.Lines.Count == 0 && section.Cards.Count == 0 && section.Empty is not null)
                 output.AppendLine(Md(section.Empty));
             foreach (var line in section.Lines)
                 output.AppendLine($"- {Md(line)}");
+            foreach (var card in section.Cards)
+            {
+                output.AppendLine().AppendLine($"### \\[{Md(card.Severity)}\\] {Md(card.Headline)}").AppendLine();
+                if (card.Why is not null)
+                    output.AppendLine($"**Why:** {Md(card.Why)}").AppendLine();
+                if (card.Fix is not null)
+                    output.AppendLine($"**Fix:** {Md(card.Fix)}").AppendLine();
+                foreach (var item in card.Items)
+                    output.AppendLine($"- {Md(item)}");
+                if (card.Total > card.Items.Count)
+                    output.AppendLine($"- ... and {card.Total - card.Items.Count} more{(card.More is null ? "" : $" ({Md(card.More)})")}");
+            }
             output.AppendLine();
         }
         return output.ToString();
@@ -61,13 +102,21 @@ public static class Render
               h1 { margin-bottom: .2rem; } .sub { color: var(--muted); margin-top: 0; }
               h2 { border-bottom: 1px solid var(--line); padding-bottom: .2rem; margin-top: 2rem; }
               li { margin: .35rem 0; } .empty { color: var(--muted); }
+              .card { border: 1px solid var(--line); border-radius: 8px; padding: .6rem 1rem; margin: .8rem 0; }
+              .card h3 { font-size: 1rem; margin: .2rem 0 .4rem; } .card p { margin: .3rem 0; }
+              .sev { display: inline-block; font-size: .75rem; font-weight: 600; text-transform: uppercase; padding: 0 .45rem; border-radius: 4px; margin-right: .4rem; color: #fff; background: #777; }
+              .sev-critical { background: #b3261e; } .sev-high { background: #c2410c; } .sev-medium { background: #a16207; } .sev-low { background: #2563eb; } .sev-info { background: #6b7280; }
+              details summary { cursor: pointer; color: var(--muted); } details ul { max-height: 28rem; overflow: auto; }
+              .intro { font-size: 1.05rem; }
             </style></head><body>
             <h1>{{E(document.Title)}}</h1><p class="sub">{{E(document.Subtitle)}}</p>
             """);
         foreach (var section in document.Sections)
         {
             output.Append(CultureInfo.InvariantCulture, $"<h2>{E(section.Title)}</h2>");
-            if (section.Lines.Count == 0 && section.Empty is not null)
+            if (section.Intro is not null)
+                output.Append(CultureInfo.InvariantCulture, $"<p class=\"intro\">{E(section.Intro)}</p>");
+            if (section.Lines.Count == 0 && section.Cards.Count == 0 && section.Empty is not null)
                 output.Append(CultureInfo.InvariantCulture, $"<p class=\"empty\">{E(section.Empty)}</p>");
             if (section.Lines.Count > 0)
             {
@@ -75,6 +124,26 @@ public static class Render
                 foreach (var line in section.Lines)
                     output.Append(CultureInfo.InvariantCulture, $"<li>{E(line)}</li>");
                 output.Append("</ul>");
+            }
+            foreach (var card in section.Cards)
+            {
+                // The severity names a CSS class only when it is one of ours; anything else gets the plain badge.
+                var sev = card.Severity is "critical" or "high" or "medium" or "low" or "info" ? $" sev-{card.Severity}" : "";
+                output.Append(CultureInfo.InvariantCulture, $"<div class=\"card\"><h3><span class=\"sev{sev}\">{E(card.Severity)}</span>{E(card.Headline)}</h3>");
+                if (card.Why is not null)
+                    output.Append(CultureInfo.InvariantCulture, $"<p>{E(card.Why)}</p>");
+                if (card.Fix is not null)
+                    output.Append(CultureInfo.InvariantCulture, $"<p><b>Fix:</b> {E(card.Fix)}</p>");
+                if (card.Items.Count > 0)
+                {
+                    output.Append(CultureInfo.InvariantCulture, $"<details><summary>{card.Total} affected - show</summary><ul>");
+                    foreach (var item in card.Items)
+                        output.Append(CultureInfo.InvariantCulture, $"<li>{E(item)}</li>");
+                    if (card.Total > card.Items.Count)
+                        output.Append(CultureInfo.InvariantCulture, $"<li class=\"empty\">... and {card.Total - card.Items.Count} more{(card.More is null ? "" : $" ({E(card.More)})")}</li>");
+                    output.Append("</ul></details>");
+                }
+                output.Append("</div>");
             }
         }
         output.Append("</body></html>");

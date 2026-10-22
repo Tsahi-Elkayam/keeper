@@ -385,6 +385,8 @@ public sealed class Scanner(RunnerRegistry registry, TimeProvider? clock = null)
         }
 
         var findings = 0;
+        // Whether every count of a partial read still settled its answer (see CountOne): then the rule saw enough.
+        var settled = true;
         if (rule.Count is { } count)
         {
             // A per-host query counts per host: "no update installed in 45 days" and "more than 3 local
@@ -434,7 +436,12 @@ public sealed class Scanner(RunnerRegistry registry, TimeProvider? clock = null)
             }
         }
 
-        Coverage(outcome.State, outcome.State == "ok" ? null : outcome.Reason, outcome.Rows.Count);
+        // A count rule whose every count was settled despite a partial read has its answer: its coverage is ok, so it
+        // can read as correct. A rule judged object by object never is - an object not read could be the one that fails.
+        if (outcome.State == "partial" && rule.Count is not null && settled)
+            Coverage("ok", $"the read was partial, but the count already settles this rule: {outcome.Reason}", outcome.Rows.Count);
+        else
+            Coverage(outcome.State, outcome.State == "ok" ? null : outcome.Reason, outcome.Rows.Count);
         return findings;
 
         // by: one count per value of a field - "more than one admin per site" - each its own result and finding.
@@ -471,8 +478,8 @@ public sealed class Scanner(RunnerRegistry registry, TimeProvider? clock = null)
             return total;
         }
 
-        // partial: why the read is incomplete. Its count is a floor - enough to fail, never to pass; a share
-        // of a partial read says nothing either way.
+        // partial: why the read is incomplete. Its count is a floor - enough to fail a gt/ge limit or to pass an
+        // lt/le one, never the other way; eq, ne and a share of a partial read say nothing either way.
         // Rows outside this count that could still belong to it (rows with no group, for a count by group): all of
         // them (they could join a share and dilute it), and those that could also match (they could add to it).
         int CountOne(List<(JsonObject Row, string? Target)> rows, string entityType, string target, string? partial, string? group,
@@ -526,12 +533,19 @@ public sealed class Scanner(RunnerRegistry registry, TimeProvider? clock = null)
                 : verdict.Fails == false && (Differs(high) || Differs(low)));
             if (uncertain)
             {
+                settled = false;
                 Result(entityType, target, new Verdict(null, verdict.Value, verdict.Operand,
                     $"{unjudged + (int)extraUnknown} rows could not be judged, and they could change the outcome"));
                 return 0;
             }
-            if (partial is not null && (verdict.Fails != true || count.Percent))
+            // A partial read's count is a floor: the real count is at least this, so only what more rows cannot
+            // change is certain. Over a gt/ge limit it stays over (a failure stands); at or above an lt/le limit it
+            // stays there (a pass stands: one policy found auditing logons already answers "no policy does").
+            // The other way round, and eq, ne and shares, the rows not read could overturn it: unknown.
+            var certain = !count.Percent && (count.Op is "gt" or "ge" ? verdict.Fails == true : count.Op is "lt" or "le" && verdict.Fails == false);
+            if (partial is not null && !certain)
             {
+                settled = false;
                 run.Result(new ResultRecord
                 {
                     Instance = instance, System = system, RuleId = rule.Id, EntityType = entityType, EntityKey = target, State = "unknown",

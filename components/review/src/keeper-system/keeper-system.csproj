@@ -1,8 +1,6 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
-    <OutputType>Exe</OutputType>
-    <AssemblyName>keeper-system</AssemblyName>
-    <RootNamespace>Keeper.Cli.System</RootNamespace>
+    <AssemblyName>Keeper.Cli.System</AssemblyName>
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="..\Keeper.Review.Cli\Keeper.Review.Cli.csproj" />

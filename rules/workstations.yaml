@@ -3586,3 +3586,492 @@ rules:
       value: 2
       where: { field: CSEElaspedTimeInMilliSeconds, op: gt, value: 5000, threshold: workstations.gp-extension-max-ms }
     evidence: "{host}: {count} slow extension runs in 7 days ({sample})"
+
+  # ---- TPM and BitLocker key management -------------------------------------------------------
+
+  - id: WS-TPM-NOT-READY
+    title: TPM is absent, disabled or not activated
+    kind: misconfigured
+    lens: security
+    category: CFG
+    severity: medium
+    why: BitLocker's secure protector, Credential Guard, virtualisation-based security and device health attestation all need a TPM that is present, enabled and activated; a TPM turned off in firmware leaves these on a password or on nothing. A PC with no TPM at all returns no row here and is covered by the Windows 11 readiness reporting.
+    fix: Turn the TPM on and activate it in firmware (often labelled PTT or fTPM), then confirm BitLocker uses the TPM protector; replace devices with no TPM 2.0 at refresh.
+    refs: [NIST-800-53:SC-12, NIST-800-53:IA-7, CIS-Controls-v8:3.6]
+    query:
+      protocol: cim
+      namespace: root/cimv2/Security/MicrosoftTpm
+      wql: SELECT IsEnabled_InitialValue, IsActivated_InitialValue, IsOwned_InitialValue, SpecVersion, ManufacturerIdTxt FROM Win32_Tpm
+      key: host
+    each:
+      any:
+        - { field: IsEnabled_InitialValue, op: eq, value: false }
+        - { field: IsActivated_InitialValue, op: eq, value: false }
+    evidence: "{host}: TPM enabled {IsEnabled_InitialValue}, activated {IsActivated_InitialValue}, spec {SpecVersion}"
+
+  - id: WS-REG-BITLOCKER-NO-ESCROW
+    title: BitLocker recovery information is not escrowed by policy
+    kind: misconfigured
+    lens: security
+    category: CFG
+    severity: medium
+    why: Without a policy that backs the recovery key to AD DS, a key left only on the device (or nowhere) cannot be recovered when the TPM state changes or the user forgets the PIN, so the drive's data is lost; it also means no central record exists to unlock a seized or failed machine. A missing OSActiveDirectoryBackup keeps the insecure default of no escrow. Devices whose keys escrow to Entra ID through Intune are not visible in this AD-only value.
+    fix: Enable 'Store BitLocker recovery information in AD DS' (OSActiveDirectoryBackup = 1) and 'Do not enable BitLocker until recovery information is stored' by policy; confirm the keys appear on the computer object.
+    refs: [NIST-800-53:SC-12, NIST-800-53:SC-28, CIS-Controls-v8:3.6]
+    query:
+      protocol: registry
+      path: SOFTWARE\Policies\Microsoft\FVE
+      values: [OSActiveDirectoryBackup, OSRequireActiveDirectoryBackup, ActiveDirectoryBackup]
+      key: host
+    each:
+      any:
+        - { field: OSActiveDirectoryBackup, op: absent }
+        - { field: OSActiveDirectoryBackup, op: ne, value: 1 }
+    evidence: "{host}: OSActiveDirectoryBackup {OSActiveDirectoryBackup}, require {OSRequireActiveDirectoryBackup}"
+
+  # ---- Defender: ASR, controlled folder access, sample submission -----------------------------
+
+  - id: WS-DEFENDER-ASR-OFF
+    title: Attack surface reduction rules are not configured
+    kind: misconfigured
+    lens: security
+    category: MON
+    severity: medium
+    why: Attack surface reduction rules block the common entry techniques - Office spawning child processes, scripts launching executables, credential theft from LSASS, abuse of WMI and PSExec - that signatures do not catch; with no rule ids set, none of that is blocked. Applies where Defender is the active antivirus.
+    fix: Deploy the ASR rule set in block mode by policy or Intune after an audit period; keep the rule ids and their actions under review.
+    refs: [NIST-800-53:SI-3, CIS-Controls-v8:10.5, MITRE-ATTACK:T1562.001]
+    query:
+      protocol: cim
+      namespace: root/Microsoft/Windows/Defender
+      wql: SELECT * FROM MSFT_MpPreference
+      key: host
+    each: { field: AttackSurfaceReductionRules_Ids, op: empty }
+    evidence: "{host}: ASR rule ids {AttackSurfaceReductionRules_Ids}, actions {AttackSurfaceReductionRules_Actions}"
+
+  - id: WS-DEFENDER-CFA-OFF
+    title: Defender controlled folder access is off
+    kind: misconfigured
+    lens: security
+    category: MON
+    severity: low
+    why: Controlled folder access stops untrusted processes writing to user document and desktop folders, the anti-ransomware control of Defender; off (0) or audit-only (2) it blocks nothing. It needs an allow-list for line-of-business apps, so treat this as a control to roll out rather than an outright fault.
+    fix: Set controlled folder access to Enabled (1) by policy after an audit period, with the trusted applications allow-listed.
+    refs: [NIST-800-53:SI-3, CIS-Controls-v8:10.1, MITRE-ATTACK:T1486]
+    query:
+      protocol: cim
+      namespace: root/Microsoft/Windows/Defender
+      wql: SELECT * FROM MSFT_MpPreference
+      key: host
+    each: { field: EnableControlledFolderAccess, op: ne, value: 1 }
+    evidence: "{host}: controlled folder access {EnableControlledFolderAccess} (1 block, 2 audit, 0 off)"
+
+  - id: WS-DEFENDER-SAMPLE-SUBMISSION-OFF
+    title: Defender never submits samples for cloud analysis
+    kind: misconfigured
+    lens: security
+    category: MON
+    severity: low
+    why: 'With sample submission set to never send (2), the cloud cannot analyse a new, never-seen file, so block at first sight and the fastest cloud verdicts fall back to local signatures only. Where data-handling policy forbids sending files, the safe-samples setting (1) still keeps most of the benefit.'
+    fix: Set sample submission to send safe samples (1) by policy, or to send all samples where policy allows; keep cloud-delivered protection on.
+    refs: [NIST-800-53:SI-3, CIS-Controls-v8:10.7]
+    query:
+      protocol: cim
+      namespace: root/Microsoft/Windows/Defender
+      wql: SELECT * FROM MSFT_MpPreference
+      key: host
+    each: { field: SubmitSamplesConsent, op: eq, value: 2 }
+    evidence: "{host}: SubmitSamplesConsent {SubmitSamplesConsent} (2 = never send), MAPS {MAPSReporting}"
+
+  # ---- firewall default action -----------------------------------------------------------------
+
+  - id: WS-FW-INBOUND-ALLOW
+    title: Firewall profile allows inbound traffic by default
+    kind: misconfigured
+    lens: security
+    category: AUT
+    severity: high
+    entity: firewall-profile
+    why: Default-allow inbound means only explicit block rules protect the PC, so every listening service and every new one is reachable from the network; the public profile allowing inbound on a laptop is the worst case. This reads the local store.
+    fix: Set the default inbound action to Block for every profile by policy and add explicit allow rules only for what the PC must serve.
+    refs: [CIS-Controls-v8:4.5, NIST-800-53:SC-7]
+    query:
+      protocol: cim
+      namespace: root/StandardCimv2
+      wql: SELECT Name, Enabled, DefaultInboundAction FROM MSFT_NetFirewallProfile
+      key: "{host}|{Name}"
+    each:
+      all:
+        - { field: Enabled, op: ne, value: 0 }
+        - { field: DefaultInboundAction, op: eq, value: 2 }
+    evidence: "{host}: {Name} profile default inbound action Allow"
+
+  # ---- Windows Update policy on the client ----------------------------------------------------
+
+  - id: WS-REG-WU-AU-DISABLED
+    title: Automatic Updates turned off by policy on the workstation
+    kind: misconfigured
+    lens: both
+    category: LCM
+    severity: high
+    why: A policy that sets NoAutoUpdate stops the PC detecting, downloading and installing updates on its own; unless Configuration Manager or another tool drives patching, the PC falls behind every month. This is distinct from the update services being disabled (WS-SVC-UPDATE-DISABLED).
+    fix: Remove the policy that turns Automatic Updates off, or confirm which tool patches the PC and on what schedule.
+    refs: [NIST-800-53:SI-2, CIS-Controls-v8:7.3]
+    query:
+      protocol: registry
+      path: SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU
+      values: [NoAutoUpdate, UseWUServer, AUOptions]
+      key: host
+    each: { field: NoAutoUpdate, op: eq, value: 1 }
+    evidence: "{host}: NoAutoUpdate = {NoAutoUpdate}, AUOptions {AUOptions}, UseWUServer {UseWUServer}"
+
+  - id: WS-REG-WU-DEFERRAL-LONG
+    title: Quality updates deferred or paused too long by policy
+    kind: misconfigured
+    lens: both
+    category: LCM
+    severity: medium
+    why: A long Windows Update for Business deferral, or a pause left in place, holds back the monthly security (quality) updates well past their release, so the PC stays exposed to patched vulnerabilities while reports still call the policy intentional. Feature-update deferral is expected; quality-update deferral of more than a few days is not.
+    fix: Reduce the quality-update deferral to a few days at most and clear any lingering pause; feature-update deferral may stay as the servicing plan requires.
+    refs: [NIST-800-53:SI-2, CIS-Controls-v8:7.3]
+    query:
+      protocol: registry
+      path: SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate
+      values: [DeferQualityUpdatesPeriodInDays, DeferFeatureUpdatesPeriodInDays, PauseQualityUpdatesStartTime, PauseFeatureUpdatesStartTime]
+      key: host
+    each:
+      any:
+        - { field: DeferQualityUpdatesPeriodInDays, op: gt, value: 7, threshold: workstations.quality-update-defer-max-days }
+        - { field: PauseQualityUpdatesStartTime, op: notempty }
+    evidence: "{host}: quality defer {DeferQualityUpdatesPeriodInDays} days, quality pause {PauseQualityUpdatesStartTime}, feature defer {DeferFeatureUpdatesPeriodInDays} days"
+
+  # ---- session security: screen lock, AutoRun, SmartScreen, removable storage -----------------
+
+  - id: WS-REG-INACTIVITY-TIMEOUT
+    title: Screen does not lock after an inactivity period
+    kind: misconfigured
+    lens: security
+    category: AUT
+    severity: low
+    why: Without a machine inactivity limit the PC stays unlocked when the user walks away, so anyone who sits down has their session; the policy value is in seconds and a value of 0 or a missing value means no automatic lock. A long value weakens the control the same way.
+    fix: Set 'Interactive logon - Machine inactivity limit' to 900 seconds or fewer by policy (InactivityTimeoutSecs).
+    refs: [NIST-800-53:AC-11, CIS-Controls-v8:4.3]
+    query:
+      protocol: registry
+      path: SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System
+      values: [InactivityTimeoutSecs]
+      key: host
+    each:
+      any:
+        - { field: InactivityTimeoutSecs, op: absent }
+        - { field: InactivityTimeoutSecs, op: eq, value: 0 }
+        - { field: InactivityTimeoutSecs, op: gt, value: 900, threshold: workstations.inactivity-timeout-max-secs }
+    evidence: "{host}: InactivityTimeoutSecs = {InactivityTimeoutSecs} (missing or 0 = no automatic lock)"
+
+  - id: WS-REG-AUTORUN-ON
+    title: AutoRun and AutoPlay are not fully disabled
+    kind: misconfigured
+    lens: security
+    category: AUT
+    severity: low
+    why: When AutoRun is not disabled for every drive type, inserting a USB stick or mapping a share can run code automatically; it is a long-standing route for worms and malicious media. The disabled-for-all value is 255; a missing value leaves AutoRun partly enabled.
+    fix: Set 'Turn off Autoplay' to Enabled for all drives by policy (NoDriveTypeAutoRun = 255).
+    refs: [NIST-800-53:CM-7, CIS-Controls-v8:10.3, MITRE-ATTACK:T1091]
+    query:
+      protocol: registry
+      path: SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer
+      values: [NoDriveTypeAutoRun, NoAutorun]
+      key: host
+    each:
+      any:
+        - { field: NoDriveTypeAutoRun, op: absent }
+        - { field: NoDriveTypeAutoRun, op: ne, value: 255 }
+    evidence: "{host}: NoDriveTypeAutoRun = {NoDriveTypeAutoRun} (255 = all drives disabled), NoAutorun {NoAutorun}"
+
+  - id: WS-REG-SMARTSCREEN-OFF
+    title: SmartScreen reputation check is turned off
+    kind: misconfigured
+    lens: security
+    category: AUT
+    severity: low
+    why: SmartScreen warns before a user runs a file or visits a site that has a bad or unknown reputation; a policy that sets EnableSmartScreen to 0 removes that warning across Explorer and the browser, so downloaded malware and phishing pages open without challenge.
+    fix: Set 'Configure Windows Defender SmartScreen' to Enabled with Warn or Warn and prevent bypass by policy (EnableSmartScreen = 1).
+    refs: [NIST-800-53:SI-3, CIS-Controls-v8:9.3, MITRE-ATTACK:T1204]
+    query:
+      protocol: registry
+      path: SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System
+      values: [EnableSmartScreen, ShellSmartScreenLevel]
+      key: host
+    each: { field: EnableSmartScreen, op: eq, value: 0 }
+    evidence: "{host}: EnableSmartScreen = {EnableSmartScreen}, level {ShellSmartScreenLevel}"
+
+  - id: WS-REG-REMOVABLE-STORAGE-UNRESTRICTED
+    title: Removable storage access is not restricted by policy
+    kind: misconfigured
+    lens: security
+    category: CFG
+    severity: low
+    why: With no removable-storage policy, any USB mass-storage device can be read from and written to, which is both a data-exfiltration path and the way autorun and dropper malware arrives; a missing Deny_All leaves removable storage fully open. Organisations that permit USB storage should gate this with a tenant exception.
+    fix: Set 'All Removable Storage classes - Deny all access' (Deny_All = 1), or at least deny write access, by policy; where USB storage is needed, control it with device control instead of leaving it open.
+    refs: [NIST-800-53:MP-7, CIS-Controls-v8:10.3, MITRE-ATTACK:T1091, MITRE-ATTACK:T1052.001]
+    query:
+      protocol: registry
+      path: SOFTWARE\Policies\Microsoft\Windows\RemovableStorageDevices
+      values: [Deny_All, Deny_Write, Deny_Read]
+      key: host
+    each:
+      any:
+        - { field: Deny_All, op: absent }
+        - { field: Deny_All, op: ne, value: 1 }
+    evidence: "{host}: Deny_All {Deny_All}, Deny_Write {Deny_Write}, Deny_Read {Deny_Read}"
+
+  # ---- LAPS, built-in administrator ----------------------------------------------------------
+
+  - id: WS-REG-LAPS-NOT-CONFIGURED
+    title: Windows LAPS is not managing the local administrator password
+    kind: misconfigured
+    lens: security
+    category: IAM
+    severity: medium
+    why: Without LAPS every PC tends to share one local administrator password set at imaging, so one recovered or cracked password is admin on the whole fleet (pass-the-hash and pass-the-password). BackupDirectory 0 or missing means the modern Windows LAPS is not backing up a unique password; estates still on legacy Microsoft LAPS set a different key (AdmPwd) that this value does not see.
+    fix: Configure Windows LAPS to manage the built-in administrator with a unique rotated password escrowed to AD DS or Entra ID (BackupDirectory 2 or 1); retire the shared imaging password.
+    refs: [NIST-800-53:AC-2, NIST-800-53:IA-5, CIS-Controls-v8:5.2, MITRE-ATTACK:T1078.003]
+    query:
+      protocol: registry
+      path: SOFTWARE\Microsoft\Policies\LAPS
+      values: [BackupDirectory, PasswordExpirationProtectionEnabled, ADPasswordEncryptionEnabled]
+      key: host
+    each:
+      any:
+        - { field: BackupDirectory, op: absent }
+        - { field: BackupDirectory, op: eq, value: 0 }
+    evidence: "{host}: LAPS BackupDirectory {BackupDirectory} (0 or missing = not configured)"
+
+  - id: WS-BUILTIN-ADMIN-ENABLED
+    title: Built-in Administrator account is enabled
+    kind: misconfigured
+    lens: security
+    category: IAM
+    severity: medium
+    entity: local-account
+    why: The built-in Administrator (RID 500) has a known SID, is exempt from lockout by default, and is a shared account nobody is individually accountable for; left enabled it is a standing target for password spraying and pass-the-hash, and on a fleet with a shared password it opens every PC.
+    fix: Disable the built-in Administrator and administer PCs with named accounts; where a break-glass local admin is required, give it a unique LAPS-managed password.
+    refs: [NIST-800-53:AC-2, CIS-Controls-v8:5.2, MITRE-ATTACK:T1078.003]
+    query:
+      protocol: cim
+      wql: SELECT Name, SID, Disabled, PasswordRequired, Lockout FROM Win32_UserAccount WHERE LocalAccount = TRUE
+      key: "{host}|{Name}"
+    each:
+      all:
+        - { field: SID, op: match, value: '-500$' }
+        - { field: Disabled, op: eq, value: false }
+    evidence: "{host}: built-in Administrator {Name} is enabled"
+
+  - id: WS-BUILTIN-ADMIN-NOT-RENAMED
+    title: Built-in Administrator account still has its default name
+    kind: misconfigured
+    lens: security
+    category: IAM
+    severity: low
+    entity: local-account
+    why: An attacker who knows the local administrator is still called 'Administrator' can target it by name for password spraying; renaming it removes one free fact. This reads the RID-500 account by SID, so a renamed account does not fire.
+    fix: Rename the built-in Administrator from its default by policy; it keeps RID 500, so also confirm it is disabled (WS-BUILTIN-ADMIN-ENABLED).
+    refs: [NIST-800-53:AC-2, CIS-Controls-v8:5.2]
+    query:
+      protocol: cim
+      wql: SELECT Name, SID, Disabled, PasswordRequired, Lockout FROM Win32_UserAccount WHERE LocalAccount = TRUE
+      key: "{host}|{Name}"
+    each:
+      all:
+        - { field: SID, op: match, value: '-500$' }
+        - { field: Name, op: eq, value: Administrator }
+    evidence: "{host}: RID-500 account is still named {Name}"
+
+  # ---- PowerShell logging ---------------------------------------------------------------------
+
+  - id: WS-REG-PS-SCRIPTBLOCK-OFF
+    title: PowerShell script-block logging is not enabled
+    kind: misconfigured
+    lens: security
+    category: LOG
+    severity: medium
+    why: Without script-block logging there is no record of what PowerShell actually ran, so fileless and obfuscated attacks, which lean on PowerShell, leave almost nothing to investigate on the PC. A missing value means the setting was never enabled.
+    fix: Set 'Turn on PowerShell Script Block Logging' to Enabled by policy and forward the Microsoft-Windows-PowerShell/Operational log to a collector.
+    refs: [NIST-800-53:AU-2, CIS-Controls-v8:8.8, MITRE-ATTACK:T1059.001]
+    query:
+      protocol: registry
+      path: SOFTWARE\Policies\Microsoft\Windows\PowerShell\ScriptBlockLogging
+      values: [EnableScriptBlockLogging]
+      key: host
+    each:
+      any:
+        - { field: EnableScriptBlockLogging, op: absent }
+        - { field: EnableScriptBlockLogging, op: ne, value: 1 }
+    evidence: "{host}: EnableScriptBlockLogging = {EnableScriptBlockLogging} (missing = off)"
+
+  - id: WS-REG-PS-MODULE-LOGGING-OFF
+    title: PowerShell module logging is not enabled
+    kind: misconfigured
+    lens: security
+    category: LOG
+    severity: low
+    why: Module logging records the pipeline of configured modules; without it the detail that distinguishes a normal administrative command from an attack is not captured. It complements script-block logging.
+    fix: Set 'Turn on Module Logging' to Enabled by policy with the module names set to '*'.
+    refs: [NIST-800-53:AU-2, CIS-Controls-v8:8.8, MITRE-ATTACK:T1059.001]
+    query:
+      protocol: registry
+      path: SOFTWARE\Policies\Microsoft\Windows\PowerShell\ModuleLogging
+      values: [EnableModuleLogging]
+      key: host
+    each:
+      any:
+        - { field: EnableModuleLogging, op: absent }
+        - { field: EnableModuleLogging, op: ne, value: 1 }
+    evidence: "{host}: EnableModuleLogging = {EnableModuleLogging} (missing = off)"
+
+  - id: WS-REG-PS-TRANSCRIPTION-OFF
+    title: PowerShell transcription is not enabled
+    kind: misconfigured
+    lens: security
+    category: LOG
+    severity: low
+    why: Transcription writes a full input-and-output record of every PowerShell session to a protected path; without it there is no durable trail of what a user or an attacker did interactively on the PC.
+    fix: Set 'Turn on PowerShell Transcription' to Enabled by policy, with invocation headers on and an output directory on a write-protected collector share.
+    refs: [NIST-800-53:AU-2, CIS-Controls-v8:8.8, MITRE-ATTACK:T1059.001]
+    query:
+      protocol: registry
+      path: SOFTWARE\Policies\Microsoft\Windows\PowerShell\Transcription
+      values: [EnableTranscripting, OutputDirectory]
+      key: host
+    each:
+      any:
+        - { field: EnableTranscripting, op: absent }
+        - { field: EnableTranscripting, op: ne, value: 1 }
+    evidence: "{host}: EnableTranscripting = {EnableTranscripting} (missing = off)"
+
+  # ---- anonymous enumeration, Point and Print, time ------------------------------------------
+
+  - id: WS-REG-ANON-ENUM
+    title: Anonymous enumeration of accounts or shares allowed
+    kind: misconfigured
+    lens: security
+    category: AUT
+    severity: medium
+    why: With RestrictAnonymousSAM turned off, or Everyone folded into the anonymous token, an unauthenticated session can list local accounts and shares, which hands an attacker the user names for password spraying and the shares to probe.
+    fix: Set 'Do not allow anonymous enumeration of SAM accounts' on and 'Let Everyone permissions apply to anonymous users' off by policy.
+    refs: [NIST-800-53:AC-3, NIST-800-53:AC-6, MITRE-ATTACK:T1087.001]
+    query:
+      protocol: registry
+      path: SYSTEM\CurrentControlSet\Control\Lsa
+      values: [RestrictAnonymous, RestrictAnonymousSAM, EveryoneIncludesAnonymous]
+      key: host
+    each:
+      any:
+        - { field: RestrictAnonymousSAM, op: eq, value: 0 }
+        - { field: EveryoneIncludesAnonymous, op: eq, value: 1 }
+    evidence: "{host}: RestrictAnonymousSAM {RestrictAnonymousSAM}, RestrictAnonymous {RestrictAnonymous}, EveryoneIncludesAnonymous {EveryoneIncludesAnonymous}"
+
+  - id: WS-REG-POINTANDPRINT-WEAK
+    title: Point and Print lets non-administrators install print drivers
+    kind: misconfigured
+    lens: security
+    category: AUT
+    severity: high
+    why: 'NoWarningNoElevationOnInstall set, or driver installation not restricted to administrators, is the PrintNightmare configuration: a standard user, or a remote attacker with any credentials, can install a malicious print driver and run code as SYSTEM. A missing RestrictDriverInstallationToAdministrators keeps the patched admin-only default.'
+    fix: Remove NoWarningNoElevationOnInstall and the prompt-suppression values and leave driver installation restricted to administrators.
+    refs: [NIST-800-53:CM-7, NIST-800-53:AC-6, MITRE-ATTACK:T1068]
+    query:
+      protocol: registry
+      path: SOFTWARE\Policies\Microsoft\Windows NT\Printers\PointAndPrint
+      values: [NoWarningNoElevationOnInstall, UpdatePromptSettings, RestrictDriverInstallationToAdministrators]
+      key: host
+    each:
+      any:
+        - { field: NoWarningNoElevationOnInstall, op: eq, value: 1 }
+        - { field: UpdatePromptSettings, op: eq, value: 1 }
+        - { field: RestrictDriverInstallationToAdministrators, op: eq, value: 0 }
+    evidence: "{host}: NoWarningNoElevationOnInstall {NoWarningNoElevationOnInstall}, RestrictDriverInstallationToAdministrators {RestrictDriverInstallationToAdministrators}"
+
+  - id: WS-REG-W32TIME-NOSYNC
+    title: Windows Time service set not to synchronise
+    kind: misconfigured
+    lens: both
+    category: CFG
+    severity: medium
+    why: A PC whose time client type is NoSync does not discipline its clock at all; it drifts until Kerberos fails for everything it authenticates to past the five-minute skew, which shows up as random logon, Group Policy and resource-access failures. Domain members should be NT5DS.
+    fix: Set the time client type to NT5DS (domain hierarchy) and clear a manual NoSync left from troubleshooting.
+    refs: [NIST-800-53:AU-8, NIST-800-53:SC-45]
+    query:
+      protocol: registry
+      path: SYSTEM\CurrentControlSet\Services\W32Time\Parameters
+      values: [Type, NtpServer]
+      key: host
+    each: { field: Type, op: eq, value: NoSync }
+    evidence: "{host}: W32Time Type = {Type}, source {NtpServer}"
+
+  # ---- machine certificate store (read-only, through the registry certificates view) -----------
+  # One row per certificate in the LocalMachine personal (MY) store. Self-signed certificates are
+  # left out of the expiry rule.
+
+  - id: WS-CERT-MACHINE-EXPIRING
+    title: Machine certificate expiring or expired in the personal store
+    kind: broken
+    lens: both
+    category: PKI
+    severity:
+      daysLeft: notAfter
+      ranges: [ { max: 0, value: critical }, { max: 14, value: high }, { max: 30, value: medium } ]
+      default: low
+    entity: certificate
+    deadline: notAfter
+    why: A CA-issued certificate in the LocalMachine personal store backs the PC's 802.1X or VPN client-authentication identity, a management agent's mutual TLS, or a line-of-business client; when it expires that connection stops or starts failing validation, usually with no warning until the day it lapses.
+    fix: Renew or replace the certificate and its binding before the date (auto-enrolment where it applies); retire certificates no service uses any more.
+    refs: [NIST-800-53:SC-12, NIST-800-53:SC-17]
+    query:
+      protocol: registry
+      path: SOFTWARE\Microsoft\SystemCertificates\MY
+      certificates: true
+      key: "{host}|{store}|{thumbprint}"
+    each:
+      all:
+        - { field: selfSigned, op: eq, value: false }
+        - { field: notAfter, op: until-lt, value: 30, threshold: workstations.cert-notice-days }
+    evidence: "{host}: {subject} expires {notAfter} ({daysLeft} days), issuer {issuer}"
+
+  - id: WS-CERT-MACHINE-WEAK-KEY
+    title: Machine certificate with a weak RSA key in the personal store
+    kind: misconfigured
+    lens: security
+    category: PKI
+    severity: high
+    entity: certificate
+    why: An RSA key shorter than 2048 bits is factorable within reach of a motivated attacker, so a client-authentication or TLS identity presenting it can be impersonated; 1024-bit keys are no longer trusted by Windows chain validation.
+    fix: Reissue the certificate with a 2048-bit or stronger RSA key (or an elliptic-curve key) and replace the binding.
+    refs: [NIST-800-53:SC-12, NIST-800-53:SC-13, MITRE-ATTACK:T1552.004]
+    query:
+      protocol: registry
+      path: SOFTWARE\Microsoft\SystemCertificates\MY
+      certificates: true
+      key: "{host}|{store}|{thumbprint}"
+    each:
+      all:
+        - { field: keyAlgorithm, op: match, value: 'RSA' }
+        - { field: keySize, op: lt, value: 2048, threshold: workstations.cert-min-rsa-key }
+    evidence: "{host}: {subject} uses a {keySize}-bit {keyAlgorithm} key"
+
+  - id: WS-CERT-MACHINE-SHA1
+    title: Machine certificate signed with SHA-1 in the personal store
+    kind: misconfigured
+    lens: security
+    category: PKI
+    severity: medium
+    entity: certificate
+    why: SHA-1 is collision-broken, so a SHA-1-signed certificate can in principle be forged; modern clients warn on or refuse it, which breaks the connection it backs as the other end is updated.
+    fix: Reissue the certificate with a SHA-256 or stronger signature and replace the binding.
+    refs: [NIST-800-53:SC-13, MITRE-ATTACK:T1553.004]
+    query:
+      protocol: registry
+      path: SOFTWARE\Microsoft\SystemCertificates\MY
+      certificates: true
+      key: "{host}|{store}|{thumbprint}"
+    each: { field: signatureAlgorithm, op: match, value: '(^|[^0-9])sha1|md5|md2' }
+    evidence: "{host}: {subject} signed with {signatureAlgorithm}"

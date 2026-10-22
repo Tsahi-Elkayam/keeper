@@ -256,6 +256,55 @@ public sealed class ScannerTests : IDisposable
         Assert.Equal("fail", counts["pc01.example.org"]);
     }
 
+    [Fact]
+    public async Task A_partial_read_can_fail_more_than_but_never_fewer_than()
+    {
+        // Four rows where the query always returns at least ten: some were not read. Two unmanaged is already more
+        // than one, whatever the rest hold; two managed may well be three once the rest are read.
+        Drop("users/d.json", """
+            { "users": [ { "name": "a", "managed": false }, { "name": "b", "managed": false }, { "name": "c", "managed": true }, { "name": "d", "managed": true } ] }
+            """);
+        var path = Path.Combine(_dir, "partial.yaml");
+        File.WriteAllText(path, """
+            schema: keeper.rules/1
+            system: example
+            integration: files
+            defaults: { lens: both, refresh: 1d, category: HYG, kind: misconfigured, severity: medium, entity: device }
+            rules:
+              - id: EX-TOO-MANY-UNMANAGED
+                title: Too many unmanaged
+                query: { protocol: file, path: "users/d.json", items: users, key: name, min_rows: 10 }
+                count: { op: gt, value: 1, where: { field: managed, op: eq, value: false } }
+              - id: EX-TOO-FEW-MANAGED
+                title: Too few managed
+                query: { protocol: file, path: "users/d.json", items: users, key: name, min_rows: 10 }
+                count: { op: lt, value: 3, where: { field: managed, op: eq, value: true } }
+              - id: EX-NONE-MANAGED
+                title: No device managed
+                query: { protocol: file, path: "users/d.json", items: users, key: name, min_rows: 10 }
+                count: { op: lt, value: 1, where: { field: managed, op: eq, value: true } }
+              - id: EX-NOT-ENOUGH-UNMANAGED
+                title: More than three unmanaged
+                query: { protocol: file, path: "users/d.json", items: users, key: name, min_rows: 10 }
+                count: { op: gt, value: 3, where: { field: managed, op: eq, value: false } }
+            """);
+
+        var report = await Scan(file: RuleLoader.LoadFile(path, "test", Runners.Registry().Validators));
+
+        var results = Read<ResultRecord>(report, RunFolder.Results).ToDictionary(r => r.RuleId, r => r.State);
+        Assert.Equal("fail", results["EX-TOO-MANY-UNMANAGED"]);     // 2 > 1 already
+        Assert.Equal("unknown", results["EX-TOO-FEW-MANAGED"]);     // 2 < 3 so far; the rest may add more
+        Assert.Equal("pass", results["EX-NONE-MANAGED"]);           // 2 found: "none" is already false
+        Assert.Equal("unknown", results["EX-NOT-ENOUGH-UNMANAGED"]); // 2, not yet over 3
+
+        // A rule whose answer the partial read already settled saw enough; one it could not settle did not.
+        var rules = Read<CoverageRecord>(report, RunFolder.Coverage).Where(c => c.Scope == "rule").ToDictionary(c => c.Item, c => c.State);
+        Assert.Equal("ok", rules["EX-NONE-MANAGED"]);
+        Assert.Equal("ok", rules["EX-TOO-MANY-UNMANAGED"]);
+        Assert.Equal("partial", rules["EX-TOO-FEW-MANAGED"]);
+        Assert.Equal("EX-TOO-MANY-UNMANAGED", Assert.Single(Read<FindingRecord>(report, RunFolder.Findings)).RuleId);
+    }
+
     private async Task<ScanReport> ScanUsers(string countYaml, string? deadline = null)
     {
         Drop("users/d.json", """

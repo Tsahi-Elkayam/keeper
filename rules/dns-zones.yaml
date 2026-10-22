@@ -1,0 +1,958 @@
+schema: keeper.rules/1
+system: dns-zones
+name: Microsoft DNS - AD-integrated zones (directory)
+integration: ldap
+
+# AD-integrated DNS as the directory stores it, read over LDAP only. Three places hold zones:
+#   DC=DomainDnsZones,<domain>   - zones replicated to the domain's DNS servers
+#   DC=ForestDnsZones,<forest root> - zones replicated to every DNS server of the forest (_msdcs)
+#   CN=MicrosoftDNS,CN=System,<domain> - the legacy domain-partition store (its existence is flagged by
+#     AD-DNS-ZONE-LEGACY-STORAGE in the active-directory pack; here only its ACLs and nodes are judged)
+# The integration's DC must host the application partitions (a DC that runs DNS); the runner does not
+# chase referrals, so a DC without them makes these reads fail (unknown), never pass.
+# dnsRecord and dNSProperty are binary and not decoded: record types, record data, a zone's dynamic
+# update mode and aging are judged by the dns-server (cim) pack instead. See docs\backlog\dns.md.
+# DnsAdmins and DnsUpdateProxy are named by their English default DNs, like the active-directory pack;
+# the plain "DnsAdmins has enabled members" count is AD-GROUP-DNSADMINS-SIZE there.
+
+defaults:
+  kind: misconfigured
+  lens: security
+  refresh: 1d
+
+rules:
+
+  # ---------------------------------------------------------------- coverage
+
+  - id: DNS-ZONE-DOMAIN-NONE
+    title: No zone found in the domain DNS application partition
+    kind: missing
+    lens: maintenance
+    category: MON
+    severity: low
+    entity: dns-zone
+    refresh: 7d
+    why: >-
+      Every zone and node rule over DomainDnsZones reads this location. The partition answered but held no
+      zone: either the domain's DNS is not AD-integrated (zones live in files, the legacy store or another
+      product), or the reading account cannot list the zones - in which case every rule here passes
+      without having looked.
+    fix: Confirm where the domain's zones are stored; if they are AD-integrated, give the scanning account read access to the MicrosoftDNS container of the partition and rescan.
+    refs: [NIST-800-53:CM-8]
+    query:
+      protocol: ldap
+      base: 'CN=MicrosoftDNS,DC=DomainDnsZones,{DOMAINDN}'
+      scope: onelevel
+      filter: '(&(objectClass=dnsZone)(!(dc=RootDNSServers))(!(dc=..TrustAnchors))(!(dc=TrustAnchors))(!(dc=..Deleted*)))'
+      attributes: [dc, whenCreated, whenChanged]
+      key: distinguishedName
+      name: dc
+    count: none
+    evidence: "The domain DNS partition returned {count} zones"
+
+  # ---------------------------------------------------------------- zone object permissions
+
+  - id: DNS-ZONE-DOMAIN-ACL-WRITE-BROAD
+    title: Domain-replicated DNS zone can be rewritten by a broad principal
+    category: IAM
+    severity: high
+    entity: dns-zone
+    why: >-
+      Full control, permission changes, ownership, generic or all-property writes, or delete rights on the
+      zone object for everyone, all authenticated users, domain users or computers let any account change
+      the zone's settings (dynamic update mode, transfers), delete it, or grant itself more. A null DACL,
+      and Everyone or Anonymous allowed to create records, are judged here too.
+    fix: Remove those entries from the zone's security tab (or with dsacls); keep write and control rights for DnsAdmins, Domain Admins, Enterprise Admins, SYSTEM and the domain controllers.
+    refs: [NIST-800-53:AC-6, NIST-800-53:SC-20, MITRE-ATTACK:T1557]
+    query:
+      protocol: ldap
+      base: 'CN=MicrosoftDNS,DC=DomainDnsZones,{DOMAINDN}'
+      scope: onelevel
+      filter: '(&(objectClass=dnsZone)(!(dc=RootDNSServers))(!(dc=..TrustAnchors))(!(dc=TrustAnchors))(!(dc=..Deleted*)))'
+      attributes: [dc, nTSecurityDescriptor, whenChanged]
+      key: distinguishedName
+      name: dc
+    each:
+      any:
+        - { field: nTSecurityDescriptor.noDacl, op: eq, value: true }
+        - element:
+            of: nTSecurityDescriptor.dacl
+            match: any
+            where:
+              all:
+                - { field: type, op: in, value: [allow, allow-object] }
+                - { field: inheritOnly, op: ne, value: true }
+                - any:
+                    - all:
+                        - { field: trustee, op: sid-in, value: [everyone, anonymous, authenticated-users, domain-users, domain-computers, builtin-users, builtin-guests, domain-guests, pre-windows-2000-compatible-access, network, interactive] }
+                        - any:
+                            - { field: rights, op: contains, value: GenericAll }
+                            - { field: rights, op: contains, value: WriteDacl }
+                            - { field: rights, op: contains, value: WriteOwner }
+                            - { field: rights, op: contains, value: GenericWrite }
+                            - { field: rights, op: contains, value: Delete }
+                            - { field: rights, op: contains, value: DeleteTree }
+                            - { field: rights, op: contains, value: DeleteChild }
+                            - all:
+                                - { field: rights, op: contains, value: WriteProperty }
+                                - { field: objectType, op: absent }
+                    - all:
+                        - { field: trustee, op: sid-in, value: [everyone, anonymous, builtin-guests, domain-guests] }
+                        - { field: rights, op: contains, value: CreateChild }
+    evidence: "Zone {dc} - a broad principal holds write, delete or control rights on the zone object"
+
+  - id: DNS-ZONE-FOREST-ACL-WRITE-BROAD
+    title: Forest-replicated DNS zone can be rewritten by a broad principal
+    category: IAM
+    severity: high
+    entity: dns-zone
+    why: >-
+      The forest partition holds _msdcs, where every domain controller's locator and replication records
+      live. Broad write, delete or control rights on such a zone let any account redirect or remove the
+      records the whole forest uses to find its domain controllers. A null DACL and anonymous record
+      creation are judged here too.
+    fix: Remove those entries from the zone object; keep write and control rights for DnsAdmins, Domain Admins, Enterprise Admins, SYSTEM and the domain controllers.
+    refs: [NIST-800-53:AC-6, NIST-800-53:SC-20, MITRE-ATTACK:T1557]
+    query:
+      protocol: ldap
+      base: 'CN=MicrosoftDNS,DC=ForestDnsZones,{ROOTDN}'
+      scope: onelevel
+      filter: '(&(objectClass=dnsZone)(!(dc=RootDNSServers))(!(dc=..TrustAnchors))(!(dc=TrustAnchors))(!(dc=..Deleted*)))'
+      attributes: [dc, nTSecurityDescriptor, whenChanged]
+      key: distinguishedName
+      name: dc
+      min_rows: 1
+    each:
+      any:
+        - { field: nTSecurityDescriptor.noDacl, op: eq, value: true }
+        - element:
+            of: nTSecurityDescriptor.dacl
+            match: any
+            where:
+              all:
+                - { field: type, op: in, value: [allow, allow-object] }
+                - { field: inheritOnly, op: ne, value: true }
+                - any:
+                    - all:
+                        - { field: trustee, op: sid-in, value: [everyone, anonymous, authenticated-users, domain-users, domain-computers, builtin-users, builtin-guests, domain-guests, pre-windows-2000-compatible-access, network, interactive] }
+                        - any:
+                            - { field: rights, op: contains, value: GenericAll }
+                            - { field: rights, op: contains, value: WriteDacl }
+                            - { field: rights, op: contains, value: WriteOwner }
+                            - { field: rights, op: contains, value: GenericWrite }
+                            - { field: rights, op: contains, value: Delete }
+                            - { field: rights, op: contains, value: DeleteTree }
+                            - { field: rights, op: contains, value: DeleteChild }
+                            - all:
+                                - { field: rights, op: contains, value: WriteProperty }
+                                - { field: objectType, op: absent }
+                    - all:
+                        - { field: trustee, op: sid-in, value: [everyone, anonymous, builtin-guests, domain-guests] }
+                        - { field: rights, op: contains, value: CreateChild }
+    evidence: "Zone {dc} - a broad principal holds write, delete or control rights on the zone object"
+
+  - id: DNS-ZONE-LEGACY-ACL-WRITE-BROAD
+    title: Legacy-stored DNS zone can be rewritten by a broad principal
+    category: IAM
+    severity: high
+    entity: dns-zone
+    why: >-
+      Zones in the domain partition inherit from the domain root, so a broad grant made high on the domain
+      (often by an old product installer) reaches them too. Broad write, delete or control rights on the
+      zone let any account change or remove it; a null DACL and anonymous record creation are judged here
+      too.
+    fix: Remove the broad entries (at the zone, or where they are inherited from), then move the zone to an application partition.
+    refs: [NIST-800-53:AC-6, NIST-800-53:SC-20, MITRE-ATTACK:T1557]
+    refresh: 7d
+    query:
+      protocol: ldap
+      base: 'CN=MicrosoftDNS,CN=System,{DOMAINDN}'
+      scope: onelevel
+      filter: '(&(objectClass=dnsZone)(!(dc=RootDNSServers))(!(dc=..TrustAnchors))(!(dc=TrustAnchors))(!(dc=..Deleted*)))'
+      attributes: [dc, nTSecurityDescriptor, whenChanged]
+      key: distinguishedName
+      name: dc
+    each:
+      any:
+        - { field: nTSecurityDescriptor.noDacl, op: eq, value: true }
+        - element:
+            of: nTSecurityDescriptor.dacl
+            match: any
+            where:
+              all:
+                - { field: type, op: in, value: [allow, allow-object] }
+                - { field: inheritOnly, op: ne, value: true }
+                - any:
+                    - all:
+                        - { field: trustee, op: sid-in, value: [everyone, anonymous, authenticated-users, domain-users, domain-computers, builtin-users, builtin-guests, domain-guests, pre-windows-2000-compatible-access, network, interactive] }
+                        - any:
+                            - { field: rights, op: contains, value: GenericAll }
+                            - { field: rights, op: contains, value: WriteDacl }
+                            - { field: rights, op: contains, value: WriteOwner }
+                            - { field: rights, op: contains, value: GenericWrite }
+                            - { field: rights, op: contains, value: Delete }
+                            - { field: rights, op: contains, value: DeleteTree }
+                            - { field: rights, op: contains, value: DeleteChild }
+                            - all:
+                                - { field: rights, op: contains, value: WriteProperty }
+                                - { field: objectType, op: absent }
+                    - all:
+                        - { field: trustee, op: sid-in, value: [everyone, anonymous, builtin-guests, domain-guests] }
+                        - { field: rights, op: contains, value: CreateChild }
+    evidence: "Zone {dc} - a broad principal holds write, delete or control rights on the zone object"
+
+  - id: DNS-ZONE-DOMAIN-AUTHUSERS-CREATE
+    title: Any authenticated account can add names to the DNS zone
+    category: IAM
+    severity: low
+    entity: dns-zone
+    why: >-
+      The default zone permissions let every authenticated user and computer create new records, which
+      secure dynamic update relies on. It also lets any account register a name that does not exist yet -
+      a wildcard, WPAD, a mistyped server name - and receive the traffic and authentications meant for it.
+      Low because it is the Windows default; the WPAD, wildcard and node-permission rules catch abuse.
+    fix: Where machines register through DHCP or are statically recorded, remove "Create all child objects" for Authenticated Users and grant it to the computer groups or DHCP service accounts that need it; otherwise pre-create sensitive names (wpad, *) so they cannot be claimed.
+    refs: [NIST-800-53:AC-6, NIST-800-53:SC-20, MITRE-ATTACK:T1557]
+    refresh: 7d
+    query:
+      protocol: ldap
+      base: 'CN=MicrosoftDNS,DC=DomainDnsZones,{DOMAINDN}'
+      scope: onelevel
+      filter: '(&(objectClass=dnsZone)(!(dc=RootDNSServers))(!(dc=..TrustAnchors))(!(dc=TrustAnchors))(!(dc=..Deleted*)))'
+      attributes: [dc, nTSecurityDescriptor, whenChanged]
+      key: distinguishedName
+      name: dc
+    each:
+      element:
+        of: nTSecurityDescriptor.dacl
+        match: any
+        where:
+          all:
+            - { field: type, op: in, value: [allow, allow-object] }
+            - { field: inheritOnly, op: ne, value: true }
+            - { field: trustee, op: sid-in, value: [authenticated-users, domain-users, domain-computers, builtin-users] }
+            - { field: rights, op: contains, value: CreateChild }
+    evidence: "Zone {dc} - any authenticated account may create records"
+
+  - id: DNS-ZONE-DOMAIN-CONTROL-UNLISTED
+    title: Domain-replicated DNS zone can be controlled by a principal outside the approved list
+    category: IAM
+    severity: medium
+    entity: dns-zone
+    why: >-
+      Full control, permission or ownership changes on a zone object are DNS administration. A delegated
+      helpdesk group, a departed admin's account or a product's service account holding them is an
+      unreviewed path to redirect names inside the domain. DnsAdmins has no fixed RID, so the approved
+      list must be the tenant's own.
+    fix: >-
+      Set threshold.dns.zone-control-trustees to the trustees allowed to control zones - for example
+      domain-admins, enterprise-admins, builtin-administrators, local-system, enterprise-domain-controllers,
+      domain-controllers, creator-owner and the DnsAdmins group's SID - then remove every other control grant.
+    refs: [NIST-800-53:AC-6, NIST-800-53:AC-5]
+    query:
+      protocol: ldap
+      base: 'CN=MicrosoftDNS,DC=DomainDnsZones,{DOMAINDN}'
+      scope: onelevel
+      filter: '(&(objectClass=dnsZone)(!(dc=RootDNSServers))(!(dc=..TrustAnchors))(!(dc=TrustAnchors))(!(dc=..Deleted*)))'
+      attributes: [dc, nTSecurityDescriptor, whenChanged]
+      key: distinguishedName
+      name: dc
+    each:
+      element:
+        of: nTSecurityDescriptor.dacl
+        match: any
+        where:
+          all:
+            - { field: type, op: in, value: [allow, allow-object] }
+            - { field: inheritOnly, op: ne, value: true }
+            - any:
+                - { field: rights, op: contains, value: GenericAll }
+                - { field: rights, op: contains, value: WriteDacl }
+                - { field: rights, op: contains, value: WriteOwner }
+            - { field: trustee, op: sid-notin, value: [domain-admins, enterprise-admins, builtin-administrators, local-system, enterprise-domain-controllers, domain-controllers, creator-owner], threshold: dns.zone-control-trustees, required: true }
+    evidence: "Zone {dc} - a principal outside the approved list holds control rights"
+
+  - id: DNS-ZONE-FOREST-CONTROL-UNLISTED
+    title: Forest-replicated DNS zone can be controlled by a principal outside the approved list
+    category: IAM
+    severity: medium
+    entity: dns-zone
+    why: >-
+      Control of a forest-wide zone (usually _msdcs) is control of how every domain controller is found.
+      Any trustee with full control, permission or ownership rights beyond the approved administrators is
+      an unreviewed path to the forest's locator records.
+    fix: Set threshold.dns.zone-control-trustees (shared with the domain-partition rule) to the approved trustees including the DnsAdmins SID, then remove every other control grant.
+    refs: [NIST-800-53:AC-6, NIST-800-53:AC-5]
+    query:
+      protocol: ldap
+      base: 'CN=MicrosoftDNS,DC=ForestDnsZones,{ROOTDN}'
+      scope: onelevel
+      filter: '(&(objectClass=dnsZone)(!(dc=RootDNSServers))(!(dc=..TrustAnchors))(!(dc=TrustAnchors))(!(dc=..Deleted*)))'
+      attributes: [dc, nTSecurityDescriptor, whenChanged]
+      key: distinguishedName
+      name: dc
+      min_rows: 1
+    each:
+      element:
+        of: nTSecurityDescriptor.dacl
+        match: any
+        where:
+          all:
+            - { field: type, op: in, value: [allow, allow-object] }
+            - { field: inheritOnly, op: ne, value: true }
+            - any:
+                - { field: rights, op: contains, value: GenericAll }
+                - { field: rights, op: contains, value: WriteDacl }
+                - { field: rights, op: contains, value: WriteOwner }
+            - { field: trustee, op: sid-notin, value: [domain-admins, enterprise-admins, builtin-administrators, local-system, enterprise-domain-controllers, domain-controllers, creator-owner], threshold: dns.zone-control-trustees, required: true }
+    evidence: "Zone {dc} - a principal outside the approved list holds control rights"
+
+  - id: DNS-ZONE-DOMAIN-OWNER-UNUSUAL
+    title: Domain-replicated DNS zone is owned by a principal that is not an administrator group
+    category: IAM
+    severity: low
+    entity: dns-zone
+    why: >-
+      The owner of an object can always rewrite its permissions. A zone owned by an individual account
+      (typically whoever created it) keeps that account able to take the zone over after it leaves the DNS
+      team. A zone created by a DNS server may show that server's computer account as owner; add it to the
+      list or record an exception.
+    fix: Take ownership for Domain Admins (or the approved DNS group) and record the expected owners in threshold.dns.zone-owners.
+    refs: [NIST-800-53:AC-6]
+    refresh: 7d
+    query:
+      protocol: ldap
+      base: 'CN=MicrosoftDNS,DC=DomainDnsZones,{DOMAINDN}'
+      scope: onelevel
+      filter: '(&(objectClass=dnsZone)(!(dc=RootDNSServers))(!(dc=..TrustAnchors))(!(dc=TrustAnchors))(!(dc=..Deleted*)))'
+      attributes: [dc, nTSecurityDescriptor, whenCreated]
+      key: distinguishedName
+      name: dc
+    each: { field: nTSecurityDescriptor.owner, op: sid-notin, value: [domain-admins, enterprise-admins, builtin-administrators, local-system, enterprise-domain-controllers, domain-controllers], threshold: dns.zone-owners }
+    evidence: "Zone {dc} - owner {nTSecurityDescriptor.owner}"
+
+  - id: DNS-ZONE-FOREST-OWNER-UNUSUAL
+    title: Forest-replicated DNS zone is owned by a principal that is not an administrator group
+    category: IAM
+    severity: low
+    entity: dns-zone
+    why: The owner of a forest-wide zone can rewrite its permissions at any time; an individual or service account as owner keeps a silent path to the forest's locator records.
+    fix: Take ownership for Enterprise Admins or Domain Admins and record the expected owners in threshold.dns.zone-owners.
+    refs: [NIST-800-53:AC-6]
+    refresh: 7d
+    query:
+      protocol: ldap
+      base: 'CN=MicrosoftDNS,DC=ForestDnsZones,{ROOTDN}'
+      scope: onelevel
+      filter: '(&(objectClass=dnsZone)(!(dc=RootDNSServers))(!(dc=..TrustAnchors))(!(dc=TrustAnchors))(!(dc=..Deleted*)))'
+      attributes: [dc, nTSecurityDescriptor, whenCreated]
+      key: distinguishedName
+      name: dc
+      min_rows: 1
+    each: { field: nTSecurityDescriptor.owner, op: sid-notin, value: [domain-admins, enterprise-admins, builtin-administrators, local-system, enterprise-domain-controllers, domain-controllers], threshold: dns.zone-owners }
+    evidence: "Zone {dc} - owner {nTSecurityDescriptor.owner}"
+
+  - id: DNS-ZONE-LEGACY-OWNER-UNUSUAL
+    title: Legacy-stored DNS zone is owned by a principal that is not an administrator group
+    category: IAM
+    severity: low
+    entity: dns-zone
+    why: The owner of a zone can rewrite its permissions at any time; legacy zones are often old and owned by accounts nobody reviews any more.
+    fix: Take ownership for Domain Admins, then move the zone to an application partition.
+    refs: [NIST-800-53:AC-6]
+    refresh: 7d
+    query:
+      protocol: ldap
+      base: 'CN=MicrosoftDNS,CN=System,{DOMAINDN}'
+      scope: onelevel
+      filter: '(&(objectClass=dnsZone)(!(dc=RootDNSServers))(!(dc=..TrustAnchors))(!(dc=TrustAnchors))(!(dc=..Deleted*)))'
+      attributes: [dc, nTSecurityDescriptor, whenCreated]
+      key: distinguishedName
+      name: dc
+    each: { field: nTSecurityDescriptor.owner, op: sid-notin, value: [domain-admins, enterprise-admins, builtin-administrators, local-system, enterprise-domain-controllers, domain-controllers], threshold: dns.zone-owners }
+    evidence: "Zone {dc} - owner {nTSecurityDescriptor.owner}"
+
+  # ---------------------------------------------------------------- the MicrosoftDNS containers
+
+  - id: DNS-CONTAINER-DOMAIN-ACL-BROAD
+    title: Broad principal can create or change zones in the domain DNS partition
+    category: IAM
+    severity: high
+    entity: dns-container
+    why: >-
+      The MicrosoftDNS container holds the zones. Create-child or write rights on it for a broad principal
+      let any account add a zone - for example one named after an internal or public domain - that every
+      DNS server of the domain then loads and answers authoritatively.
+    fix: Remove the broad entries from CN=MicrosoftDNS in the DomainDnsZones partition; zone creation belongs to DnsAdmins and the domain admin groups.
+    refs: [NIST-800-53:AC-6, NIST-800-53:SC-20, MITRE-ATTACK:T1557]
+    refresh: 7d
+    query:
+      protocol: ldap
+      base: 'CN=MicrosoftDNS,DC=DomainDnsZones,{DOMAINDN}'
+      scope: base
+      filter: '(objectClass=*)'
+      attributes: [cn, nTSecurityDescriptor]
+      key: distinguishedName
+      name: cn
+      min_rows: 1
+    each:
+      any:
+        - { field: nTSecurityDescriptor.noDacl, op: eq, value: true }
+        - element:
+            of: nTSecurityDescriptor.dacl
+            match: any
+            where:
+              all:
+                - { field: type, op: in, value: [allow, allow-object] }
+                - { field: inheritOnly, op: ne, value: true }
+                - { field: trustee, op: sid-in, value: [everyone, anonymous, authenticated-users, domain-users, domain-computers, builtin-users, builtin-guests, domain-guests, pre-windows-2000-compatible-access, network, interactive] }
+                - any:
+                    - { field: rights, op: contains, value: CreateChild }
+                    - { field: rights, op: contains, value: GenericAll }
+                    - { field: rights, op: contains, value: WriteDacl }
+                    - { field: rights, op: contains, value: WriteOwner }
+                    - { field: rights, op: contains, value: GenericWrite }
+                    - { field: rights, op: contains, value: DeleteChild }
+                    - { field: rights, op: contains, value: DeleteTree }
+    evidence: "{distinguishedName} - a broad principal may create, delete or control zones"
+
+  - id: DNS-CONTAINER-FOREST-ACL-BROAD
+    title: Broad principal can create or change zones in the forest DNS partition
+    category: IAM
+    severity: high
+    entity: dns-container
+    why: A zone added to the forest partition is loaded by every DNS server in the forest; create-child or write rights on its MicrosoftDNS container for a broad principal let any account publish names forest-wide.
+    fix: Remove the broad entries from CN=MicrosoftDNS in the ForestDnsZones partition.
+    refs: [NIST-800-53:AC-6, NIST-800-53:SC-20, MITRE-ATTACK:T1557]
+    refresh: 7d
+    query:
+      protocol: ldap
+      base: 'CN=MicrosoftDNS,DC=ForestDnsZones,{ROOTDN}'
+      scope: base
+      filter: '(objectClass=*)'
+      attributes: [cn, nTSecurityDescriptor]
+      key: distinguishedName
+      name: cn
+      min_rows: 1
+    each:
+      any:
+        - { field: nTSecurityDescriptor.noDacl, op: eq, value: true }
+        - element:
+            of: nTSecurityDescriptor.dacl
+            match: any
+            where:
+              all:
+                - { field: type, op: in, value: [allow, allow-object] }
+                - { field: inheritOnly, op: ne, value: true }
+                - { field: trustee, op: sid-in, value: [everyone, anonymous, authenticated-users, domain-users, domain-computers, builtin-users, builtin-guests, domain-guests, pre-windows-2000-compatible-access, network, interactive] }
+                - any:
+                    - { field: rights, op: contains, value: CreateChild }
+                    - { field: rights, op: contains, value: GenericAll }
+                    - { field: rights, op: contains, value: WriteDacl }
+                    - { field: rights, op: contains, value: WriteOwner }
+                    - { field: rights, op: contains, value: GenericWrite }
+                    - { field: rights, op: contains, value: DeleteChild }
+                    - { field: rights, op: contains, value: DeleteTree }
+    evidence: "{distinguishedName} - a broad principal may create, delete or control zones"
+
+  # ---------------------------------------------------------------- zone hygiene
+
+  - id: DNS-ZONE-DOMAIN-DELETED-LINGERING
+    title: Deleted DNS zone still present in the domain partition
+    kind: broken
+    lens: maintenance
+    category: HYG
+    severity: low
+    entity: dns-zone
+    why: When a zone is deleted the DNS server first renames it to ..Deleted-<name> and removes it later. One that stays for more than three weeks (past the 14-day tombstone interval and a week of replication slack) points at a deletion that did not complete or replicate, and blocks re-creating a zone of the same name on some servers.
+    fix: Confirm the zone is meant to be gone, check replication of the DomainDnsZones partition, then remove the leftover object with ADSI Edit.
+    refs: [NIST-800-53:CM-6]
+    refresh: 7d
+    query:
+      protocol: ldap
+      base: 'CN=MicrosoftDNS,DC=DomainDnsZones,{DOMAINDN}'
+      scope: onelevel
+      filter: '(&(objectClass=dnsZone)(dc=..Deleted*))'
+      attributes: [dc, whenChanged]
+      key: distinguishedName
+      name: dc
+    each: { field: whenChanged, op: age-gt, value: 21, threshold: dns.deleted-zone-grace-days }
+    evidence: "{dc} - deleted, last changed {whenChanged}"
+
+  - id: DNS-ZONE-FOREST-DELETED-LINGERING
+    title: Deleted DNS zone still present in the forest partition
+    kind: broken
+    lens: maintenance
+    category: HYG
+    severity: low
+    entity: dns-zone
+    why: A ..Deleted- zone that stays in the forest partition is a deletion that did not complete or replicate across the forest's DNS servers.
+    fix: Confirm the zone is meant to be gone, check replication of the ForestDnsZones partition, then remove the leftover object.
+    refs: [NIST-800-53:CM-6]
+    refresh: 7d
+    query:
+      protocol: ldap
+      base: 'CN=MicrosoftDNS,DC=ForestDnsZones,{ROOTDN}'
+      scope: onelevel
+      filter: '(&(objectClass=dnsZone)(dc=..Deleted*))'
+      attributes: [dc, whenChanged]
+      key: distinguishedName
+      name: dc
+    each: { field: whenChanged, op: age-gt, value: 21, threshold: dns.deleted-zone-grace-days }
+    evidence: "{dc} - deleted, last changed {whenChanged}"
+
+  # ---------------------------------------------------------------- names that capture traffic
+
+  - id: DNS-NODE-DOMAIN-WILDCARD
+    title: Wildcard name in a domain-replicated DNS zone
+    category: CFG
+    severity: high
+    entity: dns-node
+    why: >-
+      A * record answers for every name in the zone that does not exist. Inside a Windows domain that turns
+      every mistyped server name, and every name a client falls back to after a failed lookup, into traffic
+      and authentication attempts sent to one address - the classic way to capture credentials through
+      AD-integrated DNS without touching the network.
+    fix: Find out who created it (the node's owner and whenCreated); delete it unless a documented service needs it, and record that exception.
+    refs: [NIST-800-53:SC-20, MITRE-ATTACK:T1557]
+    query:
+      protocol: ldap
+      base: 'CN=MicrosoftDNS,DC=DomainDnsZones,{DOMAINDN}'
+      filter: '(&(objectClass=dnsNode)(dc=\2a)(!(dNSTombstoned=TRUE)))'
+      attributes: [dc, whenCreated, whenChanged]
+      key: distinguishedName
+      name: dc
+    each: { field: distinguishedName, op: notmatch, value: ',DC=(\.\.Deleted[^,]*|(\.\.)?TrustAnchors),CN=MicrosoftDNS,' }
+    evidence: "{distinguishedName} - created {whenCreated}"
+
+  - id: DNS-NODE-FOREST-WILDCARD
+    title: Wildcard name in a forest-replicated DNS zone
+    category: CFG
+    severity: high
+    entity: dns-node
+    why: A * record in a forest-wide zone answers for every non-existent name under it on every DNS server of the forest, capturing lookups and the authentications that follow them.
+    fix: Delete the wildcard unless a documented service needs it.
+    refs: [NIST-800-53:SC-20, MITRE-ATTACK:T1557]
+    query:
+      protocol: ldap
+      base: 'CN=MicrosoftDNS,DC=ForestDnsZones,{ROOTDN}'
+      filter: '(&(objectClass=dnsNode)(dc=\2a)(!(dNSTombstoned=TRUE)))'
+      attributes: [dc, whenCreated, whenChanged]
+      key: distinguishedName
+      name: dc
+    each: { field: distinguishedName, op: notmatch, value: ',DC=(\.\.Deleted[^,]*|(\.\.)?TrustAnchors),CN=MicrosoftDNS,' }
+    evidence: "{distinguishedName} - created {whenCreated}"
+
+  - id: DNS-NODE-LEGACY-WILDCARD
+    title: Wildcard name in a legacy-stored DNS zone
+    category: CFG
+    severity: high
+    entity: dns-node
+    why: A * record answers for every non-existent name in the zone, capturing mistyped and fallback lookups and the authentications that follow them.
+    fix: Delete the wildcard unless a documented service needs it.
+    refs: [NIST-800-53:SC-20, MITRE-ATTACK:T1557]
+    query:
+      protocol: ldap
+      base: 'CN=MicrosoftDNS,CN=System,{DOMAINDN}'
+      filter: '(&(objectClass=dnsNode)(dc=\2a)(!(dNSTombstoned=TRUE)))'
+      attributes: [dc, whenCreated, whenChanged]
+      key: distinguishedName
+      name: dc
+    each: { field: distinguishedName, op: notmatch, value: ',DC=(\.\.Deleted[^,]*|(\.\.)?TrustAnchors),CN=MicrosoftDNS,' }
+    evidence: "{distinguishedName} - created {whenCreated}"
+
+  - id: DNS-NODE-DOMAIN-WPAD-ISATAP
+    title: WPAD or ISATAP name registered in a domain-replicated DNS zone
+    category: CFG
+    severity:
+      field: dc
+      map: { wpad: medium, isatap: low }
+      default: low
+    entity: dns-node
+    why: >-
+      Browsers and Windows look up wpad to find a proxy configuration, and isatap to build an IPv6 tunnel.
+      Whoever answers those names can proxy or tunnel the clients' traffic. The DNS server's global query
+      block list normally hides them; a record that exists shows either a deliberate use or a name someone
+      registered on purpose.
+    fix: If the organisation does not publish proxy auto-configuration or ISATAP by these names, delete the node and keep both names on the global query block list; if it does, record the exception and restrict who can modify the node.
+    refs: [NIST-800-53:SC-20, MITRE-ATTACK:T1557]
+    query:
+      protocol: ldap
+      base: 'CN=MicrosoftDNS,DC=DomainDnsZones,{DOMAINDN}'
+      filter: '(&(objectClass=dnsNode)(|(dc=wpad)(dc=isatap))(!(dNSTombstoned=TRUE)))'
+      attributes: [dc, whenCreated, whenChanged]
+      key: distinguishedName
+      name: dc
+    each: { field: distinguishedName, op: notmatch, value: ',DC=(\.\.Deleted[^,]*|(\.\.)?TrustAnchors),CN=MicrosoftDNS,' }
+    evidence: "{distinguishedName} - created {whenCreated}"
+
+  - id: DNS-NODE-FOREST-WPAD-ISATAP
+    title: WPAD or ISATAP name registered in a forest-replicated DNS zone
+    category: CFG
+    severity:
+      field: dc
+      map: { wpad: medium, isatap: low }
+      default: low
+    entity: dns-node
+    why: Whoever answers wpad or isatap can proxy or tunnel the traffic of clients that look them up; a record in a forest-wide zone serves them on every DNS server of the forest.
+    fix: Delete the node unless the organisation deliberately publishes these names, and keep both on the global query block list.
+    refs: [NIST-800-53:SC-20, MITRE-ATTACK:T1557]
+    query:
+      protocol: ldap
+      base: 'CN=MicrosoftDNS,DC=ForestDnsZones,{ROOTDN}'
+      filter: '(&(objectClass=dnsNode)(|(dc=wpad)(dc=isatap))(!(dNSTombstoned=TRUE)))'
+      attributes: [dc, whenCreated, whenChanged]
+      key: distinguishedName
+      name: dc
+    each: { field: distinguishedName, op: notmatch, value: ',DC=(\.\.Deleted[^,]*|(\.\.)?TrustAnchors),CN=MicrosoftDNS,' }
+    evidence: "{distinguishedName} - created {whenCreated}"
+
+  - id: DNS-NODE-LEGACY-WPAD-ISATAP
+    title: WPAD or ISATAP name registered in a legacy-stored DNS zone
+    category: CFG
+    severity:
+      field: dc
+      map: { wpad: medium, isatap: low }
+      default: low
+    entity: dns-node
+    why: Whoever answers wpad or isatap can proxy or tunnel the traffic of clients that look them up.
+    fix: Delete the node unless the organisation deliberately publishes these names, and keep both on the global query block list.
+    refs: [NIST-800-53:SC-20, MITRE-ATTACK:T1557]
+    query:
+      protocol: ldap
+      base: 'CN=MicrosoftDNS,CN=System,{DOMAINDN}'
+      filter: '(&(objectClass=dnsNode)(|(dc=wpad)(dc=isatap))(!(dNSTombstoned=TRUE)))'
+      attributes: [dc, whenCreated, whenChanged]
+      key: distinguishedName
+      name: dc
+    each: { field: distinguishedName, op: notmatch, value: ',DC=(\.\.Deleted[^,]*|(\.\.)?TrustAnchors),CN=MicrosoftDNS,' }
+    evidence: "{distinguishedName} - created {whenCreated}"
+
+  # ---------------------------------------------------------------- node permissions
+
+  - id: DNS-NODE-DOMAIN-ACL-WRITE-BROAD
+    title: DNS name in a domain-replicated zone can be rewritten by a broad principal
+    category: IAM
+    severity: high
+    entity: dns-node
+    why: >-
+      A node whose permissions let everyone, all authenticated users or all domain computers write or take
+      control of it can be pointed anywhere by any account - a server name redirected to a host that
+      collects the credentials of everyone connecting to it. Nodes registered through non-secure dynamic
+      update, or created by hand with loose permissions, end up like this.
+    fix: Reset the node's permissions (delete and re-register the record, or remove the broad entries), and make the zone accept secure dynamic updates only.
+    refs: [NIST-800-53:AC-6, NIST-800-53:SC-20, MITRE-ATTACK:T1557]
+    refresh: 7d
+    query:
+      protocol: ldap
+      base: 'CN=MicrosoftDNS,DC=DomainDnsZones,{DOMAINDN}'
+      filter: '(&(objectClass=dnsNode)(!(dNSTombstoned=TRUE)))'
+      attributes: [dc, nTSecurityDescriptor, whenChanged]
+      key: distinguishedName
+      name: dc
+      pageSize: 1000
+    each:
+      all:
+        - { field: distinguishedName, op: notmatch, value: ',DC=(\.\.Deleted[^,]*|(\.\.)?TrustAnchors),CN=MicrosoftDNS,' }
+        - any:
+            - { field: nTSecurityDescriptor.noDacl, op: eq, value: true }
+            - element:
+                of: nTSecurityDescriptor.dacl
+                match: any
+                where:
+                  all:
+                    - { field: type, op: in, value: [allow, allow-object] }
+                    - { field: inheritOnly, op: ne, value: true }
+                    - { field: trustee, op: sid-in, value: [everyone, anonymous, authenticated-users, domain-users, domain-computers, builtin-users, builtin-guests, domain-guests, pre-windows-2000-compatible-access, network, interactive] }
+                    - any:
+                        - { field: rights, op: contains, value: GenericAll }
+                        - { field: rights, op: contains, value: WriteDacl }
+                        - { field: rights, op: contains, value: WriteOwner }
+                        - { field: rights, op: contains, value: GenericWrite }
+                        - { field: rights, op: contains, value: Delete }
+                        - all:
+                            - { field: rights, op: contains, value: WriteProperty }
+                            - { field: objectType, op: absent }
+    evidence: "{distinguishedName} - a broad principal may rewrite or take over this name"
+
+  - id: DNS-NODE-FOREST-ACL-WRITE-BROAD
+    title: DNS name in a forest-replicated zone can be rewritten by a broad principal
+    category: IAM
+    severity: high
+    entity: dns-node
+    why: Locator and replication names in _msdcs that any account can rewrite let that account steer domain controllers and clients to a host of its choosing for replication and authentication.
+    fix: Reset the node's permissions and let the domain controllers re-register their records (restart Netlogon), with the zone on secure dynamic updates only.
+    refs: [NIST-800-53:AC-6, NIST-800-53:SC-20, MITRE-ATTACK:T1557]
+    refresh: 7d
+    query:
+      protocol: ldap
+      base: 'CN=MicrosoftDNS,DC=ForestDnsZones,{ROOTDN}'
+      filter: '(&(objectClass=dnsNode)(!(dNSTombstoned=TRUE)))'
+      attributes: [dc, nTSecurityDescriptor, whenChanged]
+      key: distinguishedName
+      name: dc
+      pageSize: 1000
+    each:
+      all:
+        - { field: distinguishedName, op: notmatch, value: ',DC=(\.\.Deleted[^,]*|(\.\.)?TrustAnchors),CN=MicrosoftDNS,' }
+        - any:
+            - { field: nTSecurityDescriptor.noDacl, op: eq, value: true }
+            - element:
+                of: nTSecurityDescriptor.dacl
+                match: any
+                where:
+                  all:
+                    - { field: type, op: in, value: [allow, allow-object] }
+                    - { field: inheritOnly, op: ne, value: true }
+                    - { field: trustee, op: sid-in, value: [everyone, anonymous, authenticated-users, domain-users, domain-computers, builtin-users, builtin-guests, domain-guests, pre-windows-2000-compatible-access, network, interactive] }
+                    - any:
+                        - { field: rights, op: contains, value: GenericAll }
+                        - { field: rights, op: contains, value: WriteDacl }
+                        - { field: rights, op: contains, value: WriteOwner }
+                        - { field: rights, op: contains, value: GenericWrite }
+                        - { field: rights, op: contains, value: Delete }
+                        - all:
+                            - { field: rights, op: contains, value: WriteProperty }
+                            - { field: objectType, op: absent }
+    evidence: "{distinguishedName} - a broad principal may rewrite or take over this name"
+
+  # ---------------------------------------------------------------- node hygiene
+
+  - id: DNS-NODE-DOMAIN-TOMBSTONE-OLD
+    title: Tombstoned DNS names are not being purged (domain partition)
+    kind: broken
+    lens: maintenance
+    category: HYG
+    severity: low
+    entity: dns-node
+    why: A deleted or scavenged record is first tombstoned and then removed by the DNS server's daily clean-up once the tombstone interval (14 days by default) has passed. Tombstones much older than that mean the clean-up is not running on any server of the partition, and the partition keeps growing.
+    fix: Check the DNS Server event log on the domain's DNS servers for clean-up errors and the DsTombstoneInterval setting; confirm partition replication is healthy.
+    refs: [NIST-800-53:CM-6]
+    refresh: 7d
+    query:
+      protocol: ldap
+      base: 'CN=MicrosoftDNS,DC=DomainDnsZones,{DOMAINDN}'
+      filter: '(&(objectClass=dnsNode)(dNSTombstoned=TRUE)(whenChanged<={GT:30}))'
+      attributes: [dc, whenChanged]
+      key: distinguishedName
+      name: dc
+    count:
+      op: gt
+      value: 0
+      where: { field: distinguishedName, op: notmatch, value: ',DC=(\.\.Deleted[^,]*|(\.\.)?TrustAnchors),CN=MicrosoftDNS,' }
+    evidence: "{count} tombstoned names unchanged for over 30 days, for example {sample}"
+
+  - id: DNS-NODE-FOREST-TOMBSTONE-OLD
+    title: Tombstoned DNS names are not being purged (forest partition)
+    kind: broken
+    lens: maintenance
+    category: HYG
+    severity: low
+    entity: dns-node
+    why: Tombstones far older than the tombstone interval in the forest partition mean no DNS server is removing them.
+    fix: Check the DNS Server event log and DsTombstoneInterval on the forest's DNS servers, and partition replication.
+    refs: [NIST-800-53:CM-6]
+    refresh: 7d
+    query:
+      protocol: ldap
+      base: 'CN=MicrosoftDNS,DC=ForestDnsZones,{ROOTDN}'
+      filter: '(&(objectClass=dnsNode)(dNSTombstoned=TRUE)(whenChanged<={GT:30}))'
+      attributes: [dc, whenChanged]
+      key: distinguishedName
+      name: dc
+    count:
+      op: gt
+      value: 0
+      where: { field: distinguishedName, op: notmatch, value: ',DC=(\.\.Deleted[^,]*|(\.\.)?TrustAnchors),CN=MicrosoftDNS,' }
+    evidence: "{count} tombstoned names unchanged for over 30 days, for example {sample}"
+
+  - id: DNS-NODE-DOMAIN-STALE-SHARE
+    title: Large share of DNS names unchanged for over a year
+    kind: broken
+    lens: maintenance
+    category: HYG
+    severity: low
+    entity: dns-node
+    why: >-
+      Where aging is on, dynamically registered names are rewritten as their owners refresh them, so a
+      name untouched for a year usually belongs to a machine that is gone, and a large share of them means
+      scavenging is not working: old names point at addresses since reused, and lookups land on the wrong
+      host. With aging off (the Windows default) a refresh that changes nothing does not rewrite the name,
+      so stable machines look old too - the default share is set high for that reason. Static records
+      also never change, so this is a share, not a list.
+    fix: Turn on aging for dynamically updated zones and scavenging on one DNS server (see the dns-server pack), then review the oldest static records with their owners.
+    refs: [NIST-800-53:CM-8]
+    refresh: 7d
+    query:
+      protocol: ldap
+      base: 'CN=MicrosoftDNS,DC=DomainDnsZones,{DOMAINDN}'
+      filter: '(&(objectClass=dnsNode)(!(dNSTombstoned=TRUE))(!(dc=@))(!(dc=_*)))'
+      attributes: [dc, whenChanged]
+      key: distinguishedName
+      name: dc
+      pageSize: 1000
+    count:
+      op: gt
+      value: 50
+      threshold: dns.stale-node-percent-max
+      percent: true
+      where:
+        all:
+          - { field: distinguishedName, op: notmatch, value: ',DC=(\.\.Deleted[^,]*|(\.\.)?TrustAnchors),CN=MicrosoftDNS,' }
+          - { field: whenChanged, op: age-gt, value: 365, threshold: dns.stale-node-days }
+    evidence: "{count}% of the names have not changed in the stale window, for example {sample}"
+
+  # ---------------------------------------------------------------- DnsAdmins and DnsUpdateProxy
+
+  - id: DNS-DNSADMINS-BROAD-MEMBER
+    title: DnsAdmins contains a broad group
+    category: IAM
+    severity: critical
+    entity: group
+    why: DnsAdmins can make the DNS service on a domain controller load code as SYSTEM. With Domain Users, Domain Computers, Authenticated Users, Everyone or a similar group as a member, every account in that group is one step from controlling the domain.
+    fix: Remove the broad member at once, then review who used DNS administration while it was there.
+    refs: [NIST-800-53:AC-6(5), MITRE-ATTACK:T1574.002]
+    query:
+      protocol: ldap
+      base: 'CN=DnsAdmins,CN=Users,{DOMAINDN}'
+      scope: base
+      filter: '(objectClass=group)'
+      attributes: [cn, member]
+      key: distinguishedName
+      name: cn
+      min_rows: 1
+    each: { field: member, op: match, value: '^CN=(Domain Users|Domain Computers|Domain Guests|Users|Guests|S-1-5-11|S-1-1-0|S-1-5-7|S-1-5-4|S-1-5-2|S-1-5-32-545|S-1-5-32-546),' }
+    evidence: "{cn} has broad members - {member}"
+
+  - id: DNS-DNSADMINS-COMPUTER-MEMBER
+    title: Computer account is a member of DnsAdmins
+    category: IAM
+    severity: high
+    entity: computer
+    why: A computer in DnsAdmins, directly or nested, makes every local administrator of that computer - and anyone who compromises it - able to load code as SYSTEM on the domain controllers that run DNS.
+    fix: Remove the computer from DnsAdmins; a server that manages DNS should use an administrator's account through a privileged access path, not its own identity.
+    refs: [NIST-800-53:AC-6(5), MITRE-ATTACK:T1574.002]
+    query:
+      protocol: ldap
+      filter: '(&{COMPUTER}(memberOf:1.2.840.113556.1.4.1941:=CN=DnsAdmins,CN=Users,{DOMAINDN}))'
+      attributes: [sAMAccountName, dNSHostName, operatingSystem]
+      key: sAMAccountName
+      name: dNSHostName
+    each: any
+    evidence: "{sAMAccountName} ({operatingSystem}) is in DnsAdmins"
+
+  - id: DNS-DNSADMINS-NESTED-GROUP
+    title: Group nested inside DnsAdmins
+    category: IAM
+    severity: medium
+    entity: group
+    why: >-
+      Every member of a nested group is a DNS administrator, and DnsAdmins is administrative on domain
+      controllers. Nested groups are usually managed by people who do not know that, and their members
+      escape the review that DnsAdmins itself gets. Groups AdminSDHolder already protects (adminCount 1)
+      are left out on the assumption they are tier-0 and reviewed; that is a heuristic - adminCount can
+      be left over on a group removed from a protected one.
+    fix: Replace the nested group with named tier-0 administrators, or bring the nested group under the same protection and review as DnsAdmins.
+    refs: [NIST-800-53:AC-6(5), NIST-800-53:AC-2]
+    query:
+      protocol: ldap
+      filter: '(&(objectClass=group)(!(adminCount=1))(memberOf:1.2.840.113556.1.4.1941:=CN=DnsAdmins,CN=Users,{DOMAINDN}))'
+      attributes: [sAMAccountName, distinguishedName, adminCount]
+      key: distinguishedName
+      name: sAMAccountName
+    each: any
+    evidence: "{sAMAccountName} is nested in DnsAdmins"
+
+  - id: DNS-DNSADMINS-ACL-WRITE
+    title: DnsAdmins membership can be changed by a non-administrator
+    category: IAM
+    severity: high
+    entity: group
+    why: >-
+      DnsAdmins is not one of the groups AdminSDHolder protects, so delegations made for ordinary groups
+      (helpdesk, provisioning tools, product installers) often reach it. Whoever can add members to it can
+      add themselves and load code as SYSTEM on the DNS domain controllers. Account Operators also hold
+      this right by default and are left out here; keep that group empty (AD-GROUP-OPERATORS-NOT-EMPTY).
+      In forests that have or had Exchange on-premises, Exchange's own groups (Organization Management,
+      Exchange Trusted Subsystem, Exchange Windows Permissions) usually hold such rights through
+      inheritance and will show here.
+    fix: >-
+      Remove write, member-write, ownership and permission rights on CN=DnsAdmins for everyone except the
+      domain admin groups. Where a grant is accepted - Exchange's groups above, or an approved tier-0
+      management tool - list the full set of allowed trustees (domain admin groups included, by name or SID)
+      in threshold.dns.dnsadmins-acl-trustees; for Exchange, prefer removing the inherited rights (split
+      permissions) over accepting them.
+    refs: [NIST-800-53:AC-6(5), NIST-800-53:AC-5, MITRE-ATTACK:T1098, MITRE-ATTACK:T1574.002]
+    query:
+      protocol: ldap
+      base: 'CN=DnsAdmins,CN=Users,{DOMAINDN}'
+      scope: base
+      filter: '(objectClass=group)'
+      attributes: [cn, nTSecurityDescriptor]
+      key: distinguishedName
+      name: cn
+      min_rows: 1
+    each:
+      any:
+        - { field: nTSecurityDescriptor.noDacl, op: eq, value: true }
+        - { field: nTSecurityDescriptor.owner, op: sid-notin, value: [domain-admins, enterprise-admins, builtin-administrators, local-system], threshold: dns.dnsadmins-acl-trustees }
+        - element:
+            of: nTSecurityDescriptor.dacl
+            match: any
+            where:
+              all:
+                - { field: type, op: in, value: [allow, allow-object] }
+                - { field: inheritOnly, op: ne, value: true }
+                - { field: trustee, op: sid-notin, value: [domain-admins, enterprise-admins, builtin-administrators, local-system, account-operators], threshold: dns.dnsadmins-acl-trustees }
+                - any:
+                    - { field: rights, op: contains, value: GenericAll }
+                    - { field: rights, op: contains, value: WriteDacl }
+                    - { field: rights, op: contains, value: WriteOwner }
+                    - { field: rights, op: contains, value: GenericWrite }
+                    - all:
+                        - { field: rights, op: contains, value: WriteProperty }
+                        - any:
+                            - { field: objectType, op: absent }
+                            - { field: objectTypeName, op: eq, value: member }
+                    - all:
+                        - { field: rights, op: contains, value: Self }
+                        - { field: objectTypeName, op: eq, value: member }
+    evidence: "{cn} - owner {nTSecurityDescriptor.owner}; a principal outside the domain admin groups can change its membership or permissions"
+
+  - id: DNS-UPDATEPROXY-DC-MEMBER
+    title: Domain controller is a member of DnsUpdateProxy
+    category: IAM
+    severity: high
+    entity: computer
+    why: Records created by members of DnsUpdateProxy get no owner protection, so any authenticated computer can take them over. A domain controller in the group (usually because it also runs DHCP) leaves its own locator and host records, and those it registers for clients, open to hijacking.
+    fix: Remove the domain controller from DnsUpdateProxy and give its DHCP server a dedicated, unprivileged DNS update credential; better, move DHCP off the domain controller.
+    refs: [NIST-800-53:AC-6, NIST-800-53:SC-20, MITRE-ATTACK:T1557]
+    query:
+      protocol: ldap
+      filter: '(&{COMPUTER}{UAC:8192}(memberOf:1.2.840.113556.1.4.1941:=CN=DnsUpdateProxy,CN=Users,{DOMAINDN}))'
+      attributes: [sAMAccountName, dNSHostName]
+      key: sAMAccountName
+      name: dNSHostName
+    each: any
+    evidence: "{dNSHostName} is a domain controller in DnsUpdateProxy"
+
+  - id: DNS-UPDATEPROXY-MEMBERS
+    title: DnsUpdateProxy has members
+    lens: both
+    category: IAM
+    severity: low
+    entity: group
+    why: DnsUpdateProxy is meant for DHCP servers that register records on behalf of clients; the records they create are left without owner protection, so any computer can later rewrite them. Members that are not DHCP servers, or DHCP servers that have a dedicated update credential, should not be there.
+    fix: Keep only DHCP servers that have no dedicated DNS update credential; configure the credential and empty the group where possible.
+    refs: [NIST-800-53:AC-6, NIST-800-53:SC-20]
+    refresh: 7d
+    query:
+      protocol: ldap
+      base: 'CN=DnsUpdateProxy,CN=Users,{DOMAINDN}'
+      scope: base
+      filter: '(&(objectClass=group)(member=*))'
+      attributes: [cn, member]
+      key: distinguishedName
+      name: cn
+    each: any
+    evidence: "{cn} members - {member}"

@@ -9,6 +9,10 @@ TestResults/
 /home/
 /demo/
 
+# Per-client folders: each client's own config\ (systems, integrations, thresholds, overrides) and
+# data\ (collected findings/runs). Tenant data - never in the public repo.
+/clients/
+
 # Tenant files - a backstop in case one lands in the repo anyway
 settings.json
 denylist.txt

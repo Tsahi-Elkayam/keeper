@@ -1,0 +1,3007 @@
+schema: keeper.rules/1
+system: gcp
+name: Google Cloud
+integration: gcp
+# Endpoint: Cloud Asset Inventory at the scope to review - https://cloudasset.googleapis.com/v1/organizations/<n>
+# (recommended), .../folders/<n> or .../projects/<id>. Every rule is one ListAssets read (GET /assets) of ONE
+# asset type with one content type:
+#   RESOURCE     - resource.data is the resource as its own service's REST API represents it
+#   IAM_POLICY   - iamPolicy.bindings[] { role, members[] } and iamPolicy.auditConfigs[]
+#   ORG_POLICY   - orgPolicy[] { constraint, booleanPolicy.enforced, listPolicy }
+# Each asset row also carries name (the full resource name, the key), assetType, updateTime and ancestors[].
+#
+# Conventions in this file:
+# - Google's JSON leaves out a boolean that is false. "Not on" is therefore written
+#   any: [ absent, eq false ], never "ne true" (which is n/a on a missing field, never a finding).
+# - Organisation-policy rules read the organisation's own policies (CIS checks the organisation). At folder or
+#   project scope there is no organisation row, so they read nothing; GCP-SCOPE-NOT-ORGANIZATION says so.
+# - Count rules ("at least one X must exist") are judged over the whole scope, not per project: at organisation
+#   scope one project having the X passes the rule for all of them. Per-project must-exist is in the backlog.
+# - Durations in Google's JSON are seconds with an "s" ("7776000s"); the duration ops do not read that form,
+#   so "longer than 90 days" is a regular expression on the number of seconds (> 7776000).
+# - Instances whose name starts gke- are GKE nodes, judged by the GKE rules instead.
+# What ListAssets cannot answer is in docs/backlog/gcp.md.
+defaults:
+  lens: security
+  refresh: 1d
+rules:
+
+  # ---- scope and inventory -------------------------------------------------------------------------
+
+  - id: GCP-SCOPE-NO-PROJECTS
+    title: The review identity sees no projects
+    kind: missing
+    lens: both
+    category: MON
+    severity: medium
+    entity: instance
+    why: With no project visible every rule in this file reads nothing and the result looks clean. The usual causes are a missing Cloud Asset Viewer grant on the scope or the Cloud Asset API not enabled in the scanning service account's project.
+    fix: Grant the scanning service account Cloud Asset Viewer (roles/cloudasset.viewer) on the organisation, folder or project the endpoint names, enable cloudasset.googleapis.com in its own project, then rerun.
+    refs: [NIST-800-53:CA-7, CIS-GCP:2.13]
+    query: { protocol: http, path: /assets, params: { assetTypes: cloudresourcemanager.googleapis.com/Project, contentType: RESOURCE, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name, name: resource.data.projectId }
+    count: none
+    evidence: "no projects returned by Cloud Asset Inventory"
+
+  - id: GCP-SCOPE-NOT-ORGANIZATION
+    title: The scan scope holds no organisation, so organisation-level rules read nothing
+    kind: missing
+    lens: both
+    category: MON
+    severity: info
+    entity: instance
+    refresh: 7d
+    why: Organisation policies, organisation IAM, organisation-wide audit logging and essential contacts are set on the organisation resource. When the endpoint names a folder or a project, those rules have nothing to read and stay silent.
+    fix: Point the integration at https://cloudasset.googleapis.com/v1/organizations/<number> and grant Cloud Asset Viewer there.
+    refs: [NIST-800-53:CA-7]
+    query: { protocol: http, path: /assets, params: { assetTypes: cloudresourcemanager.googleapis.com/Organization, contentType: RESOURCE, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name, name: resource.data.displayName }
+    count: none
+    evidence: "no organisation in the scan scope"
+
+  - id: GCP-PROJECT-NO-LABELS
+    title: Project has no labels
+    kind: missing
+    lens: maintenance
+    category: HYG
+    severity: low
+    entity: project
+    refresh: 7d
+    why: Without owner, environment and cost-centre labels, billing exports and incident routing cannot attribute the project, and nobody is obviously responsible for what runs in it.
+    fix: Apply the labelling standard (owner, environment, cost centre) to the project and enforce it at creation.
+    refs: [NIST-800-53:CM-8, CIS-Controls-v8:1.1]
+    query: { protocol: http, path: /assets, params: { assetTypes: cloudresourcemanager.googleapis.com/Project, contentType: RESOURCE, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name, name: resource.data.projectId }
+    each:
+      all:
+        - { field: resource.data.lifecycleState, op: eq, value: ACTIVE }
+        - any:
+            - { field: resource.data.labels, op: absent }
+            - { field: resource.data.labels, op: eq, value: "{}" }
+    evidence: "{resource.data.projectId}: no labels"
+
+  # ---- IAM: organisation and folder policies -------------------------------------------------------
+
+  - id: GCP-IAM-ORG-PUBLIC-MEMBER
+    title: Organisation IAM policy grants a role to allUsers or allAuthenticatedUsers
+    kind: misconfigured
+    category: IAM
+    severity: critical
+    entity: organization
+    why: A binding at the organisation to allUsers (anyone) or allAuthenticatedUsers (any Google account in the world) is inherited by every folder, project and resource below it.
+    fix: Remove the allUsers / allAuthenticatedUsers members from the organisation policy and enforce Domain Restricted Sharing (iam.allowedPolicyMemberDomains).
+    refs: [CIS-GCP:1.1, NIST-800-53:AC-3, NIST-800-53:AC-6]
+    query: { protocol: http, path: /assets, params: { assetTypes: cloudresourcemanager.googleapis.com/Organization, contentType: IAM_POLICY, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name }
+    each: { field: "iamPolicy.bindings[].members", op: in, value: [allUsers, allAuthenticatedUsers] }
+    evidence: "{name}: a binding names allUsers or allAuthenticatedUsers"
+
+  - id: GCP-IAM-ORG-PERSONAL-ACCOUNT
+    title: Organisation IAM policy grants a role to a personal Gmail account
+    kind: misconfigured
+    category: IAM
+    severity: high
+    entity: organization
+    why: A consumer Gmail account is outside the organisation's identity lifecycle, MFA and conditional access; when its owner leaves, the access stays.
+    fix: Replace the Gmail member with a corporate identity (or a group of them) and enforce Domain Restricted Sharing.
+    refs: [CIS-GCP:1.1, NIST-800-53:AC-2, NIST-800-53:IA-2]
+    query: { protocol: http, path: /assets, params: { assetTypes: cloudresourcemanager.googleapis.com/Organization, contentType: IAM_POLICY, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name }
+    each: { field: "iamPolicy.bindings[].members", op: match, value: '^(user|group):[^@]+@(gmail|googlemail)\.com$' }
+    evidence: "{name}: a binding names a gmail.com / googlemail.com account"
+
+  - id: GCP-IAM-ORG-BASIC-ROLE
+    title: Organisation IAM policy grants Owner or Editor
+    kind: misconfigured
+    category: IAM
+    severity: high
+    entity: organization
+    why: The basic roles carry thousands of permissions; at the organisation they apply to every project, including ones created later. No one should need them that broadly.
+    fix: Replace roles/owner and roles/editor at the organisation with the predefined roles the holder actually needs, granted on the folders or projects concerned.
+    refs: [NIST-800-53:AC-6, CIS-Controls-v8:6.8]
+    query: { protocol: http, path: /assets, params: { assetTypes: cloudresourcemanager.googleapis.com/Organization, contentType: IAM_POLICY, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name }
+    each:
+      element:
+        of: iamPolicy.bindings
+        where:
+          all:
+            - { field: role, op: in, value: [roles/owner, roles/editor] }
+            - { field: members, op: notempty }
+    evidence: "{name}: roles/owner or roles/editor granted at the organisation"
+
+  - id: GCP-IAM-ORG-SERVICE-ACCOUNT-ADMIN
+    title: Organisation IAM policy grants a service account an administrative role
+    kind: misconfigured
+    category: IAM
+    severity: high
+    entity: organization
+    why: A service account's key or token is a credential that works without MFA; with an admin role at the organisation, anyone who obtains it controls every project.
+    fix: Grant the service account only the predefined roles its workload needs, on the narrowest folder or project; remove Owner, Editor and *Admin roles at the organisation.
+    refs: [CIS-GCP:1.5, NIST-800-53:AC-6]
+    query: { protocol: http, path: /assets, params: { assetTypes: cloudresourcemanager.googleapis.com/Organization, contentType: IAM_POLICY, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name }
+    each:
+      element:
+        of: iamPolicy.bindings
+        where:
+          all:
+            - { field: role, op: match, value: '^roles/(owner|editor|.*[aA]dmin(\.v1)?)$' }
+            - { field: members, op: match, value: '^serviceAccount:(?![^@]*@gcp-sa-)[^@]+@[^@]+\.iam\.gserviceaccount\.com$' }
+    evidence: "{name}: a user-managed service account holds an administrative role at the organisation"
+
+  - id: GCP-IAM-FOLDER-PUBLIC-MEMBER
+    title: Folder IAM policy grants a role to allUsers or allAuthenticatedUsers
+    kind: misconfigured
+    category: IAM
+    severity: critical
+    entity: folder
+    why: A public binding on a folder is inherited by every project and resource in it.
+    fix: Remove the allUsers / allAuthenticatedUsers members from the folder policy and enforce Domain Restricted Sharing.
+    refs: [CIS-GCP:1.1, NIST-800-53:AC-3]
+    query: { protocol: http, path: /assets, params: { assetTypes: cloudresourcemanager.googleapis.com/Folder, contentType: IAM_POLICY, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name }
+    each: { field: "iamPolicy.bindings[].members", op: in, value: [allUsers, allAuthenticatedUsers] }
+    evidence: "{name}: a binding names allUsers or allAuthenticatedUsers"
+
+  - id: GCP-IAM-FOLDER-PERSONAL-ACCOUNT
+    title: Folder IAM policy grants a role to a personal Gmail account
+    kind: misconfigured
+    category: IAM
+    severity: high
+    entity: folder
+    why: A consumer Gmail account is outside the organisation's identity lifecycle, MFA and conditional access, and its access is inherited by every project in the folder.
+    fix: Replace the Gmail member with a corporate identity and enforce Domain Restricted Sharing.
+    refs: [CIS-GCP:1.1, NIST-800-53:AC-2]
+    query: { protocol: http, path: /assets, params: { assetTypes: cloudresourcemanager.googleapis.com/Folder, contentType: IAM_POLICY, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name }
+    each: { field: "iamPolicy.bindings[].members", op: match, value: '^(user|group):[^@]+@(gmail|googlemail)\.com$' }
+    evidence: "{name}: a binding names a gmail.com / googlemail.com account"
+
+  - id: GCP-IAM-FOLDER-BASIC-ROLE
+    title: Folder IAM policy grants Owner or Editor
+    kind: misconfigured
+    category: IAM
+    severity: medium
+    entity: folder
+    why: Owner or Editor on a folder applies to every project in it, present and future; the basic roles are far broader than any one job needs.
+    fix: Replace the basic roles with predefined roles granted on the projects that need them.
+    refs: [NIST-800-53:AC-6, CIS-Controls-v8:6.8]
+    query: { protocol: http, path: /assets, params: { assetTypes: cloudresourcemanager.googleapis.com/Folder, contentType: IAM_POLICY, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name }
+    each:
+      element:
+        of: iamPolicy.bindings
+        where:
+          all:
+            - { field: role, op: in, value: [roles/owner, roles/editor] }
+            - { field: members, op: notempty }
+    evidence: "{name}: roles/owner or roles/editor granted on the folder"
+
+  # ---- IAM: project policies -----------------------------------------------------------------------
+
+  - id: GCP-IAM-PROJECT-PUBLIC-MEMBER
+    title: Project IAM policy grants a role to allUsers or allAuthenticatedUsers
+    kind: misconfigured
+    category: IAM
+    severity: critical
+    entity: project
+    why: A public binding on a project gives anyone on the internet (allUsers) or any Google account (allAuthenticatedUsers) that role on every resource in the project.
+    fix: Remove the allUsers / allAuthenticatedUsers members from the project policy; share individual resources deliberately if public access is truly required.
+    refs: [CIS-GCP:1.1, NIST-800-53:AC-3, NIST-800-53:AC-6]
+    query: { protocol: http, path: /assets, params: { assetTypes: cloudresourcemanager.googleapis.com/Project, contentType: IAM_POLICY, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name }
+    each: { field: "iamPolicy.bindings[].members", op: in, value: [allUsers, allAuthenticatedUsers] }
+    evidence: "{name}: a binding names allUsers or allAuthenticatedUsers"
+
+  - id: GCP-IAM-PROJECT-PERSONAL-ACCOUNT
+    title: Project IAM policy grants a role to a personal Gmail account
+    kind: misconfigured
+    category: IAM
+    severity: high
+    entity: project
+    why: CIS requires corporate credentials only. A consumer Gmail account has no organisational MFA, conditional access or offboarding; when the person leaves, the access stays.
+    fix: Replace the Gmail member with a corporate identity (or a group) and enforce Domain Restricted Sharing so it cannot be added again.
+    refs: [CIS-GCP:1.1, NIST-800-53:AC-2, NIST-800-53:IA-2]
+    query: { protocol: http, path: /assets, params: { assetTypes: cloudresourcemanager.googleapis.com/Project, contentType: IAM_POLICY, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name }
+    each: { field: "iamPolicy.bindings[].members", op: match, value: '^(user|group):[^@]+@(gmail|googlemail)\.com$' }
+    evidence: "{name}: a binding names a gmail.com / googlemail.com account"
+
+  - id: GCP-IAM-PROJECT-EXTERNAL-MEMBER
+    title: Project IAM policy grants a role to an identity outside the organisation's domains
+    kind: misconfigured
+    category: IAM
+    severity: medium
+    entity: project
+    why: A user or group from another domain is governed by someone else's identity lifecycle; guests and former partners keep access nobody reviews.
+    fix: Remove members from domains the organisation does not own, or document the partnership; enforce Domain Restricted Sharing. Set threshold.gcp.iam.external-member-pattern to a pattern that matches outside members, e.g. ^(user|group):(?!.*@(corp\.example|example)\.org$).
+    refs: [NIST-800-53:AC-2, NIST-800-53:AC-3]
+    query: { protocol: http, path: /assets, params: { assetTypes: cloudresourcemanager.googleapis.com/Project, contentType: IAM_POLICY, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name }
+    each: { field: "iamPolicy.bindings[].members", op: match, value: '^$', threshold: gcp.iam.external-member-pattern, required: true }
+    evidence: "{name}: a binding names a member outside the organisation's domains"
+
+  - id: GCP-IAM-PROJECT-BASIC-ROLE-USER
+    title: Project grants Owner or Editor directly to a user
+    kind: misconfigured
+    category: IAM
+    severity: medium
+    entity: project
+    why: Owner and Editor hold nearly every permission in the project. Granted to individual users they are standing admin rights that bypass group-based review and least privilege.
+    fix: Grant predefined roles through groups instead; keep Owner to a break-glass group.
+    refs: [NIST-800-53:AC-6, NIST-800-53:AC-2, CIS-Controls-v8:6.8]
+    query: { protocol: http, path: /assets, params: { assetTypes: cloudresourcemanager.googleapis.com/Project, contentType: IAM_POLICY, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name }
+    each:
+      element:
+        of: iamPolicy.bindings
+        where:
+          all:
+            - { field: role, op: in, value: [roles/owner, roles/editor] }
+            - { field: members, op: match, value: '^user:' }
+    evidence: "{name}: roles/owner or roles/editor granted to individual users"
+
+  - id: GCP-IAM-PROJECT-DOMAIN-BASIC-ROLE
+    title: Project grants Owner or Editor to a whole domain
+    kind: misconfigured
+    category: IAM
+    severity: high
+    entity: project
+    why: A "domain:" member gives the role to every account in that domain, today and in future, including service and shared accounts.
+    fix: Replace the domain member with a specific group holding a predefined role.
+    refs: [NIST-800-53:AC-6, NIST-800-53:AC-2]
+    query: { protocol: http, path: /assets, params: { assetTypes: cloudresourcemanager.googleapis.com/Project, contentType: IAM_POLICY, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name }
+    each:
+      element:
+        of: iamPolicy.bindings
+        where:
+          all:
+            - { field: role, op: in, value: [roles/owner, roles/editor] }
+            - { field: members, op: match, value: '^domain:' }
+    evidence: "{name}: roles/owner or roles/editor granted to a whole domain"
+
+  - id: GCP-IAM-PROJECT-SERVICE-ACCOUNT-ADMIN
+    title: User-managed service account holds Owner, Editor or an admin role on a project
+    kind: misconfigured
+    category: IAM
+    severity: high
+    entity: project
+    why: A service account's key or token works without MFA from anywhere; with Owner, Editor or an *Admin role, whoever obtains it - a leaked key, a compromised workload - controls the project.
+    fix: Grant the service account only the predefined roles its workload uses; remove Owner, Editor and *Admin roles. Google-managed service agents are not counted here.
+    refs: [CIS-GCP:1.5, NIST-800-53:AC-6, MITRE-ATTACK:T1078.004]
+    query: { protocol: http, path: /assets, params: { assetTypes: cloudresourcemanager.googleapis.com/Project, contentType: IAM_POLICY, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name }
+    each:
+      element:
+        of: iamPolicy.bindings
+        where:
+          all:
+            - { field: role, op: match, value: '^roles/(owner|editor|.*[aA]dmin(\.v1)?)$' }
+            - { field: members, op: match, value: '^serviceAccount:(?![^@]*@gcp-sa-)[^@]+@[^@]+\.iam\.gserviceaccount\.com$' }
+    evidence: "{name}: a user-managed service account holds Owner, Editor or an admin role"
+
+  - id: GCP-IAM-PROJECT-DEFAULT-SA-PRIVILEGED
+    title: Default Compute Engine or App Engine service account holds Owner or Editor
+    kind: misconfigured
+    category: IAM
+    severity: high
+    entity: project
+    why: The default service accounts get Editor automatically and are attached to every VM, function and App Engine service that does not name another; any code running there can change almost anything in the project.
+    fix: Remove Editor/Owner from the default service accounts, give each workload its own service account with narrow roles, and enforce iam.automaticIamGrantsForDefaultServiceAccounts.
+    refs: [CIS-GCP:1.5, CIS-GCP:4.1, NIST-800-53:AC-6]
+    query: { protocol: http, path: /assets, params: { assetTypes: cloudresourcemanager.googleapis.com/Project, contentType: IAM_POLICY, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name }
+    each:
+      element:
+        of: iamPolicy.bindings
+        where:
+          all:
+            - { field: role, op: in, value: [roles/owner, roles/editor] }
+            - { field: members, op: match, value: '^serviceAccount:(\d+-compute@developer|[^@]+@appspot)\.gserviceaccount\.com$' }
+    evidence: "{name}: a default service account holds roles/owner or roles/editor"
+
+  - id: GCP-IAM-PROJECT-SA-IMPERSONATION
+    title: Service Account User or Token Creator granted at project level
+    kind: misconfigured
+    category: IAM
+    severity: medium
+    entity: project
+    why: Granted on the project, these roles let the member act as, or mint tokens for, every service account in it - including the most privileged one.
+    fix: Grant roles/iam.serviceAccountUser and roles/iam.serviceAccountTokenCreator on the specific service accounts that need it, not on the project.
+    refs: [CIS-GCP:1.6, NIST-800-53:AC-6, MITRE-ATTACK:T1548]
+    query: { protocol: http, path: /assets, params: { assetTypes: cloudresourcemanager.googleapis.com/Project, contentType: IAM_POLICY, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name }
+    each:
+      element:
+        of: iamPolicy.bindings
+        where:
+          all:
+            - { field: role, op: in, value: [roles/iam.serviceAccountUser, roles/iam.serviceAccountTokenCreator] }
+            - { field: members, op: notempty }
+    evidence: "{name}: Service Account User or Token Creator granted at project level"
+
+  - id: GCP-IAM-PROJECT-MANY-OWNERS
+    title: Project has more owners than the baseline allows
+    kind: misconfigured
+    category: IAM
+    severity: low
+    entity: project
+    why: Every owner can grant themselves or anyone else any access; the more there are, the harder each one is to justify and review.
+    fix: Reduce roles/owner to a small break-glass group (by default at most 3 members, threshold.gcp.iam.max-project-owners); give everyone else predefined roles.
+    refs: [NIST-800-53:AC-6, NIST-800-53:AC-2]
+    query: { protocol: http, path: /assets, params: { assetTypes: cloudresourcemanager.googleapis.com/Project, contentType: IAM_POLICY, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name }
+    each:
+      element:
+        of: iamPolicy.bindings
+        where:
+          all:
+            - { field: role, op: eq, value: roles/owner }
+            - { field: members, op: size-gt, value: 3, threshold: gcp.iam.max-project-owners }
+    evidence: "{name}: more than the allowed number of members hold roles/owner"
+
+  - id: GCP-IAM-PROJECT-DELETED-MEMBER
+    title: Project IAM policy still names deleted identities
+    kind: misconfigured
+    lens: both
+    category: HYG
+    severity: low
+    entity: project
+    why: A binding to a deleted user, group or service account does nothing today, but it is clutter in every access review, and an undeleted service account with the same name gets the role back.
+    fix: Remove the "deleted:" members from the project's bindings.
+    refs: [NIST-800-53:AC-2]
+    query: { protocol: http, path: /assets, params: { assetTypes: cloudresourcemanager.googleapis.com/Project, contentType: IAM_POLICY, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name }
+    each: { field: "iamPolicy.bindings[].members", op: match, value: '^deleted:' }
+    evidence: "{name}: bindings still name deleted identities"
+
+  - id: GCP-IAM-SERVICE-ACCOUNT-PUBLIC
+    title: Service account IAM policy lets allUsers or allAuthenticatedUsers use it
+    kind: misconfigured
+    category: IAM
+    severity: critical
+    entity: service-account
+    why: A public binding on a service account lets anyone act as it or mint its tokens, with every permission the service account holds.
+    fix: Remove allUsers / allAuthenticatedUsers from the service account's IAM policy.
+    refs: [CIS-GCP:1.1, NIST-800-53:AC-3, MITRE-ATTACK:T1078.004]
+    query: { protocol: http, path: /assets, params: { assetTypes: iam.googleapis.com/ServiceAccount, contentType: IAM_POLICY, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name }
+    each: { field: "iamPolicy.bindings[].members", op: in, value: [allUsers, allAuthenticatedUsers] }
+    evidence: "{name}: a binding names allUsers or allAuthenticatedUsers"
+
+  # ---- audit logging -------------------------------------------------------------------------------
+
+  - id: GCP-AUDIT-ORG-DATA-ACCESS-OFF
+    title: Organisation does not log data access for all services
+    kind: missing
+    lens: both
+    category: LOG
+    severity: medium
+    entity: organization
+    why: Admin Activity logs are always on, but reads and writes of data (DATA_READ, DATA_WRITE) are logged only when an audit config asks for them. Without one for allServices, an exfiltration or a quiet change of data leaves no trace.
+    fix: Add an audit config at the organisation for service allServices with DATA_READ and DATA_WRITE (and ADMIN_READ) and no exempted members. Projects can add more but cannot turn it off.
+    refs: [CIS-GCP:2.1, NIST-800-53:AU-2, NIST-800-53:AU-12]
+    query: { protocol: http, path: /assets, params: { assetTypes: cloudresourcemanager.googleapis.com/Organization, contentType: IAM_POLICY, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name }
+    each:
+      any:
+        - { field: iamPolicy.auditConfigs, op: absent }
+        - not:
+            element:
+              of: iamPolicy.auditConfigs
+              where:
+                all:
+                  - { field: service, op: eq, value: allServices }
+                  - element: { of: auditLogConfigs, where: { field: logType, op: eq, value: DATA_READ } }
+                  - element: { of: auditLogConfigs, where: { field: logType, op: eq, value: DATA_WRITE } }
+    evidence: "{name}: no allServices audit config with DATA_READ and DATA_WRITE"
+
+  - id: GCP-AUDIT-ORG-EXEMPTED-MEMBERS
+    title: Organisation audit logging exempts some identities
+    kind: misconfigured
+    lens: both
+    category: LOG
+    severity: medium
+    entity: organization
+    why: An exempted member's data access is never logged anywhere in the organisation - exactly the blind spot an insider or a stolen service account would want.
+    fix: Remove the exemptedMembers from the organisation's audit configs.
+    refs: [CIS-GCP:2.1, NIST-800-53:AU-2]
+    query: { protocol: http, path: /assets, params: { assetTypes: cloudresourcemanager.googleapis.com/Organization, contentType: IAM_POLICY, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name }
+    each:
+      element:
+        of: "iamPolicy.auditConfigs[].auditLogConfigs"
+        where: { field: exemptedMembers, op: notempty }
+    evidence: "{name}: audit logging exempts members {iamPolicy.auditConfigs[].auditLogConfigs[].exemptedMembers}"
+
+  - id: GCP-AUDIT-PROJECT-EXEMPTED-MEMBERS
+    title: Project audit logging exempts some identities
+    kind: misconfigured
+    lens: both
+    category: LOG
+    severity: medium
+    entity: project
+    why: An exempted member's data access in this project is never logged, whatever the organisation asks for.
+    fix: Remove the exemptedMembers from the project's audit configs.
+    refs: [CIS-GCP:2.1, NIST-800-53:AU-2]
+    query: { protocol: http, path: /assets, params: { assetTypes: cloudresourcemanager.googleapis.com/Project, contentType: IAM_POLICY, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name }
+    each:
+      element:
+        of: "iamPolicy.auditConfigs[].auditLogConfigs"
+        where: { field: exemptedMembers, op: notempty }
+    evidence: "{name}: audit logging exempts members {iamPolicy.auditConfigs[].auditLogConfigs[].exemptedMembers}"
+
+  # ---- service accounts, keys and custom roles -----------------------------------------------------
+
+  - id: GCP-SA-USER-MANAGED-KEY
+    title: Service account has a user-managed key
+    kind: misconfigured
+    category: IAM
+    severity: medium
+    entity: service-account-key
+    why: A downloaded key is a long-lived credential that works from anywhere and is easily copied into code, laptops and CI systems; Google-managed keys and workload identity avoid it entirely.
+    fix: Move the workload to attached service accounts, workload identity federation or short-lived tokens; delete the key and enforce iam.disableServiceAccountKeyCreation.
+    refs: [CIS-GCP:1.4, NIST-800-53:IA-5, NIST-800-53:AC-2]
+    query: { protocol: http, path: /assets, params: { assetTypes: iam.googleapis.com/ServiceAccountKey, contentType: RESOURCE, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name }
+    each:
+      all:
+        - { field: resource.data.keyType, op: eq, value: USER_MANAGED }
+        - any:
+            - { field: resource.data.disabled, op: absent }
+            - { field: resource.data.disabled, op: eq, value: false }
+    evidence: "{name}: user-managed key ({resource.data.keyOrigin}) valid from {resource.data.validAfterTime}"
+
+  - id: GCP-SA-KEY-OLD
+    title: User-managed service account key older than 90 days
+    kind: misconfigured
+    category: IAM
+    severity: high
+    entity: service-account-key
+    why: A key that is never rotated stays valid for everyone who has ever held a copy; the longer it lives, the more copies exist and the longer a leak goes unnoticed.
+    fix: Rotate the key (create a new one, move the clients, delete the old one) or, better, replace it with keyless authentication. The age limit is threshold.gcp.iam.sa-key-max-age-days.
+    refs: [CIS-GCP:1.7, NIST-800-53:IA-5(1)]
+    query: { protocol: http, path: /assets, params: { assetTypes: iam.googleapis.com/ServiceAccountKey, contentType: RESOURCE, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name }
+    each:
+      all:
+        - { field: resource.data.keyType, op: eq, value: USER_MANAGED }
+        - any:
+            - { field: resource.data.disabled, op: absent }
+            - { field: resource.data.disabled, op: eq, value: false }
+        - { field: resource.data.validAfterTime, op: age-gt, value: 90, threshold: gcp.iam.sa-key-max-age-days }
+    evidence: "{name}: user-managed key valid since {resource.data.validAfterTime}"
+
+  - id: GCP-IAM-CUSTOM-ROLE-ESCALATION
+    title: Custom role holds permissions that allow privilege escalation
+    kind: misconfigured
+    category: IAM
+    severity: high
+    entity: custom-role
+    why: Permissions such as setting IAM policies, creating service account keys, minting tokens or acting as a service account let the holder grant themselves any other role - a custom role with them is an admin role under an innocuous name.
+    fix: Remove the escalation permissions from the custom role, or replace it with a predefined admin role so that access reviews see it for what it is.
+    refs: [NIST-800-53:AC-6, MITRE-ATTACK:T1098]
+    query: { protocol: http, path: /assets, params: { assetTypes: iam.googleapis.com/Role, contentType: RESOURCE, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name, name: resource.data.title }
+    each:
+      all:
+        - any:
+            - { field: resource.data.deleted, op: absent }
+            - { field: resource.data.deleted, op: eq, value: false }
+        - field: resource.data.includedPermissions
+          op: in
+          value: [resourcemanager.projects.setIamPolicy, resourcemanager.folders.setIamPolicy, resourcemanager.organizations.setIamPolicy, iam.serviceAccounts.setIamPolicy, iam.serviceAccountKeys.create, iam.serviceAccounts.getAccessToken, iam.serviceAccounts.signBlob, iam.serviceAccounts.signJwt, iam.serviceAccounts.implicitDelegation, iam.serviceAccounts.actAs, iam.roles.update, iam.roles.create, deploymentmanager.deployments.create, cloudfunctions.functions.setIamPolicy, storage.buckets.setIamPolicy]
+    evidence: "{resource.data.title} ({name}): holds IAM-changing or impersonation permissions"
+
+  # ---- API keys ------------------------------------------------------------------------------------
+
+  - id: GCP-APIKEY-EXISTS
+    title: Project has an API key
+    kind: misconfigured
+    category: AUT
+    severity: low
+    entity: api-key
+    why: An API key is a bearer secret with no identity behind it; it is usually embedded in apps and pages where anyone can read it. CIS asks that keys exist only where nothing else works.
+    fix: Use service accounts or OAuth where the API supports it; delete keys that are not needed.
+    refs: [CIS-GCP:1.12, NIST-800-53:IA-5]
+    query: { protocol: http, path: /assets, params: { assetTypes: apikeys.googleapis.com/Key, contentType: RESOURCE, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name, name: resource.data.displayName }
+    each: any
+    evidence: "{name}: API key '{resource.data.displayName}' created {resource.data.createTime}"
+
+  - id: GCP-APIKEY-NO-APPLICATION-RESTRICTION
+    title: API key can be used from any application, host or address
+    kind: misconfigured
+    category: AUT
+    severity: medium
+    entity: api-key
+    why: Without an HTTP-referrer, IP, Android or iOS restriction, a key copied from a page or an app works from anywhere, and the project pays for whatever it is used for.
+    fix: Restrict the key to the referrers, server addresses or app signatures that use it.
+    refs: [CIS-GCP:1.13, NIST-800-53:AC-3]
+    query: { protocol: http, path: /assets, params: { assetTypes: apikeys.googleapis.com/Key, contentType: RESOURCE, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name, name: resource.data.displayName }
+    each:
+      all:
+        - { field: resource.data.restrictions.browserKeyRestrictions, op: absent }
+        - { field: resource.data.restrictions.serverKeyRestrictions, op: absent }
+        - { field: resource.data.restrictions.androidKeyRestrictions, op: absent }
+        - { field: resource.data.restrictions.iosKeyRestrictions, op: absent }
+    evidence: "{name}: no application restriction on API key '{resource.data.displayName}'"
+
+  - id: GCP-APIKEY-NO-API-RESTRICTION
+    title: API key can call any enabled API
+    kind: misconfigured
+    category: AUT
+    severity: medium
+    entity: api-key
+    why: An unrestricted key works against every API enabled in the project, so a key meant for Maps can also call, and bill, anything else.
+    fix: Restrict the key to the APIs the application calls (API restrictions / apiTargets).
+    refs: [CIS-GCP:1.14, NIST-800-53:AC-6]
+    query: { protocol: http, path: /assets, params: { assetTypes: apikeys.googleapis.com/Key, contentType: RESOURCE, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name, name: resource.data.displayName }
+    each: { field: resource.data.restrictions.apiTargets, op: empty }
+    evidence: "{name}: no API restriction on API key '{resource.data.displayName}'"
+
+  - id: GCP-APIKEY-OLD
+    title: API key older than 90 days
+    kind: misconfigured
+    category: AUT
+    severity: low
+    entity: api-key
+    why: A key that is never replaced stays valid in every copy ever made of it - old app versions, public repositories, logs.
+    fix: Create a new key, move the applications to it and delete the old one (threshold.gcp.apikeys.max-age-days, default 90).
+    refs: [CIS-GCP:1.15, NIST-800-53:IA-5(1)]
+    query: { protocol: http, path: /assets, params: { assetTypes: apikeys.googleapis.com/Key, contentType: RESOURCE, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name, name: resource.data.displayName }
+    each: { field: resource.data.createTime, op: age-gt, value: 90, threshold: gcp.apikeys.max-age-days }
+    evidence: "{name}: API key '{resource.data.displayName}' created {resource.data.createTime}"
+
+  # ---- organisation policies ----------------------------------------------------------------------
+  # Read from the organisation's own ORG_POLICY row. A boolean constraint passes only when an entry for it says
+  # enforced: true; an entry without "enforced" is an explicit "not enforced". A list constraint passes when it
+  # denies all values or names an allow or deny list.
+
+  - id: GCP-ORGPOLICY-NONE
+    title: No organisation policy is set on the organisation
+    kind: missing
+    category: CFG
+    severity: high
+    entity: instance
+    why: Organisation policies are the guardrails that stop public buckets, downloaded keys, external IPs and outside identities before anyone creates them. With none set, every project relies on each team getting every setting right.
+    fix: Set the baseline constraints below at the organisation (service account keys, uniform bucket access, public access prevention, domain restricted sharing, OS Login, serial ports, external IPs). At folder or project scope this rule also fires; see GCP-SCOPE-NOT-ORGANIZATION.
+    refs: [NIST-800-53:CM-2, NIST-800-53:CM-7, CIS-Controls-v8:4.1]
+    query: { protocol: http, path: /assets, params: { assetTypes: cloudresourcemanager.googleapis.com/Organization, contentType: ORG_POLICY, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name }
+    count: none
+    evidence: "no organisation policy found on the organisation"
+
+  - id: GCP-ORGPOLICY-SA-KEY-CREATION
+    title: Organisation policy does not block service account key creation
+    kind: missing
+    category: IAM
+    severity: medium
+    entity: organization
+    why: As long as anyone with the right role can download a service account key, long-lived credentials keep appearing in code, CI systems and laptops.
+    fix: Enforce iam.disableServiceAccountKeyCreation at the organisation; grant documented exceptions on individual projects.
+    refs: [CIS-GCP:1.4, NIST-800-53:IA-5, NIST-800-53:CM-7]
+    query: { protocol: http, path: /assets, params: { assetTypes: cloudresourcemanager.googleapis.com/Organization, contentType: ORG_POLICY, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name }
+    each:
+      not:
+        element:
+          of: orgPolicy
+          where:
+            all:
+              - { field: constraint, op: match, value: '^constraints/iam\.(managed\.)?disableServiceAccountKeyCreation$' }
+              - not: { any: [ { field: booleanPolicy.enforced, op: absent }, { field: booleanPolicy.enforced, op: ne, value: true } ] }
+    evidence: "{name}: iam.disableServiceAccountKeyCreation is not enforced"
+
+  - id: GCP-ORGPOLICY-SA-KEY-UPLOAD
+    title: Organisation policy does not block uploading service account keys
+    kind: missing
+    category: IAM
+    severity: low
+    entity: organization
+    why: An uploaded key's private half was generated outside Google; nobody can tell where it is kept or who holds it.
+    fix: Enforce iam.disableServiceAccountKeyUpload at the organisation.
+    refs: [NIST-800-53:IA-5, NIST-800-53:SC-12]
+    query: { protocol: http, path: /assets, params: { assetTypes: cloudresourcemanager.googleapis.com/Organization, contentType: ORG_POLICY, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name }
+    each:
+      not:
+        element:
+          of: orgPolicy
+          where:
+            all:
+              - { field: constraint, op: match, value: '^constraints/iam\.(managed\.)?disableServiceAccountKeyUpload$' }
+              - not: { any: [ { field: booleanPolicy.enforced, op: absent }, { field: booleanPolicy.enforced, op: ne, value: true } ] }
+    evidence: "{name}: iam.disableServiceAccountKeyUpload is not enforced"
+
+  - id: GCP-ORGPOLICY-DEFAULT-SA-GRANTS
+    title: Organisation policy does not stop automatic Editor grants to default service accounts
+    kind: missing
+    category: IAM
+    severity: medium
+    entity: organization
+    why: Without this constraint, every new project's default Compute Engine and App Engine service accounts receive Editor, and every VM or function that uses them inherits it.
+    fix: Enforce iam.automaticIamGrantsForDefaultServiceAccounts at the organisation (it affects new projects; fix existing ones with GCP-IAM-PROJECT-DEFAULT-SA-PRIVILEGED).
+    refs: [CIS-GCP:4.1, NIST-800-53:AC-6]
+    query: { protocol: http, path: /assets, params: { assetTypes: cloudresourcemanager.googleapis.com/Organization, contentType: ORG_POLICY, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name }
+    each:
+      not:
+        element:
+          of: orgPolicy
+          where:
+            all:
+              - { field: constraint, op: eq, value: constraints/iam.automaticIamGrantsForDefaultServiceAccounts }
+              - not: { any: [ { field: booleanPolicy.enforced, op: absent }, { field: booleanPolicy.enforced, op: ne, value: true } ] }
+    evidence: "{name}: iam.automaticIamGrantsForDefaultServiceAccounts is not enforced"
+
+  - id: GCP-ORGPOLICY-DOMAIN-RESTRICTED-SHARING
+    title: Organisation policy does not restrict IAM members to the organisation's own domains
+    kind: missing
+    category: IAM
+    severity: high
+    entity: organization
+    why: Without Domain Restricted Sharing anyone with setIamPolicy can grant access to a Gmail account, another company's users, or allUsers - the root of most public-data incidents.
+    fix: Set iam.allowedPolicyMemberDomains at the organisation to the organisation's own customer ID(s) (and any approved partner), with documented exceptions.
+    refs: [CIS-GCP:1.1, NIST-800-53:AC-3, NIST-800-53:AC-20]
+    query: { protocol: http, path: /assets, params: { assetTypes: cloudresourcemanager.googleapis.com/Organization, contentType: ORG_POLICY, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name }
+    each:
+      not:
+        element:
+          of: orgPolicy
+          where:
+            all:
+              - { field: constraint, op: eq, value: constraints/iam.allowedPolicyMemberDomains }
+              - any:
+                  - { field: listPolicy.allowedValues, op: notempty }
+                  - not: { any: [ { field: listPolicy.allValues, op: absent }, { field: listPolicy.allValues, op: ne, value: DENY } ] }
+    evidence: "{name}: iam.allowedPolicyMemberDomains is not restricted"
+
+  - id: GCP-ORGPOLICY-UNIFORM-BUCKET-ACCESS
+    title: Organisation policy does not require uniform bucket-level access
+    kind: missing
+    category: IAM
+    severity: medium
+    entity: organization
+    why: With object ACLs allowed, a single object can be made public or shared outside IAM, where bucket-level reviews never see it.
+    fix: Enforce storage.uniformBucketLevelAccess at the organisation.
+    refs: [CIS-GCP:5.2, NIST-800-53:AC-3]
+    query: { protocol: http, path: /assets, params: { assetTypes: cloudresourcemanager.googleapis.com/Organization, contentType: ORG_POLICY, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name }
+    each:
+      not:
+        element:
+          of: orgPolicy
+          where:
+            all:
+              - { field: constraint, op: eq, value: constraints/storage.uniformBucketLevelAccess }
+              - not: { any: [ { field: booleanPolicy.enforced, op: absent }, { field: booleanPolicy.enforced, op: ne, value: true } ] }
+    evidence: "{name}: storage.uniformBucketLevelAccess is not enforced"
+
+  - id: GCP-ORGPOLICY-PUBLIC-ACCESS-PREVENTION
+    title: Organisation policy does not enforce public access prevention on storage
+    kind: missing
+    category: IAM
+    severity: high
+    entity: organization
+    why: Public access prevention stops any bucket or object being granted to allUsers or allAuthenticatedUsers, whatever its IAM policy says. Without it, one wrong binding publishes data.
+    fix: Enforce storage.publicAccessPrevention at the organisation; carve out the few projects that serve public content.
+    refs: [CIS-GCP:5.1, NIST-800-53:AC-3, NIST-800-53:AC-22]
+    query: { protocol: http, path: /assets, params: { assetTypes: cloudresourcemanager.googleapis.com/Organization, contentType: ORG_POLICY, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name }
+    each:
+      not:
+        element:
+          of: orgPolicy
+          where:
+            all:
+              - { field: constraint, op: eq, value: constraints/storage.publicAccessPrevention }
+              - not: { any: [ { field: booleanPolicy.enforced, op: absent }, { field: booleanPolicy.enforced, op: ne, value: true } ] }
+    evidence: "{name}: storage.publicAccessPrevention is not enforced"
+
+  - id: GCP-ORGPOLICY-SKIP-DEFAULT-NETWORK
+    title: Organisation policy does not stop new projects getting the default network
+    kind: missing
+    category: CFG
+    severity: low
+    entity: organization
+    why: The default network comes with firewall rules that open SSH, RDP and ICMP from the internet; every new project that gets it starts exposed.
+    fix: Enforce compute.skipDefaultNetworkCreation at the organisation.
+    refs: [CIS-GCP:3.1, NIST-800-53:CM-7, NIST-800-53:SC-7]
+    query: { protocol: http, path: /assets, params: { assetTypes: cloudresourcemanager.googleapis.com/Organization, contentType: ORG_POLICY, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name }
+    each:
+      not:
+        element:
+          of: orgPolicy
+          where:
+            all:
+              - { field: constraint, op: eq, value: constraints/compute.skipDefaultNetworkCreation }
+              - not: { any: [ { field: booleanPolicy.enforced, op: absent }, { field: booleanPolicy.enforced, op: ne, value: true } ] }
+    evidence: "{name}: compute.skipDefaultNetworkCreation is not enforced"
+
+  - id: GCP-ORGPOLICY-REQUIRE-OS-LOGIN
+    title: Organisation policy does not require OS Login
+    kind: missing
+    category: AUT
+    severity: medium
+    entity: organization
+    why: Without OS Login, SSH access to VMs is granted by keys pasted into metadata, outside IAM, without MFA and without being revoked when a person leaves.
+    fix: Enforce compute.requireOsLogin at the organisation.
+    refs: [CIS-GCP:4.4, NIST-800-53:AC-2, NIST-800-53:IA-2]
+    query: { protocol: http, path: /assets, params: { assetTypes: cloudresourcemanager.googleapis.com/Organization, contentType: ORG_POLICY, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name }
+    each:
+      not:
+        element:
+          of: orgPolicy
+          where:
+            all:
+              - { field: constraint, op: match, value: '^constraints/compute\.(managed\.)?requireOsLogin$' }
+              - not: { any: [ { field: booleanPolicy.enforced, op: absent }, { field: booleanPolicy.enforced, op: ne, value: true } ] }
+    evidence: "{name}: compute.requireOsLogin is not enforced"
+
+  - id: GCP-ORGPOLICY-SERIAL-PORT
+    title: Organisation policy does not disable interactive serial port access
+    kind: missing
+    category: AUT
+    severity: medium
+    entity: organization
+    why: The interactive serial console accepts connections from any IP address and bypasses the VM's firewall rules.
+    fix: Enforce compute.disableSerialPortAccess at the organisation.
+    refs: [CIS-GCP:4.5, NIST-800-53:AC-17, NIST-800-53:CM-7]
+    query: { protocol: http, path: /assets, params: { assetTypes: cloudresourcemanager.googleapis.com/Organization, contentType: ORG_POLICY, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name }
+    each:
+      not:
+        element:
+          of: orgPolicy
+          where:
+            all:
+              - { field: constraint, op: match, value: '^constraints/compute\.(managed\.)?disableSerialPortAccess$' }
+              - not: { any: [ { field: booleanPolicy.enforced, op: absent }, { field: booleanPolicy.enforced, op: ne, value: true } ] }
+    evidence: "{name}: compute.disableSerialPortAccess is not enforced"
+
+  - id: GCP-ORGPOLICY-EXTERNAL-IP
+    title: Organisation policy does not restrict external IP addresses on VMs
+    kind: missing
+    category: CFG
+    severity: medium
+    entity: organization
+    why: Any VM can be given a public address, putting it straight on the internet and bypassing the network's planned entry points.
+    fix: Set compute.vmExternalIpAccess at the organisation to deny all, with an allow list of the instances that must have one.
+    refs: [CIS-GCP:4.9, NIST-800-53:SC-7]
+    query: { protocol: http, path: /assets, params: { assetTypes: cloudresourcemanager.googleapis.com/Organization, contentType: ORG_POLICY, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name }
+    each:
+      not:
+        element:
+          of: orgPolicy
+          where:
+            all:
+              - { field: constraint, op: match, value: '^constraints/compute\.(managed\.)?vmExternalIpAccess$' }
+              - any:
+                  - { field: listPolicy.allowedValues, op: notempty }
+                  - { field: listPolicy.deniedValues, op: notempty }
+                  - not: { any: [ { field: listPolicy.allValues, op: absent }, { field: listPolicy.allValues, op: ne, value: DENY } ] }
+    evidence: "{name}: compute.vmExternalIpAccess is not restricted"
+
+  - id: GCP-ORGPOLICY-REQUIRE-SHIELDED-VM
+    title: Organisation policy does not require Shielded VMs
+    kind: missing
+    category: CFG
+    severity: low
+    entity: organization
+    why: Shielded VM (secure boot, vTPM, integrity monitoring) defends against boot-level rootkits; without the constraint, images and instances without it can still be created.
+    fix: Enforce compute.requireShieldedVm at the organisation.
+    refs: [CIS-GCP:4.8, NIST-800-53:SI-7]
+    query: { protocol: http, path: /assets, params: { assetTypes: cloudresourcemanager.googleapis.com/Organization, contentType: ORG_POLICY, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name }
+    each:
+      not:
+        element:
+          of: orgPolicy
+          where:
+            all:
+              - { field: constraint, op: eq, value: constraints/compute.requireShieldedVm }
+              - not: { any: [ { field: booleanPolicy.enforced, op: absent }, { field: booleanPolicy.enforced, op: ne, value: true } ] }
+    evidence: "{name}: compute.requireShieldedVm is not enforced"
+
+  - id: GCP-ORGPOLICY-VM-IP-FORWARDING
+    title: Organisation policy does not restrict IP forwarding on VMs
+    kind: missing
+    category: CFG
+    severity: low
+    entity: organization
+    why: A VM that forwards packets can route traffic around firewall rules and act as an unplanned gateway.
+    fix: Set compute.vmCanIpForward at the organisation to deny all, allowing only the network appliances that need it.
+    refs: [CIS-GCP:4.6, NIST-800-53:SC-7]
+    query: { protocol: http, path: /assets, params: { assetTypes: cloudresourcemanager.googleapis.com/Organization, contentType: ORG_POLICY, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name }
+    each:
+      not:
+        element:
+          of: orgPolicy
+          where:
+            all:
+              - { field: constraint, op: match, value: '^constraints/compute\.(managed\.)?vmCanIpForward$' }
+              - any:
+                  - { field: listPolicy.allowedValues, op: notempty }
+                  - { field: listPolicy.deniedValues, op: notempty }
+                  - not: { any: [ { field: listPolicy.allValues, op: absent }, { field: listPolicy.allValues, op: ne, value: DENY } ] }
+    evidence: "{name}: compute.vmCanIpForward is not restricted"
+
+  - id: GCP-ORGPOLICY-SQL-PUBLIC-IP
+    title: Organisation policy does not restrict public IPs on Cloud SQL
+    kind: missing
+    category: CFG
+    severity: medium
+    entity: organization
+    why: Any Cloud SQL instance can be given a public address, one authorized-network mistake away from the internet.
+    fix: Enforce sql.restrictPublicIp at the organisation.
+    refs: [CIS-GCP:6.6, NIST-800-53:SC-7]
+    query: { protocol: http, path: /assets, params: { assetTypes: cloudresourcemanager.googleapis.com/Organization, contentType: ORG_POLICY, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name }
+    each:
+      not:
+        element:
+          of: orgPolicy
+          where:
+            all:
+              - { field: constraint, op: eq, value: constraints/sql.restrictPublicIp }
+              - not: { any: [ { field: booleanPolicy.enforced, op: absent }, { field: booleanPolicy.enforced, op: ne, value: true } ] }
+    evidence: "{name}: sql.restrictPublicIp is not enforced"
+
+  - id: GCP-ORGPOLICY-SQL-AUTHORIZED-NETWORKS
+    title: Organisation policy does not restrict Cloud SQL authorized networks
+    kind: missing
+    category: CFG
+    severity: medium
+    entity: organization
+    why: Authorized networks open a database's public address to a range of the internet; without the constraint anyone can add 0.0.0.0/0.
+    fix: Enforce sql.restrictAuthorizedNetworks at the organisation.
+    refs: [CIS-GCP:6.5, NIST-800-53:SC-7]
+    query: { protocol: http, path: /assets, params: { assetTypes: cloudresourcemanager.googleapis.com/Organization, contentType: ORG_POLICY, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name }
+    each:
+      not:
+        element:
+          of: orgPolicy
+          where:
+            all:
+              - { field: constraint, op: eq, value: constraints/sql.restrictAuthorizedNetworks }
+              - not: { any: [ { field: booleanPolicy.enforced, op: absent }, { field: booleanPolicy.enforced, op: ne, value: true } ] }
+    evidence: "{name}: sql.restrictAuthorizedNetworks is not enforced"
+
+  - id: GCP-ORGPOLICY-RESOURCE-LOCATIONS
+    title: Organisation policy does not restrict where resources may be created
+    kind: missing
+    lens: both
+    category: CFG
+    severity: low
+    entity: organization
+    why: Without a location restriction, data can be stored in any region, which may break residency obligations and spreads resources over regions nobody monitors.
+    fix: Set gcp.resourceLocations at the organisation to the approved regions or value groups.
+    refs: [NIST-800-53:SC-7, NIST-800-53:CM-7]
+    query: { protocol: http, path: /assets, params: { assetTypes: cloudresourcemanager.googleapis.com/Organization, contentType: ORG_POLICY, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name }
+    each:
+      not:
+        element:
+          of: orgPolicy
+          where:
+            all:
+              - { field: constraint, op: eq, value: constraints/gcp.resourceLocations }
+              - any:
+                  - { field: listPolicy.allowedValues, op: notempty }
+                  - { field: listPolicy.deniedValues, op: notempty }
+    evidence: "{name}: gcp.resourceLocations is not restricted"
+
+  - id: GCP-ORGPOLICY-CROSS-PROJECT-SA
+    title: Organisation policy allows service accounts to be used across projects
+    kind: missing
+    category: IAM
+    severity: low
+    entity: organization
+    why: When a service account can be attached to resources in other projects, a grant in one project quietly extends its reach into another, and project boundaries stop meaning isolation.
+    fix: Enforce iam.disableCrossProjectServiceAccountUsage at the organisation, excepting the projects that host shared service accounts.
+    refs: [NIST-800-53:AC-6, NIST-800-53:AC-4]
+    query: { protocol: http, path: /assets, params: { assetTypes: cloudresourcemanager.googleapis.com/Organization, contentType: ORG_POLICY, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name }
+    each:
+      not:
+        element:
+          of: orgPolicy
+          where:
+            all:
+              - { field: constraint, op: eq, value: constraints/iam.disableCrossProjectServiceAccountUsage }
+              - not: { any: [ { field: booleanPolicy.enforced, op: absent }, { field: booleanPolicy.enforced, op: ne, value: true } ] }
+    evidence: "{name}: iam.disableCrossProjectServiceAccountUsage is not enforced"
+
+  - id: GCP-ORGPOLICY-CONTACT-DOMAINS
+    title: Organisation policy does not restrict essential contacts to the organisation's domains
+    kind: missing
+    category: CFG
+    severity: low
+    entity: organization
+    why: Security and suspension notices can be routed to any address, including a personal mailbox or a former contractor.
+    fix: Set essentialcontacts.allowedContactDomains at the organisation to the organisation's own mail domains.
+    refs: [CIS-GCP:1.16, NIST-800-53:IR-6]
+    query: { protocol: http, path: /assets, params: { assetTypes: cloudresourcemanager.googleapis.com/Organization, contentType: ORG_POLICY, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name }
+    each:
+      not:
+        element:
+          of: orgPolicy
+          where:
+            all:
+              - { field: constraint, op: eq, value: constraints/essentialcontacts.allowedContactDomains }
+              - any:
+                  - { field: listPolicy.allowedValues, op: notempty }
+                  - { field: listPolicy.deniedValues, op: notempty }
+    evidence: "{name}: essentialcontacts.allowedContactDomains is not restricted"
+
+  - id: GCP-ORGPOLICY-PROJECT-OVERRIDE
+    title: Project turns off a security organisation policy
+    kind: misconfigured
+    category: CFG
+    severity: medium
+    entity: project
+    why: A project-level policy that sets a security constraint to not enforced, or allows all values, overrides the organisation's guardrail for everything in that project. Some exceptions are deliberate; each should be documented.
+    fix: Remove the project-level override, or record why the project needs the exception and review it.
+    refs: [NIST-800-53:CM-6, NIST-800-53:CM-3]
+    query: { protocol: http, path: /assets, params: { assetTypes: cloudresourcemanager.googleapis.com/Project, contentType: ORG_POLICY, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name }
+    each:
+      element:
+        of: orgPolicy
+        where:
+          any:
+            - all:
+                - { field: constraint, op: in, value: [constraints/iam.disableServiceAccountKeyCreation, constraints/iam.disableServiceAccountKeyUpload, constraints/iam.automaticIamGrantsForDefaultServiceAccounts, constraints/storage.uniformBucketLevelAccess, constraints/storage.publicAccessPrevention, constraints/compute.requireOsLogin, constraints/compute.disableSerialPortAccess, constraints/compute.requireShieldedVm, constraints/sql.restrictPublicIp, constraints/sql.restrictAuthorizedNetworks, constraints/compute.skipDefaultNetworkCreation] }
+                - { field: booleanPolicy, op: exists }
+                - any: [ { field: booleanPolicy.enforced, op: absent }, { field: booleanPolicy.enforced, op: eq, value: false } ]
+            - all:
+                - { field: constraint, op: in, value: [constraints/iam.allowedPolicyMemberDomains, constraints/compute.vmExternalIpAccess, constraints/compute.vmCanIpForward] }
+                - { field: listPolicy.allValues, op: eq, value: ALLOW }
+    evidence: "{name}: a project policy turns off one of the security constraints"
+
+  - id: GCP-ORGPOLICY-FOLDER-OVERRIDE
+    title: Folder turns off a security organisation policy
+    kind: misconfigured
+    category: CFG
+    severity: medium
+    entity: folder
+    why: A folder-level policy that sets a security constraint to not enforced, or allows all values, removes the organisation's guardrail for every project in the folder.
+    fix: Remove the folder-level override, or record why the folder needs the exception and review it.
+    refs: [NIST-800-53:CM-6, NIST-800-53:CM-3]
+    query: { protocol: http, path: /assets, params: { assetTypes: cloudresourcemanager.googleapis.com/Folder, contentType: ORG_POLICY, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name }
+    each:
+      element:
+        of: orgPolicy
+        where:
+          any:
+            - all:
+                - { field: constraint, op: in, value: [constraints/iam.disableServiceAccountKeyCreation, constraints/iam.disableServiceAccountKeyUpload, constraints/iam.automaticIamGrantsForDefaultServiceAccounts, constraints/storage.uniformBucketLevelAccess, constraints/storage.publicAccessPrevention, constraints/compute.requireOsLogin, constraints/compute.disableSerialPortAccess, constraints/compute.requireShieldedVm, constraints/sql.restrictPublicIp, constraints/sql.restrictAuthorizedNetworks, constraints/compute.skipDefaultNetworkCreation] }
+                - { field: booleanPolicy, op: exists }
+                - any: [ { field: booleanPolicy.enforced, op: absent }, { field: booleanPolicy.enforced, op: eq, value: false } ]
+            - all:
+                - { field: constraint, op: in, value: [constraints/iam.allowedPolicyMemberDomains, constraints/compute.vmExternalIpAccess, constraints/compute.vmCanIpForward] }
+                - { field: listPolicy.allValues, op: eq, value: ALLOW }
+    evidence: "{name}: a folder policy turns off one of the security constraints"
+
+  # ---- essential contacts --------------------------------------------------------------------------
+
+  - id: GCP-CONTACTS-NO-SECURITY
+    title: No essential contact receives security notifications
+    kind: missing
+    lens: both
+    category: MON
+    severity: medium
+    entity: instance
+    why: Google sends security bulletins, compromised-credential and abuse notices to essential contacts; without one for security (or all) categories they go to whoever happens to hold an owner role, or nowhere.
+    fix: Add a monitored group mailbox as an essential contact at the organisation for SECURITY (and TECHNICAL_INCIDENTS, SUSPENSION, LEGAL), or for ALL.
+    refs: [CIS-GCP:1.16, NIST-800-53:IR-6, NIST-800-53:SI-5]
+    query: { protocol: http, path: /assets, params: { assetTypes: essentialcontacts.googleapis.com/Contact, contentType: RESOURCE, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name }
+    count: { op: lt, value: 1, where: { field: resource.data.notificationCategorySubscriptions, op: in, value: [ALL, SECURITY] } }
+    evidence: "{count} essential contact(s) subscribed to security notifications"
+
+  - id: GCP-CONTACTS-NO-SUSPENSION
+    title: No essential contact receives suspension notifications
+    kind: missing
+    lens: both
+    category: MON
+    severity: medium
+    entity: instance
+    why: A project suspension (for abuse, a compromised key mining crypto, or billing) is announced to essential contacts; if nobody receives it, the first sign is the outage.
+    fix: Add a monitored group mailbox as an essential contact for SUSPENSION, or for ALL.
+    refs: [CIS-GCP:1.16, NIST-800-53:IR-6]
+    query: { protocol: http, path: /assets, params: { assetTypes: essentialcontacts.googleapis.com/Contact, contentType: RESOURCE, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name }
+    count: { op: lt, value: 1, where: { field: resource.data.notificationCategorySubscriptions, op: in, value: [ALL, SUSPENSION] } }
+    evidence: "{count} essential contact(s) subscribed to suspension notifications"
+
+  - id: GCP-CONTACTS-INVALID
+    title: Essential contact address is marked invalid
+    kind: broken
+    lens: both
+    category: MON
+    severity: low
+    entity: contact
+    why: Google marks a contact invalid when mail to it bounces; notifications sent there are lost.
+    fix: Correct or replace the contact's address and resend verification.
+    refs: [NIST-800-53:IR-6]
+    query: { protocol: http, path: /assets, params: { assetTypes: essentialcontacts.googleapis.com/Contact, contentType: RESOURCE, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name }
+    each: { field: resource.data.validationState, op: eq, value: INVALID }
+    evidence: "{name}: contact marked {resource.data.validationState}, categories {resource.data.notificationCategorySubscriptions}"
+
+  # ---- logging and monitoring ----------------------------------------------------------------------
+
+  - id: GCP-LOGGING-NO-FULL-SINK
+    title: No log sink exports all log entries
+    kind: missing
+    lens: both
+    category: LOG
+    severity: medium
+    entity: instance
+    why: Logs kept only in the default buckets expire after 30 days (audit admin logs after 400) and can be deleted by project owners. A sink with no filter copies everything to storage the organisation controls.
+    fix: Create an aggregated sink at the organisation (include children, empty filter) to a locked bucket, BigQuery dataset or Pub/Sub topic in a dedicated logging project.
+    refs: [CIS-GCP:2.2, NIST-800-53:AU-9, NIST-800-53:AU-11]
+    query: { protocol: http, path: /assets, params: { assetTypes: logging.googleapis.com/LogSink, contentType: RESOURCE, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name, name: resource.data.name }
+    count:
+      op: lt
+      value: 1
+      where:
+        all:
+          - { field: resource.data.filter, op: empty }
+          - any: [ { field: resource.data.disabled, op: absent }, { field: resource.data.disabled, op: eq, value: false } ]
+    evidence: "{count} enabled sink(s) without a filter"
+
+  - id: GCP-LOGGING-SINK-DISABLED
+    title: Log sink is disabled
+    kind: broken
+    lens: both
+    category: LOG
+    severity: low
+    entity: log-sink
+    why: A disabled sink exports nothing; if it was the copy of record, logs are expiring in the source buckets unnoticed.
+    fix: Re-enable the sink or delete it if it is no longer needed.
+    refs: [NIST-800-53:AU-9]
+    query: { protocol: http, path: /assets, params: { assetTypes: logging.googleapis.com/LogSink, contentType: RESOURCE, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name, name: resource.data.name }
+    each: { field: resource.data.disabled, op: eq, value: true }
+    evidence: "{name}: sink to {resource.data.destination} is disabled"
+
+  - id: GCP-MONITORING-METRIC-OWNERSHIP
+    title: No log-based metric watches project ownership changes
+    kind: missing
+    lens: both
+    category: MON
+    severity: medium
+    entity: instance
+    why: Adding an owner is the quickest way to take over a project; CIS expects a log metric and alert so the change is seen the day it happens. (Alert policies built directly on log-match conditions are not counted here.)
+    fix: Create a log-based metric on project ownership invitations and owner grants/removals, and an alert policy on it routed to the security team.
+    refs: [CIS-GCP:2.4, NIST-800-53:AU-6, NIST-800-53:SI-4]
+    query: { protocol: http, path: /assets, params: { assetTypes: logging.googleapis.com/LogMetric, contentType: RESOURCE, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name, name: resource.data.name }
+    count:
+      op: lt
+      value: 1
+      where:
+        all:
+          - { field: resource.data.filter, op: match, value: 'projectOwnerInvitee|roles/owner' }
+          - any: [ { field: resource.data.disabled, op: absent }, { field: resource.data.disabled, op: eq, value: false } ]
+    evidence: "{count} log metric(s) on ownership changes"
+
+  - id: GCP-MONITORING-METRIC-AUDIT-CONFIG
+    title: No log-based metric watches audit configuration changes
+    kind: missing
+    lens: both
+    category: MON
+    severity: medium
+    entity: instance
+    why: Turning off data-access logging is how an attacker hides what comes next; the change itself is logged and should alert.
+    fix: Create a log-based metric on SetIamPolicy calls that carry auditConfigDeltas, and an alert policy on it.
+    refs: [CIS-GCP:2.5, NIST-800-53:AU-6, NIST-800-53:AU-9]
+    query: { protocol: http, path: /assets, params: { assetTypes: logging.googleapis.com/LogMetric, contentType: RESOURCE, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name, name: resource.data.name }
+    count:
+      op: lt
+      value: 1
+      where:
+        all:
+          - { field: resource.data.filter, op: match, value: 'auditConfigDeltas' }
+          - any: [ { field: resource.data.disabled, op: absent }, { field: resource.data.disabled, op: eq, value: false } ]
+    evidence: "{count} log metric(s) on audit configuration changes"
+
+  - id: GCP-MONITORING-METRIC-CUSTOM-ROLE
+    title: No log-based metric watches custom role changes
+    kind: missing
+    lens: both
+    category: MON
+    severity: low
+    entity: instance
+    why: A custom role quietly widened with an escalation permission is a durable backdoor; creating, updating or deleting roles should alert.
+    fix: Create a log-based metric on resource.type="iam_role" CreateRole / UpdateRole / DeleteRole, and an alert policy on it.
+    refs: [CIS-GCP:2.6, NIST-800-53:AU-6, NIST-800-53:AC-2(4)]
+    query: { protocol: http, path: /assets, params: { assetTypes: logging.googleapis.com/LogMetric, contentType: RESOURCE, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name, name: resource.data.name }
+    count:
+      op: lt
+      value: 1
+      where:
+        all:
+          - { field: resource.data.filter, op: match, value: 'iam_role' }
+          - any: [ { field: resource.data.disabled, op: absent }, { field: resource.data.disabled, op: eq, value: false } ]
+    evidence: "{count} log metric(s) on custom role changes"
+
+  - id: GCP-MONITORING-METRIC-FIREWALL
+    title: No log-based metric watches VPC firewall rule changes
+    kind: missing
+    lens: both
+    category: MON
+    severity: medium
+    entity: instance
+    why: A new or widened firewall rule is how a host gets exposed to the internet; the change should alert.
+    fix: Create a log-based metric on resource.type="gce_firewall_rule" insert/patch/delete, and an alert policy on it.
+    refs: [CIS-GCP:2.7, NIST-800-53:AU-6, NIST-800-53:SC-7]
+    query: { protocol: http, path: /assets, params: { assetTypes: logging.googleapis.com/LogMetric, contentType: RESOURCE, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name, name: resource.data.name }
+    count:
+      op: lt
+      value: 1
+      where:
+        all:
+          - { field: resource.data.filter, op: match, value: 'gce_firewall_rule|compute\.firewalls\.' }
+          - any: [ { field: resource.data.disabled, op: absent }, { field: resource.data.disabled, op: eq, value: false } ]
+    evidence: "{count} log metric(s) on firewall rule changes"
+
+  - id: GCP-MONITORING-METRIC-ROUTE
+    title: No log-based metric watches VPC route changes
+    kind: missing
+    lens: both
+    category: MON
+    severity: low
+    entity: instance
+    why: A changed route can send traffic through an attacker-controlled instance or around inspection; the change should alert.
+    fix: Create a log-based metric on resource.type="gce_route" insert/delete, and an alert policy on it.
+    refs: [CIS-GCP:2.8, NIST-800-53:AU-6]
+    query: { protocol: http, path: /assets, params: { assetTypes: logging.googleapis.com/LogMetric, contentType: RESOURCE, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name, name: resource.data.name }
+    count:
+      op: lt
+      value: 1
+      where:
+        all:
+          - { field: resource.data.filter, op: match, value: 'gce_route|compute\.routes\.' }
+          - any: [ { field: resource.data.disabled, op: absent }, { field: resource.data.disabled, op: eq, value: false } ]
+    evidence: "{count} log metric(s) on route changes"
+
+  - id: GCP-MONITORING-METRIC-NETWORK
+    title: No log-based metric watches VPC network changes
+    kind: missing
+    lens: both
+    category: MON
+    severity: low
+    entity: instance
+    why: New networks, peerings and network deletions change what can reach what; they should alert.
+    fix: Create a log-based metric on resource.type="gce_network" insert/patch/delete/peering changes, and an alert policy on it.
+    refs: [CIS-GCP:2.9, NIST-800-53:AU-6]
+    query: { protocol: http, path: /assets, params: { assetTypes: logging.googleapis.com/LogMetric, contentType: RESOURCE, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name, name: resource.data.name }
+    count:
+      op: lt
+      value: 1
+      where:
+        all:
+          - { field: resource.data.filter, op: match, value: 'gce_network(?!_)|compute\.networks\.' }
+          - any: [ { field: resource.data.disabled, op: absent }, { field: resource.data.disabled, op: eq, value: false } ]
+    evidence: "{count} log metric(s) on network changes"
+
+  - id: GCP-MONITORING-METRIC-BUCKET-IAM
+    title: No log-based metric watches Cloud Storage IAM changes
+    kind: missing
+    lens: both
+    category: MON
+    severity: low
+    entity: instance
+    why: A bucket made public or shared outside is a data leak in one call; the permission change should alert.
+    fix: Create a log-based metric on resource.type="gcs_bucket" storage.setIamPermissions, and an alert policy on it.
+    refs: [CIS-GCP:2.10, NIST-800-53:AU-6]
+    query: { protocol: http, path: /assets, params: { assetTypes: logging.googleapis.com/LogMetric, contentType: RESOURCE, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name, name: resource.data.name }
+    count:
+      op: lt
+      value: 1
+      where:
+        all:
+          - { field: resource.data.filter, op: match, value: 'storage\.setIamPermissions' }
+          - any: [ { field: resource.data.disabled, op: absent }, { field: resource.data.disabled, op: eq, value: false } ]
+    evidence: "{count} log metric(s) on bucket IAM changes"
+
+  - id: GCP-MONITORING-METRIC-SQL-CONFIG
+    title: No log-based metric watches Cloud SQL configuration changes
+    kind: missing
+    lens: both
+    category: MON
+    severity: low
+    entity: instance
+    why: Turning on a public IP, adding an authorized network or switching off backups on a database are changes that should alert.
+    fix: Create a log-based metric on cloudsql.instances.update, and an alert policy on it.
+    refs: [CIS-GCP:2.11, NIST-800-53:AU-6]
+    query: { protocol: http, path: /assets, params: { assetTypes: logging.googleapis.com/LogMetric, contentType: RESOURCE, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name, name: resource.data.name }
+    count:
+      op: lt
+      value: 1
+      where:
+        all:
+          - { field: resource.data.filter, op: match, value: 'cloudsql\.instances\.update' }
+          - any: [ { field: resource.data.disabled, op: absent }, { field: resource.data.disabled, op: eq, value: false } ]
+    evidence: "{count} log metric(s) on Cloud SQL configuration changes"
+
+  - id: GCP-MONITORING-NO-LOG-ALERT
+    title: No enabled alert policy is built on logs
+    kind: missing
+    lens: both
+    category: MON
+    severity: medium
+    entity: instance
+    why: Log-based metrics only count; nothing reaches a person until an alert policy fires on one (or on a log match). With no such policy, every CIS change-monitoring metric is silent.
+    fix: Create enabled alert policies on the change-monitoring log metrics (or log-match conditions), each with a notification channel.
+    refs: [CIS-GCP:2.4, CIS-GCP:2.7, NIST-800-53:SI-4, NIST-800-53:IR-6]
+    query: { protocol: http, path: /assets, params: { assetTypes: monitoring.googleapis.com/AlertPolicy, contentType: RESOURCE, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name, name: resource.data.displayName }
+    count:
+      op: lt
+      value: 1
+      where:
+        all:
+          - { field: resource.data.enabled, op: eq, value: true }
+          - any:
+              - { field: "resource.data.conditions[].conditionThreshold.filter", op: match, value: 'logging\.googleapis\.com/user/' }
+              - { field: "resource.data.conditions[].conditionMatchedLog.filter", op: notempty }
+    evidence: "{count} enabled alert polic(ies) on log metrics or log matches"
+
+  - id: GCP-MONITORING-ALERT-NO-CHANNEL
+    title: Enabled alert policy notifies nobody
+    kind: misconfigured
+    lens: both
+    category: MON
+    severity: low
+    entity: alert-policy
+    why: An alert policy without a notification channel opens incidents that only someone already looking at the console will see.
+    fix: Attach a notification channel (a group mailbox, chat or paging integration) to the policy, or delete it.
+    refs: [NIST-800-53:IR-6, NIST-800-53:SI-4]
+    query: { protocol: http, path: /assets, params: { assetTypes: monitoring.googleapis.com/AlertPolicy, contentType: RESOURCE, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name, name: resource.data.displayName }
+    each:
+      all:
+        - { field: resource.data.enabled, op: eq, value: true }
+        - { field: resource.data.notificationChannels, op: empty }
+    evidence: "{resource.data.displayName}: enabled with no notification channel"
+
+  # ---- VPC networks and subnets --------------------------------------------------------------------
+
+  - id: GCP-NETWORK-DEFAULT-EXISTS
+    title: Project still has the default network
+    kind: misconfigured
+    category: CFG
+    severity: medium
+    entity: network
+    why: The auto-created default network spans every region and comes with firewall rules that allow SSH, RDP and ICMP from anywhere; workloads end up in it by accident.
+    fix: Move workloads to a custom-mode network with planned ranges and firewall rules, then delete the default network; enforce compute.skipDefaultNetworkCreation.
+    refs: [CIS-GCP:3.1, NIST-800-53:SC-7, NIST-800-53:CM-7]
+    query: { protocol: http, path: /assets, params: { assetTypes: compute.googleapis.com/Network, contentType: RESOURCE, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name, name: resource.data.name }
+    each: { field: resource.data.name, op: eq, value: default }
+    evidence: "{name}: default network present"
+
+  - id: GCP-NETWORK-LEGACY
+    title: Legacy (non-subnet) VPC network
+    kind: misconfigured
+    lens: both
+    category: LCM
+    severity: medium
+    entity: network
+    why: A legacy network has one global range and no subnets, so it cannot have VPC flow logs, Private Google Access or per-region ranges, and many newer features do not support it.
+    fix: Migrate the workloads to a VPC network with subnets and delete the legacy network.
+    refs: [CIS-GCP:3.2, NIST-800-53:SC-7]
+    query: { protocol: http, path: /assets, params: { assetTypes: compute.googleapis.com/Network, contentType: RESOURCE, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name, name: resource.data.name }
+    each: { field: resource.data.IPv4Range, op: exists }
+    evidence: "{name}: legacy network with range {resource.data.IPv4Range}"
+
+  - id: GCP-SUBNET-FLOW-LOGS-OFF
+    title: Subnet has VPC flow logs turned off
+    kind: missing
+    lens: both
+    category: LOG
+    severity: medium
+    entity: subnetwork
+    why: Without flow logs there is no record of which addresses talked to which, on what port - the first thing an incident responder asks for.
+    fix: Turn on flow logs for the subnet (5-second aggregation, full sampling and all metadata for CIS; a lower sampling rate where cost matters).
+    refs: [CIS-GCP:3.8, NIST-800-53:AU-12, NIST-800-53:SI-4]
+    query: { protocol: http, path: /assets, params: { assetTypes: compute.googleapis.com/Subnetwork, contentType: RESOURCE, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name, name: resource.data.name }
+    each:
+      all:
+        - any: [ { field: resource.data.purpose, op: absent }, { field: resource.data.purpose, op: eq, value: PRIVATE } ]
+        - any: [ { field: resource.data.logConfig.enable, op: absent }, { field: resource.data.logConfig.enable, op: eq, value: false } ]
+        - any: [ { field: resource.data.enableFlowLogs, op: absent }, { field: resource.data.enableFlowLogs, op: eq, value: false } ]
+    evidence: "{name}: flow logs off ({resource.data.ipCidrRange})"
+
+  - id: GCP-SUBNET-PRIVATE-GOOGLE-ACCESS-OFF
+    title: Subnet has Private Google Access turned off
+    kind: misconfigured
+    lens: both
+    category: CFG
+    severity: low
+    entity: subnetwork
+    why: Without Private Google Access, VMs without public addresses cannot reach Google APIs, so teams give them public IPs or a NAT path instead.
+    fix: Turn on Private Google Access on the subnet.
+    refs: [NIST-800-53:SC-7]
+    query: { protocol: http, path: /assets, params: { assetTypes: compute.googleapis.com/Subnetwork, contentType: RESOURCE, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name, name: resource.data.name }
+    each:
+      all:
+        - any: [ { field: resource.data.purpose, op: absent }, { field: resource.data.purpose, op: eq, value: PRIVATE } ]
+        - any: [ { field: resource.data.privateIpGoogleAccess, op: absent }, { field: resource.data.privateIpGoogleAccess, op: eq, value: false } ]
+    evidence: "{name}: Private Google Access off ({resource.data.ipCidrRange})"
+
+  # ---- VPC firewall rules ---------------------------------------------------------------------------
+  # Each "from the internet" rule is an enabled INGRESS allow rule whose source ranges include 0.0.0.0/0 or ::/0.
+  # Port rules match a port listed on its own ("22"); a rule allowing a whole protocol is GCP-FIREWALL-INTERNET-ALL-PORTS
+  # and a range ("20-30") is GCP-FIREWALL-INTERNET-PORT-RANGE.
+
+  - id: GCP-FIREWALL-INTERNET-ALL-PORTS
+    title: Firewall rule allows every port from the internet
+    kind: misconfigured
+    category: CFG
+    severity: critical
+    entity: firewall-rule
+    why: An allow rule for all protocols, or for TCP/UDP with no port list, from 0.0.0.0/0 exposes every service on the targeted instances - databases, admin consoles, agents - to the whole internet.
+    fix: Replace the rule with specific ports from specific source ranges; use Identity-Aware Proxy (35.235.240.0/20) or a VPN for administration.
+    refs: [CIS-GCP:3.6, CIS-GCP:3.7, NIST-800-53:SC-7, NIST-800-53:AC-17]
+    query: { protocol: http, path: /assets, params: { assetTypes: compute.googleapis.com/Firewall, contentType: RESOURCE, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name, name: resource.data.name }
+    each:
+      all:
+        - { field: resource.data.direction, op: eq, value: INGRESS }
+        - any: [ { field: resource.data.disabled, op: absent }, { field: resource.data.disabled, op: eq, value: false } ]
+        - { field: resource.data.sourceRanges, op: in, value: ["0.0.0.0/0", "::/0"] }
+        - element:
+            of: resource.data.allowed
+            where:
+              any:
+                - { field: IPProtocol, op: eq, value: all }
+                - all:
+                    - { field: IPProtocol, op: in, value: [tcp, udp, sctp, "6", "17"] }
+                    - { field: ports, op: absent }
+    evidence: "{resource.data.name} on {resource.data.network}: all ports open to {resource.data.sourceRanges}"
+
+  - id: GCP-FIREWALL-INTERNET-SSH
+    title: Firewall rule allows SSH from the internet
+    kind: misconfigured
+    category: CFG
+    severity: high
+    entity: firewall-rule
+    why: SSH open to 0.0.0.0/0 is scanned and brute-forced within minutes of exposure; a weak key, a leaked key or an sshd vulnerability is then a direct way in.
+    fix: Restrict the source to Identity-Aware Proxy (35.235.240.0/20), a VPN or bastion range; use OS Login.
+    refs: [CIS-GCP:3.6, NIST-800-53:SC-7, NIST-800-53:AC-17, MITRE-ATTACK:T1133]
+    query: { protocol: http, path: /assets, params: { assetTypes: compute.googleapis.com/Firewall, contentType: RESOURCE, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name, name: resource.data.name }
+    each:
+      all:
+        - { field: resource.data.direction, op: eq, value: INGRESS }
+        - any: [ { field: resource.data.disabled, op: absent }, { field: resource.data.disabled, op: eq, value: false } ]
+        - { field: resource.data.sourceRanges, op: in, value: ["0.0.0.0/0", "::/0"] }
+        - element:
+            of: resource.data.allowed
+            where:
+              all:
+                - { field: IPProtocol, op: in, value: [tcp, "6"] }
+                - { field: ports, op: in, value: ["22"] }
+    evidence: "{resource.data.name} on {resource.data.network}: tcp/22 open to {resource.data.sourceRanges}"
+
+  - id: GCP-FIREWALL-INTERNET-RDP
+    title: Firewall rule allows RDP from the internet
+    kind: misconfigured
+    category: CFG
+    severity: high
+    entity: firewall-rule
+    why: RDP open to 0.0.0.0/0 is one of the most common ransomware entry points - password spraying and RDP vulnerabilities need nothing more.
+    fix: Restrict the source to Identity-Aware Proxy (35.235.240.0/20), a VPN or bastion range.
+    refs: [CIS-GCP:3.7, NIST-800-53:SC-7, NIST-800-53:AC-17, MITRE-ATTACK:T1133]
+    query: { protocol: http, path: /assets, params: { assetTypes: compute.googleapis.com/Firewall, contentType: RESOURCE, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name, name: resource.data.name }
+    each:
+      all:
+        - { field: resource.data.direction, op: eq, value: INGRESS }
+        - any: [ { field: resource.data.disabled, op: absent }, { field: resource.data.disabled, op: eq, value: false } ]
+        - { field: resource.data.sourceRanges, op: in, value: ["0.0.0.0/0", "::/0"] }
+        - element:
+            of: resource.data.allowed
+            where:
+              all:
+                - { field: IPProtocol, op: in, value: [tcp, udp, "6", "17"] }
+                - { field: ports, op: in, value: ["3389"] }
+    evidence: "{resource.data.name} on {resource.data.network}: 3389 open to {resource.data.sourceRanges}"
+
+  - id: GCP-FIREWALL-INTERNET-DATABASE
+    title: Firewall rule allows a database or cache port from the internet
+    kind: misconfigured
+    category: CFG
+    severity: high
+    entity: firewall-rule
+    why: Database and cache engines (SQL Server, Oracle, MySQL, PostgreSQL, MongoDB, Redis, Elasticsearch, Cassandra, CouchDB, Memcached...) are not built to face the internet; exposed ones are found and ransomed by automated scans.
+    fix: Remove internet access to the port; reach the database over private addresses, a VPN or a managed proxy.
+    refs: [NIST-800-53:SC-7, NIST-800-53:AC-4, MITRE-ATTACK:T1190]
+    query: { protocol: http, path: /assets, params: { assetTypes: compute.googleapis.com/Firewall, contentType: RESOURCE, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name, name: resource.data.name }
+    each:
+      all:
+        - { field: resource.data.direction, op: eq, value: INGRESS }
+        - any: [ { field: resource.data.disabled, op: absent }, { field: resource.data.disabled, op: eq, value: false } ]
+        - { field: resource.data.sourceRanges, op: in, value: ["0.0.0.0/0", "::/0"] }
+        - element:
+            of: resource.data.allowed
+            where:
+              all:
+                - { field: IPProtocol, op: in, value: [tcp, "6"] }
+                - { field: ports, op: in, value: ["1433", "1434", "1521", "3306", "5432", "6379", "7000", "7001", "7199", "8529", "9042", "9160", "9200", "9300", "11211", "27017", "27018", "27019", "28017", "5984", "7210", "50000"] }
+    evidence: "{resource.data.name} on {resource.data.network}: database port(s) {resource.data.allowed[].ports} open to {resource.data.sourceRanges}"
+
+  - id: GCP-FIREWALL-INTERNET-ADMIN-SERVICES
+    title: Firewall rule allows Windows sharing, clear-text administration or a container API from the internet
+    kind: misconfigured
+    category: CFG
+    severity: high
+    entity: firewall-rule
+    why: RPC, NetBIOS and SMB invite relay attacks and wormable vulnerabilities; Telnet, FTP, VNC and WinRM send credentials in clear text or are weakly authenticated; an exposed Docker daemon, kubelet or etcd gives remote code execution or the cluster's secrets. None of them belongs on the internet.
+    fix: Remove internet access to ports 20-21, 23, 135, 137-139, 445, 5800, 5900, 5985-5986, 2375-2376, 2379-2380, 6443, 10250 and 10255; reach them over Identity-Aware Proxy, a VPN or private networks.
+    refs: [NIST-800-53:SC-7, NIST-800-53:SC-8, NIST-800-53:AC-17, MITRE-ATTACK:T1210, MITRE-ATTACK:T1190]
+    query: { protocol: http, path: /assets, params: { assetTypes: compute.googleapis.com/Firewall, contentType: RESOURCE, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name, name: resource.data.name }
+    each:
+      all:
+        - { field: resource.data.direction, op: eq, value: INGRESS }
+        - any: [ { field: resource.data.disabled, op: absent }, { field: resource.data.disabled, op: eq, value: false } ]
+        - { field: resource.data.sourceRanges, op: in, value: ["0.0.0.0/0", "::/0"] }
+        - element:
+            of: resource.data.allowed
+            where:
+              all:
+                - { field: IPProtocol, op: in, value: [tcp, udp, "6", "17"] }
+                - { field: ports, op: in, value: ["20", "21", "23", "135", "137", "138", "139", "137-139", "445", "5800", "5900", "5985", "5986", "2375", "2376", "2379", "2380", "6443", "10250", "10255"] }
+    evidence: "{resource.data.name} on {resource.data.network}: port(s) {resource.data.allowed[].ports} open to {resource.data.sourceRanges}"
+
+  - id: GCP-FIREWALL-INTERNET-PORT-RANGE
+    title: Firewall rule allows a port range from the internet
+    kind: misconfigured
+    category: CFG
+    severity: medium
+    entity: firewall-rule
+    why: A port range from 0.0.0.0/0 exposes whatever happens to listen in it, now or later - including the administration and database ports the specific rules look for.
+    fix: Replace the range with the individual ports the service needs, from the narrowest source ranges.
+    refs: [NIST-800-53:SC-7, NIST-800-53:CM-7]
+    query: { protocol: http, path: /assets, params: { assetTypes: compute.googleapis.com/Firewall, contentType: RESOURCE, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name, name: resource.data.name }
+    each:
+      all:
+        - { field: resource.data.direction, op: eq, value: INGRESS }
+        - any: [ { field: resource.data.disabled, op: absent }, { field: resource.data.disabled, op: eq, value: false } ]
+        - { field: resource.data.sourceRanges, op: in, value: ["0.0.0.0/0", "::/0"] }
+        - { field: "resource.data.allowed[].ports", op: match, value: '^\d+-\d+$' }
+    evidence: "{resource.data.name} on {resource.data.network}: range(s) {resource.data.allowed[].ports} open to {resource.data.sourceRanges}"
+
+  - id: GCP-FIREWALL-INTERNET-ANY
+    title: Firewall rule allows inbound traffic from the internet
+    kind: misconfigured
+    category: CFG
+    severity: low
+    entity: firewall-rule
+    why: Every rule open to 0.0.0.0/0 is part of the internet attack surface. Web ports on a load balancer's backends are often intended; the list is what to review.
+    fix: Confirm each internet-facing rule has an owner and a reason; narrow the source ranges where the service is not public; put public web services behind a load balancer with Cloud Armor.
+    refs: [NIST-800-53:SC-7, NIST-800-53:CM-7]
+    query: { protocol: http, path: /assets, params: { assetTypes: compute.googleapis.com/Firewall, contentType: RESOURCE, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name, name: resource.data.name }
+    each:
+      all:
+        - { field: resource.data.direction, op: eq, value: INGRESS }
+        - any: [ { field: resource.data.disabled, op: absent }, { field: resource.data.disabled, op: eq, value: false } ]
+        - { field: resource.data.sourceRanges, op: in, value: ["0.0.0.0/0", "::/0"] }
+        - { field: resource.data.allowed, op: notempty }
+    evidence: "{resource.data.name} on {resource.data.network}: allows {resource.data.allowed[].IPProtocol} {resource.data.allowed[].ports} from {resource.data.sourceRanges}"
+
+  - id: GCP-FIREWALL-LOGGING-OFF
+    title: Firewall rule does not log its matches
+    kind: missing
+    lens: both
+    category: LOG
+    severity: low
+    entity: firewall-rule
+    why: Without firewall rule logging there is no record of what a rule allowed or denied, so an exposure cannot be traced or measured.
+    fix: Turn on logging for the rule (at least for rules open to the internet and for deny rules).
+    refs: [NIST-800-53:AU-12, NIST-800-53:SC-7]
+    query: { protocol: http, path: /assets, params: { assetTypes: compute.googleapis.com/Firewall, contentType: RESOURCE, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name, name: resource.data.name }
+    each:
+      all:
+        - any: [ { field: resource.data.disabled, op: absent }, { field: resource.data.disabled, op: eq, value: false } ]
+        - any: [ { field: resource.data.logConfig.enable, op: absent }, { field: resource.data.logConfig.enable, op: eq, value: false } ]
+    evidence: "{resource.data.name} on {resource.data.network}: logging off"
+
+  # ---- Cloud DNS -----------------------------------------------------------------------------------
+
+  - id: GCP-DNS-DNSSEC-OFF
+    title: Public DNS zone has DNSSEC turned off
+    kind: misconfigured
+    category: CFG
+    severity: medium
+    entity: dns-zone
+    why: Without DNSSEC, resolvers cannot tell a forged answer from a real one, so the zone's names can be spoofed through cache poisoning.
+    fix: Turn on DNSSEC for the zone and publish the DS record at the registrar.
+    refs: [CIS-GCP:3.3, NIST-800-53:SC-20]
+    query: { protocol: http, path: /assets, params: { assetTypes: dns.googleapis.com/ManagedZone, contentType: RESOURCE, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name, name: resource.data.dnsName }
+    each:
+      all:
+        - any: [ { field: resource.data.visibility, op: absent }, { field: resource.data.visibility, op: eq, value: public } ]
+        - any: [ { field: resource.data.dnssecConfig.state, op: absent }, { field: resource.data.dnssecConfig.state, op: ne, value: "on" } ]
+    evidence: "{resource.data.dnsName}: DNSSEC state {resource.data.dnssecConfig.state}"
+
+  - id: GCP-DNS-DNSSEC-RSASHA1
+    title: DNSSEC zone signs with RSASHA1
+    kind: misconfigured
+    category: PKI
+    severity: medium
+    entity: dns-zone
+    why: SHA-1 signatures are no longer collision-resistant; CIS asks that neither the key-signing nor the zone-signing key use RSASHA1.
+    fix: Change the zone's DNSSEC key specs to RSASHA256 (or ECDSAP256SHA256) - this needs DNSSEC turned off and on again, or a key rollover.
+    refs: [CIS-GCP:3.4, CIS-GCP:3.5, NIST-800-53:SC-13, NIST-800-53:SC-20]
+    query: { protocol: http, path: /assets, params: { assetTypes: dns.googleapis.com/ManagedZone, contentType: RESOURCE, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name, name: resource.data.dnsName }
+    each:
+      all:
+        - { field: resource.data.dnssecConfig.state, op: eq, value: "on" }
+        - { field: "resource.data.dnssecConfig.defaultKeySpecs[].algorithm", op: eq, value: rsasha1 }
+    evidence: "{resource.data.dnsName}: key algorithms {resource.data.dnssecConfig.defaultKeySpecs[].algorithm}"
+
+  - id: GCP-DNS-POLICY-LOGGING-OFF
+    title: DNS server policy for VPC networks does not log queries
+    kind: missing
+    lens: both
+    category: LOG
+    severity: medium
+    entity: dns-policy
+    why: VPC DNS logging records every name the network's VMs resolve - the trail that shows malware calling home or data leaving through DNS.
+    fix: Turn on logging (enableLogging) in the DNS policy attached to the networks.
+    refs: [CIS-GCP:2.12, NIST-800-53:AU-12, NIST-800-53:SI-4]
+    query: { protocol: http, path: /assets, params: { assetTypes: dns.googleapis.com/Policy, contentType: RESOURCE, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name, name: resource.data.name }
+    each:
+      all:
+        - { field: resource.data.networks, op: notempty }
+        - any: [ { field: resource.data.enableLogging, op: absent }, { field: resource.data.enableLogging, op: eq, value: false } ]
+    evidence: "{resource.data.name}: logging off for networks {resource.data.networks[].networkUrl}"
+
+  - id: GCP-DNS-NO-LOGGING-POLICY
+    title: No DNS policy logs VPC queries anywhere
+    kind: missing
+    lens: both
+    category: LOG
+    severity: medium
+    entity: instance
+    why: VPC DNS queries are logged only through a DNS server policy with logging on, attached to the network. With none in the scope, no network's lookups are recorded.
+    fix: Create a DNS policy with enableLogging on and attach it to every VPC network.
+    refs: [CIS-GCP:2.12, NIST-800-53:AU-12]
+    query: { protocol: http, path: /assets, params: { assetTypes: dns.googleapis.com/Policy, contentType: RESOURCE, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name, name: resource.data.name }
+    count: { op: lt, value: 1, where: { all: [ { field: resource.data.enableLogging, op: eq, value: true }, { field: resource.data.networks, op: notempty } ] } }
+    evidence: "{count} DNS polic(ies) with logging attached to a network"
+
+  # ---- load balancing, TLS and Cloud Armor ---------------------------------------------------------
+
+  - id: GCP-SSL-POLICY-WEAK
+    title: SSL policy allows TLS below 1.2 or the compatible cipher profile
+    kind: misconfigured
+    category: PKI
+    severity: medium
+    entity: ssl-policy
+    why: TLS 1.0 and 1.1 and the COMPATIBLE profile's ciphers are deprecated and fail most compliance baselines; clients that need them are rare.
+    fix: Set the policy to minimum TLS 1.2 with the MODERN or RESTRICTED profile.
+    refs: [CIS-GCP:3.9, NIST-800-53:SC-8, NIST-800-53:SC-13]
+    query: { protocol: http, path: /assets, params: { assetTypes: compute.googleapis.com/SslPolicy, contentType: RESOURCE, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name, name: resource.data.name }
+    each:
+      any:
+        - { field: resource.data.minTlsVersion, op: in, value: [TLS_1_0, TLS_1_1] }
+        - { field: resource.data.minTlsVersion, op: absent }
+        - { field: resource.data.profile, op: eq, value: COMPATIBLE }
+    evidence: "{resource.data.name}: minimum {resource.data.minTlsVersion}, profile {resource.data.profile}"
+
+  - id: GCP-HTTPS-PROXY-DEFAULT-SSL-POLICY
+    title: HTTPS load balancer uses the default SSL policy
+    kind: misconfigured
+    category: PKI
+    severity: medium
+    entity: https-proxy
+    why: With no SSL policy attached, the load balancer accepts TLS 1.0 with the COMPATIBLE cipher set.
+    fix: Attach an SSL policy with minimum TLS 1.2 and the MODERN or RESTRICTED profile.
+    refs: [CIS-GCP:3.9, NIST-800-53:SC-8]
+    query: { protocol: http, path: /assets, params: { assetTypes: compute.googleapis.com/TargetHttpsProxy, contentType: RESOURCE, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name, name: resource.data.name }
+    each: { field: resource.data.sslPolicy, op: absent }
+    evidence: "{resource.data.name}: no SSL policy (TLS 1.0 allowed)"
+
+  - id: GCP-SSL-PROXY-DEFAULT-SSL-POLICY
+    title: SSL proxy load balancer uses the default SSL policy
+    kind: misconfigured
+    category: PKI
+    severity: medium
+    entity: ssl-proxy
+    why: With no SSL policy attached, the proxy accepts TLS 1.0 with the COMPATIBLE cipher set.
+    fix: Attach an SSL policy with minimum TLS 1.2 and the MODERN or RESTRICTED profile.
+    refs: [CIS-GCP:3.9, NIST-800-53:SC-8]
+    query: { protocol: http, path: /assets, params: { assetTypes: compute.googleapis.com/TargetSslProxy, contentType: RESOURCE, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name, name: resource.data.name }
+    each: { field: resource.data.sslPolicy, op: absent }
+    evidence: "{resource.data.name}: no SSL policy (TLS 1.0 allowed)"
+
+  - id: GCP-BACKEND-SERVICE-LOGGING-OFF
+    title: External HTTP(S) load balancer backend does not log requests
+    kind: missing
+    lens: both
+    category: LOG
+    severity: low
+    entity: backend-service
+    why: Load balancer request logs are the record of who called the service, from where and with what result - essential for investigating abuse of a public application.
+    fix: Turn on logging on the backend service (a sample rate below 1.0 is fine where volume is high).
+    refs: [CIS-GCP:2.16, NIST-800-53:AU-12]
+    query: { protocol: http, path: /assets, params: { assetTypes: compute.googleapis.com/BackendService, contentType: RESOURCE, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name, name: resource.data.name }
+    each:
+      all:
+        - { field: resource.data.loadBalancingScheme, op: in, value: [EXTERNAL, EXTERNAL_MANAGED] }
+        - { field: resource.data.protocol, op: in, value: [HTTP, HTTPS, HTTP2] }
+        - any: [ { field: resource.data.logConfig.enable, op: absent }, { field: resource.data.logConfig.enable, op: eq, value: false } ]
+    evidence: "{resource.data.name}: request logging off"
+
+  - id: GCP-BACKEND-SERVICE-NO-CLOUD-ARMOR
+    title: External HTTP(S) load balancer backend has no Cloud Armor policy
+    kind: missing
+    category: CFG
+    severity: low
+    entity: backend-service
+    why: Without a security policy the public service has no WAF rules, rate limiting or IP blocking in front of it.
+    fix: Attach a Cloud Armor security policy with the preconfigured WAF rules and a rate limit.
+    refs: [NIST-800-53:SC-7, NIST-800-53:SC-5]
+    query: { protocol: http, path: /assets, params: { assetTypes: compute.googleapis.com/BackendService, contentType: RESOURCE, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name, name: resource.data.name }
+    each:
+      all:
+        - { field: resource.data.loadBalancingScheme, op: in, value: [EXTERNAL, EXTERNAL_MANAGED] }
+        - { field: resource.data.protocol, op: in, value: [HTTP, HTTPS, HTTP2] }
+        - { field: resource.data.securityPolicy, op: absent }
+    evidence: "{resource.data.name}: no Cloud Armor policy"
+
+  - id: GCP-CERTIFICATE-EXPIRY
+    title: Load balancer certificate expires soon
+    kind: broken
+    lens: both
+    category: PKI
+    severity:
+      daysLeft: resource.data.expireTime
+      ranges: [ { max: 0, value: critical }, { max: 14, value: high }, { max: 30, value: medium } ]
+      default: low
+    entity: certificate
+    deadline: resource.data.expireTime
+    why: When the certificate expires, every client of the load balancer gets a TLS error. Self-managed certificates are not renewed by Google.
+    fix: Renew and upload the certificate, or switch to a Google-managed certificate; remove certificates no proxy uses.
+    refs: [NIST-800-53:SC-17]
+    query: { protocol: http, path: /assets, params: { assetTypes: compute.googleapis.com/SslCertificate, contentType: RESOURCE, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name, name: resource.data.name }
+    each: { field: resource.data.expireTime, op: until-lt, value: 45, threshold: gcp.certificates.notice-days }
+    evidence: "{resource.data.name} ({resource.data.type}): expires {resource.data.expireTime}"
+
+  - id: GCP-CERTIFICATE-MANAGED-NOT-ACTIVE
+    title: Google-managed certificate is not active
+    kind: broken
+    lens: both
+    category: PKI
+    severity: medium
+    entity: certificate
+    why: A managed certificate stuck in provisioning or failed (usually because DNS does not point at the load balancer) is not served, so the domains it covers get errors or the old certificate.
+    fix: Check the domain status in the certificate, fix the DNS records so they resolve to the load balancer, or remove the unused certificate.
+    refs: [NIST-800-53:SC-17]
+    query: { protocol: http, path: /assets, params: { assetTypes: compute.googleapis.com/SslCertificate, contentType: RESOURCE, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name, name: resource.data.name }
+    each:
+      all:
+        - { field: resource.data.type, op: eq, value: MANAGED }
+        - { field: resource.data.managed.status, op: ne, value: ACTIVE }
+    evidence: "{resource.data.name}: managed certificate status {resource.data.managed.status}"
+
+  - id: GCP-ADDRESS-UNUSED
+    title: Reserved external IP address is not in use
+    kind: misconfigured
+    lens: maintenance
+    category: CST
+    severity: low
+    entity: address
+    refresh: 7d
+    why: A static external address that is reserved but not attached is billed every hour and is easy to forget in firewall and DNS records.
+    fix: Release the address, or attach it to the resource it was reserved for.
+    refs: [NIST-800-53:CM-8]
+    query: { protocol: http, path: /assets, params: { assetTypes: compute.googleapis.com/Address, contentType: RESOURCE, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name, name: resource.data.name }
+    each:
+      all:
+        - { field: resource.data.status, op: eq, value: RESERVED }
+        - any: [ { field: resource.data.addressType, op: absent }, { field: resource.data.addressType, op: eq, value: EXTERNAL } ]
+    evidence: "{resource.data.name}: {resource.data.address} reserved since {resource.data.creationTimestamp}, not attached"
+
+  # ---- Compute Engine: project-wide metadata --------------------------------------------------------
+
+  - id: GCP-COMPUTE-PROJECT-OS-LOGIN-OFF
+    title: Project does not turn on OS Login for its VMs
+    kind: misconfigured
+    category: AUT
+    severity: medium
+    entity: project
+    why: Without OS Login, SSH access is granted by public keys in metadata - outside IAM, without MFA and not removed when a person leaves. The organisation constraint compute.requireOsLogin overrides this setting when enforced.
+    fix: Set the project metadata key enable-oslogin to TRUE (or enforce compute.requireOsLogin) and grant roles/compute.osLogin / osAdminLogin instead of keys.
+    refs: [CIS-GCP:4.4, NIST-800-53:AC-2, NIST-800-53:IA-2]
+    query: { protocol: http, path: /assets, params: { assetTypes: compute.googleapis.com/Project, contentType: RESOURCE, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name, name: resource.data.name }
+    each:
+      any:
+        - { field: resource.data.commonInstanceMetadata.items, op: absent }
+        - not:
+            element:
+              of: resource.data.commonInstanceMetadata.items
+              where: { all: [ { field: key, op: eq, value: enable-oslogin }, { field: value, op: eq, value: "true" } ] }
+    evidence: "{resource.data.name}: project metadata does not set enable-oslogin=TRUE"
+
+  - id: GCP-COMPUTE-PROJECT-SSH-KEYS
+    title: Project metadata holds SSH keys for every VM
+    kind: misconfigured
+    category: AUT
+    severity: medium
+    entity: project
+    why: A key in project-wide metadata opens every VM in the project that does not block it, and nobody revokes it when its owner leaves.
+    fix: Remove the ssh-keys entries from project metadata and use OS Login; on VMs that must use keys, set block-project-ssh-keys.
+    refs: [CIS-GCP:4.3, NIST-800-53:AC-2, NIST-800-53:IA-5]
+    query: { protocol: http, path: /assets, params: { assetTypes: compute.googleapis.com/Project, contentType: RESOURCE, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name, name: resource.data.name }
+    each:
+      element:
+        of: resource.data.commonInstanceMetadata.items
+        where: { all: [ { field: key, op: in, value: [ssh-keys, sshKeys] }, { field: value, op: notempty } ] }
+    evidence: "{resource.data.name}: project-wide SSH keys present in metadata"
+
+  - id: GCP-COMPUTE-PROJECT-SERIAL-PORT
+    title: Project metadata turns on the interactive serial console for every VM
+    kind: misconfigured
+    category: AUT
+    severity: medium
+    entity: project
+    why: The serial console accepts connections from any address and ignores firewall rules; set project-wide it applies to every VM.
+    fix: Remove serial-port-enable from project metadata (or set it to false) and enforce compute.disableSerialPortAccess.
+    refs: [CIS-GCP:4.5, NIST-800-53:AC-17]
+    query: { protocol: http, path: /assets, params: { assetTypes: compute.googleapis.com/Project, contentType: RESOURCE, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name, name: resource.data.name }
+    each:
+      element:
+        of: resource.data.commonInstanceMetadata.items
+        where: { all: [ { field: key, op: eq, value: serial-port-enable }, { field: value, op: in, value: ["true", "1"] } ] }
+    evidence: "{resource.data.name}: serial-port-enable set in project metadata"
+
+  # ---- Compute Engine: instances --------------------------------------------------------------------
+
+  - id: GCP-VM-DEFAULT-SERVICE-ACCOUNT
+    title: VM runs as the default Compute Engine service account
+    kind: misconfigured
+    category: IAM
+    severity: medium
+    entity: instance
+    why: The default service account usually holds Editor on the project, so any code on the VM - or anyone who compromises it - can change almost everything in the project.
+    fix: Create a dedicated service account with only the roles the workload needs and attach it to the VM.
+    refs: [CIS-GCP:4.1, NIST-800-53:AC-6]
+    query: { protocol: http, path: /assets, params: { assetTypes: compute.googleapis.com/Instance, contentType: RESOURCE, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name, name: resource.data.name }
+    each:
+      all:
+        - { field: resource.data.name, op: notmatch, value: '^gke-' }
+        - { field: "resource.data.serviceAccounts[].email", op: match, value: '^\d+-compute@developer\.gserviceaccount\.com$' }
+    evidence: "{resource.data.name}: runs as {resource.data.serviceAccounts[].email}"
+
+  - id: GCP-VM-DEFAULT-SA-FULL-SCOPE
+    title: VM runs as the default service account with full access to all Cloud APIs
+    kind: misconfigured
+    category: IAM
+    severity: high
+    entity: instance
+    why: The cloud-platform scope removes the last limit on the default service account's Editor role; a compromised VM can then call every API in the project.
+    fix: Attach a dedicated service account with narrow roles; if the default must stay, limit its access scopes.
+    refs: [CIS-GCP:4.2, NIST-800-53:AC-6]
+    query: { protocol: http, path: /assets, params: { assetTypes: compute.googleapis.com/Instance, contentType: RESOURCE, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name, name: resource.data.name }
+    each:
+      all:
+        - { field: resource.data.name, op: notmatch, value: '^gke-' }
+        - element:
+            of: resource.data.serviceAccounts
+            where:
+              all:
+                - { field: email, op: match, value: '^\d+-compute@developer\.gserviceaccount\.com$' }
+                - { field: scopes, op: contains, value: "https://www.googleapis.com/auth/cloud-platform" }
+    evidence: "{resource.data.name}: default service account with the cloud-platform scope"
+
+  - id: GCP-VM-PROJECT-SSH-KEYS-ALLOWED
+    title: VM accepts project-wide SSH keys
+    kind: misconfigured
+    category: AUT
+    severity: low
+    entity: instance
+    why: A VM that does not block project-wide keys can be reached with any key placed in project metadata, so one key opens every such VM. With OS Login on, metadata keys are ignored anyway.
+    fix: Set the instance metadata key block-project-ssh-keys to true, or turn on OS Login.
+    refs: [CIS-GCP:4.3, NIST-800-53:AC-2]
+    query: { protocol: http, path: /assets, params: { assetTypes: compute.googleapis.com/Instance, contentType: RESOURCE, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name, name: resource.data.name }
+    each:
+      all:
+        - { field: resource.data.name, op: notmatch, value: '^gke-' }
+        - any:
+            - { field: resource.data.metadata.items, op: absent }
+            - not:
+                element:
+                  of: resource.data.metadata.items
+                  where: { all: [ { field: key, op: eq, value: block-project-ssh-keys }, { field: value, op: eq, value: "true" } ] }
+    evidence: "{resource.data.name}: block-project-ssh-keys not set"
+
+  - id: GCP-VM-OS-LOGIN-DISABLED
+    title: VM turns OS Login off in its own metadata
+    kind: misconfigured
+    category: AUT
+    severity: medium
+    entity: instance
+    why: An instance-level enable-oslogin=FALSE overrides the project setting, so the VM falls back to unmanaged SSH keys.
+    fix: Remove enable-oslogin=FALSE from the instance metadata (or set it to TRUE).
+    refs: [CIS-GCP:4.4, NIST-800-53:AC-2]
+    query: { protocol: http, path: /assets, params: { assetTypes: compute.googleapis.com/Instance, contentType: RESOURCE, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name, name: resource.data.name }
+    each:
+      element:
+        of: resource.data.metadata.items
+        where: { all: [ { field: key, op: eq, value: enable-oslogin }, { field: value, op: in, value: ["false", "0"] } ] }
+    evidence: "{resource.data.name}: enable-oslogin=FALSE in instance metadata"
+
+  - id: GCP-VM-SERIAL-PORT-ENABLED
+    title: VM has interactive serial console access turned on
+    kind: misconfigured
+    category: AUT
+    severity: medium
+    entity: instance
+    why: The interactive serial console accepts connections from any IP address and is not subject to the VM's firewall rules.
+    fix: Remove serial-port-enable from the instance metadata (or set it to false); enforce compute.disableSerialPortAccess.
+    refs: [CIS-GCP:4.5, NIST-800-53:AC-17]
+    query: { protocol: http, path: /assets, params: { assetTypes: compute.googleapis.com/Instance, contentType: RESOURCE, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name, name: resource.data.name }
+    each:
+      element:
+        of: resource.data.metadata.items
+        where: { all: [ { field: key, op: eq, value: serial-port-enable }, { field: value, op: in, value: ["true", "1"] } ] }
+    evidence: "{resource.data.name}: serial-port-enable set"
+
+  - id: GCP-VM-IP-FORWARDING
+    title: VM can forward IP packets
+    kind: misconfigured
+    category: CFG
+    severity: medium
+    entity: instance
+    why: A VM with IP forwarding can send and receive packets for addresses that are not its own, acting as a router that bypasses the network's design and firewall rules.
+    fix: Turn off IP forwarding unless the VM is a deliberate network appliance (NAT, firewall, VPN), and document those.
+    refs: [CIS-GCP:4.6, NIST-800-53:SC-7]
+    query: { protocol: http, path: /assets, params: { assetTypes: compute.googleapis.com/Instance, contentType: RESOURCE, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name, name: resource.data.name }
+    each:
+      all:
+        - { field: resource.data.name, op: notmatch, value: '^gke-' }
+        - { field: resource.data.canIpForward, op: eq, value: true }
+    evidence: "{resource.data.name}: IP forwarding on"
+
+  - id: GCP-VM-PUBLIC-IP
+    title: VM has a public IP address
+    kind: misconfigured
+    category: CFG
+    severity: medium
+    entity: instance
+    why: A public address puts the VM directly on the internet, where only its firewall rules stand between it and every scanner.
+    fix: Remove the external address; reach the VM through Identity-Aware Proxy, a load balancer or Cloud NAT for outbound traffic.
+    refs: [CIS-GCP:4.9, NIST-800-53:SC-7]
+    query: { protocol: http, path: /assets, params: { assetTypes: compute.googleapis.com/Instance, contentType: RESOURCE, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name, name: resource.data.name }
+    each:
+      all:
+        - { field: resource.data.name, op: notmatch, value: '^gke-' }
+        - { field: "resource.data.networkInterfaces[].accessConfigs", op: notempty }
+    evidence: "{resource.data.name}: external address {resource.data.networkInterfaces[].accessConfigs[].natIP}"
+
+  - id: GCP-VM-SHIELDED-OFF
+    title: VM runs without vTPM or integrity monitoring
+    kind: misconfigured
+    category: CFG
+    severity: low
+    entity: instance
+    why: Shielded VM's vTPM and integrity monitoring detect a tampered boot chain; without them a bootkit is invisible to the platform.
+    fix: Stop the VM, turn on vTPM and integrity monitoring (Shielded VM), and start it; use Shielded-VM-capable images.
+    refs: [CIS-GCP:4.8, NIST-800-53:SI-7]
+    query: { protocol: http, path: /assets, params: { assetTypes: compute.googleapis.com/Instance, contentType: RESOURCE, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name, name: resource.data.name }
+    each:
+      all:
+        - { field: resource.data.name, op: notmatch, value: '^gke-' }
+        - any:
+            - { field: resource.data.shieldedInstanceConfig.enableVtpm, op: absent }
+            - { field: resource.data.shieldedInstanceConfig.enableVtpm, op: eq, value: false }
+            - { field: resource.data.shieldedInstanceConfig.enableIntegrityMonitoring, op: absent }
+            - { field: resource.data.shieldedInstanceConfig.enableIntegrityMonitoring, op: eq, value: false }
+    evidence: "{resource.data.name}: vTPM {resource.data.shieldedInstanceConfig.enableVtpm}, integrity monitoring {resource.data.shieldedInstanceConfig.enableIntegrityMonitoring}"
+
+  - id: GCP-VM-SECURE-BOOT-OFF
+    title: VM runs without Secure Boot
+    kind: misconfigured
+    category: CFG
+    severity: low
+    entity: instance
+    why: Secure Boot refuses unsigned boot components, stopping bootkits before they load. It is off by default.
+    fix: Stop the VM, turn on Secure Boot and start it (after checking that any custom kernel modules are signed).
+    refs: [CIS-GCP:4.8, NIST-800-53:SI-7]
+    query: { protocol: http, path: /assets, params: { assetTypes: compute.googleapis.com/Instance, contentType: RESOURCE, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name, name: resource.data.name }
+    each:
+      all:
+        - { field: resource.data.name, op: notmatch, value: '^gke-' }
+        - any:
+            - { field: resource.data.shieldedInstanceConfig.enableSecureBoot, op: absent }
+            - { field: resource.data.shieldedInstanceConfig.enableSecureBoot, op: eq, value: false }
+    evidence: "{resource.data.name}: Secure Boot off"
+
+  - id: GCP-VM-CONFIDENTIAL-OFF
+    title: VM does not use Confidential Computing
+    kind: misconfigured
+    category: CFG
+    severity: info
+    entity: instance
+    why: Confidential VMs keep memory encrypted while in use; CIS lists it for workloads that process sensitive data. Only some machine types support it.
+    fix: For VMs handling sensitive data, recreate them on a Confidential-VM machine type (N2D, C2D, C3...). Ignore for other workloads.
+    refs: [CIS-GCP:4.11, NIST-800-53:SC-28]
+    query: { protocol: http, path: /assets, params: { assetTypes: compute.googleapis.com/Instance, contentType: RESOURCE, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name, name: resource.data.name }
+    each:
+      all:
+        - { field: resource.data.name, op: notmatch, value: '^gke-' }
+        - any:
+            - { field: resource.data.confidentialInstanceConfig.enableConfidentialCompute, op: absent }
+            - { field: resource.data.confidentialInstanceConfig.enableConfidentialCompute, op: eq, value: false }
+    evidence: "{resource.data.name}: not a Confidential VM"
+
+  - id: GCP-VM-STOPPED-LONG
+    title: VM has been stopped for more than 30 days
+    kind: misconfigured
+    lens: maintenance
+    category: CST
+    severity: low
+    entity: instance
+    refresh: 7d
+    why: A VM stopped for a month is usually abandoned; its disks and reserved addresses are still billed, and its unpatched image comes back if someone starts it.
+    fix: Snapshot and delete the VM if it is no longer needed, or record why it is kept (threshold.gcp.compute.stopped-days).
+    refs: [NIST-800-53:CM-8]
+    query: { protocol: http, path: /assets, params: { assetTypes: compute.googleapis.com/Instance, contentType: RESOURCE, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name, name: resource.data.name }
+    each:
+      all:
+        - { field: resource.data.status, op: eq, value: TERMINATED }
+        - { field: resource.data.lastStopTimestamp, op: age-gt, value: 30, threshold: gcp.compute.stopped-days }
+    evidence: "{resource.data.name}: stopped since {resource.data.lastStopTimestamp}"
+
+  # ---- Compute Engine: disks, images, snapshots -------------------------------------------------------
+
+  - id: GCP-DISK-NO-CUSTOMER-KEY
+    title: Disk is encrypted with a Google-managed key only
+    kind: misconfigured
+    category: CFG
+    severity: low
+    entity: disk
+    why: With Google-managed keys, the organisation cannot revoke access to the data by disabling a key, and key use is not in its own audit trail. CIS asks for customer-supplied keys on critical VMs; customer-managed (KMS) keys are the usual answer.
+    fix: For disks holding sensitive data, recreate them from a snapshot with a Cloud KMS key (CMEK) or a customer-supplied key.
+    refs: [CIS-GCP:4.7, NIST-800-53:SC-28, NIST-800-53:SC-12]
+    query: { protocol: http, path: /assets, params: { assetTypes: compute.googleapis.com/Disk, contentType: RESOURCE, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name, name: resource.data.name }
+    each:
+      all:
+        - { field: resource.data.name, op: notmatch, value: '^gke-' }
+        - { field: resource.data.diskEncryptionKey.kmsKeyName, op: absent }
+        - { field: resource.data.diskEncryptionKey.sha256, op: absent }
+    evidence: "{resource.data.name}: Google-managed encryption"
+
+  - id: GCP-DISK-UNATTACHED
+    title: Disk is not attached to any VM
+    kind: misconfigured
+    lens: maintenance
+    category: CST
+    severity: low
+    entity: disk
+    refresh: 7d
+    why: An unattached disk is billed for its full size and often holds data from a deleted VM that nobody is responsible for any more.
+    fix: Snapshot and delete the disk if it is no longer needed, or attach it where it belongs (judged after threshold.gcp.compute.unattached-days days).
+    refs: [NIST-800-53:CM-8]
+    query: { protocol: http, path: /assets, params: { assetTypes: compute.googleapis.com/Disk, contentType: RESOURCE, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name, name: resource.data.name }
+    each:
+      all:
+        - { field: resource.data.users, op: empty }
+        - any:
+            - { field: resource.data.lastDetachTimestamp, op: age-gt, value: 14, threshold: gcp.compute.unattached-days }
+            - all:
+                - { field: resource.data.lastDetachTimestamp, op: absent }
+                - { field: resource.data.creationTimestamp, op: age-gt, value: 14, threshold: gcp.compute.unattached-days }
+    evidence: "{resource.data.name}: {resource.data.sizeGb} GB, unattached (last detached {resource.data.lastDetachTimestamp}, created {resource.data.creationTimestamp})"
+
+  - id: GCP-IMAGE-PUBLIC
+    title: Custom image is shared with allUsers or allAuthenticatedUsers
+    kind: misconfigured
+    category: IAM
+    severity: high
+    entity: image
+    why: A public image can be used by anyone to start a VM - with whatever data, credentials or configuration was baked into it.
+    fix: Remove allUsers / allAuthenticatedUsers from the image's IAM policy; share with specific projects or groups.
+    refs: [NIST-800-53:AC-3, NIST-800-53:AC-22]
+    query: { protocol: http, path: /assets, params: { assetTypes: compute.googleapis.com/Image, contentType: IAM_POLICY, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name }
+    each: { field: "iamPolicy.bindings[].members", op: in, value: [allUsers, allAuthenticatedUsers] }
+    evidence: "{name}: shared publicly"
+
+  # ---- Cloud Storage ----------------------------------------------------------------------------------
+
+  - id: GCP-BUCKET-PUBLIC
+    title: Bucket is readable or writable by allUsers or allAuthenticatedUsers
+    kind: misconfigured
+    category: IAM
+    severity: critical
+    entity: bucket
+    why: A public binding on a bucket lets anyone on the internet (or any Google account) list, read or - with a write role - plant objects in it.
+    fix: Remove allUsers / allAuthenticatedUsers from the bucket's IAM policy; serve deliberately public content through a load balancer or a dedicated project, and enforce public access prevention elsewhere.
+    refs: [CIS-GCP:5.1, NIST-800-53:AC-3, NIST-800-53:AC-22, MITRE-ATTACK:T1530]
+    query: { protocol: http, path: /assets, params: { assetTypes: storage.googleapis.com/Bucket, contentType: IAM_POLICY, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name }
+    each: { field: "iamPolicy.bindings[].members", op: in, value: [allUsers, allAuthenticatedUsers] }
+    evidence: "{name}: a binding names allUsers or allAuthenticatedUsers"
+
+  - id: GCP-BUCKET-UNIFORM-ACCESS-OFF
+    title: Bucket uses object ACLs instead of uniform bucket-level access
+    kind: misconfigured
+    category: IAM
+    severity: medium
+    entity: bucket
+    why: With fine-grained ACLs, any single object can be made public or shared outside IAM, and bucket-level reviews never see it.
+    fix: Turn on uniform bucket-level access (after moving any needed object ACLs into IAM) and enforce storage.uniformBucketLevelAccess.
+    refs: [CIS-GCP:5.2, NIST-800-53:AC-3]
+    query: { protocol: http, path: /assets, params: { assetTypes: storage.googleapis.com/Bucket, contentType: RESOURCE, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name, name: resource.data.name }
+    each:
+      any:
+        - { field: resource.data.iamConfiguration.uniformBucketLevelAccess.enabled, op: absent }
+        - { field: resource.data.iamConfiguration.uniformBucketLevelAccess.enabled, op: eq, value: false }
+    evidence: "{resource.data.name}: uniform bucket-level access off"
+
+  - id: GCP-BUCKET-PUBLIC-ACCESS-PREVENTION-OFF
+    title: Bucket does not enforce public access prevention itself
+    kind: misconfigured
+    category: IAM
+    severity: low
+    entity: bucket
+    why: Public access prevention blocks public grants whatever the IAM policy says. A bucket that only inherits it is protected only while the organisation constraint storage.publicAccessPrevention is enforced; check GCP-ORGPOLICY-PUBLIC-ACCESS-PREVENTION first.
+    fix: Set publicAccessPrevention to enforced on buckets that must never be public, and enforce the organisation constraint.
+    refs: [CIS-GCP:5.1, NIST-800-53:AC-3]
+    query: { protocol: http, path: /assets, params: { assetTypes: storage.googleapis.com/Bucket, contentType: RESOURCE, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name, name: resource.data.name }
+    each:
+      any:
+        - { field: resource.data.iamConfiguration.publicAccessPrevention, op: absent }
+        - { field: resource.data.iamConfiguration.publicAccessPrevention, op: ne, value: enforced }
+    evidence: "{resource.data.name}: public access prevention {resource.data.iamConfiguration.publicAccessPrevention}"
+
+  - id: GCP-BUCKET-VERSIONING-OFF
+    title: Bucket does not keep object versions
+    kind: missing
+    lens: both
+    category: BCK
+    severity: low
+    entity: bucket
+    why: Without versioning, an overwritten or deleted object is gone (beyond the soft-delete window); ransomware and bad deploys rely on that.
+    fix: Turn on object versioning with a lifecycle rule that removes old versions after a set time.
+    refs: [NIST-800-53:CP-9, NIST-800-53:SI-12]
+    query: { protocol: http, path: /assets, params: { assetTypes: storage.googleapis.com/Bucket, contentType: RESOURCE, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name, name: resource.data.name }
+    each:
+      any:
+        - { field: resource.data.versioning.enabled, op: absent }
+        - { field: resource.data.versioning.enabled, op: eq, value: false }
+    evidence: "{resource.data.name}: versioning off"
+
+  - id: GCP-BUCKET-SOFT-DELETE-OFF
+    title: Bucket has soft delete turned off
+    kind: missing
+    lens: both
+    category: BCK
+    severity: low
+    entity: bucket
+    why: Soft delete keeps deleted objects restorable for a period (7 days by default); turned off, a deletion is final immediately.
+    fix: Turn soft delete back on with a retention of at least 7 days.
+    refs: [NIST-800-53:CP-9]
+    query: { protocol: http, path: /assets, params: { assetTypes: storage.googleapis.com/Bucket, contentType: RESOURCE, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name, name: resource.data.name }
+    each: { field: resource.data.softDeletePolicy.retentionDurationSeconds, op: eq, value: 0 }
+    evidence: "{resource.data.name}: soft delete off"
+
+  - id: GCP-BUCKET-ACCESS-LOGGING-OFF
+    title: Bucket does not write usage logs
+    kind: missing
+    lens: both
+    category: LOG
+    severity: low
+    entity: bucket
+    why: Usage logs record every request to the bucket, including anonymous ones that data-access audit logs do not cover; for public or sensitive buckets they are the only trail.
+    fix: Turn on usage logging to a separate log bucket, or rely on data-access audit logs for buckets that are never public.
+    refs: [NIST-800-53:AU-12]
+    query: { protocol: http, path: /assets, params: { assetTypes: storage.googleapis.com/Bucket, contentType: RESOURCE, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name, name: resource.data.name }
+    each: { field: resource.data.logging.logBucket, op: absent }
+    evidence: "{resource.data.name}: usage logging off"
+
+  - id: GCP-BUCKET-RETENTION-UNLOCKED
+    title: Bucket retention policy is not locked
+    kind: misconfigured
+    lens: both
+    category: BCK
+    severity: low
+    entity: bucket
+    why: An unlocked retention policy can be shortened or removed by anyone with storage admin rights, so it does not protect logs or records from a determined insider or attacker. CIS asks for locked retention on log-export buckets.
+    fix: Once the retention period is right, lock the policy (it then cannot be reduced or removed).
+    refs: [CIS-GCP:2.3, NIST-800-53:AU-9, NIST-800-53:AU-11]
+    query: { protocol: http, path: /assets, params: { assetTypes: storage.googleapis.com/Bucket, contentType: RESOURCE, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name, name: resource.data.name }
+    each:
+      all:
+        - { field: resource.data.retentionPolicy.retentionPeriod, op: exists }
+        - any:
+            - { field: resource.data.retentionPolicy.isLocked, op: absent }
+            - { field: resource.data.retentionPolicy.isLocked, op: eq, value: false }
+    evidence: "{resource.data.name}: retention {resource.data.retentionPolicy.retentionPeriod}s, not locked"
+
+  - id: GCP-BUCKET-NO-CUSTOMER-KEY
+    title: Bucket has no default customer-managed encryption key
+    kind: misconfigured
+    category: CFG
+    severity: info
+    entity: bucket
+    why: With Google-managed keys the organisation cannot revoke access to the data by disabling a key, and key use is not in its own audit trail. Needed where policy or regulation asks for customer-managed keys.
+    fix: Set a default Cloud KMS key on buckets that hold sensitive data.
+    refs: [NIST-800-53:SC-28, NIST-800-53:SC-12]
+    query: { protocol: http, path: /assets, params: { assetTypes: storage.googleapis.com/Bucket, contentType: RESOURCE, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name, name: resource.data.name }
+    each: { field: resource.data.encryption.defaultKmsKeyName, op: absent }
+    evidence: "{resource.data.name}: Google-managed encryption"
+
+  # ---- Cloud SQL ------------------------------------------------------------------------------------
+  # resource.data is the Cloud SQL Admin API's DatabaseInstance. Flag rules read settings.databaseFlags[] { name,
+  # value }; a flag that is not set has its engine default, so "must be on" flags whose default is off fail when
+  # absent, and "must be off" flags whose default is off fail only when set on.
+
+  - id: GCP-SQL-OPEN-TO-WORLD
+    title: Cloud SQL instance accepts connections from any internet address
+    kind: misconfigured
+    category: CFG
+    severity: critical
+    entity: sql-instance
+    why: An authorized network of 0.0.0.0/0 on a public IP lets anyone on the internet reach the database's login prompt; password guessing and engine vulnerabilities do the rest.
+    fix: Remove 0.0.0.0/0 from the authorized networks; connect through private IP, the Cloud SQL Auth Proxy or connectors, and enforce sql.restrictAuthorizedNetworks.
+    refs: [CIS-GCP:6.5, NIST-800-53:SC-7, MITRE-ATTACK:T1190]
+    query: { protocol: http, path: /assets, params: { assetTypes: sqladmin.googleapis.com/Instance, contentType: RESOURCE, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name, name: resource.data.name }
+    each:
+      all:
+        - { field: resource.data.settings.ipConfiguration.ipv4Enabled, op: eq, value: true }
+        - { field: "resource.data.settings.ipConfiguration.authorizedNetworks[].value", op: in, value: ["0.0.0.0/0", "::/0"] }
+    evidence: "{resource.data.name} ({resource.data.databaseVersion}): authorized networks {resource.data.settings.ipConfiguration.authorizedNetworks[].value}"
+
+  - id: GCP-SQL-PUBLIC-IP
+    title: Cloud SQL instance has a public IP address
+    kind: misconfigured
+    category: CFG
+    severity: medium
+    entity: sql-instance
+    why: A public address puts the database one authorized-network entry away from the internet, and it is reachable through the Auth Proxy from anywhere an IAM principal sits.
+    fix: Move clients to private IP (Private Service Access or Private Service Connect) and turn the public IP off; enforce sql.restrictPublicIp.
+    refs: [CIS-GCP:6.6, NIST-800-53:SC-7]
+    query: { protocol: http, path: /assets, params: { assetTypes: sqladmin.googleapis.com/Instance, contentType: RESOURCE, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name, name: resource.data.name }
+    each: { field: resource.data.settings.ipConfiguration.ipv4Enabled, op: eq, value: true }
+    evidence: "{resource.data.name} ({resource.data.databaseVersion}): public IP on"
+
+  - id: GCP-SQL-SSL-NOT-REQUIRED
+    title: Cloud SQL instance accepts unencrypted connections
+    kind: misconfigured
+    category: PKI
+    severity: high
+    entity: sql-instance
+    why: Without enforced TLS, clients can connect in clear text, exposing credentials and data to anyone on the path.
+    fix: Set the SSL mode to ENCRYPTED_ONLY (or TRUSTED_CLIENT_CERTIFICATE_REQUIRED) after confirming the clients use TLS or the connectors.
+    refs: [CIS-GCP:6.4, NIST-800-53:SC-8]
+    query: { protocol: http, path: /assets, params: { assetTypes: sqladmin.googleapis.com/Instance, contentType: RESOURCE, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name, name: resource.data.name }
+    each:
+      any:
+        - { field: resource.data.settings.ipConfiguration.sslMode, op: eq, value: ALLOW_UNENCRYPTED_AND_ENCRYPTED }
+        - all:
+            - { field: resource.data.settings.ipConfiguration.sslMode, op: absent }
+            - any:
+                - { field: resource.data.settings.ipConfiguration.requireSsl, op: absent }
+                - { field: resource.data.settings.ipConfiguration.requireSsl, op: eq, value: false }
+    evidence: "{resource.data.name} ({resource.data.databaseVersion}): SSL mode {resource.data.settings.ipConfiguration.sslMode}, require SSL {resource.data.settings.ipConfiguration.requireSsl}"
+
+  - id: GCP-SQL-BACKUPS-OFF
+    title: Cloud SQL instance has automated backups turned off
+    kind: missing
+    lens: both
+    category: BCK
+    severity: high
+    entity: sql-instance
+    why: Without automated backups, a dropped table, corrupted data or a ransomed database can only be restored from whatever export someone happened to make.
+    fix: Turn on automated backups (and point-in-time recovery) with a retention that meets the recovery objectives.
+    refs: [CIS-GCP:6.7, NIST-800-53:CP-9]
+    query: { protocol: http, path: /assets, params: { assetTypes: sqladmin.googleapis.com/Instance, contentType: RESOURCE, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name, name: resource.data.name }
+    each:
+      all:
+        - any: [ { field: resource.data.instanceType, op: absent }, { field: resource.data.instanceType, op: eq, value: CLOUD_SQL_INSTANCE } ]
+        - any:
+            - { field: resource.data.settings.backupConfiguration.enabled, op: absent }
+            - { field: resource.data.settings.backupConfiguration.enabled, op: eq, value: false }
+    evidence: "{resource.data.name} ({resource.data.databaseVersion}): automated backups off"
+
+  - id: GCP-SQL-PITR-OFF
+    title: Cloud SQL instance cannot be restored to a point in time
+    kind: missing
+    lens: both
+    category: BCK
+    severity: low
+    entity: sql-instance
+    why: With only daily backups, a mistake at 17:00 loses everything since the morning's backup; point-in-time recovery replays the logs to the minute before.
+    fix: Turn on point-in-time recovery (binary logging for MySQL, write-ahead log archiving for PostgreSQL and SQL Server).
+    refs: [NIST-800-53:CP-9, NIST-800-53:CP-10]
+    query: { protocol: http, path: /assets, params: { assetTypes: sqladmin.googleapis.com/Instance, contentType: RESOURCE, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name, name: resource.data.name }
+    each:
+      all:
+        - any: [ { field: resource.data.instanceType, op: absent }, { field: resource.data.instanceType, op: eq, value: CLOUD_SQL_INSTANCE } ]
+        - { field: resource.data.settings.backupConfiguration.enabled, op: eq, value: true }
+        - any: [ { field: resource.data.settings.backupConfiguration.binaryLogEnabled, op: absent }, { field: resource.data.settings.backupConfiguration.binaryLogEnabled, op: eq, value: false } ]
+        - any: [ { field: resource.data.settings.backupConfiguration.pointInTimeRecoveryEnabled, op: absent }, { field: resource.data.settings.backupConfiguration.pointInTimeRecoveryEnabled, op: eq, value: false } ]
+    evidence: "{resource.data.name} ({resource.data.databaseVersion}): point-in-time recovery off"
+
+  - id: GCP-SQL-OUTDATED-VERSION
+    title: Cloud SQL instance runs a database version past its standard support
+    kind: misconfigured
+    lens: both
+    category: LCM
+    severity: medium
+    entity: sql-instance
+    why: Engine versions past community end of life get no more security fixes from the project, and Cloud SQL charges for extended support on them.
+    fix: Plan and test a major version upgrade. The versions flagged are threshold.gcp.sql.outdated-version-pattern (default MySQL 5.x and PostgreSQL 12 and older).
+    refs: [NIST-800-53:SA-22, NIST-800-53:SI-2]
+    query: { protocol: http, path: /assets, params: { assetTypes: sqladmin.googleapis.com/Instance, contentType: RESOURCE, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name, name: resource.data.name }
+    each: { field: resource.data.databaseVersion, op: match, value: '^(MYSQL_5_[567]|POSTGRES_(9_6|1[0-2]))$', threshold: gcp.sql.outdated-version-pattern }
+    evidence: "{resource.data.name}: {resource.data.databaseVersion}"
+
+  - id: GCP-SQL-NOT-RUNNABLE
+    title: Cloud SQL instance is suspended or failed
+    kind: broken
+    lens: maintenance
+    category: AVL
+    severity: medium
+    entity: sql-instance
+    why: A suspended or failed instance serves nothing; suspension usually follows a billing or abuse issue, failure an operation that did not finish.
+    fix: Check the instance's operations and the project's billing state; restore or recreate the instance, or delete it if it is retired.
+    refs: [NIST-800-53:CP-10]
+    query: { protocol: http, path: /assets, params: { assetTypes: sqladmin.googleapis.com/Instance, contentType: RESOURCE, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name, name: resource.data.name }
+    each: { field: resource.data.state, op: in, value: [SUSPENDED, FAILED, UNKNOWN_STATE] }
+    evidence: "{resource.data.name}: state {resource.data.state}"
+
+  - id: GCP-SQL-MYSQL-SHOW-DATABASES
+    title: MySQL instance lets users list databases they cannot use
+    kind: misconfigured
+    category: CFG
+    severity: low
+    entity: sql-instance
+    why: Without skip_show_database, any account can enumerate every database on the server - free reconnaissance after a low-privilege credential leaks.
+    fix: Set the database flag skip_show_database to on.
+    refs: [CIS-GCP:6.1.2, NIST-800-53:AC-6]
+    query: { protocol: http, path: /assets, params: { assetTypes: sqladmin.googleapis.com/Instance, contentType: RESOURCE, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name, name: resource.data.name }
+    each:
+      all:
+        - { field: resource.data.databaseVersion, op: match, value: '^MYSQL' }
+        - any:
+            - { field: resource.data.settings.databaseFlags, op: absent }
+            - not:
+                element:
+                  of: resource.data.settings.databaseFlags
+                  where: { all: [ { field: name, op: eq, value: skip_show_database }, { field: value, op: eq, value: "on" } ] }
+    evidence: "{resource.data.name} ({resource.data.databaseVersion}): skip_show_database not on"
+
+  - id: GCP-SQL-MYSQL-LOCAL-INFILE
+    title: MySQL instance allows LOAD DATA LOCAL
+    kind: misconfigured
+    category: CFG
+    severity: medium
+    entity: sql-instance
+    why: With local_infile on, a malicious or compromised server can make a client send it any file the client can read, and SQL injection can load attacker data.
+    fix: Set the database flag local_infile to off.
+    refs: [CIS-GCP:6.1.3, NIST-800-53:CM-7]
+    query: { protocol: http, path: /assets, params: { assetTypes: sqladmin.googleapis.com/Instance, contentType: RESOURCE, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name, name: resource.data.name }
+    each:
+      all:
+        - { field: resource.data.databaseVersion, op: match, value: '^MYSQL' }
+        - element:
+            of: resource.data.settings.databaseFlags
+            where: { all: [ { field: name, op: eq, value: local_infile }, { field: value, op: eq, value: "on" } ] }
+    evidence: "{resource.data.name} ({resource.data.databaseVersion}): local_infile on"
+
+  - id: GCP-SQL-POSTGRES-CONNECTION-LOGGING-OFF
+    title: PostgreSQL instance does not log connections and disconnections
+    kind: missing
+    lens: both
+    category: LOG
+    severity: low
+    entity: sql-instance
+    why: Without log_connections and log_disconnections there is no record of who logged in to the database, from where, or for how long.
+    fix: Set the database flags log_connections and log_disconnections to on.
+    refs: [CIS-GCP:6.2.2, CIS-GCP:6.2.3, NIST-800-53:AU-12, NIST-800-53:AC-7]
+    query: { protocol: http, path: /assets, params: { assetTypes: sqladmin.googleapis.com/Instance, contentType: RESOURCE, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name, name: resource.data.name }
+    each:
+      all:
+        - { field: resource.data.databaseVersion, op: match, value: '^POSTGRES' }
+        - any:
+            - { field: resource.data.settings.databaseFlags, op: absent }
+            - not:
+                element:
+                  of: resource.data.settings.databaseFlags
+                  where: { all: [ { field: name, op: eq, value: log_connections }, { field: value, op: eq, value: "on" } ] }
+            - not:
+                element:
+                  of: resource.data.settings.databaseFlags
+                  where: { all: [ { field: name, op: eq, value: log_disconnections }, { field: value, op: eq, value: "on" } ] }
+    evidence: "{resource.data.name} ({resource.data.databaseVersion}): log_connections / log_disconnections not both on"
+
+  - id: GCP-SQL-POSTGRES-LOG-STATEMENT
+    title: PostgreSQL instance does not log schema changes
+    kind: missing
+    lens: both
+    category: LOG
+    severity: low
+    entity: sql-instance
+    why: With log_statement at its default (none), CREATE, ALTER and DROP statements leave no trace; CIS asks for at least DDL.
+    fix: Set the database flag log_statement to ddl (or mod where the volume is acceptable).
+    refs: [CIS-GCP:6.2.4, NIST-800-53:AU-12]
+    query: { protocol: http, path: /assets, params: { assetTypes: sqladmin.googleapis.com/Instance, contentType: RESOURCE, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name, name: resource.data.name }
+    each:
+      all:
+        - { field: resource.data.databaseVersion, op: match, value: '^POSTGRES' }
+        - any:
+            - { field: resource.data.settings.databaseFlags, op: absent }
+            - not:
+                element:
+                  of: resource.data.settings.databaseFlags
+                  where: { all: [ { field: name, op: eq, value: log_statement }, { field: value, op: in, value: [ddl, mod, all] } ] }
+    evidence: "{resource.data.name} ({resource.data.databaseVersion}): log_statement below ddl"
+
+  - id: GCP-SQL-POSTGRES-ERROR-LOGGING-WEAK
+    title: PostgreSQL instance logs errors with too little detail or severity filtering set wrong
+    kind: misconfigured
+    lens: both
+    category: LOG
+    severity: low
+    entity: sql-instance
+    why: CIS asks for log_error_verbosity of at least default, log_min_messages at warning or stricter and log_min_error_statement at error or stricter. A terse verbosity hides the failing statement; debug or info levels flood the log and can write data into it.
+    fix: Set log_error_verbosity to default (or verbose), log_min_messages to warning and log_min_error_statement to error - or remove the flags to get those defaults.
+    refs: [CIS-GCP:6.2.1, CIS-GCP:6.2.5, CIS-GCP:6.2.6, NIST-800-53:AU-3]
+    query: { protocol: http, path: /assets, params: { assetTypes: sqladmin.googleapis.com/Instance, contentType: RESOURCE, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name, name: resource.data.name }
+    each:
+      all:
+        - { field: resource.data.databaseVersion, op: match, value: '^POSTGRES' }
+        - element:
+            of: resource.data.settings.databaseFlags
+            where:
+              any:
+                - all: [ { field: name, op: eq, value: log_error_verbosity }, { field: value, op: eq, value: terse } ]
+                - all: [ { field: name, op: eq, value: log_min_messages }, { field: value, op: in, value: [debug5, debug4, debug3, debug2, debug1, info, notice] } ]
+                - all: [ { field: name, op: eq, value: log_min_error_statement }, { field: value, op: in, value: [debug5, debug4, debug3, debug2, debug1, info, notice, warning] } ]
+    evidence: "{resource.data.name} ({resource.data.databaseVersion}): error logging flags below the CIS levels"
+
+  - id: GCP-SQL-POSTGRES-LOG-MIN-DURATION
+    title: PostgreSQL instance logs statement text by duration
+    kind: misconfigured
+    category: LOG
+    severity: low
+    entity: sql-instance
+    why: log_min_duration_statement writes the full text of slow statements - with the values in them - into the logs, where personal data and secrets end up readable by everyone with log access.
+    fix: Set log_min_duration_statement to -1 (off); use Query Insights for performance analysis.
+    refs: [CIS-GCP:6.2.7, NIST-800-53:SI-11, NIST-800-53:AU-9]
+    query: { protocol: http, path: /assets, params: { assetTypes: sqladmin.googleapis.com/Instance, contentType: RESOURCE, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name, name: resource.data.name }
+    each:
+      all:
+        - { field: resource.data.databaseVersion, op: match, value: '^POSTGRES' }
+        - element:
+            of: resource.data.settings.databaseFlags
+            where: { all: [ { field: name, op: eq, value: log_min_duration_statement }, { field: value, op: ne, value: "-1" } ] }
+    evidence: "{resource.data.name} ({resource.data.databaseVersion}): log_min_duration_statement set"
+
+  - id: GCP-SQL-POSTGRES-PGAUDIT-OFF
+    title: PostgreSQL instance does not have database auditing (pgAudit) turned on
+    kind: missing
+    lens: both
+    category: LOG
+    severity: low
+    entity: sql-instance
+    why: pgAudit records who read or changed what inside the database, in a form Cloud Logging keeps as audit logs; without it there is no session-level audit trail.
+    fix: Set the database flag cloudsql.enable_pgaudit to on, create the extension and configure pgaudit.log for the classes needed.
+    refs: [CIS-GCP:6.2.8, NIST-800-53:AU-2, NIST-800-53:AU-12]
+    query: { protocol: http, path: /assets, params: { assetTypes: sqladmin.googleapis.com/Instance, contentType: RESOURCE, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name, name: resource.data.name }
+    each:
+      all:
+        - { field: resource.data.databaseVersion, op: match, value: '^POSTGRES' }
+        - any:
+            - { field: resource.data.settings.databaseFlags, op: absent }
+            - not:
+                element:
+                  of: resource.data.settings.databaseFlags
+                  where: { all: [ { field: name, op: eq, value: cloudsql.enable_pgaudit }, { field: value, op: eq, value: "on" } ] }
+    evidence: "{resource.data.name} ({resource.data.databaseVersion}): cloudsql.enable_pgaudit not on"
+
+  - id: GCP-SQL-SQLSERVER-RISKY-FEATURE
+    title: SQL Server instance turns on external scripts, cross-database ownership chaining or contained authentication
+    kind: misconfigured
+    category: CFG
+    severity: medium
+    entity: sql-instance
+    why: External scripts run R/Python code from inside the database; cross-database ownership chaining lets a user in one database reach objects in another; contained databases authenticate users the instance's login policy never sees. CIS asks for all three off.
+    fix: Set the flags "external scripts enabled", "cross db ownership chaining" and "contained database authentication" to off unless a documented application needs one.
+    refs: [CIS-GCP:6.3.1, CIS-GCP:6.3.2, CIS-GCP:6.3.7, NIST-800-53:CM-7, NIST-800-53:AC-6]
+    query: { protocol: http, path: /assets, params: { assetTypes: sqladmin.googleapis.com/Instance, contentType: RESOURCE, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name, name: resource.data.name }
+    each:
+      all:
+        - { field: resource.data.databaseVersion, op: match, value: '^SQLSERVER' }
+        - element:
+            of: resource.data.settings.databaseFlags
+            where:
+              all:
+                - { field: name, op: in, value: [external scripts enabled, cross db ownership chaining, contained database authentication] }
+                - { field: value, op: eq, value: "on" }
+    evidence: "{resource.data.name} ({resource.data.databaseVersion}): a risky feature flag is on"
+
+  - id: GCP-SQL-SQLSERVER-REMOTE-ACCESS
+    title: SQL Server instance allows remote stored-procedure execution
+    kind: misconfigured
+    category: CFG
+    severity: low
+    entity: sql-instance
+    why: The "remote access" option (on by default) lets stored procedures be run from other servers, a path for lateral movement and denial of service.
+    fix: Set the database flag "remote access" to off.
+    refs: [CIS-GCP:6.3.5, NIST-800-53:CM-7]
+    query: { protocol: http, path: /assets, params: { assetTypes: sqladmin.googleapis.com/Instance, contentType: RESOURCE, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name, name: resource.data.name }
+    each:
+      all:
+        - { field: resource.data.databaseVersion, op: match, value: '^SQLSERVER' }
+        - any:
+            - { field: resource.data.settings.databaseFlags, op: absent }
+            - not:
+                element:
+                  of: resource.data.settings.databaseFlags
+                  where: { all: [ { field: name, op: eq, value: remote access }, { field: value, op: eq, value: "off" } ] }
+    evidence: "{resource.data.name} ({resource.data.databaseVersion}): remote access not off"
+
+  - id: GCP-SQL-SQLSERVER-TRACE-3625-OFF
+    title: SQL Server instance shows full error details to all users
+    kind: misconfigured
+    category: CFG
+    severity: low
+    entity: sql-instance
+    why: Without trace flag 3625, error messages returned to non-sysadmin users include object names and values that help an attacker map the database.
+    fix: Set the database flag 3625 to on.
+    refs: [CIS-GCP:6.3.6, NIST-800-53:SI-11]
+    query: { protocol: http, path: /assets, params: { assetTypes: sqladmin.googleapis.com/Instance, contentType: RESOURCE, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name, name: resource.data.name }
+    each:
+      all:
+        - { field: resource.data.databaseVersion, op: match, value: '^SQLSERVER' }
+        - any:
+            - { field: resource.data.settings.databaseFlags, op: absent }
+            - not:
+                element:
+                  of: resource.data.settings.databaseFlags
+                  where: { all: [ { field: name, op: eq, value: "3625" }, { field: value, op: eq, value: "on" } ] }
+    evidence: "{resource.data.name} ({resource.data.databaseVersion}): trace flag 3625 not on"
+
+  - id: GCP-SQL-SQLSERVER-CONNECTION-OPTIONS
+    title: SQL Server instance limits user connections or changes default user options
+    kind: misconfigured
+    lens: both
+    category: CFG
+    severity: low
+    entity: sql-instance
+    why: A "user connections" limit lets a burst of logins lock everyone else out; "user options" silently changes query behaviour for every session. CIS asks that neither be set without a reason.
+    fix: Remove the "user options" flag and set "user connections" to 0 (unlimited) unless a documented capacity limit needs it.
+    refs: [CIS-GCP:6.3.3, CIS-GCP:6.3.4, NIST-800-53:SC-5, NIST-800-53:CM-6]
+    query: { protocol: http, path: /assets, params: { assetTypes: sqladmin.googleapis.com/Instance, contentType: RESOURCE, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name, name: resource.data.name }
+    each:
+      all:
+        - { field: resource.data.databaseVersion, op: match, value: '^SQLSERVER' }
+        - element:
+            of: resource.data.settings.databaseFlags
+            where:
+              any:
+                - { field: name, op: eq, value: user options }
+                - all: [ { field: name, op: eq, value: user connections }, { field: value, op: ne, value: "0" } ]
+    evidence: "{resource.data.name} ({resource.data.databaseVersion}): user options or a user connections limit set"
+
+  # ---- Google Kubernetes Engine -------------------------------------------------------------------------
+  # resource.data is the GKE API's Cluster, node pools included (nodePools[]). Ids cite the CIS GKE Benchmark.
+
+  - id: GCP-GKE-LEGACY-ABAC
+    title: GKE cluster has legacy attribute-based access control turned on
+    kind: misconfigured
+    category: IAM
+    severity: high
+    entity: gke-cluster
+    why: Legacy ABAC grants broad, static permissions that RBAC cannot narrow; with it on, many service accounts in the cluster hold far more than they need.
+    fix: Turn off legacy authorization and grant access through Kubernetes RBAC and IAM.
+    refs: [CIS-GKE:5.8.4, NIST-800-53:AC-6]
+    mask: [resource.data.masterAuth.clientKey]
+    query: { protocol: http, path: /assets, params: { assetTypes: container.googleapis.com/Cluster, contentType: RESOURCE, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name, name: resource.data.name }
+    each: { field: resource.data.legacyAbac.enabled, op: eq, value: true }
+    evidence: "{resource.data.name}: legacy ABAC on"
+
+  - id: GCP-GKE-STATIC-CREDENTIALS
+    title: GKE cluster accepts a static password or issues a client certificate
+    kind: misconfigured
+    category: AUT
+    severity: high
+    entity: gke-cluster
+    why: Basic-auth passwords and client certificates are static cluster-admin credentials that cannot be revoked short of rotating the cluster's CA, and they bypass IAM entirely.
+    fix: Turn off basic authentication and client certificate issuance; authenticate with IAM / OIDC. On older clusters this needs credential rotation.
+    refs: [CIS-GKE:5.8.1, CIS-GKE:5.8.2, NIST-800-53:IA-2, NIST-800-53:IA-5]
+    mask: [resource.data.masterAuth.clientKey]
+    query: { protocol: http, path: /assets, params: { assetTypes: container.googleapis.com/Cluster, contentType: RESOURCE, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name, name: resource.data.name }
+    each:
+      any:
+        - { field: resource.data.masterAuth.username, op: notempty }
+        - { field: resource.data.masterAuth.clientCertificateConfig.issueClientCertificate, op: eq, value: true }
+    evidence: "{resource.data.name}: static credentials enabled (basic auth or client certificate)"
+
+  - id: GCP-GKE-PRIVATE-NODES-OFF
+    title: GKE cluster nodes have public IP addresses
+    kind: misconfigured
+    category: CFG
+    severity: medium
+    entity: gke-cluster
+    why: Nodes with public addresses are reachable from the internet, so a NodePort service or a kubelet misconfiguration is exposed directly.
+    fix: Use private nodes (create node pools with private nodes, or recreate the cluster as private) and Cloud NAT for outbound traffic.
+    refs: [CIS-GKE:5.6.5, NIST-800-53:SC-7]
+    query: { protocol: http, path: /assets, params: { assetTypes: container.googleapis.com/Cluster, contentType: RESOURCE, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name, name: resource.data.name }
+    each:
+      all:
+        - any: [ { field: resource.data.privateClusterConfig.enablePrivateNodes, op: absent }, { field: resource.data.privateClusterConfig.enablePrivateNodes, op: eq, value: false } ]
+        - any: [ { field: resource.data.networkConfig.defaultEnablePrivateNodes, op: absent }, { field: resource.data.networkConfig.defaultEnablePrivateNodes, op: eq, value: false } ]
+    evidence: "{resource.data.name}: private nodes off"
+
+  - id: GCP-GKE-CONTROL-PLANE-OPEN
+    title: GKE control plane is reachable from any internet address
+    kind: misconfigured
+    category: CFG
+    severity: high
+    entity: gke-cluster
+    why: A public Kubernetes API endpoint without authorized networks (or with 0.0.0.0/0 authorized) is open to every scanner; any credential leak or API server vulnerability is directly exploitable.
+    fix: Turn on authorized networks with the admin and CI ranges only, or make the endpoint private and reach it over a VPN, bastion or Connect gateway.
+    refs: [CIS-GKE:5.6.3, CIS-GKE:5.6.4, NIST-800-53:SC-7, NIST-800-53:AC-17]
+    query: { protocol: http, path: /assets, params: { assetTypes: container.googleapis.com/Cluster, contentType: RESOURCE, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name, name: resource.data.name }
+    each:
+      all:
+        - any: [ { field: resource.data.privateClusterConfig.enablePrivateEndpoint, op: absent }, { field: resource.data.privateClusterConfig.enablePrivateEndpoint, op: eq, value: false } ]
+        - any: [ { field: resource.data.controlPlaneEndpointsConfig.ipEndpointsConfig.enablePublicEndpoint, op: absent }, { field: resource.data.controlPlaneEndpointsConfig.ipEndpointsConfig.enablePublicEndpoint, op: eq, value: true } ]
+        - any:
+            - { field: resource.data.masterAuthorizedNetworksConfig.enabled, op: absent }
+            - { field: resource.data.masterAuthorizedNetworksConfig.enabled, op: eq, value: false }
+            - { field: "resource.data.masterAuthorizedNetworksConfig.cidrBlocks[].cidrBlock", op: in, value: ["0.0.0.0/0", "::/0"] }
+    evidence: "{resource.data.name}: public endpoint {resource.data.endpoint}, authorized networks {resource.data.masterAuthorizedNetworksConfig.enabled}"
+
+  - id: GCP-GKE-NETWORK-POLICY-OFF
+    title: GKE cluster does not enforce network policies
+    kind: misconfigured
+    category: CFG
+    severity: medium
+    entity: gke-cluster
+    why: Without network policy enforcement every pod can reach every other pod, so one compromised workload can talk to databases and control services across all namespaces.
+    fix: Use GKE Dataplane V2 (which enforces NetworkPolicy) or turn on network policy enforcement, then add default-deny policies per namespace.
+    refs: [CIS-GKE:5.6.7, NIST-800-53:SC-7, NIST-800-53:AC-4]
+    query: { protocol: http, path: /assets, params: { assetTypes: container.googleapis.com/Cluster, contentType: RESOURCE, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name, name: resource.data.name }
+    each:
+      all:
+        - any: [ { field: resource.data.networkPolicy.enabled, op: absent }, { field: resource.data.networkPolicy.enabled, op: eq, value: false } ]
+        - any: [ { field: resource.data.networkConfig.datapathProvider, op: absent }, { field: resource.data.networkConfig.datapathProvider, op: ne, value: ADVANCED_DATAPATH } ]
+    evidence: "{resource.data.name}: network policy off, datapath {resource.data.networkConfig.datapathProvider}"
+
+  - id: GCP-GKE-WORKLOAD-IDENTITY-OFF
+    title: GKE cluster does not use Workload Identity
+    kind: misconfigured
+    category: IAM
+    severity: medium
+    entity: gke-cluster
+    why: Without Workload Identity, pods use the node's service account (or keys mounted as secrets) and can read the node metadata server, so every workload on a node shares the node's cloud permissions.
+    fix: Turn on Workload Identity on the cluster and the GKE metadata server on node pools; bind Kubernetes service accounts to dedicated IAM service accounts.
+    refs: [CIS-GKE:5.2.2, CIS-GKE:5.4.2, NIST-800-53:AC-6]
+    query: { protocol: http, path: /assets, params: { assetTypes: container.googleapis.com/Cluster, contentType: RESOURCE, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name, name: resource.data.name }
+    each: { field: resource.data.workloadIdentityConfig.workloadPool, op: empty }
+    evidence: "{resource.data.name}: no workload identity pool"
+
+  - id: GCP-GKE-SHIELDED-NODES-OFF
+    title: GKE cluster does not require Shielded GKE nodes
+    kind: misconfigured
+    category: CFG
+    severity: low
+    entity: gke-cluster
+    why: Shielded nodes prove their identity to the control plane; without them, an attacker who steals a node's bootstrap credentials can impersonate a node and read the pods' secrets.
+    fix: Turn on Shielded GKE nodes for the cluster.
+    refs: [CIS-GKE:5.5.5, NIST-800-53:SI-7, NIST-800-53:IA-3]
+    query: { protocol: http, path: /assets, params: { assetTypes: container.googleapis.com/Cluster, contentType: RESOURCE, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name, name: resource.data.name }
+    each:
+      any:
+        - { field: resource.data.shieldedNodes.enabled, op: absent }
+        - { field: resource.data.shieldedNodes.enabled, op: eq, value: false }
+    evidence: "{resource.data.name}: Shielded GKE nodes off"
+
+  - id: GCP-GKE-NODE-AUTO-UPGRADE-REPAIR-OFF
+    title: GKE node pool has auto-upgrade or auto-repair turned off
+    kind: misconfigured
+    lens: both
+    category: LCM
+    severity: medium
+    entity: gke-cluster
+    why: Without auto-upgrade, nodes fall behind on Kubernetes and OS security patches; without auto-repair, unhealthy nodes stay in service until someone notices.
+    fix: Turn on auto-upgrade and auto-repair on every node pool, with maintenance windows if timing matters.
+    refs: [CIS-GKE:5.5.2, CIS-GKE:5.5.3, NIST-800-53:SI-2]
+    query: { protocol: http, path: /assets, params: { assetTypes: container.googleapis.com/Cluster, contentType: RESOURCE, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name, name: resource.data.name }
+    each:
+      element:
+        of: resource.data.nodePools
+        where:
+          any:
+            - { field: management.autoUpgrade, op: absent }
+            - { field: management.autoUpgrade, op: eq, value: false }
+            - { field: management.autoRepair, op: absent }
+            - { field: management.autoRepair, op: eq, value: false }
+    evidence: "{resource.data.name}: node pool(s) without auto-upgrade or auto-repair"
+
+  - id: GCP-GKE-NO-RELEASE-CHANNEL
+    title: GKE cluster is not enrolled in a release channel
+    kind: misconfigured
+    lens: maintenance
+    category: LCM
+    severity: low
+    entity: gke-cluster
+    why: Outside a release channel, versions are managed by hand and clusters drift towards end of support, when Google upgrades them on its own schedule.
+    fix: Enrol the cluster in the Regular or Stable channel and set a maintenance window.
+    refs: [CIS-GKE:5.5.4, NIST-800-53:SI-2]
+    query: { protocol: http, path: /assets, params: { assetTypes: container.googleapis.com/Cluster, contentType: RESOURCE, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name, name: resource.data.name }
+    each:
+      any:
+        - { field: resource.data.releaseChannel.channel, op: absent }
+        - { field: resource.data.releaseChannel.channel, op: eq, value: UNSPECIFIED }
+    evidence: "{resource.data.name}: no release channel"
+
+  - id: GCP-GKE-LOGGING-MONITORING-OFF
+    title: GKE cluster does not send logs or metrics to Cloud Logging and Monitoring
+    kind: missing
+    lens: both
+    category: LOG
+    severity: medium
+    entity: gke-cluster
+    why: Without Cloud Logging, container, system and Kubernetes audit events are lost when a pod or node goes away; without Monitoring, nobody sees the cluster degrade.
+    fix: Turn on Cloud Logging (system and workloads) and Cloud Monitoring for the cluster.
+    refs: [CIS-GKE:5.7.1, NIST-800-53:AU-12, NIST-800-53:SI-4]
+    query: { protocol: http, path: /assets, params: { assetTypes: container.googleapis.com/Cluster, contentType: RESOURCE, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name, name: resource.data.name }
+    each:
+      any:
+        - { field: resource.data.loggingService, op: eq, value: none }
+        - { field: resource.data.monitoringService, op: eq, value: none }
+    evidence: "{resource.data.name}: logging {resource.data.loggingService}, monitoring {resource.data.monitoringService}"
+
+  - id: GCP-GKE-BINARY-AUTHORIZATION-OFF
+    title: GKE cluster does not use Binary Authorization
+    kind: missing
+    category: CFG
+    severity: low
+    entity: gke-cluster
+    why: Without Binary Authorization any image anyone can push can be deployed; with it, only images that pass the organisation's attestations or allowlist run.
+    fix: Turn on Binary Authorization (project singleton policy enforcement) and start with a dry-run policy.
+    refs: [CIS-GKE:5.10.4, NIST-800-53:CM-14, NIST-800-53:SI-7]
+    query: { protocol: http, path: /assets, params: { assetTypes: container.googleapis.com/Cluster, contentType: RESOURCE, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name, name: resource.data.name }
+    each:
+      all:
+        - any: [ { field: resource.data.binaryAuthorization.evaluationMode, op: absent }, { field: resource.data.binaryAuthorization.evaluationMode, op: in, value: [DISABLED, EVALUATION_MODE_UNSPECIFIED] } ]
+        - any: [ { field: resource.data.binaryAuthorization.enabled, op: absent }, { field: resource.data.binaryAuthorization.enabled, op: eq, value: false } ]
+    evidence: "{resource.data.name}: Binary Authorization off"
+
+  - id: GCP-GKE-NODE-DEFAULT-SERVICE-ACCOUNT
+    title: GKE node pool runs as the default Compute Engine service account
+    kind: misconfigured
+    category: IAM
+    severity: medium
+    entity: gke-cluster
+    why: The default service account usually holds Editor; every pod that can reach the node's metadata server gets those permissions.
+    fix: Create a minimal node service account (logging, monitoring, artifact read) and recreate the node pools with it.
+    refs: [CIS-GKE:5.2.1, CIS-GCP:4.1, NIST-800-53:AC-6]
+    query: { protocol: http, path: /assets, params: { assetTypes: container.googleapis.com/Cluster, contentType: RESOURCE, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name, name: resource.data.name }
+    each:
+      element:
+        of: resource.data.nodePools
+        where:
+          any:
+            - { field: config.serviceAccount, op: absent }
+            - { field: config.serviceAccount, op: eq, value: default }
+            - { field: config.serviceAccount, op: match, value: '^\d+-compute@developer\.gserviceaccount\.com$' }
+    evidence: "{resource.data.name}: node pool(s) using the default service account"
+
+  - id: GCP-GKE-SECRETS-NOT-ENCRYPTED
+    title: GKE cluster does not encrypt Kubernetes secrets with a Cloud KMS key
+    kind: misconfigured
+    category: CFG
+    severity: low
+    entity: gke-cluster
+    why: Application-layer secrets encryption wraps secrets in etcd with a key the organisation controls, so a copy of etcd or its backups does not expose them.
+    fix: Turn on application-layer secrets encryption with a Cloud KMS key in the cluster's region.
+    refs: [CIS-GKE:5.3.1, NIST-800-53:SC-28, NIST-800-53:SC-12]
+    query: { protocol: http, path: /assets, params: { assetTypes: container.googleapis.com/Cluster, contentType: RESOURCE, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name, name: resource.data.name }
+    each:
+      any:
+        - { field: resource.data.databaseEncryption.state, op: absent }
+        - { field: resource.data.databaseEncryption.state, op: ne, value: ENCRYPTED }
+    evidence: "{resource.data.name}: secrets encryption {resource.data.databaseEncryption.state}"
+
+  - id: GCP-GKE-ALPHA-CLUSTER
+    title: GKE cluster has Kubernetes alpha features turned on
+    kind: misconfigured
+    lens: both
+    category: CFG
+    severity: low
+    entity: gke-cluster
+    why: Alpha clusters run unsupported features, cannot be upgraded and are deleted after 30 days; they do not belong in anything that matters.
+    fix: Recreate the workload on a standard cluster.
+    refs: [CIS-GKE:5.10.2, NIST-800-53:CM-7]
+    query: { protocol: http, path: /assets, params: { assetTypes: container.googleapis.com/Cluster, contentType: RESOURCE, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name, name: resource.data.name }
+    each: { field: resource.data.enableKubernetesAlpha, op: eq, value: true }
+    evidence: "{resource.data.name}: alpha features on"
+
+  - id: GCP-GKE-VERSION-OLD
+    title: GKE control plane runs an old Kubernetes version
+    kind: misconfigured
+    lens: both
+    category: LCM
+    severity: medium
+    entity: gke-cluster
+    why: Kubernetes minor versions get about 14 months of standard support on GKE; older ones miss security fixes and are force-upgraded at end of life.
+    fix: Upgrade the control plane and node pools. Set threshold.gcp.gke.min-version to the oldest minor version still in standard support (e.g. 1.31).
+    refs: [NIST-800-53:SI-2, NIST-800-53:SA-22]
+    query: { protocol: http, path: /assets, params: { assetTypes: container.googleapis.com/Cluster, contentType: RESOURCE, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name, name: resource.data.name }
+    each: { field: resource.data.currentMasterVersion, op: version-lt, value: "1.0", threshold: gcp.gke.min-version, required: true }
+    evidence: "{resource.data.name}: control plane {resource.data.currentMasterVersion}"
+
+  - id: GCP-GKE-UNHEALTHY
+    title: GKE cluster is in an error or degraded state
+    kind: broken
+    lens: maintenance
+    category: AVL
+    severity: high
+    entity: gke-cluster
+    why: A cluster in ERROR or DEGRADED state cannot be relied on to schedule, scale or upgrade; the status message says why.
+    fix: Read the cluster's status message and conditions, fix the cause (quota, IAM for the service agent, network) and confirm it returns to RUNNING.
+    refs: [NIST-800-53:CP-10, NIST-800-53:SI-4]
+    query: { protocol: http, path: /assets, params: { assetTypes: container.googleapis.com/Cluster, contentType: RESOURCE, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name, name: resource.data.name }
+    each: { field: resource.data.status, op: in, value: [ERROR, DEGRADED] }
+    evidence: "{resource.data.name}: {resource.data.status} - {resource.data.statusMessage}"
+
+  # ---- Cloud KMS -------------------------------------------------------------------------------------
+  # rotationPeriod is a duration in seconds ("7776000s" = 90 days); the pattern below matches more than 7776000.
+
+  - id: GCP-KMS-KEY-PUBLIC
+    title: Cloud KMS key is usable by allUsers or allAuthenticatedUsers
+    kind: misconfigured
+    category: IAM
+    severity: critical
+    entity: crypto-key
+    why: A public binding on a key lets anyone encrypt, decrypt or sign with it, or read its metadata - defeating the point of a customer-managed key.
+    fix: Remove allUsers / allAuthenticatedUsers from the key's IAM policy (and from its key ring's).
+    refs: [CIS-GCP:1.9, NIST-800-53:AC-3, NIST-800-53:SC-12]
+    query: { protocol: http, path: /assets, params: { assetTypes: cloudkms.googleapis.com/CryptoKey, contentType: IAM_POLICY, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name }
+    each: { field: "iamPolicy.bindings[].members", op: in, value: [allUsers, allAuthenticatedUsers] }
+    evidence: "{name}: a binding names allUsers or allAuthenticatedUsers"
+
+  - id: GCP-KMS-ROTATION-OFF
+    title: Symmetric Cloud KMS key is never rotated automatically
+    kind: missing
+    category: PKI
+    severity: medium
+    entity: crypto-key
+    why: Without a rotation period, one key version protects all data for as long as the key exists, so a compromised version exposes everything ever encrypted with it.
+    fix: Set a rotation period of 90 days or less on the key.
+    refs: [CIS-GCP:1.10, NIST-800-53:SC-12]
+    query: { protocol: http, path: /assets, params: { assetTypes: cloudkms.googleapis.com/CryptoKey, contentType: RESOURCE, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name, name: resource.data.name }
+    each:
+      all:
+        - { field: resource.data.purpose, op: eq, value: ENCRYPT_DECRYPT }
+        - { field: resource.data.primary.state, op: eq, value: ENABLED }
+        - { field: resource.data.rotationPeriod, op: absent }
+    evidence: "{resource.data.name}: no rotation period"
+
+  - id: GCP-KMS-ROTATION-LONG
+    title: Cloud KMS key rotates less often than every 90 days
+    kind: misconfigured
+    category: PKI
+    severity: low
+    entity: crypto-key
+    why: CIS asks for rotation at most every 90 days; a longer period widens how much data one compromised key version exposes.
+    fix: Shorten the key's rotation period to 90 days or less.
+    refs: [CIS-GCP:1.10, NIST-800-53:SC-12]
+    query: { protocol: http, path: /assets, params: { assetTypes: cloudkms.googleapis.com/CryptoKey, contentType: RESOURCE, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name, name: resource.data.name }
+    each:
+      all:
+        - { field: resource.data.purpose, op: eq, value: ENCRYPT_DECRYPT }
+        - { field: resource.data.rotationPeriod, op: match, value: '^0*([1-9][0-9]{7,}|[89][0-9]{6}|7[89][0-9]{5}|77[89][0-9]{4}|777[7-9][0-9]{3}|7776(00[1-9]|0[1-9][0-9]|[1-9][0-9]{2}))(\.[0-9]+)?s$' }
+    evidence: "{resource.data.name}: rotation period {resource.data.rotationPeriod}"
+
+  # ---- BigQuery --------------------------------------------------------------------------------------
+
+  - id: GCP-BIGQUERY-DATASET-PUBLIC
+    title: BigQuery dataset is readable by allUsers or allAuthenticatedUsers
+    kind: misconfigured
+    category: IAM
+    severity: critical
+    entity: dataset
+    why: A public dataset exposes every table in it to anyone on the internet (or any Google account), and query costs fall on the readers' projects - leaks go unnoticed.
+    fix: Remove allUsers / allAuthenticatedUsers from the dataset's access; publish deliberately public data through a dedicated project.
+    refs: [CIS-GCP:7.1, NIST-800-53:AC-3, NIST-800-53:AC-22, MITRE-ATTACK:T1530]
+    query: { protocol: http, path: /assets, params: { assetTypes: bigquery.googleapis.com/Dataset, contentType: IAM_POLICY, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name }
+    each: { field: "iamPolicy.bindings[].members", op: in, value: [allUsers, allAuthenticatedUsers] }
+    evidence: "{name}: a binding names allUsers or allAuthenticatedUsers"
+
+  - id: GCP-BIGQUERY-DATASET-NO-CUSTOMER-KEY
+    title: BigQuery dataset has no default customer-managed encryption key
+    kind: misconfigured
+    category: CFG
+    severity: low
+    entity: dataset
+    why: With Google-managed keys the organisation cannot revoke access to the data by disabling a key. CIS asks for a default CMEK on datasets so new tables get it.
+    fix: Set a default Cloud KMS key on the dataset (and re-create or copy existing tables to apply it).
+    refs: [CIS-GCP:7.3, NIST-800-53:SC-28, NIST-800-53:SC-12]
+    query: { protocol: http, path: /assets, params: { assetTypes: bigquery.googleapis.com/Dataset, contentType: RESOURCE, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name, name: resource.data.datasetReference.datasetId }
+    each: { field: resource.data.defaultEncryptionConfiguration.kmsKeyName, op: absent }
+    evidence: "{name}: no default customer-managed key"
+
+  # ---- Cloud Functions and Cloud Run -----------------------------------------------------------------
+  # Cloud Functions here are 1st gen (cloudfunctions.googleapis.com/CloudFunction). 2nd-gen functions run as Cloud
+  # Run services and are judged by the Cloud Run rules.
+
+  - id: GCP-FUNCTION-PUBLIC
+    title: Cloud Function can be invoked by allUsers or allAuthenticatedUsers
+    kind: misconfigured
+    category: IAM
+    severity: high
+    entity: function
+    why: A public invoker binding lets anyone on the internet call the function; whatever it can reach with its service account, any caller can make it do.
+    fix: Remove allUsers / allAuthenticatedUsers; require IAM-authenticated callers, or put a load balancer with Cloud Armor and IAP in front.
+    refs: [NIST-800-53:AC-3, NIST-800-53:SC-7]
+    query: { protocol: http, path: /assets, params: { assetTypes: cloudfunctions.googleapis.com/CloudFunction, contentType: IAM_POLICY, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name }
+    each: { field: "iamPolicy.bindings[].members", op: in, value: [allUsers, allAuthenticatedUsers] }
+    evidence: "{name}: invokable by allUsers or allAuthenticatedUsers"
+
+  - id: GCP-FUNCTION-INGRESS-ALL
+    title: Cloud Function accepts requests from the whole internet
+    kind: misconfigured
+    category: CFG
+    severity: low
+    entity: function
+    why: With ingress set to allow all, the function's URL is reachable from anywhere, not only from the VPC or through the load balancer that applies WAF rules.
+    fix: Set ingress to internal only, or internal and Cloud Load Balancing, unless the function is a deliberate public endpoint.
+    refs: [NIST-800-53:SC-7]
+    query: { protocol: http, path: /assets, params: { assetTypes: cloudfunctions.googleapis.com/CloudFunction, contentType: RESOURCE, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name, name: resource.data.name }
+    each: { field: resource.data.ingressSettings, op: eq, value: ALLOW_ALL }
+    evidence: "{resource.data.name}: ingress ALLOW_ALL"
+
+  - id: GCP-FUNCTION-HTTP-ALLOWED
+    title: HTTP-triggered Cloud Function also answers plain HTTP
+    kind: misconfigured
+    category: PKI
+    severity: medium
+    entity: function
+    why: With the SECURE_OPTIONAL security level, requests (and any tokens in them) can be sent over unencrypted HTTP.
+    fix: Set the trigger's security level to SECURE_ALWAYS so HTTP is redirected to HTTPS.
+    refs: [NIST-800-53:SC-8]
+    query: { protocol: http, path: /assets, params: { assetTypes: cloudfunctions.googleapis.com/CloudFunction, contentType: RESOURCE, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name, name: resource.data.name }
+    each:
+      all:
+        - { field: resource.data.httpsTrigger, op: exists }
+        - any:
+            - { field: resource.data.httpsTrigger.securityLevel, op: absent }
+            - { field: resource.data.httpsTrigger.securityLevel, op: eq, value: SECURE_OPTIONAL }
+    evidence: "{resource.data.name}: security level {resource.data.httpsTrigger.securityLevel}"
+
+  - id: GCP-FUNCTION-DEPRECATED-RUNTIME
+    title: Cloud Function uses a deprecated runtime
+    kind: misconfigured
+    lens: both
+    category: LCM
+    severity: medium
+    entity: function
+    why: Deprecated language runtimes get no security patches, and functions on them cannot be redeployed once the runtime is decommissioned - a fix in an emergency becomes a migration.
+    fix: Move the function to a supported runtime version. The runtimes flagged are threshold.gcp.functions.deprecated-runtime-pattern (default Node.js 16 and older, Python 3.8 and older, Go 1.16 and older, Ruby 2.x, PHP 7, .NET Core 3).
+    refs: [NIST-800-53:SA-22, NIST-800-53:SI-2]
+    query: { protocol: http, path: /assets, params: { assetTypes: cloudfunctions.googleapis.com/CloudFunction, contentType: RESOURCE, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name, name: resource.data.name }
+    each: { field: resource.data.runtime, op: match, value: '^(nodejs([68]|1[0246])|python3[78]|go1(11|13|16)|ruby2[67]|php7[34]|dotnet3)$', threshold: gcp.functions.deprecated-runtime-pattern }
+    evidence: "{resource.data.name}: runtime {resource.data.runtime}"
+
+  - id: GCP-RUN-PUBLIC
+    title: Cloud Run service can be invoked by allUsers or allAuthenticatedUsers
+    kind: misconfigured
+    category: IAM
+    severity: medium
+    entity: run-service
+    why: A public invoker binding makes the service callable by anyone; right for a public website, wrong for an internal API or a 2nd-gen function that trusts its callers.
+    fix: For services that are not meant to be public, remove allUsers / allAuthenticatedUsers and require IAM authentication or IAP.
+    refs: [NIST-800-53:AC-3, NIST-800-53:SC-7]
+    query: { protocol: http, path: /assets, params: { assetTypes: run.googleapis.com/Service, contentType: IAM_POLICY, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name }
+    each: { field: "iamPolicy.bindings[].members", op: in, value: [allUsers, allAuthenticatedUsers] }
+    evidence: "{name}: invokable by allUsers or allAuthenticatedUsers"
+
+  - id: GCP-RUN-INGRESS-ALL
+    title: Cloud Run service accepts traffic from the whole internet
+    kind: misconfigured
+    category: CFG
+    severity: low
+    entity: run-service
+    why: With ingress "all", the service's run.app URL is reachable directly, bypassing any load balancer, Cloud Armor policy or IAP in front of it.
+    fix: Set ingress to internal, or internal and Cloud Load Balancing, unless the service is a deliberate public endpoint.
+    refs: [NIST-800-53:SC-7]
+    query: { protocol: http, path: /assets, params: { assetTypes: run.googleapis.com/Service, contentType: RESOURCE, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name }
+    each:
+      any:
+        - { field: 'resource.data.metadata.annotations.["run.googleapis.com/ingress"]', op: eq, value: all }
+        - { field: resource.data.ingress, op: eq, value: INGRESS_TRAFFIC_ALL }
+    evidence: "{name}: ingress open to all"
+
+  # ---- Pub/Sub -----------------------------------------------------------------------------------------
+
+  - id: GCP-PUBSUB-TOPIC-PUBLIC
+    title: Pub/Sub topic is accessible to allUsers or allAuthenticatedUsers
+    kind: misconfigured
+    category: IAM
+    severity: high
+    entity: topic
+    why: A public binding lets anyone publish into the topic (feeding forged events to every subscriber) or attach subscriptions and read its messages.
+    fix: Remove allUsers / allAuthenticatedUsers from the topic's IAM policy.
+    refs: [NIST-800-53:AC-3]
+    query: { protocol: http, path: /assets, params: { assetTypes: pubsub.googleapis.com/Topic, contentType: IAM_POLICY, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name }
+    each: { field: "iamPolicy.bindings[].members", op: in, value: [allUsers, allAuthenticatedUsers] }
+    evidence: "{name}: a binding names allUsers or allAuthenticatedUsers"
+
+  - id: GCP-PUBSUB-PUSH-UNAUTHENTICATED
+    title: Pub/Sub push subscription sends messages without an identity token
+    kind: misconfigured
+    category: AUT
+    severity: low
+    entity: subscription
+    why: Without an OIDC token on push requests, the receiving endpoint cannot tell real deliveries from anyone else posting to the same URL.
+    fix: Configure push authentication with a service account (OIDC token) and verify the token at the endpoint.
+    refs: [NIST-800-53:IA-9, NIST-800-53:SC-8]
+    query: { protocol: http, path: /assets, params: { assetTypes: pubsub.googleapis.com/Subscription, contentType: RESOURCE, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name, name: resource.data.name }
+    each:
+      all:
+        - { field: resource.data.pushConfig.pushEndpoint, op: notempty }
+        - { field: resource.data.pushConfig.oidcToken, op: absent }
+    evidence: "{resource.data.name}: push without authentication"
+
+  # ---- Secret Manager (metadata only; secret values are never read) ----------------------------------
+
+  - id: GCP-SECRET-PUBLIC
+    title: Secret Manager secret is accessible to allUsers or allAuthenticatedUsers
+    kind: misconfigured
+    category: IAM
+    severity: critical
+    entity: secret
+    why: A public binding on a secret can let anyone read its value - a password, key or token - from anywhere.
+    fix: Remove allUsers / allAuthenticatedUsers from the secret's IAM policy at once, then rotate the secret - assume it has been read.
+    refs: [NIST-800-53:AC-3, NIST-800-53:IA-5, MITRE-ATTACK:T1552]
+    query: { protocol: http, path: /assets, params: { assetTypes: secretmanager.googleapis.com/Secret, contentType: IAM_POLICY, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name }
+    each: { field: "iamPolicy.bindings[].members", op: in, value: [allUsers, allAuthenticatedUsers] }
+    evidence: "{name}: a binding names allUsers or allAuthenticatedUsers"
+
+  - id: GCP-SECRET-NO-ROTATION
+    title: Secret Manager secret has no rotation schedule
+    kind: missing
+    category: IAM
+    severity: low
+    entity: secret
+    why: Without a rotation schedule nothing reminds the owner to replace the secret, so credentials stay valid for years in every copy made of them.
+    fix: Set a rotation period (90 days or less) with a Pub/Sub topic that triggers the rotation job, or record why the secret cannot rotate.
+    refs: [NIST-800-53:IA-5(1), NIST-800-53:SC-12]
+    query: { protocol: http, path: /assets, params: { assetTypes: secretmanager.googleapis.com/Secret, contentType: RESOURCE, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name }
+    each: { field: resource.data.rotation.rotationPeriod, op: absent }
+    evidence: "{name}: no rotation schedule"
+
+  # ---- Dataproc, Artifact Registry --------------------------------------------------------------------
+
+  - id: GCP-DATAPROC-PUBLIC-IP
+    title: Dataproc cluster nodes have public IP addresses
+    kind: misconfigured
+    category: CFG
+    severity: medium
+    entity: dataproc-cluster
+    why: Hadoop and Spark daemons expose many unauthenticated web and RPC ports; on public addresses one firewall mistake puts them on the internet.
+    fix: Create clusters with internal IP only and use Cloud NAT and Private Google Access for outbound traffic.
+    refs: [NIST-800-53:SC-7]
+    query: { protocol: http, path: /assets, params: { assetTypes: dataproc.googleapis.com/Cluster, contentType: RESOURCE, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name, name: resource.data.clusterName }
+    each:
+      any:
+        - { field: resource.data.config.gceClusterConfig.internalIpOnly, op: absent }
+        - { field: resource.data.config.gceClusterConfig.internalIpOnly, op: eq, value: false }
+    evidence: "{resource.data.clusterName}: internal IP only {resource.data.config.gceClusterConfig.internalIpOnly}"
+
+  - id: GCP-DATAPROC-NO-CUSTOMER-KEY
+    title: Dataproc cluster disks are not encrypted with a customer-managed key
+    kind: misconfigured
+    category: CFG
+    severity: low
+    entity: dataproc-cluster
+    why: CIS asks for customer-managed keys on Dataproc so the organisation can revoke access to cluster data by disabling the key.
+    fix: Create clusters with a Cloud KMS key for persistent disks (encryptionConfig).
+    refs: [CIS-GCP:8.1, NIST-800-53:SC-28, NIST-800-53:SC-12]
+    query: { protocol: http, path: /assets, params: { assetTypes: dataproc.googleapis.com/Cluster, contentType: RESOURCE, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name, name: resource.data.clusterName }
+    each:
+      all:
+        - { field: resource.data.config.encryptionConfig.gcePdKmsKeyName, op: absent }
+        - { field: resource.data.config.encryptionConfig.kmsKey, op: absent }
+    evidence: "{resource.data.clusterName}: Google-managed disk encryption"
+
+  - id: GCP-ARTIFACT-REPOSITORY-PUBLIC
+    title: Artifact Registry repository is readable by allUsers or allAuthenticatedUsers
+    kind: misconfigured
+    category: IAM
+    severity: high
+    entity: repository
+    why: A public repository lets anyone pull the organisation's images and packages - with whatever configuration, internal hostnames or embedded credentials they contain.
+    fix: Remove allUsers / allAuthenticatedUsers from the repository's IAM policy unless it is a deliberate public distribution point.
+    refs: [NIST-800-53:AC-3, NIST-800-53:AC-22]
+    query: { protocol: http, path: /assets, params: { assetTypes: artifactregistry.googleapis.com/Repository, contentType: IAM_POLICY, pageSize: 1000 }, paging: cursor, cursorField: nextPageToken, cursorParam: pageToken, items: assets, key: name }
+    each: { field: "iamPolicy.bindings[].members", op: in, value: [allUsers, allAuthenticatedUsers] }
+    evidence: "{name}: a binding names allUsers or allAuthenticatedUsers"

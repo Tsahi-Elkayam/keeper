@@ -1,0 +1,1141 @@
+schema: keeper.rules/1
+system: exchange-online
+name: Exchange Online
+integration: exchange-online
+
+# Generic rules for any Exchange Online tenant, read through the REST endpoint the Exchange
+# Online PowerShell module itself calls (https://outlook.office365.com/adminapi/beta/<tenant id>).
+# Every query is one POST to /InvokeCommand whose body names a Get- cmdlet and its read parameters;
+# the integration type refuses any non-Get cmdlet and any parameter that makes one do more than read.
+# The cmdlet result array comes back under the OData `value` field (items: value).
+#
+# These are tenant-independent: no mailbox, domain, group or address is named, no count is assumed.
+# Where a check needs the tenant's own list (allowed forwarding exceptions, partner domains), the rule
+# carries a threshold the tenant fills. Checks that need a non-Get cmdlet, Security & Compliance
+# (Purview / Search-UnifiedAuditLog), Graph, a trend across runs, or a process attestation are in
+# docs\backlog\exchange-online.md.
+
+defaults:
+  lens: security
+  refresh: 1d
+
+rules:
+  # ============================================================ mailbox auditing (logging) ===
+  - id: EXO-AUDIT-DISABLED-ORG
+    title: Mailbox auditing is turned off for the organisation
+    kind: misconfigured
+    category: LOG
+    severity: high
+    entity: org-config
+    why: "With AuditDisabled set to true no mailbox records owner, delegate or admin actions, so who read or deleted a message cannot be answered after a compromise."
+    fix: "Set-OrganizationConfig -AuditDisabled $false so mailbox auditing is on by default again (planned write)."
+    refs: ["CIS-M365-6.1.1", "CISA-SCuBA:MS.EXO.13.1", "NIST-800-53:AU-2", "NIST-800-53:AU-12"]
+    query:
+      protocol: http
+      method: post
+      path: /InvokeCommand
+      body:
+        CmdletInput:
+          CmdletName: Get-OrganizationConfig
+          Parameters: {}
+      items: value
+      min_rows: 1
+      key: Identity
+      name: Name
+    each: { field: AuditDisabled, op: eq, value: true }
+    evidence: "AuditDisabled = {AuditDisabled}"
+
+  - id: EXO-AUDIT-BYPASS-PRESENT
+    title: An account is set to bypass mailbox auditing
+    kind: misconfigured
+    category: LOG
+    severity: high
+    entity: mailbox-audit-bypass
+    why: "An account with AuditBypassEnabled leaves no trace in any mailbox it touches, the classic hiding place for a stale service account or an attacker."
+    fix: "Set-MailboxAuditBypassAssociation -AuditBypassEnabled $false for the account, and confirm why it was ever set (planned write)."
+    refs: ["CIS-M365-6.1.3", "NIST-800-53:AU-9", "NIST-800-53:AU-12"]
+    query:
+      protocol: http
+      method: post
+      path: /InvokeCommand
+      body:
+        CmdletInput:
+          CmdletName: Get-MailboxAuditBypassAssociation
+          Parameters: { ResultSize: Unlimited }
+      items: value
+      key: Identity
+      name: Name
+    each: { field: AuditBypassEnabled, op: eq, value: true }
+    evidence: "{Identity}: AuditBypassEnabled = {AuditBypassEnabled}"
+
+  # ======================================================= forwarding and auto-forward ===
+  - id: EXO-REMOTE-DOMAIN-AUTOFORWARD
+    title: A remote domain allows automatic forwarding to the internet
+    kind: misconfigured
+    category: CFG
+    severity: medium
+    entity: remote-domain
+    why: "The remote domain is one of the places that can permit automatic external forwarding; with AutoForwardEnabled true, mailbox and inbox-rule forwards to that domain leave the tenant silently."
+    fix: "Set-RemoteDomain -AutoForwardEnabled $false on the domain (the default remote domain especially), keeping only the documented exception (planned write)."
+    refs: ["CIS-M365-6.2.1", "CISA-SCuBA:MS.EXO.1.1", "NIST-800-53:AC-4"]
+    query:
+      protocol: http
+      method: post
+      path: /InvokeCommand
+      body:
+        CmdletInput:
+          CmdletName: Get-RemoteDomain
+          Parameters: {}
+      items: value
+      key: Identity
+      name: DomainName
+    each: { field: AutoForwardEnabled, op: eq, value: true }
+    evidence: "{DomainName}: AutoForwardEnabled = {AutoForwardEnabled}"
+
+  - id: EXO-OUTBOUND-SPAM-FORWARDING-ALLOWED
+    title: An outbound spam policy does not block automatic external forwarding
+    kind: misconfigured
+    category: CFG
+    severity: high
+    entity: outbound-spam-policy
+    why: "AutoForwardingMode set to Off is the tenant switch that stops every automatic external forward whatever set it; On permits it, and Automatic leaves the decision to Microsoft rather than denying it."
+    fix: "Set-HostedOutboundSpamFilterPolicy -AutoForwardingMode Off on each policy, and scope any genuine exception to the documented mailbox through its own rule (planned write)."
+    refs: ["CIS-M365-6.2.1", "CISA-SCuBA:MS.EXO.1.1", "NIST-800-53:AC-4", "NIST-800-53:SC-7"]
+    query:
+      protocol: http
+      method: post
+      path: /InvokeCommand
+      body:
+        CmdletInput:
+          CmdletName: Get-HostedOutboundSpamFilterPolicy
+          Parameters: {}
+      items: value
+      key: Identity
+      name: Name
+    each: { field: AutoForwardingMode, op: ne, value: "Off" }
+    evidence: "{Name}: AutoForwardingMode = {AutoForwardingMode}"
+
+  - id: EXO-MAILBOX-FORWARDING-SET
+    title: A mailbox forwards its mail to another address
+    kind: misconfigured
+    category: IAM
+    severity: high
+    entity: mailbox
+    why: "A mailbox-level forward sends a copy or all of the mail elsewhere; forwarding inside and outside the organisation is the classic post-compromise persistence and breaks a no-forwarding mail policy. The tenant's approved forwarding exceptions go in the allow-list threshold."
+    fix: "Confirm the forward with the owner, remove ForwardingSmtpAddress or ForwardingAddress unless it is a recorded exception, and check who set it (production write, the user decides)."
+    refs: ["CIS-M365-6.2.1", "CISA-SCuBA:MS.EXO.1.1", "NIST-800-53:AC-4", "NIST-800-53:SI-4"]
+    query:
+      protocol: http
+      method: post
+      path: /InvokeCommand
+      body:
+        CmdletInput:
+          CmdletName: Get-Mailbox
+          Parameters: { ResultSize: Unlimited }
+      items: value
+      key: Identity
+      name: PrimarySmtpAddress
+    each:
+      all:
+        - any:
+            - { field: ForwardingSmtpAddress, op: notempty }
+            - { field: ForwardingAddress, op: notempty }
+        - field: PrimarySmtpAddress
+          op: notin
+          threshold: exchange-online.allowed-forwarding-addresses
+          value: []
+    evidence: "{PrimarySmtpAddress}: ForwardingSmtpAddress {ForwardingSmtpAddress}, ForwardingAddress {ForwardingAddress}, DeliverToMailboxAndForward {DeliverToMailboxAndForward}"
+
+  # ============================================================ transport (mail flow) rules ===
+  - id: EXO-TRANSPORT-RULE-REDIRECT-EXTERNAL
+    title: An enabled transport rule redirects or blind-copies mail
+    kind: misconfigured
+    category: CFG
+    severity: high
+    entity: transport-rule
+    why: "A mail flow rule that redirects or blind-copies messages is a silent tenant-wide copy of mail; sent to an outside address it is an exfiltration path that no user sees."
+    fix: "Review each redirect, blind-copy and copy-to target with its owner; disable rules that copy mail outside and find who created them (planned write)."
+    refs: ["CIS-M365-6.2.1", "NIST-800-53:AC-4", "NIST-800-53:SI-4"]
+    query:
+      protocol: http
+      method: post
+      path: /InvokeCommand
+      body:
+        CmdletInput:
+          CmdletName: Get-TransportRule
+          Parameters: { ResultSize: Unlimited }
+      items: value
+      key: Guid
+      name: Name
+    each:
+      all:
+        - { field: State, op: eq, value: Enabled }
+        - any:
+            - { field: RedirectMessageTo, op: notempty }
+            - { field: BlindCopyTo, op: notempty }
+            - { field: AddToRecipients, op: notempty }
+    evidence: "{Name}: RedirectMessageTo {RedirectMessageTo}, BlindCopyTo {BlindCopyTo}, AddToRecipients {AddToRecipients}"
+
+  - id: EXO-TRANSPORT-RULE-SCL-BYPASS
+    title: An enabled transport rule bypasses spam filtering
+    kind: misconfigured
+    category: CFG
+    severity: high
+    entity: transport-rule
+    why: "A rule that sets SCL to -1 marks the matched mail as not spam and skips Defender filtering; keyed on a sender domain or address, anyone who spoofs it reaches inboxes directly."
+    fix: "Remove the SCL -1 action; use the Tenant Allow/Block List or advanced delivery for genuine cases, restricted to a connector or certificate (planned write)."
+    refs: ["CIS-M365-6.2.2", "CISA-SCuBA:MS.EXO.12.1", "NIST-800-53:SI-3", "NIST-800-53:SI-8"]
+    query:
+      protocol: http
+      method: post
+      path: /InvokeCommand
+      body:
+        CmdletInput:
+          CmdletName: Get-TransportRule
+          Parameters: { ResultSize: Unlimited }
+      items: value
+      key: Guid
+      name: Name
+    each:
+      all:
+        - { field: State, op: eq, value: Enabled }
+        - { field: SetSCL, op: eq, value: -1 }
+    evidence: "{Name}: SetSCL = {SetSCL}"
+
+  - id: EXO-TRANSPORT-RULE-NEW
+    title: A transport rule is new since the last scan
+    kind: misconfigured
+    category: CFG
+    severity: medium
+    entity: transport-rule
+    refresh: 7d
+    why: "A new or changed mail flow rule changes how mail is handled for everyone and is invisible to users; a rule that appeared between scans must be matched to a change record."
+    fix: "Confirm the rule with the admin who added it; revert it if it was not approved. Resolves on the next scan that sees no change."
+    refs: ["NIST-800-53:CM-3", "NIST-800-53:CM-5"]
+    query:
+      protocol: http
+      method: post
+      path: /InvokeCommand
+      body:
+        CmdletInput:
+          CmdletName: Get-TransportRule
+          Parameters: { ResultSize: Unlimited }
+      items: value
+      key: Guid
+      name: Name
+    each: { field: _new, op: eq, value: true }
+    evidence: "{Name}: new transport rule (state {State}, mode {Mode})"
+
+  - id: EXO-TRANSPORT-RULE-TEST-MODE
+    title: A transport rule is in test mode and acts on nothing
+    kind: misconfigured
+    category: HYG
+    severity: low
+    entity: transport-rule
+    why: "A rule in Audit or AuditAndNotify mode (test mode) takes no action on mail; left there it is dead configuration that confuses the next troubleshooting session and can be mistaken for an enforced control."
+    fix: "Move the rule to Enforce if it is meant to act, or delete it; record a deliberate test-mode rule (planned write)."
+    refs: ["NIST-800-53:CM-3"]
+    query:
+      protocol: http
+      method: post
+      path: /InvokeCommand
+      body:
+        CmdletInput:
+          CmdletName: Get-TransportRule
+          Parameters: { ResultSize: Unlimited }
+      items: value
+      key: Guid
+      name: Name
+    each:
+      all:
+        - { field: State, op: eq, value: Enabled }
+        - { field: Mode, op: ne, value: Enforce }
+    evidence: "{Name}: mode {Mode}"
+
+  - id: EXO-O365-CONNECTORS-ENABLED
+    title: Office 365 connectors for Outlook and groups are enabled
+    kind: misconfigured
+    category: LCM
+    severity: low
+    entity: org-config
+    why: "Microsoft is retiring Office 365 connectors in favour of Workflows; while enabled they also post external content into group mailboxes, and they will stop working on the retirement date."
+    fix: "Disable connectors for Outlook and groups unless a named workflow owner needs them with a migration date (planned write)."
+    refs: ["NIST-800-53:CM-7", "NIST-800-53:SA-22"]
+    query:
+      protocol: http
+      method: post
+      path: /InvokeCommand
+      body:
+        CmdletInput:
+          CmdletName: Get-OrganizationConfig
+          Parameters: {}
+      items: value
+      min_rows: 1
+      key: Identity
+      name: Name
+    each: { field: ConnectorsEnabled, op: eq, value: true }
+    evidence: "ConnectorsEnabled = {ConnectorsEnabled}, ConnectorsEnabledForOutlook = {ConnectorsEnabledForOutlook}, ConnectorsEnabledForTeams = {ConnectorsEnabledForTeams}"
+
+  # ============================================================ connectors and domains ===
+  - id: EXO-INBOUND-CONNECTOR-NO-TLS
+    title: A partner inbound connector does not require TLS
+    kind: misconfigured
+    category: CFG
+    severity: high
+    entity: connector
+    why: "A partner inbound connector without RequireTls and without a certificate or IP restriction lets anyone who claims to be that partner deliver mail that is treated as trusted and skips filtering."
+    fix: "Set RequireTls and restrict the connector by TlsSenderCertificateName or SenderIPAddresses, or remove it (planned write)."
+    refs: ["NIST-800-53:SC-8", "NIST-800-53:SC-7"]
+    query:
+      protocol: http
+      method: post
+      path: /InvokeCommand
+      body:
+        CmdletInput:
+          CmdletName: Get-InboundConnector
+          Parameters: {}
+      items: value
+      key: Identity
+      name: Name
+    each:
+      all:
+        - { field: Enabled, op: eq, value: true }
+        - { field: ConnectorType, op: eq, value: Partner }
+        - { field: RequireTls, op: eq, value: false }
+    evidence: "{Name}: ConnectorType {ConnectorType}, RequireTls {RequireTls}, restriction cert {RestrictDomainsToCertificate} ip {RestrictDomainsToIPAddresses}"
+
+  - id: EXO-INBOUND-CONNECTOR-NEW
+    title: An inbound connector is new since the last scan
+    kind: misconfigured
+    category: CFG
+    severity: high
+    entity: connector
+    refresh: 7d
+    why: "A new inbound connector is the classic mail-relay backdoor: it can accept mail from an attacker's host as internal and bypass filtering, and it is invisible to users."
+    fix: "Confirm the connector with the admin who created it; disable an unexplained one and investigate (planned write). Resolves on the next scan that sees no change."
+    refs: ["NIST-800-53:CM-3", "NIST-800-53:SI-4"]
+    query:
+      protocol: http
+      method: post
+      path: /InvokeCommand
+      body:
+        CmdletInput:
+          CmdletName: Get-InboundConnector
+          Parameters: {}
+      items: value
+      key: Identity
+      name: Name
+    each: { field: _new, op: eq, value: true }
+    evidence: "{Name}: new inbound connector (type {ConnectorType}, enabled {Enabled})"
+
+  - id: EXO-OUTBOUND-CONNECTOR-WEAK-TLS
+    title: An enabled outbound connector uses opportunistic TLS
+    kind: misconfigured
+    category: CFG
+    severity: medium
+    entity: connector
+    why: "An outbound connector set to EncryptionOnly accepts any certificate and downgrades to clear text if the far side misbehaves, so municipal mail it routes can leave unprotected or go to a host nobody vetted."
+    fix: "Set the connector's TlsSettings to DomainValidation or CertificateValidation with a TlsDomain, or remove it (planned write)."
+    refs: ["NIST-800-53:SC-8"]
+    query:
+      protocol: http
+      method: post
+      path: /InvokeCommand
+      body:
+        CmdletInput:
+          CmdletName: Get-OutboundConnector
+          Parameters: {}
+      items: value
+      key: Identity
+      name: Name
+    each:
+      all:
+        - { field: Enabled, op: eq, value: true }
+        - { field: TlsSettings, op: eq, value: EncryptionOnly }
+    evidence: "{Name}: TlsSettings {TlsSettings}, TlsDomain {TlsDomain}, smart hosts {SmartHosts}"
+
+  - id: EXO-OUTBOUND-CONNECTOR-NEW
+    title: An outbound connector is new since the last scan
+    kind: misconfigured
+    category: CFG
+    severity: high
+    entity: connector
+    refresh: 7d
+    why: "A new or changed outbound connector can route all mail through an attacker-controlled host; a connector that appeared between scans must be matched to a change record."
+    fix: "Confirm the connector with the admin who created it; disable an unexplained one and investigate (planned write). Resolves on the next scan that sees no change."
+    refs: ["NIST-800-53:CM-3", "NIST-800-53:SI-4"]
+    query:
+      protocol: http
+      method: post
+      path: /InvokeCommand
+      body:
+        CmdletInput:
+          CmdletName: Get-OutboundConnector
+          Parameters: {}
+      items: value
+      key: Identity
+      name: Name
+    each: { field: _new, op: eq, value: true }
+    evidence: "{Name}: new outbound connector (enabled {Enabled}, smart hosts {SmartHosts})"
+
+  - id: EXO-ACCEPTED-DOMAIN-RELAY
+    title: An accepted domain relays or matches sub-domains
+    kind: misconfigured
+    category: CFG
+    severity: medium
+    entity: accepted-domain
+    why: "An InternalRelay domain, or one with MatchSubDomains on, disables directory-based edge blocking and can relay mail for addresses nobody owns, which is both a delivery risk and an open-relay surface."
+    fix: "Set the domain to Authoritative after confirming no on-premises recipients, and turn MatchSubDomains off unless a relay is documented (planned write)."
+    refs: ["NIST-800-53:SC-7", "NIST-800-53:CM-8"]
+    query:
+      protocol: http
+      method: post
+      path: /InvokeCommand
+      body:
+        CmdletInput:
+          CmdletName: Get-AcceptedDomain
+          Parameters: {}
+      items: value
+      key: Identity
+      name: DomainName
+    each:
+      any:
+        - { field: DomainType, op: eq, value: InternalRelay }
+        - { field: MatchSubDomains, op: eq, value: true }
+    evidence: "{DomainName}: DomainType {DomainType}, MatchSubDomains {MatchSubDomains}"
+
+  # ============================================================ authentication policy ===
+  - id: EXO-SMTP-AUTH-ENABLED-ORG
+    title: SMTP AUTH is enabled for the organisation
+    kind: misconfigured
+    category: AUT
+    severity: high
+    entity: org-config
+    why: "SMTP AUTH is a password protocol attackers spray; left enabled tenant-wide it is a door that cannot do MFA, and the safe pattern is off organisation-wide with per-device exceptions."
+    fix: "Set-TransportConfig -SmtpClientAuthenticationDisabled $true once the devices that relied on it are moved to a relay connector or High Volume Email (planned write)."
+    refs: ["CIS-M365-6.5.4", "CISA-SCuBA:MS.EXO.5.1", "NIST-800-53:IA-2", "NIST-800-53:CM-7"]
+    query:
+      protocol: http
+      method: post
+      path: /InvokeCommand
+      body:
+        CmdletInput:
+          CmdletName: Get-TransportConfig
+          Parameters: {}
+      items: value
+      min_rows: 1
+      key: Identity
+    each: { field: SmtpClientAuthenticationDisabled, op: eq, value: false }
+    evidence: "SmtpClientAuthenticationDisabled = {SmtpClientAuthenticationDisabled}"
+
+  - id: EXO-SMTP-AUTH-PER-MAILBOX
+    title: A mailbox has SMTP AUTH explicitly enabled
+    kind: misconfigured
+    category: AUT
+    severity: medium
+    entity: cas-mailbox
+    why: "A per-mailbox SmtpClientAuthenticationDisabled of false overrides the tenant switch and reopens password-only submission for that account; on a person's mailbox it reopens spraying, and every exception should be a device or application account."
+    fix: "Set-CASMailbox -SmtpClientAuthenticationDisabled $true (or $null) for person mailboxes; keep only device or application accounts as exceptions, on OAuth or a dated migration (planned write)."
+    refs: ["NIST-800-53:IA-2"]
+    query:
+      protocol: http
+      method: post
+      path: /InvokeCommand
+      body:
+        CmdletInput:
+          CmdletName: Get-CASMailbox
+          Parameters: { ResultSize: Unlimited }
+      items: value
+      key: Identity
+      name: PrimarySmtpAddress
+    each: { field: SmtpClientAuthenticationDisabled, op: eq, value: false }
+    evidence: "{PrimarySmtpAddress}: SmtpClientAuthenticationDisabled = {SmtpClientAuthenticationDisabled}"
+
+  - id: EXO-POP-IMAP-ENABLED-MAILBOX
+    title: A mailbox has POP or IMAP enabled
+    kind: misconfigured
+    category: AUT
+    severity: medium
+    entity: cas-mailbox
+    why: "POP and IMAP clients cannot do Conditional Access device checks and download the whole mailbox; they are a favourite of credential-stuffing tools and should be off except for documented application accounts."
+    fix: "Set-CASMailbox -PopEnabled $false -ImapEnabled $false in bulk, keeping only documented application mailboxes (planned write)."
+    refs: ["NIST-800-53:CM-7", "NIST-800-53:IA-2"]
+    query:
+      protocol: http
+      method: post
+      path: /InvokeCommand
+      body:
+        CmdletInput:
+          CmdletName: Get-CASMailbox
+          Parameters: { ResultSize: Unlimited }
+      items: value
+      key: Identity
+      name: PrimarySmtpAddress
+    each:
+      any:
+        - { field: PopEnabled, op: eq, value: true }
+        - { field: ImapEnabled, op: eq, value: true }
+    evidence: "{PrimarySmtpAddress}: PopEnabled {PopEnabled}, ImapEnabled {ImapEnabled}"
+
+  - id: EXO-POP-IMAP-ENABLED-PLAN
+    title: A CAS mailbox plan still enables POP or IMAP for new mailboxes
+    kind: misconfigured
+    category: AUT
+    severity: low
+    entity: cas-mailbox-plan
+    why: "The CAS mailbox plan decides what a new joiner is born with; if it still enables POP or IMAP, every new mailbox gets them back after a bulk clean-up."
+    fix: "Set-CASMailboxPlan -PopEnabled $false -ImapEnabled $false on each plan (planned write)."
+    refs: ["NIST-800-53:CM-7"]
+    query:
+      protocol: http
+      method: post
+      path: /InvokeCommand
+      body:
+        CmdletInput:
+          CmdletName: Get-CASMailboxPlan
+          Parameters: {}
+      items: value
+      key: Identity
+      name: Name
+    each:
+      any:
+        - { field: PopEnabled, op: eq, value: true }
+        - { field: ImapEnabled, op: eq, value: true }
+    evidence: "{Name}: PopEnabled {PopEnabled}, ImapEnabled {ImapEnabled}"
+
+  - id: EXO-MODERN-AUTH-OFF
+    title: Modern authentication for Outlook is off
+    kind: misconfigured
+    category: AUT
+    severity: medium
+    entity: org-config
+    why: "Without OAuth2ClientProfileEnabled, Outlook falls back to basic prompts that cannot do MFA, so the sign-in is a password-only door that Conditional Access cannot protect."
+    fix: "Set-OrganizationConfig -OAuth2ClientProfileEnabled $true (planned write)."
+    refs: ["CIS-M365-6.5.1", "NIST-800-53:IA-2"]
+    query:
+      protocol: http
+      method: post
+      path: /InvokeCommand
+      body:
+        CmdletInput:
+          CmdletName: Get-OrganizationConfig
+          Parameters: {}
+      items: value
+      min_rows: 1
+      key: Identity
+      name: Name
+    each: { field: OAuth2ClientProfileEnabled, op: eq, value: false }
+    evidence: "OAuth2ClientProfileEnabled = {OAuth2ClientProfileEnabled}"
+
+  - id: EXO-DIRECT-SEND-ALLOWED
+    title: Direct Send of unauthenticated internal-looking mail is allowed
+    kind: misconfigured
+    category: AUT
+    severity: medium
+    entity: org-config
+    why: "Direct Send lets anyone deliver mail that appears to come from an internal address straight to the tenant's MX; phishing campaigns abused it, and RejectDirectSend closes it."
+    fix: "Set-OrganizationConfig -RejectDirectSend $true after devices that relied on Direct Send are moved to a relay connector (planned write)."
+    refs: ["CIS-M365-6.5.5", "NIST-800-53:SI-8", "NIST-800-53:SC-7"]
+    query:
+      protocol: http
+      method: post
+      path: /InvokeCommand
+      body:
+        CmdletInput:
+          CmdletName: Get-OrganizationConfig
+          Parameters: {}
+      items: value
+      min_rows: 1
+      key: Identity
+      name: Name
+    each: { field: RejectDirectSend, op: eq, value: false }
+    evidence: "RejectDirectSend = {RejectDirectSend}"
+
+  - id: EXO-AUTH-POLICY-ALLOWS-BASIC
+    title: An authentication policy re-allows basic authentication
+    kind: misconfigured
+    category: AUT
+    severity: medium
+    entity: auth-policy
+    why: "Basic authentication is off service-wide, but an authentication policy with any AllowBasicAuth setting on re-opens password-only access for the users it is assigned to, bypassing the service-wide block."
+    fix: "Create and assign a block-all authentication policy (every AllowBasicAuth parameter false) and document any per-user exception (planned write)."
+    refs: ["NIST-800-53:IA-2"]
+    query:
+      protocol: http
+      method: post
+      path: /InvokeCommand
+      body:
+        CmdletInput:
+          CmdletName: Get-AuthenticationPolicy
+          Parameters: {}
+      items: value
+      key: Identity
+      name: Name
+    each:
+      any:
+        - { field: AllowBasicAuthSmtp, op: eq, value: true }
+        - { field: AllowBasicAuthPop, op: eq, value: true }
+        - { field: AllowBasicAuthImap, op: eq, value: true }
+        - { field: AllowBasicAuthActiveSync, op: eq, value: true }
+        - { field: AllowBasicAuthWebServices, op: eq, value: true }
+        - { field: AllowBasicAuthMapi, op: eq, value: true }
+    evidence: "{Name}: SMTP {AllowBasicAuthSmtp}, POP {AllowBasicAuthPop}, IMAP {AllowBasicAuthImap}, EAS {AllowBasicAuthActiveSync}, EWS {AllowBasicAuthWebServices}, MAPI {AllowBasicAuthMapi}"
+
+  - id: EXO-CLIENT-ACCESS-RULES-PRESENT
+    title: Client access rules still exist after their retirement
+    kind: misconfigured
+    category: AUT
+    severity: low
+    entity: client-access-rule
+    why: "Client access rules were retired in favour of Conditional Access; any rule left reflects a design nobody maintains and can block or allow access in ways the Conditional Access view does not show."
+    fix: "Recreate the intent in Conditional Access (Entra), then remove the client access rules (planned write)."
+    refs: ["NIST-800-53:AC-17"]
+    query:
+      protocol: http
+      method: post
+      path: /InvokeCommand
+      body:
+        CmdletInput:
+          CmdletName: Get-ClientAccessRule
+          Parameters: {}
+      items: value
+      key: Identity
+      name: Name
+    each: any
+    evidence: "{Name}: action {Action}, priority {Priority}, enabled {Enabled}"
+
+  # ============================================================ RBAC and role assignment ===
+  - id: EXO-DIRECT-USER-ROLE-ASSIGNMENT
+    title: An administrative role is assigned directly to a user
+    kind: misconfigured
+    category: IAM
+    severity: medium
+    entity: role-assignment
+    why: "A management role assigned straight to a user, outside a role group, bypasses the role-group review and is invisible in the admin-centre lists, so over-privilege hides there. End-user My* roles are excluded."
+    fix: "Move the assignment into a role group or remove it; grant admin rights through Entra PIM instead (planned write)."
+    refs: ["NIST-800-53:AC-6"]
+    query:
+      protocol: http
+      method: post
+      path: /InvokeCommand
+      body:
+        CmdletInput:
+          CmdletName: Get-ManagementRoleAssignment
+          Parameters: { RoleAssigneeType: User }
+      items: value
+      key: Identity
+      name: Role
+    each: { field: Role, op: notmatch, value: '^My ' }
+    evidence: "{Identity}: role {Role} assigned directly to {RoleAssignee}"
+
+  - id: EXO-APP-ROLE-ASSIGNMENT-UNSCOPED
+    title: An application holds an Exchange role with no management scope
+    kind: misconfigured
+    category: IAM
+    severity: medium
+    entity: role-assignment
+    why: "An RBAC for Applications assignment with no CustomResourceScope gives the service principal its role (Mail.Read, Mail.Send and the like) over every mailbox, not the ones it needs."
+    fix: "Add a management scope that limits the assignment to the intended mailboxes, or remove it, and record the owner (planned write)."
+    refs: ["NIST-800-53:AC-6", "NIST-800-53:AC-3"]
+    query:
+      protocol: http
+      method: post
+      path: /InvokeCommand
+      body:
+        CmdletInput:
+          CmdletName: Get-ManagementRoleAssignment
+          Parameters: { RoleAssigneeType: ServicePrincipal }
+      items: value
+      key: Identity
+      name: Role
+    each: { field: CustomResourceScope, op: empty }
+    evidence: "{Identity}: {RoleAssignee} holds {Role} with no resource scope"
+
+  - id: EXO-APPLICATIONIMPERSONATION-ASSIGNED
+    title: The retired ApplicationImpersonation role is still assigned
+    kind: misconfigured
+    category: LCM
+    severity: low
+    entity: role-assignment
+    why: "The ApplicationImpersonation role was removed from Exchange Online; a leftover assignment hides which app could act as any mailbox and should be migrated to RBAC for Applications."
+    fix: "Recreate the scope as an RBAC for Applications assignment, then remove the ApplicationImpersonation assignment (planned write)."
+    refs: ["NIST-800-53:AC-6", "NIST-800-53:SA-22"]
+    query:
+      protocol: http
+      method: post
+      path: /InvokeCommand
+      body:
+        CmdletInput:
+          CmdletName: Get-ManagementRoleAssignment
+          Parameters: { Role: ApplicationImpersonation }
+      items: value
+      key: Identity
+      name: Role
+    each: any
+    evidence: "{Identity}: ApplicationImpersonation held by {RoleAssignee} ({RoleAssigneeType})"
+
+  - id: EXO-APPLICATION-ACCESS-POLICY-LEFTOVER
+    title: A legacy Application Access Policy is still in place
+    kind: misconfigured
+    category: LCM
+    severity: low
+    entity: application-access-policy
+    why: "Application Access Policies are superseded by RBAC for Applications; a leftover policy hides which apps can read which mailboxes and is managed outside the role model."
+    fix: "Recreate the scope as an RBAC for Applications assignment, then remove the Application Access Policy (planned write)."
+    refs: ["NIST-800-53:AC-6"]
+    query:
+      protocol: http
+      method: post
+      path: /InvokeCommand
+      body:
+        CmdletInput:
+          CmdletName: Get-ApplicationAccessPolicy
+          Parameters: {}
+      items: value
+      key: Identity
+    each: any
+    evidence: "{Identity}: {AccessRight} for app {AppId}, scope {PolicyScopeGroupId}"
+
+  - id: EXO-POWERSHELL-ADDIN-INSTALL-ALLOWED
+    title: A role assignment policy lets users install Outlook add-ins
+    kind: misconfigured
+    category: CFG
+    severity: medium
+    entity: role-assignment-policy
+    why: "A role assignment policy that carries My Custom Apps, My Marketplace Apps or My ReadWriteMailbox Apps lets its mailboxes install Outlook add-ins themselves; add-ins can read and send mail on the user's behalf and should be deployed centrally after review."
+    fix: "Remove those three end-user roles from the role assignment policy and deploy reviewed add-ins centrally (planned write)."
+    refs: ["CIS-M365-6.3.1", "NIST-800-53:CM-11"]
+    query:
+      protocol: http
+      method: post
+      path: /InvokeCommand
+      body:
+        CmdletInput:
+          CmdletName: Get-RoleAssignmentPolicy
+          Parameters: {}
+      items: value
+      key: Identity
+      name: Name
+    each: { field: AssignedRoles, op: match, value: 'My (Custom|Marketplace|ReadWriteMailbox) Apps' }
+    evidence: "{Name}: assigned roles {AssignedRoles}"
+
+  # ============================================================ OWA and mobile policy ===
+  - id: EXO-OWA-PERSONAL-ACCOUNTS
+    title: Outlook on the web lets users add personal accounts
+    kind: misconfigured
+    category: CFG
+    severity: medium
+    entity: owa-policy
+    why: "With PersonalAccountsEnabled on, a user can add a Gmail or Outlook.com account to new Outlook and OWA and drag municipal mail into a personal mailbox."
+    fix: "Set-OwaMailboxPolicy -PersonalAccountsEnabled $false -PersonalAccountCalendarsEnabled $false on every OWA mailbox policy (planned write)."
+    refs: ["CIS-M365-6.3.2", "NIST-800-53:AC-20", "NIST-800-53:AC-4"]
+    query:
+      protocol: http
+      method: post
+      path: /InvokeCommand
+      body:
+        CmdletInput:
+          CmdletName: Get-OwaMailboxPolicy
+          Parameters: {}
+      items: value
+      key: Identity
+      name: Name
+    each: { field: PersonalAccountsEnabled, op: eq, value: true }
+    evidence: "{Name}: PersonalAccountsEnabled = {PersonalAccountsEnabled}"
+
+  - id: EXO-OWA-STORAGE-PROVIDERS
+    title: Outlook on the web allows third-party storage providers
+    kind: misconfigured
+    category: CFG
+    severity: low
+    entity: owa-policy
+    why: "AdditionalStorageProvidersAvailable lets users open and save attachments to Dropbox or Google Drive from the municipal mailbox, moving data to storage the organisation does not manage."
+    fix: "Set-OwaMailboxPolicy -AdditionalStorageProvidersAvailable $false on every OWA mailbox policy (planned write)."
+    refs: ["CIS-M365-6.5.3", "NIST-800-53:AC-20"]
+    query:
+      protocol: http
+      method: post
+      path: /InvokeCommand
+      body:
+        CmdletInput:
+          CmdletName: Get-OwaMailboxPolicy
+          Parameters: {}
+      items: value
+      key: Identity
+      name: Name
+    each: { field: AdditionalStorageProvidersAvailable, op: eq, value: true }
+    evidence: "{Name}: AdditionalStorageProvidersAvailable = {AdditionalStorageProvidersAvailable}"
+
+  - id: EXO-ACTIVESYNC-DEFAULT-ALLOW
+    title: New mobile devices are allowed to sync by default
+    kind: misconfigured
+    category: CFG
+    severity: medium
+    entity: activesync-org-settings
+    why: "With the ActiveSync default access level set to Allow, any new native mail app over Exchange ActiveSync syncs the mailbox before anyone reviews it, outside Intune app protection and on possibly unpatched phones."
+    fix: "Set the default access level to Quarantine or Block and allow Outlook for iOS/Android, or require an app-protected client through Conditional Access (planned write)."
+    refs: ["NIST-800-53:AC-19"]
+    query:
+      protocol: http
+      method: post
+      path: /InvokeCommand
+      body:
+        CmdletInput:
+          CmdletName: Get-ActiveSyncOrganizationSettings
+          Parameters: {}
+      items: value
+      min_rows: 1
+      key: Identity
+    each: { field: DefaultAccessLevel, op: eq, value: Allow }
+    evidence: "DefaultAccessLevel = {DefaultAccessLevel}"
+
+  - id: EXO-EXTERNAL-TAG-OFF
+    title: The external sender tag is not shown in Outlook
+    kind: misconfigured
+    category: CFG
+    severity: medium
+    entity: org-config
+    why: "The native external callout is the cheapest user-visible signal against impersonation of colleagues and senior officials; with it off, external mail looks the same as internal."
+    fix: "Set-ExternalInOutlook -Enabled $true, keeping only partner domains with a recorded reason on the allow list (planned write)."
+    refs: ["CIS-M365-6.2.3", "CISA-SCuBA:MS.EXO.7.1", "NIST-800-53:SI-8"]
+    query:
+      protocol: http
+      method: post
+      path: /InvokeCommand
+      body:
+        CmdletInput:
+          CmdletName: Get-ExternalInOutlook
+          Parameters: {}
+      items: value
+      key: Identity
+    each: { field: Enabled, op: eq, value: false }
+    evidence: "external sender tag Enabled = {Enabled}, allow list {AllowList}"
+
+  - id: EXO-MAILTIPS-EXTERNAL-OFF
+    title: MailTips for external recipients are off
+    kind: misconfigured
+    category: CFG
+    severity: low
+    entity: org-config
+    why: "The external-recipient MailTip warns a user before they send to an outside address, which prevents most accidental disclosures; with it off that warning never appears."
+    fix: "Set-OrganizationConfig -MailTipsExternalRecipientsTipsEnabled $true (and the other MailTips parameters) (planned write)."
+    refs: ["CIS-M365-6.5.2", "NIST-800-53:AC-22"]
+    query:
+      protocol: http
+      method: post
+      path: /InvokeCommand
+      body:
+        CmdletInput:
+          CmdletName: Get-OrganizationConfig
+          Parameters: {}
+      items: value
+      min_rows: 1
+      key: Identity
+      name: Name
+    each: { field: MailTipsExternalRecipientsTipsEnabled, op: eq, value: false }
+    evidence: "MailTipsExternalRecipientsTipsEnabled = {MailTipsExternalRecipientsTipsEnabled}"
+
+  # ============================================================ sharing and federation ===
+  - id: EXO-SHARING-POLICY-ANONYMOUS
+    title: A sharing policy publishes calendars anonymously
+    kind: misconfigured
+    category: CFG
+    severity: medium
+    entity: sharing-policy
+    why: "An enabled sharing policy with an Anonymous entry lets a calendar be published as a public URL with every meeting on it; it survives the person leaving and exposes staff schedules to anyone with the link."
+    fix: "Limit the sharing policy to free/busy for the Anonymous and wildcard entries, or disable it (planned write)."
+    refs: ["CISA-SCuBA:MS.EXO.6.1", "CIS-M365-1.3.3", "NIST-800-53:AC-21", "NIST-800-53:AC-22"]
+    query:
+      protocol: http
+      method: post
+      path: /InvokeCommand
+      body:
+        CmdletInput:
+          CmdletName: Get-SharingPolicy
+          Parameters: {}
+      items: value
+      key: Identity
+      name: Name
+    each:
+      all:
+        - { field: Enabled, op: eq, value: true }
+        - { field: Domains, op: match, value: 'Anonymous' }
+    evidence: "{Name}: domains {Domains}"
+
+  - id: EXO-ORG-RELATIONSHIP-BROAD
+    title: An organisation relationship shares more than free/busy or allows mailbox moves
+    kind: misconfigured
+    category: CFG
+    severity: low
+    entity: org-relationship
+    why: "An organisation relationship exposes free/busy (or more) to another tenant; a relationship left from an old project or hybrid, or one above AvailabilityOnly or with mailbox moves on, is standing access nobody reviews."
+    fix: "Limit FreeBusyAccessLevel to AvailabilityOnly, turn MailboxMoveEnabled off unless migrating, and remove stale relationships (planned write)."
+    refs: ["NIST-800-53:AC-21"]
+    query:
+      protocol: http
+      method: post
+      path: /InvokeCommand
+      body:
+        CmdletInput:
+          CmdletName: Get-OrganizationRelationship
+          Parameters: {}
+      items: value
+      key: Identity
+      name: Name
+    each:
+      all:
+        - { field: Enabled, op: eq, value: true }
+        - any:
+            - { field: MailboxMoveEnabled, op: eq, value: true }
+            - { field: FreeBusyAccessLevel, op: eq, value: LimitedDetails }
+            - { field: FreeBusyAccessLevel, op: eq, value: Reviewer }
+    evidence: "{Name}: domains {DomainNames}, FreeBusyAccessLevel {FreeBusyAccessLevel}, MailboxMoveEnabled {MailboxMoveEnabled}"
+
+  # ============================================================ groups ===
+  - id: EXO-DL-ACCEPTS-EXTERNAL-SENDERS
+    title: A distribution group accepts mail from external senders
+    kind: misconfigured
+    category: CFG
+    severity: medium
+    entity: distribution-group
+    why: "A distribution list with RequireSenderAuthenticationEnabled off accepts mail from the internet: one external message reaches every member, so the list is a phishing amplifier. Documented public contact lists are the only exception."
+    fix: "Set-DistributionGroup -RequireSenderAuthenticationEnabled $true, keeping only documented public contact groups open (planned write)."
+    refs: ["NIST-800-53:SI-8", "NIST-800-53:AC-4"]
+    query:
+      protocol: http
+      method: post
+      path: /InvokeCommand
+      body:
+        CmdletInput:
+          CmdletName: Get-DistributionGroup
+          Parameters: { ResultSize: Unlimited }
+      items: value
+      key: Identity
+      name: PrimarySmtpAddress
+    each: { field: RequireSenderAuthenticationEnabled, op: eq, value: false }
+    evidence: "{PrimarySmtpAddress}: RequireSenderAuthenticationEnabled = {RequireSenderAuthenticationEnabled}"
+
+  - id: EXO-DL-NO-OWNER
+    title: A distribution group has no owner
+    kind: misconfigured
+    category: HYG
+    severity: low
+    entity: distribution-group
+    why: "A distribution group with an empty ManagedBy cannot be reviewed or managed by the business; ownerless groups accumulate and nobody can say who the list is for."
+    fix: "Assign an owner in ManagedBy, or remove the group if it is dead (planned write)."
+    refs: ["NIST-800-53:AC-2", "NIST-800-53:CM-8"]
+    query:
+      protocol: http
+      method: post
+      path: /InvokeCommand
+      body:
+        CmdletInput:
+          CmdletName: Get-DistributionGroup
+          Parameters: { ResultSize: Unlimited }
+      items: value
+      key: Identity
+      name: PrimarySmtpAddress
+    each: { field: ManagedBy, op: empty }
+    evidence: "{PrimarySmtpAddress}: ManagedBy is empty"
+
+  - id: EXO-M365-GROUP-ACCEPTS-EXTERNAL-SENDERS
+    title: A Microsoft 365 group mailbox accepts external senders
+    kind: misconfigured
+    category: CFG
+    severity: low
+    entity: m365-group
+    why: "A Microsoft 365 group mailbox with RequireSenderAuthenticationEnabled off lands internet mail in a team's shared inbox and Teams channel, which is a phishing path into the team unless it is a documented public group."
+    fix: "Set-UnifiedGroup -RequireSenderAuthenticationEnabled $true unless the group is deliberately public (planned write)."
+    refs: ["NIST-800-53:SI-8"]
+    query:
+      protocol: http
+      method: post
+      path: /InvokeCommand
+      body:
+        CmdletInput:
+          CmdletName: Get-UnifiedGroup
+          Parameters: { ResultSize: Unlimited }
+      items: value
+      key: Identity
+      name: PrimarySmtpAddress
+    each: { field: RequireSenderAuthenticationEnabled, op: eq, value: false }
+    evidence: "{PrimarySmtpAddress}: RequireSenderAuthenticationEnabled = {RequireSenderAuthenticationEnabled}, AccessType {AccessType}"
+
+  # ============================================================ shared mailboxes ===
+  - id: EXO-SHARED-MBX-SENT-ITEMS-NOT-SAVED
+    title: A shared mailbox does not save sent mail to itself
+    kind: misconfigured
+    category: CFG
+    severity: low
+    entity: mailbox
+    lens: maintenance
+    why: "Without MessageCopyForSentAs and MessageCopyForSendOnBehalf on, mail sent from a shared mailbox stays only in the sender's own mailbox and disappears from the team view when that person leaves."
+    fix: "Set-Mailbox -MessageCopyForSentAsEnabled $true -MessageCopyForSendOnBehalfEnabled $true on the shared mailbox (planned write)."
+    refs: ["NIST-800-53:AU-11"]
+    query:
+      protocol: http
+      method: post
+      path: /InvokeCommand
+      body:
+        CmdletInput:
+          CmdletName: Get-Mailbox
+          Parameters: { ResultSize: Unlimited, RecipientTypeDetails: SharedMailbox }
+      items: value
+      key: Identity
+      name: PrimarySmtpAddress
+    each:
+      any:
+        - { field: MessageCopyForSentAsEnabled, op: eq, value: false }
+        - { field: MessageCopyForSendOnBehalfEnabled, op: eq, value: false }
+    evidence: "{PrimarySmtpAddress}: MessageCopyForSentAsEnabled {MessageCopyForSentAsEnabled}, MessageCopyForSendOnBehalfEnabled {MessageCopyForSendOnBehalfEnabled}"
+
+  # ============================================================ retention and recovery ===
+  - id: EXO-LITIGATION-HOLD-NO-OWNER
+    title: A litigation hold has no owner or reason recorded
+    kind: misconfigured
+    category: BCK
+    severity: medium
+    entity: mailbox
+    why: "A litigation hold with no owner or reason cannot be released or defended, and an unbounded hold accumulates Recoverable Items forever; it is also a sign of a hold set and forgotten."
+    fix: "Record the case owner and reason in LitigationHoldOwner and RetentionComment, and release holds no longer needed (legal decision, planned write)."
+    refs: ["NIST-800-53:AU-11", "NIST-800-53:SI-12"]
+    query:
+      protocol: http
+      method: post
+      path: /InvokeCommand
+      body:
+        CmdletInput:
+          CmdletName: Get-Mailbox
+          Parameters: { ResultSize: Unlimited }
+      items: value
+      key: Identity
+      name: PrimarySmtpAddress
+    each:
+      all:
+        - { field: LitigationHoldEnabled, op: eq, value: true }
+        - { field: LitigationHoldOwner, op: empty }
+    evidence: "{PrimarySmtpAddress}: litigation hold on, owner empty, duration {LitigationHoldDuration}"
+
+  - id: EXO-DELETED-ITEMS-RETENTION-SHORT
+    title: A mailbox keeps deleted items too briefly or without single item recovery
+    kind: misconfigured
+    category: BCK
+    severity: low
+    entity: mailbox
+    lens: both
+    why: "Microsoft's default of 14 days is too short for a municipality where users report deletions weeks later; a RetainDeletedItemsFor under 30 days, or SingleItemRecoveryEnabled off, means a deleted message is unrecoverable sooner than people ask for it."
+    fix: "Set-Mailbox -RetainDeletedItemsFor 30 -SingleItemRecoveryEnabled $true (and the mailbox plans) in bulk (planned write)."
+    refs: ["NIST-800-53:CP-9"]
+    query:
+      protocol: http
+      method: post
+      path: /InvokeCommand
+      body:
+        CmdletInput:
+          CmdletName: Get-Mailbox
+          Parameters: { ResultSize: Unlimited }
+      items: value
+      key: Identity
+      name: PrimarySmtpAddress
+    each:
+      any:
+        - { field: RetainDeletedItemsFor, op: duration-lt, value: 30, threshold: exchange-online.deleted-items-retention-min-days }
+        - { field: SingleItemRecoveryEnabled, op: eq, value: false }
+    evidence: "{PrimarySmtpAddress}: RetainDeletedItemsFor {RetainDeletedItemsFor}, SingleItemRecoveryEnabled {SingleItemRecoveryEnabled}"
+
+  - id: EXO-MRM-PROCESSING-DISABLED
+    title: Messaging records management processing is disabled for the organisation
+    kind: misconfigured
+    category: BCK
+    severity: low
+    entity: org-config
+    lens: maintenance
+    why: "When ElcProcessingDisabled is true, archive-move and deletion retention tags never run, so mailboxes fill and retention is not applied even where it is configured."
+    fix: "Set-OrganizationConfig -ElcProcessingDisabled $false and assign a retention policy to every mailbox (planned write)."
+    refs: ["NIST-800-53:SI-12"]
+    query:
+      protocol: http
+      method: post
+      path: /InvokeCommand
+      body:
+        CmdletInput:
+          CmdletName: Get-OrganizationConfig
+          Parameters: {}
+      items: value
+      min_rows: 1
+      key: Identity
+      name: Name
+    each: { field: ElcProcessingDisabled, op: eq, value: true }
+    evidence: "ElcProcessingDisabled = {ElcProcessingDisabled}"
+
+  # ============================================================ monitoring ===
+  - id: EXO-RESTRICTED-SENDER-PRESENT
+    title: An account is restricted from sending mail
+    kind: broken
+    category: MON
+    severity: high
+    entity: restricted-sender
+    refresh: 6h
+    why: "Exchange Online blocks an account from sending when it detects spam from it; a restricted sender is almost always a compromised mailbox, and it is also locked out of sending legitimate business mail until released."
+    fix: "Investigate as a compromise (sign-ins, inbox rules, mail accessed), reset the password and revoke sessions, then Remove-BlockedSenderAddress (production write, the user decides)."
+    refs: ["NIST-800-53:IR-4", "NIST-800-53:SI-4"]
+    query:
+      protocol: http
+      method: post
+      path: /InvokeCommand
+      body:
+        CmdletInput:
+          CmdletName: Get-BlockedSenderAddress
+          Parameters: {}
+      items: value
+      key: SenderAddress
+    each: any
+    evidence: "{SenderAddress}: restricted since {CreatedDatetime}, reason {Reason}"
+
+  # ============================================================ DKIM ===
+  - id: EXO-DKIM-DISABLED
+    title: DKIM signing is disabled for a sending domain
+    kind: misconfigured
+    category: PKI
+    severity: high
+    entity: dkim-config
+    why: "Without DKIM, DMARC alignment depends on SPF alone and forwarded municipal mail fails authentication, so spoofers can imitate the domain more easily."
+    fix: "Publish the selector CNAMEs in DNS and enable DKIM for the domain (Set-DkimSigningConfig -Enabled $true) (planned write)."
+    refs: ["CIS-M365-2.1.9", "CISA-SCuBA:MS.EXO.3.1", "NIST-800-53:SC-8", "NIST-800-53:SI-8"]
+    query:
+      protocol: http
+      method: post
+      path: /InvokeCommand
+      body:
+        CmdletInput:
+          CmdletName: Get-DkimSigningConfig
+          Parameters: {}
+      items: value
+      key: Domain
+    each: { field: Enabled, op: eq, value: false }
+    evidence: "{Domain}: DKIM Enabled {Enabled}, Status {Status}"
+
+  - id: EXO-DKIM-WEAK-KEY
+    title: A DKIM selector uses a key weaker than 2048-bit
+    kind: misconfigured
+    category: PKI
+    severity: low
+    entity: dkim-config
+    why: "A 1024-bit DKIM key is below current practice; a key that is also never rotated stays valid forever if it leaks."
+    fix: "Rotate-DkimSigningConfig -KeySize 2048 for the domain and rotate keys within 12 months (planned write)."
+    refs: ["NIST-800-53:SC-12"]
+    query:
+      protocol: http
+      method: post
+      path: /InvokeCommand
+      body:
+        CmdletInput:
+          CmdletName: Get-DkimSigningConfig
+          Parameters: {}
+      items: value
+      key: Domain
+    each:
+      any:
+        - { field: Selector1KeySize, op: lt, value: 2048 }
+        - { field: Selector2KeySize, op: lt, value: 2048 }
+    evidence: "{Domain}: Selector1KeySize {Selector1KeySize}, Selector2KeySize {Selector2KeySize}"

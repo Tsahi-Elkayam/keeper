@@ -1394,3 +1394,440 @@ rules:
         - { field: IsClient, op: eq, value: true }
         - { field: EPInfectionStatus, op: in, value: [3, 4] }
     evidence: "{Name}: infection status {EPInfectionStatus}, last threat {EPLastThreatName} at {EPLastInfectionTime}"
+
+  # ---- more client health, deployments, hygiene and security (AdminService) ----------------------
+  # Generic additions; all read AdminService. The site's SQL instance (backup, agent jobs, tempdb,
+  # memory, build, server roles) is covered by rules/sql-server.yaml as a sql integration target, so
+  # it is not duplicated here; the legacy catalogue's SQL-only and site-control (lazy) checks that
+  # cannot be reached this way are recorded in docs/backlog/windows-estate.md.
+
+  - id: SCCM-INCONSOLE-UPDATE-AVAILABLE
+    title: In-console update or hotfix released weeks ago is not installed
+    kind: missing
+    lens: both
+    category: LCM
+    severity: medium
+    entity: site
+    refresh: 1d
+    why: In-console updates carry site fixes and the servicing path to the next release; one left available for weeks means the site runs with known defects and falls behind its support window.
+    fix: Install the update from Updates and Servicing in the off-hours window after a site backup, or record why it is skipped (for example a CMG-only hotfix on a site with no CMG).
+    refs: [NIST-800-53:SI-2, NIST-800-53:SA-22]
+    query:
+      protocol: http
+      path: /wmi/SMS_CM_UpdatePackages
+      params:
+        $select: PackageGuid,Name,State,FullVersion,DateReleased,UpdateType
+      key: PackageGuid
+      name: Name
+    each:
+      all:
+        - { field: State, op: in, value: [262146, 327682] }
+        - { field: DateReleased, op: age-gt, value: 30, threshold: sccm.inconsole-update-grace-days }
+    evidence: "{Name} ({FullVersion}): available since {DateReleased}, not installed (state {State})"
+
+  - id: SCCM-CLIENTS-NO-CLIENT-MANY
+    title: Many device records have no Configuration Manager client
+    kind: missing
+    category: HLT
+    severity: medium
+    entity: site
+    why: A device record without a client gets no update deployment, no inventory and no compliance; a large share means discovery sees machines the site cannot manage.
+    fix: Install the client on machines still in use (push, GPO or Intune), and retire the records of machines that are gone (SCCM-RECORDS-OBSOLETE-MANY).
+    refs: [NIST-800-53:CM-8, NIST-800-53:SI-2]
+    query:
+      protocol: http
+      path: /wmi/SMS_R_System
+      params:
+        $filter: "Client eq 0 and Obsolete eq 0"
+        $select: ResourceId,Name
+      key: ResourceId
+      name: Name
+    count: { op: gt, value: 50, threshold: sccm.no-client-records-max }
+    evidence: "{count} non-obsolete device records with no client (sample: {sample})"
+
+  - id: SCCM-RECORDS-OBSOLETE-MANY
+    title: Many obsolete device records in the site
+    kind: misconfigured
+    category: HYG
+    severity: low
+    entity: site
+    why: Obsolete records are superseded duplicates the site keeps; in bulk they inflate every count, confuse targeting and slow collection evaluation.
+    fix: Confirm the aging discovery-data cleanup task is enabled and tuned, then let it remove the obsolete records (do not delete the active twin).
+    refs: [NIST-800-53:CM-8]
+    query:
+      protocol: http
+      path: /wmi/SMS_R_System
+      params:
+        $filter: "Obsolete eq 1"
+        $select: ResourceId,Name
+      key: ResourceId
+      name: Name
+    count: { op: gt, value: 100, threshold: sccm.obsolete-records-max }
+    evidence: "{count} obsolete device records (sample: {sample})"
+
+  - id: SCCM-CLIENT-OS-CLIENT-UNSUPPORTED
+    title: Active client on an operating system the current client no longer supports
+    kind: broken
+    lens: both
+    category: LCM
+    severity: medium
+    entity: computer
+    why: A client on an out-of-support operating system is stuck on an old client build, misses current client fixes, and runs an OS that no longer receives security updates.
+    fix: Upgrade or retire the device; until then record the exception. Set the pattern to the operating systems outside the current client's support list for this site release.
+    refs: [NIST-800-53:SA-22, NIST-800-53:SI-2]
+    query:
+      protocol: http
+      path: /wmi/SMS_CombinedDeviceResources
+      params:
+        $filter: "IsClient eq true and IsActive eq true"
+        $select: ResourceID,Name,DeviceOS,ClientVersion
+      key: ResourceID
+      name: Name
+    each: { field: DeviceOS, op: match, value: '^$', threshold: sccm.unsupported-client-os-pattern, required: true }
+    evidence: "{Name}: {DeviceOS}, client {ClientVersion}"
+
+  - id: SCCM-UPDATE-DEPLOYMENT-PAST-DEADLINE
+    title: Software update deployment is past its deadline and far below compliance
+    kind: broken
+    lens: both
+    category: LCM
+    severity: medium
+    entity: deployment
+    why: A required update deployment whose deadline passed and which most targeted clients still have not installed is a patch ring that is not working - a content, client-health or targeting fault leaving those devices exposed.
+    fix: Read the deployment's error and unknown counts; fix the ring (content, client health, collection), then let it re-enforce. Retire deployments that target collections the fleet no longer uses.
+    refs: [NIST-800-53:SI-2, CIS-CSC-v8:7.3]
+    query:
+      protocol: http
+      path: /wmi/SMS_DeploymentSummary
+      params:
+        $select: DeploymentID,SoftwareName,CollectionName,FeatureType,DeploymentIntent,DeploymentTime,EnforcementDeadline,NumberTargeted,NumberSuccess,NumberErrors,NumberUnknown
+      key: DeploymentID
+      name: SoftwareName
+    each:
+      all:
+        - { field: FeatureType, op: eq, value: 5 }
+        - { field: NumberTargeted, op: gt, value: 0 }
+        - { field: EnforcementDeadline, op: age-gt, value: 7, threshold: sccm.update-deadline-grace-days }
+        - { field: NumberSuccess, op: lt, value: { field: NumberTargeted, times: 0.9 } }
+    evidence: "{SoftwareName} -> {CollectionName}: {NumberSuccess} of {NumberTargeted} compliant past deadline {EnforcementDeadline}"
+
+  - id: SCCM-DEPLOYMENT-UNKNOWN-HIGH
+    title: Required deployment has many clients in an unknown state
+    kind: broken
+    category: HLT
+    severity: low
+    entity: deployment
+    why: A required deployment where many targeted clients report neither success nor failure after weeks means those clients are not evaluating or not reporting - the compliance number for it is fiction.
+    fix: Check client activity and state-message flow on a sample of the unknown devices (SCCM-CLIENT-POLICY-STALE-MANY, SCCM-CLIENTS-INACTIVE-MANY) and the management point's status processing.
+    refs: [NIST-800-53:SI-4]
+    query:
+      protocol: http
+      path: /wmi/SMS_DeploymentSummary
+      params:
+        $select: DeploymentID,SoftwareName,CollectionName,FeatureType,DeploymentIntent,DeploymentTime,EnforcementDeadline,NumberTargeted,NumberSuccess,NumberErrors,NumberUnknown
+      key: DeploymentID
+      name: SoftwareName
+    each:
+      all:
+        - { field: DeploymentIntent, op: eq, value: 1 }
+        - { field: NumberUnknown, op: gt, value: 25, threshold: sccm.deployment-unknown-max }
+        - { field: DeploymentTime, op: age-gt, value: 14, threshold: sccm.deployment-unknown-grace-days }
+    evidence: "{SoftwareName} -> {CollectionName}: {NumberUnknown} of {NumberTargeted} in unknown state since {DeploymentTime}"
+
+  - id: SCCM-UPDATE-EXPIRED-DEPLOYED
+    title: Expired update is still part of an active deployment
+    kind: misconfigured
+    category: HYG
+    severity: low
+    entity: software-update
+    why: An expired update can no longer be installed; left in a deployment it is evaluated on every client forever, bloats policy and compliance data, and hides real gaps behind a permanently non-compliant row.
+    fix: Remove the expired update from its update group and deployment (or let the automatic deployment rule rebuild the group), then let the WSUS cleanup run.
+    refs: [NIST-800-53:SI-2]
+    query:
+      protocol: http
+      path: /wmi/SMS_SoftwareUpdate
+      params:
+        $filter: "IsExpired eq true and IsDeployed eq true"
+        $select: CI_ID,ArticleID,LocalizedDisplayName,DatePosted,IsExpired,IsDeployed
+      key: CI_ID
+      name: LocalizedDisplayName
+    each: any
+    evidence: "KB{ArticleID} {LocalizedDisplayName}: expired but still deployed"
+
+  - id: SCCM-BOUNDARY-GROUP-EMPTY
+    title: Boundary group has no boundaries and no site systems
+    kind: misconfigured
+    category: HYG
+    severity: low
+    entity: boundary-group
+    why: An empty boundary group does nothing; it is left-over design that clutters the boundary configuration and invites a future reference to a group that assigns no site and offers no content.
+    fix: Delete the boundary group, or give it the boundaries and site systems it was meant to have.
+    query:
+      protocol: http
+      path: /wmi/SMS_BoundaryGroup
+      params:
+        $select: GroupID,Name,MemberCount,SiteSystemCount,DefaultSiteCode
+      key: GroupID
+      name: Name
+    each:
+      all:
+        - { field: MemberCount, op: eq, value: 0 }
+        - { field: SiteSystemCount, op: eq, value: 0 }
+    evidence: "{Name}: no boundaries and no site systems"
+
+  - id: SCCM-COLLECTION-LIMITED-TO-ALL-SYSTEMS
+    title: Collection is limited to All Systems
+    kind: misconfigured
+    category: HLT
+    severity: medium
+    entity: collection
+    why: A collection whose limiting collection is All Systems re-evaluates its rule against every device in the site each cycle; many such collections load the evaluator and slow deployments to new devices. The built-in id is a product constant.
+    fix: Limit the collection to the smallest collection that still contains its members (an OS, a site or an OU collection) so its rule runs over far fewer devices.
+    refs: [NIST-800-53:SI-4]
+    query:
+      protocol: http
+      path: /wmi/SMS_Collection
+      params:
+        $select: CollectionID,Name,LimitToCollectionID,IsBuiltIn,MemberCount
+      key: CollectionID
+      name: Name
+    each:
+      all:
+        - { field: IsBuiltIn, op: eq, value: false }
+        - { field: LimitToCollectionID, op: eq, value: SMS00001, threshold: sccm.all-systems-collection-id }
+    evidence: "{Name} ({CollectionID}): limited to All Systems, {MemberCount} members"
+
+  - id: SCCM-CONSOLE-VERSION-UNSUPPORTED
+    title: Recently used console runs an unsupported version
+    kind: misconfigured
+    lens: both
+    category: LCM
+    severity: low
+    entity: console
+    why: An old console connecting to a newer site can corrupt objects it does not understand; it also signals an admin workstation that was never updated after the site upgrade.
+    fix: Upgrade the console on that machine to the site version. Set the pattern to console builds older than the current site build.
+    refs: [NIST-800-53:SA-22]
+    query:
+      protocol: http
+      path: /wmi/SMS_ConsoleAdminsData
+      params:
+        $select: UserName,MachineName,ConsoleVersion,LastConnectedConsoleTime
+      key: "{UserName}|{MachineName}"
+      name: UserName
+    each:
+      all:
+        - { field: LastConnectedConsoleTime, op: age-lt, value: 90, threshold: sccm.console-recent-days }
+        - { field: ConsoleVersion, op: match, value: '^$', threshold: sccm.console-version-unsupported-pattern, required: true }
+    evidence: "{UserName} on {MachineName}: console {ConsoleVersion}, last connected {LastConnectedConsoleTime}"
+
+  - id: SCCM-STATUS-ERRORS-MANY
+    title: Many error status messages raised across the site today
+    kind: broken
+    category: MON
+    severity: medium
+    entity: site
+    refresh: 6h
+    why: A burst of error-severity status messages in a day is the site's own fault list; a high volume means one or more components are failing work repeatedly while dashboards may still look green.
+    fix: Monitoring > System Status > Status Message Queries; group the errors by component and message id and fix the top signatures.
+    refs: [NIST-800-53:SI-4, NIST-800-53:AU-6]
+    query:
+      protocol: http
+      path: /wmi/SMS_StatusMessage
+      params:
+        $filter: "Severity eq -1073741824 and Time ge {DAYS_AGO:1}"
+        $select: RecordID,Component,MessageID,Severity,Time,MachineName
+      key: RecordID
+      name: Component
+    count: { op: gt, value: 50, threshold: sccm.status-error-messages-max }
+    evidence: "{count} error status messages in the last day (sample: {sample})"
+
+  - id: SCCM-CLIENT-PUSH-ERRORS-MANY
+    title: Many client-push error messages in the last week
+    kind: broken
+    category: HLT
+    severity: medium
+    entity: site
+    refresh: 6h
+    why: The client push retries dead targets on every cycle; hundreds of error and warning messages a week mean the push queue is grinding on machines that are gone, renamed or unreachable while genuine failures hide in the noise.
+    fix: Group the messages by error code and machine; fix DNS/SPN duplicates (1396) and name or path problems (53/64), and prune or disable the push for machines that are gone. Do not just reset the push account.
+    refs: [NIST-800-53:SI-4]
+    query:
+      protocol: http
+      path: /wmi/SMS_StatusMessage
+      params:
+        $filter: "Component eq 'SMS_CLIENT_CONFIG_MANAGER' and Severity eq -1073741824 and Time ge {DAYS_AGO:7}"
+        $select: RecordID,Component,MessageID,Severity,Time,MachineName
+      key: RecordID
+      name: MachineName
+    count: { op: gt, value: 50, threshold: sccm.client-push-error-messages-max }
+    evidence: "{count} client-push error messages in the last 7 days (sample: {sample})"
+
+  - id: SCCM-MAINT-RETENTION-EXCESSIVE
+    title: Data-cleanup maintenance task keeps data far longer than needed
+    kind: misconfigured
+    category: HYG
+    severity: low
+    entity: maintenance-task
+    refresh: 7d
+    why: When a delete-aged task keeps discovery, inventory history or status data for many months, the site database grows and every query over those tables slows; the data past a few months is rarely used and never cleaned.
+    fix: Set the retention to the site's agreed window (commonly 90 days for status and history data) unless a longer window is recorded for a reason.
+    refs: [NIST-800-53:SI-12, NIST-800-53:AU-11]
+    query:
+      protocol: http
+      path: /wmi/SMS_SCI_SQLTask
+      params:
+        $select: ItemName,TaskName,Enabled,DeleteOlderThan,SiteCode,DaysOfWeek
+      key: TaskName
+      name: ItemName
+    each:
+      all:
+        - { field: Enabled, op: eq, value: true }
+        - { field: TaskName, op: match, value: '^(Delete Aged Discovery Data|Delete Aged Inventory History|Delete Aged Status Messages|Delete Obsolete Client Discovery Data|Delete Aged Client Operations|Delete Aged Notification Task History)$', threshold: sccm.retention-tasks }
+        - { field: DeleteOlderThan, op: gt, value: 180, threshold: sccm.maint-retention-max-days }
+    evidence: "{SiteCode} {TaskName}: keeps data {DeleteOlderThan} days"
+
+  - id: SCCM-CLIENT-CHECK-STALE-MANY
+    title: Many active clients have a stale or missing client-health evaluation
+    kind: broken
+    category: HLT
+    severity: medium
+    entity: site
+    why: ccmeval runs daily and self-repairs the client; when many active clients have no recent evaluation, the health task or ccmeval itself is broken on them and their active status cannot be trusted.
+    fix: Check the 'Configuration Manager Health Evaluation' scheduled task on a sample; a repeated stale result after remediation needs a client reinstall.
+    refs: [NIST-800-53:SI-4]
+    query:
+      protocol: http
+      path: /wmi/SMS_CombinedDeviceResources
+      params:
+        $filter: "IsClient eq true and IsActive eq true"
+        $select: ResourceID,Name,LastClientCheckTime
+      key: ResourceID
+      name: Name
+    count:
+      op: gt
+      value: 50
+      threshold: sccm.client-check-stale-max
+      where:
+        any:
+          - { field: LastClientCheckTime, op: absent }
+          - { field: LastClientCheckTime, op: age-gt, value: 7, threshold: sccm.client-check-stale-days }
+    evidence: "{count} active clients with a stale or missing client-health evaluation (sample: {sample})"
+
+  - id: SCCM-CLIENT-POLICY-STALE-MANY
+    title: Many active clients have not requested policy recently
+    kind: broken
+    category: HLT
+    severity: medium
+    entity: site
+    why: A client that stopped requesting policy learns of no new deployments or maintenance windows while it still looks active; many such clients mean a management point, boundary or certificate problem is leaving part of the fleet unmanaged.
+    fix: Check LocationServices.log and PolicyAgent.log on a sample; a missing management point or boundary group for a subnet is the usual cause.
+    refs: [NIST-800-53:SI-2, NIST-800-53:SI-4]
+    query:
+      protocol: http
+      path: /wmi/SMS_CombinedDeviceResources
+      params:
+        $filter: "IsClient eq true and IsActive eq true"
+        $select: ResourceID,Name,LastPolicyRequest
+      key: ResourceID
+      name: Name
+    count:
+      op: gt
+      value: 50
+      threshold: sccm.client-policy-stale-max
+      where:
+        any:
+          - { field: LastPolicyRequest, op: absent }
+          - { field: LastPolicyRequest, op: age-gt, value: 7, threshold: sccm.client-policy-stale-days }
+    evidence: "{count} active clients with no recent policy request (sample: {sample})"
+
+  - id: SCCM-CLIENT-NO-ASSIGNED-SITE-MANY
+    title: Many active clients carry no assigned site code
+    kind: broken
+    category: CFG
+    severity: medium
+    entity: site
+    why: A client that lost its site assignment receives no policy and no updates; many at once point to a boundary group that stopped assigning a site for a network range.
+    fix: Check the boundary groups and their site assignment for the affected networks, then let the clients re-assign.
+    refs: [NIST-800-53:CM-8, NIST-800-53:SI-2]
+    query:
+      protocol: http
+      path: /wmi/SMS_CombinedDeviceResources
+      params:
+        $filter: "IsClient eq true and IsActive eq true"
+        $select: ResourceID,Name,SiteCode
+      key: ResourceID
+      name: Name
+    count:
+      op: gt
+      value: 25
+      threshold: sccm.no-assigned-site-max
+      where: { field: SiteCode, op: empty }
+    evidence: "{count} active clients with no assigned site code (sample: {sample})"
+
+  - id: SCCM-DEPLOYMENT-NO-TARGETS
+    title: Deployment targets a collection with no members
+    kind: misconfigured
+    category: HYG
+    severity: low
+    entity: deployment
+    why: A deployment to an empty collection does nothing and is usually left-over or targeted at the wrong collection; in bulk these clutter the deployment view and hide the ones that matter.
+    fix: Delete the deployment, or retarget it to the collection that actually holds the devices.
+    refs: [NIST-800-53:CM-2]
+    query:
+      protocol: http
+      path: /wmi/SMS_DeploymentSummary
+      params:
+        $select: DeploymentID,SoftwareName,CollectionName,FeatureType,NumberTargeted,CreationTime
+      key: DeploymentID
+      name: SoftwareName
+    each:
+      all:
+        - { field: NumberTargeted, op: eq, value: 0 }
+        - { field: CreationTime, op: age-gt, value: 30, threshold: sccm.empty-deployment-grace-days }
+    evidence: "{SoftwareName} -> {CollectionName}: targets no devices, created {CreationTime}"
+
+  - id: SCCM-UPDATE-DEPLOYMENT-ANCIENT
+    title: Software update deployment left in place for well over a year
+    kind: misconfigured
+    category: HYG
+    severity: low
+    entity: deployment
+    why: Very old update deployments keep clients evaluating update groups full of superseded and expired updates every cycle, for double work and double downloads, long after the ring they served was replaced.
+    fix: Retire the old update deployment and its update group once a current ring covers the same devices.
+    refs: [NIST-800-53:SI-2]
+    query:
+      protocol: http
+      path: /wmi/SMS_DeploymentSummary
+      params:
+        $select: DeploymentID,SoftwareName,CollectionName,FeatureType,DeploymentTime
+      key: DeploymentID
+      name: SoftwareName
+    each:
+      all:
+        - { field: FeatureType, op: eq, value: 5 }
+        - { field: DeploymentTime, op: age-gt, value: 540, threshold: sccm.update-deployment-ancient-days }
+    evidence: "{SoftwareName} -> {CollectionName}: update deployment from {DeploymentTime} still present"
+
+  - id: SCCM-RBAC-FULLADMIN-PRIVILEGED-GROUP
+    title: Full Administrator granted to a highly privileged directory group
+    kind: misconfigured
+    lens: security
+    category: IAM
+    severity: medium
+    entity: admin
+    why: Granting Full Administrator (code execution on every client) to Domain Admins, Enterprise Admins or the built-in Administrators breaks tiering - every domain or forest admin inherits control of the whole managed estate, and the SCCM grant is never reviewed where those groups are.
+    fix: Grant Full Administrator through a small dedicated SCCM group, not a broad directory group, and keep highly privileged groups out of the SCCM roles.
+    refs: [NIST-800-53:AC-6, CIS-CSC-v8:5.4, MITRE-ATTACK:T1072]
+    query:
+      protocol: http
+      path: /wmi/SMS_Admin
+      params:
+        $select: AdminID,LogonName,IsGroup,IsDeleted,AccountType,RoleNames
+      key: AdminID
+      name: LogonName
+    each:
+      all:
+        - { field: IsGroup, op: eq, value: true }
+        - { field: RoleNames, op: contains, value: Full Administrator }
+        - { field: LogonName, op: match, value: 'Domain Admins|Enterprise Admins|\\Administrators$', threshold: sccm.privileged-group-pattern }
+    evidence: "{LogonName}: Full Administrator granted to a highly privileged group"

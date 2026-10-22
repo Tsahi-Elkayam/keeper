@@ -2151,3 +2151,439 @@ rules:
         - { field: type, op: ne, value: standard }
         - { field: cmdb_ci, op: empty }
     evidence: "{number} ({type}, state {state}) starts {start_date} with no configuration item: {short_description}"
+
+  # ---- privileged-role hygiene (legacy IAM-001/002/010/011) ----------------------------------
+  # These trust the encoded query the way SNOW-GUEST-USER-HAS-ROLE does: the dot-walked fields
+  # (user.active, user.locked_out, user.web_service_access_only, role.elevated_privilege) are filtered
+  # on the instance, and the account needs read on sys_user_has_role, sys_user_role and sys_user.
+
+  - id: SNOW-ADMIN-ROLE-INACTIVE-USER
+    title: Admin role is held by an inactive user
+    kind: misconfigured
+    lens: security
+    category: IAM
+    severity: high
+    entity: role-grant
+    refresh: 1d
+    why: An admin grant on an account marked inactive is a privilege the leaver process forgot; the account can be reactivated or its password reused and the holder has full control of the instance.
+    fix: Remove the admin role as part of deactivation, and add role removal to the leaver checklist so a disabled account carries no standing privilege.
+    refs: [NIST-800-53:AC-2(3), NIST-800-53:AC-6, CIS-Controls-v8:5.3]
+    query:
+      protocol: http
+      path: /api/now/table/sys_user_has_role
+      params:
+        sysparm_query: "role.name=admin^user.active=false"
+        sysparm_fields: sys_id,user,role,inherited,granted_by
+        sysparm_display_value: all
+        sysparm_exclude_reference_link: "true"
+      paging: offset
+      pageSize: 1000
+      items: result
+      key: sys_id.value
+      name: user.display_value
+    each: any
+    evidence: "{user.display_value} holds admin while the account is inactive (inherited {inherited.display_value})"
+
+  - id: SNOW-ADMIN-ROLE-LOCKED-USER
+    title: Admin role is held by a locked-out account
+    kind: misconfigured
+    lens: security
+    category: IAM
+    severity: medium
+    entity: role-grant
+    refresh: 1d
+    why: A locked-out account that still holds admin is one unlock away from full control; it is usually a dormant or compromised account that should lose its privilege, not keep it in reserve.
+    fix: Remove the admin role from the locked account, and decide whether the account should be deactivated outright.
+    refs: [NIST-800-53:AC-2, NIST-800-53:AC-6, CIS-Controls-v8:5.3]
+    query:
+      protocol: http
+      path: /api/now/table/sys_user_has_role
+      params:
+        sysparm_query: "role.name=admin^user.active=true^user.locked_out=true"
+        sysparm_fields: sys_id,user,role,inherited,granted_by
+        sysparm_display_value: all
+        sysparm_exclude_reference_link: "true"
+      paging: offset
+      pageSize: 1000
+      items: result
+      key: sys_id.value
+      name: user.display_value
+    each: any
+    evidence: "{user.display_value} holds admin but the account is locked out"
+
+  - id: SNOW-ELEVATED-ROLE-INACTIVE-USER
+    title: An elevated-privilege role is held by an inactive user
+    kind: misconfigured
+    lens: security
+    category: IAM
+    severity: medium
+    entity: role-grant
+    refresh: 1d
+    why: Roles flagged as elevated (security_admin and the others) change access controls and security settings; left on a deactivated account they are a standing route back to the instance's security configuration.
+    fix: Remove elevated-privilege roles when an account is deactivated, and review the grants that survived past departures.
+    refs: [NIST-800-53:AC-6(5), NIST-800-53:AC-2(3), CIS-Controls-v8:5.3]
+    query:
+      protocol: http
+      path: /api/now/table/sys_user_has_role
+      params:
+        sysparm_query: "role.elevated_privilege=true^user.active=false"
+        sysparm_fields: sys_id,user,role,inherited,granted_by
+        sysparm_display_value: all
+        sysparm_exclude_reference_link: "true"
+      paging: offset
+      pageSize: 1000
+      items: result
+      key: sys_id.value
+      name: user.display_value
+    each: any
+    evidence: "{user.display_value} holds elevated role {role.display_value} while the account is inactive"
+
+  - id: SNOW-ROLE-GRANT-TO-INACTIVE-USER
+    title: Many role grants point at inactive accounts
+    kind: misconfigured
+    lens: security
+    category: IAM
+    severity: low
+    entity: instance
+    refresh: 1d
+    why: Role records left on deactivated accounts are the residue of departures the leaver process did not finish; they inflate access reviews and licence counts and keep privileges attached to accounts that can be reactivated.
+    fix: Remove role grants as part of deactivation (a business rule can do it on account disable), and clear the backlog the first time.
+    refs: [NIST-800-53:AC-2(3), CIS-Controls-v8:5.3]
+    query:
+      protocol: http
+      path: /api/now/stats/sys_user_has_role
+      params:
+        sysparm_query: "user.active=false"
+        sysparm_count: "true"
+      paging: none
+      items: result
+      key: "-"
+    each: { field: stats.count, op: gt, value: 0, threshold: servicenow.max-inactive-role-grants }
+    evidence: "{stats.count} role grants are held by inactive accounts"
+
+  - id: SNOW-INTEGRATION-USER-ADMIN
+    title: An integration (web-service) account holds the admin role
+    kind: misconfigured
+    lens: security
+    category: IAM
+    severity: high
+    entity: role-grant
+    refresh: 1d
+    why: A web-service account with admin is a standing credential that can change any record, script and access control; it rarely needs more than a few tables, and its password or token lives in an integration config where rotation is easy to forget.
+    fix: Replace admin with the minimum roles the integration needs, and keep admin for named people with strong authentication.
+    refs: [NIST-800-53:AC-6, NIST-800-53:IA-9, CIS-Controls-v8:5.4]
+    query:
+      protocol: http
+      path: /api/now/table/sys_user_has_role
+      params:
+        sysparm_query: "role.name=admin^user.web_service_access_only=true"
+        sysparm_fields: sys_id,user,role,inherited,granted_by
+        sysparm_display_value: all
+        sysparm_exclude_reference_link: "true"
+      paging: offset
+      pageSize: 1000
+      items: result
+      key: sys_id.value
+      name: user.display_value
+    each: any
+    evidence: "web-service account {user.display_value} holds admin"
+
+  - id: SNOW-INTEGRATION-USER-INTERACTIVE
+    title: An integration account can also sign in interactively
+    kind: misconfigured
+    lens: security
+    category: IAM
+    severity: medium
+    entity: user
+    refresh: 1d
+    why: An account marked as an internal integration user that is not web-service-only can still sign in to the UI with its password, so its credential is a login as well as an API key and it is not covered by single sign-on or interactive MFA.
+    fix: Set web-service-access-only on integration accounts so they can call the API but not sign in, and give each one a named owner.
+    refs: [NIST-800-53:AC-6, NIST-800-53:IA-9, CIS-Controls-v8:5.5]
+    query:
+      protocol: http
+      path: /api/now/table/sys_user
+      params:
+        sysparm_query: "active=true^internal_integration_user=true^web_service_access_only=false"
+        sysparm_fields: sys_id,user_name,active,internal_integration_user,web_service_access_only,last_login_time
+        sysparm_display_value: "false"
+      paging: offset
+      pageSize: 1000
+      items: result
+      key: sys_id
+      name: user_name
+    each:
+      all:
+        - { field: internal_integration_user, op: eq, value: "true" }
+        - { field: web_service_access_only, op: ne, value: "true" }
+    evidence: "{user_name} is an integration account that is not web-service-only (last sign-in {last_login_time})"
+
+  # ---- access control and exposure (legacy CFG-015/IAM-014/CFG-021) --------------------------
+
+  - id: SNOW-ACL-CHANGED-RECENTLY
+    title: Access control rules were changed recently without a review record
+    kind: misconfigured
+    lens: security
+    category: LOG
+    severity: low
+    entity: instance
+    refresh: 1d
+    why: An access control rule decides who can read or write a table or field; a wrong role or a script that returns true opens data to everyone. ACL edits are rare and each one deserves a second pair of eyes, so a burst of recent changes is a prompt to confirm they were intended.
+    fix: Review each changed access control rule against its change or story, and turn on auditing of the sys_security_acl table so future edits leave a trail.
+    refs: [NIST-800-53:AC-3, NIST-800-53:AU-2, ISO-27001:A.8.3]
+    query:
+      protocol: http
+      path: /api/now/table/sys_security_acl
+      params:
+        sysparm_query: "active=true^sys_updated_onRELATIVEGT@dayofweek@ago@90"
+        sysparm_fields: sys_id,name,operation,sys_updated_on,sys_updated_by
+        sysparm_display_value: "false"
+      paging: offset
+      pageSize: 1000
+      items: result
+      key: sys_id
+      name: name
+    count: { op: gt, value: 0, threshold: servicenow.max-acl-changes, where: { field: sys_updated_on, op: age-lt, value: 90 } }
+    evidence: "{count} active access control rules were changed in the last 90 days"
+
+  - id: SNOW-PUBLIC-PAGE-ACTIVE
+    title: A page is served to anonymous visitors
+    kind: misconfigured
+    lens: security
+    category: CFG
+    severity: medium
+    entity: public-page
+    refresh: 1d
+    why: A page registered as public is readable without signing in, so whatever its script or embedded data exposes is exposed to anyone who can reach the instance. Instances with a custom URL answer the internet, so a page meant for internal use becomes an open endpoint.
+    fix: Confirm each active public page is meant to be public and returns nothing internal; remove the public registration from the rest.
+    refs: [NIST-800-53:AC-14, NIST-800-53:AC-3, ISO-27001:A.5.15]
+    query:
+      protocol: http
+      path: /api/now/table/sys_public
+      params:
+        sysparm_query: "active=true"
+        sysparm_fields: sys_id,page,active,description
+        sysparm_display_value: all
+        sysparm_exclude_reference_link: "true"
+      paging: offset
+      pageSize: 1000
+      items: result
+      key: sys_id.value
+      name: page.display_value
+    each: { field: active, op: eq, value: "true" }
+    evidence: "public page {page.display_value} is active and readable without signing in"
+
+  - id: SNOW-PORTAL-PAGE-PUBLIC
+    title: A Service Portal page is marked public
+    kind: misconfigured
+    lens: security
+    category: CFG
+    severity: medium
+    entity: portal-page
+    refresh: 1d
+    why: A Service Portal page flagged public renders for unauthenticated visitors, so any widget on it that reads records exposes them to everyone; on an internet-reachable portal this is the most common accidental data exposure.
+    fix: Review each public portal page and its widgets; unset public where sign-in should be required, and rely on access controls for anything a public page must show.
+    refs: [NIST-800-53:AC-14, NIST-800-53:AC-3, ISO-27001:A.5.15]
+    query:
+      protocol: http
+      path: /api/now/table/sp_page
+      params:
+        sysparm_query: "public=true"
+        sysparm_fields: sys_id,id,title,public
+        sysparm_display_value: "false"
+      paging: offset
+      pageSize: 1000
+      items: result
+      key: sys_id
+      name: title
+    each: { field: public, op: eq, value: "true" }
+    evidence: "Service Portal page {title} ({id}) is public"
+
+  - id: SNOW-REST-MESSAGE-BASIC-AUTH
+    title: Outbound REST message authenticates with basic authentication
+    kind: misconfigured
+    lens: security
+    category: CFG
+    severity: low
+    entity: rest-message
+    refresh: 1d
+    why: Basic authentication sends a reusable password on every call; if the credential is shared or the endpoint ever falls back to plain HTTP the password travels in a header that is trivial to replay.
+    fix: Move the integration to OAuth or mutual TLS where the counterparty supports it, and make sure basic-auth endpoints are HTTPS only with a dedicated, rotatable credential.
+    refs: [NIST-800-53:IA-5, NIST-800-53:SC-8, ISO-27001:A.8.5]
+    query:
+      protocol: http
+      path: /api/now/table/sys_rest_message
+      params:
+        sysparm_query: "authentication_type=basic"
+        sysparm_fields: sys_id,name,rest_endpoint,authentication_type
+        sysparm_display_value: "false"
+      paging: offset
+      pageSize: 1000
+      items: result
+      key: sys_id
+      name: name
+    each: { field: authentication_type, op: eq, value: basic }
+    evidence: "{name}: endpoint {rest_endpoint} uses basic authentication"
+
+  - id: SNOW-SOAP-MESSAGE-CLEARTEXT
+    title: Outbound SOAP message uses plain HTTP
+    kind: misconfigured
+    lens: security
+    category: CFG
+    severity: medium
+    entity: soap-message
+    refresh: 1d
+    why: A SOAP integration over plain HTTP sends its credentials and the records it carries in clear text across every network on the way, the same exposure the REST cleartext rule catches for REST messages.
+    fix: Change the endpoint to HTTPS (the target system needs a certificate) and rotate any credential that has travelled in clear text.
+    refs: [NIST-800-53:SC-8, ISO-27001:A.8.24]
+    query:
+      protocol: http
+      path: /api/now/table/sys_soap_message
+      params:
+        sysparm_query: "endpointSTARTSWITHhttp:"
+        sysparm_fields: sys_id,name,endpoint
+        sysparm_display_value: "false"
+      paging: offset
+      pageSize: 1000
+      items: result
+      key: sys_id
+      name: name
+    each: { field: endpoint, op: match, value: '^http://' }
+    evidence: "{name}: endpoint {endpoint} is plain HTTP"
+
+  # ---- platform health and data retention (legacy HLT-006/LOG-007) ---------------------------
+
+  - id: SNOW-INBOUND-EMAIL-ACCOUNT-ERROR
+    title: An inbound mail account is reporting an error
+    kind: broken
+    category: HLT
+    severity: high
+    entity: email-account
+    refresh: 6h
+    why: Tickets opened by e-mail stop silently when the inbound mailbox account cannot connect, so a recorded error on the account is intake that has already failed - a password or OAuth token that expired, or a relay that moved - with nobody told.
+    fix: Read the error on the account, renew the mailbox credential or OAuth token, and confirm mail is being received again.
+    refs: [NIST-800-53:SI-4, ISO-27001:A.8.16]
+    query:
+      protocol: http
+      path: /api/now/table/sys_email_account
+      params:
+        sysparm_query: "active=true^error_messageISNOTEMPTY"
+        sysparm_fields: sys_id,name,type,active,error_message
+        sysparm_display_value: "false"
+      paging: offset
+      pageSize: 1000
+      items: result
+      key: sys_id
+      name: name
+    each:
+      all:
+        - { field: active, op: eq, value: "true" }
+        - { field: error_message, op: notempty }
+    evidence: "{name} ({type}) reports an error: {error_message}"
+
+  - id: SNOW-AUDIT-FLUSH-ACTIVE
+    title: A table-cleaner rule deletes audit history
+    kind: misconfigured
+    lens: security
+    category: LOG
+    severity: medium
+    entity: flush-rule
+    refresh: 7d
+    why: The audit tables hold the record of who changed what, including security changes, and personal-data regulations expect them kept. An active table-cleaner (flush) rule on an audit table is quietly deleting that evidence on a schedule.
+    fix: Confirm the flush rule's retention meets the organisation's audit-retention policy, and export audit history to the central log store before anything is trimmed.
+    refs: [NIST-800-53:AU-11, ISO-27001:A.8.15]
+    query:
+      protocol: http
+      path: /api/now/table/sys_auto_flush
+      params:
+        sysparm_query: "active=true"
+        sysparm_fields: sys_id,tablename,age,active,matchfield
+        sysparm_display_value: "false"
+      paging: offset
+      pageSize: 1000
+      items: result
+      key: sys_id
+      name: tablename
+    each:
+      all:
+        - { field: active, op: eq, value: "true" }
+        - { field: tablename, op: in, value: [sys_audit, sys_audit_delete, sys_audit_relation, syslog, sysevent] }
+    evidence: "a flush rule deletes {tablename} rows older than {age}"
+
+  # ---- lifecycle and change governance (legacy LCM-005/MON-007) -------------------------------
+
+  - id: SNOW-LEGACY-WORKFLOW-ACTIVE
+    title: Published legacy (graphical) workflows are still in use
+    kind: broken
+    category: LCM
+    severity: low
+    entity: instance
+    refresh: 7d
+    why: The legacy Workflow engine is on the vendor's deprecation path; every published workflow still in use is a future forced rewrite into Flow Designer, and new ones add to that debt. Baseline workflows shipped with the platform count here, so set the threshold to the number you accept.
+    fix: Inventory the active legacy workflows, migrate the ones your processes depend on to Flow Designer, and stop building new legacy workflows.
+    refs: [NIST-800-53:SA-22, ISO-27001:A.8.8]
+    query:
+      protocol: http
+      path: /api/now/table/wf_workflow
+      params:
+        sysparm_query: "active=true^published=true"
+        sysparm_fields: sys_id,name,active,published
+        sysparm_display_value: "false"
+      paging: offset
+      pageSize: 1000
+      items: result
+      key: sys_id
+      name: name
+    count: { op: gt, value: 0, threshold: servicenow.max-legacy-workflows }
+    evidence: "{count} published legacy workflows are active"
+
+  - id: SNOW-CHANGE-CLOSED-UNSUCCESSFUL
+    title: A change closed unsuccessfully in the last week
+    kind: broken
+    category: CFG
+    severity: medium
+    entity: change
+    refresh: 6h
+    why: A change that closed unsuccessful or backed out is where the next incident usually comes from; a steady stream of them is a sign that changes are under-tested or rushed through their window.
+    fix: Review each failed change for a follow-up (a problem record, a retest, a better backout) and look for the pattern across them at the change board.
+    refs: [NIST-800-53:CM-3, ISO-27001:A.8.32]
+    query:
+      protocol: http
+      path: /api/now/table/change_request
+      params:
+        sysparm_query: "state=3^sys_updated_onRELATIVEGT@dayofweek@ago@7"
+        sysparm_fields: sys_id,number,short_description,state,close_code,type,sys_updated_on
+        sysparm_display_value: "false"
+        sysparm_exclude_reference_link: "true"
+      paging: offset
+      pageSize: 1000
+      items: result
+      key: number
+      name: short_description
+    each: { field: close_code, op: match, value: unsuccessful }
+    evidence: "{number} ({type}) closed {sys_updated_on} as {close_code}: {short_description}"
+
+  - id: SNOW-OAUTH-CLIENT-REGISTERED
+    title: OAuth application-registry entries exist and need an owner
+    kind: misconfigured
+    lens: security
+    category: IAM
+    severity: low
+    entity: instance
+    refresh: 1d
+    why: An OAuth client registration is a standing API credential that can act against the instance; each one should be accounted for with a named owner, a purpose and sensible token lifespans, or it is an unmanaged key into the platform.
+    fix: Confirm every active OAuth client against the integration inventory, remove any that are unknown, and set short access-token and bounded refresh-token lifespans.
+    refs: [NIST-800-53:IA-5, NIST-800-53:AC-2, ISO-27001:A.5.17]
+    query:
+      protocol: http
+      path: /api/now/table/oauth_entity
+      params:
+        sysparm_query: "active=true"
+        sysparm_fields: sys_id,name,type,active
+        sysparm_display_value: "false"
+      paging: offset
+      pageSize: 1000
+      items: result
+      key: sys_id
+      name: name
+    count: { op: gt, value: 0, threshold: servicenow.max-oauth-clients }
+    evidence: "{count} active OAuth application-registry entries exist"

@@ -138,6 +138,7 @@ public sealed partial class IntegrationConnection : IConnection, IAwsConnection,
             case "session-login":
             case "entra-interactive":
             case "entra-certificate":
+            case "gcp-service-account":
                 var token = await TokenAsync(cancellationToken).ConfigureAwait(false);
                 if (_record.AuthKind == "vcenter-session")
                     request.Headers.TryAddWithoutValidation("vmware-api-session-id", token);
@@ -172,6 +173,7 @@ public sealed partial class IntegrationConnection : IConnection, IAwsConnection,
                     "vcenter-session" => await VCenterSessionAsync(cancellationToken).ConfigureAwait(false),
                     "session-login" => await SessionLoginAsync(cancellationToken).ConfigureAwait(false),
                     "entra-interactive" => await EntraInteractiveAsync(cancellationToken).ConfigureAwait(false),
+                    "gcp-service-account" => await GoogleServiceAccountAsync(cancellationToken).ConfigureAwait(false),
                     _ => await EntraCertificateAsync(cancellationToken).ConfigureAwait(false),
                 };
             }

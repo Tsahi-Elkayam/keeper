@@ -1,0 +1,445 @@
+schema: keeper.rules/1
+system: rubrik
+name: Rubrik backup
+integration: rubrik
+# Endpoint: the tenant's Rubrik Security Cloud host (https://<tenant>.my.rubrik.com); queries go to the
+# default path /graphql with a service-account token (read-only custom role). Rules only send read
+# queries; the GraphQL runner refuses mutations and subscriptions before anything leaves the machine.
+#
+# Schema: Rubrik publishes the RSC GraphQL schema only inside the tenant's API explorer. The queries
+# below use the field, type and enum names of the current RSC schema as used by Rubrik's public SDKs
+# (rubrik-polaris-sdk, the PowerShell RSC SDK, the Terraform provider): clusterConnection, slaDomains
+# (GlobalSlaReply.isRetentionLockedSla) and activitySeriesConnection (filters lastActivityType /
+# lastActivityStatus / startTimeGt). There is NO live cluster to confirm these against, so every name
+# here is "confirm on first run". Two safety facts make that honest:
+#   - A wrong FIELD or TYPE name makes the whole query fail with a GraphQL error, so the rule reports
+#     unknown - never a silent pass.
+#   - Every enum guess (BACKUP, FAILURE, CONNECTED, ...) sits inside a query ARGUMENT, so a wrong enum
+#     fails GraphQL validation and the query errors too - again unknown, not a pass. The activity rules
+#     are therefore `each: any` (the server did the filtering); there is no condition that could pass
+#     quietly on a misspelt enum.
+# The checks whose correctness would depend on an unconfirmed enum compared inside a condition, on an
+# unconfirmed filter value, or on the CDM REST API (a different host this integration never reaches),
+# are in docs/backlog/rubrik.md instead.
+# The word for the third GraphQL operation type must not appear in a document.
+defaults:
+  lens: both
+  refresh: 1d
+rules:
+
+  # ---- cluster health ------------------------------------------------------------------------
+
+  - id: RBK-CLUSTER-DISCONNECTED
+    title: Rubrik cluster not connected to Rubrik Security Cloud
+    kind: broken
+    category: HLT
+    severity: critical
+    entity: cluster
+    refresh: 6h
+    why: "A cluster RSC shows as not Connected is not managed, may not be taking snapshots, and raises no alarm anywhere else; disconnection is the first thing ransomware or a network fault hides behind."
+    fix: "Check the cluster's outbound path to RSC (proxy, DNS, 443) and node status; open a Rubrik support case if the cluster itself is healthy."
+    refs: [NIST-800-53:CP-9, NIST-800-53:CA-7]
+    query:
+      protocol: graphql
+      document: |
+        query($after: String) {
+          clusterConnection(first: 200, after: $after) {
+            nodes { id name status version defaultAddress }
+            pageInfo { hasNextPage endCursor }
+          }
+        }
+      items: data.clusterConnection.nodes
+      paging: { cursor: data.clusterConnection.pageInfo.endCursor, hasNext: data.clusterConnection.pageInfo.hasNextPage, variable: after }
+      key: id
+      name: name
+    each: { field: status, op: ne, value: CONNECTED }
+    evidence: "cluster {name} ({defaultAddress}) status {status}, version {version}"
+
+  - id: RBK-CLUSTER-RUNWAY-LOW
+    title: Cluster storage runway below the planning threshold
+    kind: misconfigured
+    category: HLT
+    severity:
+      field: estimatedRunway
+      ranges: [ { max: 30, value: critical }, { max: 60, value: high }, { max: 90, value: medium } ]
+      default: low
+    entity: cluster
+    why: "Runway is the one capacity number that includes growth; a full cluster stops taking snapshots and expires the oldest ones first while the dashboard stays green until then. Under 90 days means a procurement cycle has already started late."
+    fix: "Review retention on non-critical SLAs, move long-term copies to archival, expire stale Live Mounts, or plan a node/archival expansion."
+    refs: [NIST-800-53:CP-2, NIST-800-53:SC-5]
+    query:
+      protocol: graphql
+      document: |
+        query($after: String) {
+          clusterConnection(first: 200, after: $after) {
+            nodes { id name estimatedRunway }
+            pageInfo { hasNextPage endCursor }
+          }
+        }
+      items: data.clusterConnection.nodes
+      paging: { cursor: data.clusterConnection.pageInfo.endCursor, hasNext: data.clusterConnection.pageInfo.hasNextPage, variable: after }
+      key: id
+      name: name
+    each:
+      all:
+        - { field: estimatedRunway, op: ge, value: 0 }
+        - { field: estimatedRunway, op: lt, value: 90, threshold: rubrik.runway-min-days }
+    evidence: "cluster {name}: {estimatedRunway} days of runway remaining"
+
+  - id: RBK-CLUSTER-NONE
+    title: Rubrik Security Cloud returned no clusters
+    kind: missing
+    category: HLT
+    severity: high
+    entity: instance
+    why: "An empty cluster list means nothing is registered or the service account lacks the read scope; every cluster, SLA and activity rule is quiet either way, which looks like health."
+    fix: "Confirm the cluster is registered to RSC and that the review service account's role grants read access to cluster, SLA and activity data."
+    refs: [NIST-800-53:CA-7]
+    query:
+      protocol: graphql
+      document: |
+        query($after: String) {
+          clusterConnection(first: 200, after: $after) {
+            nodes { id name }
+            pageInfo { hasNextPage endCursor }
+          }
+        }
+      items: data.clusterConnection.nodes
+      paging: { cursor: data.clusterConnection.pageInfo.endCursor, hasNext: data.clusterConnection.pageInfo.hasNextPage, variable: after }
+      key: id
+      name: name
+    count: none
+    evidence: "no Rubrik clusters returned"
+
+  # ---- SLA domains / immutability ------------------------------------------------------------
+
+  - id: RBK-SLA-NO-RETENTION-LOCK
+    title: SLA domain without retention lock (immutability)
+    kind: misconfigured
+    lens: security
+    category: BCK
+    severity: high
+    entity: sla-domain
+    refresh: 7d
+    why: "Retention lock is Rubrik's immutability control: it stops any administrator, including a compromised one, from shortening retention or deleting snapshots. An SLA without it is the 1 in 3-2-1-1-0 missing for every object it protects."
+    fix: "Enable retention lock on every SLA covering production, after a retention review (the change is hard to reverse without quorum or Rubrik support); record any SLA that is deliberately left unlocked."
+    refs: [NIST-800-53:CP-9(8), NIST-800-53:SC-28, CIS-Controls-v8:11.4]
+    query:
+      protocol: graphql
+      document: |
+        query($after: String) {
+          slaDomains(first: 200, after: $after) {
+            nodes {
+              id name
+              ... on GlobalSlaReply { isRetentionLockedSla }
+            }
+            pageInfo { hasNextPage endCursor }
+          }
+        }
+      items: data.slaDomains.nodes
+      paging: { cursor: data.slaDomains.pageInfo.endCursor, hasNext: data.slaDomains.pageInfo.hasNextPage, variable: after }
+      key: id
+      name: name
+    each: { field: isRetentionLockedSla, op: eq, value: false }
+    evidence: "SLA domain {name} is not retention-locked"
+
+  - id: RBK-SLA-NONE
+    title: No SLA domains defined in Rubrik Security Cloud
+    kind: missing
+    category: BCK
+    severity: high
+    entity: instance
+    why: "No SLA domains means no backup policy at all, or the service account cannot read them; with nothing to compare against, protection and compliance rules stay silent."
+    fix: "Create SLA domains per workload class, or grant the review service account read access to SLA data."
+    refs: [NIST-800-53:CP-9]
+    query:
+      protocol: graphql
+      document: |
+        query($after: String) {
+          slaDomains(first: 200, after: $after) {
+            nodes { id name }
+            pageInfo { hasNextPage endCursor }
+          }
+        }
+      items: data.slaDomains.nodes
+      paging: { cursor: data.slaDomains.pageInfo.endCursor, hasNext: data.slaDomains.pageInfo.hasNextPage, variable: after }
+      key: id
+      name: name
+    count: none
+    evidence: "no SLA domains returned"
+
+  # ---- activity series: backup, archival, replication, recovery, system ----------------------
+  # Every rule here filters server-side and marks each returned row a problem, so a wrong enum value
+  # in a filter fails the query (unknown) rather than passing quietly. The 7/30/90-day windows are
+  # fixed in the query because the runner cannot yet take a tenant threshold on a query argument.
+
+  - id: RBK-BACKUP-FAILED
+    title: Failed backup activity in the last 7 days
+    kind: broken
+    category: BCK
+    severity: high
+    entity: backup-activity
+    refresh: 12h
+    why: "A failed snapshot is a missed recovery point. Rubrik retries inside the SLA window and the object can still read InCompliance until the window closes, so the failure event is the earliest honest signal."
+    fix: "Read the message per object: snapshot or CBT problems go to the VMware owner, RBS connectivity to the host owner, credential errors to the account owner."
+    refs: [NIST-800-53:CP-9, NIST-800-53:AU-6]
+    query:
+      protocol: graphql
+      document: |
+        query($after: String) {
+          activitySeriesConnection(first: 200, after: $after, filters: {lastActivityType: [BACKUP], lastActivityStatus: [FAILURE], startTimeGt: "{DAYS_AGO:7}"}) {
+            nodes { activitySeriesId objectName objectType lastActivityType lastActivityStatus severity startTime lastUpdated cluster { id name } }
+            pageInfo { hasNextPage endCursor }
+          }
+        }
+      items: data.activitySeriesConnection.nodes
+      paging: { cursor: data.activitySeriesConnection.pageInfo.endCursor, hasNext: data.activitySeriesConnection.pageInfo.hasNextPage, variable: after }
+      maxPages: 50
+      key: activitySeriesId
+      name: objectName
+    each: any
+    evidence: "{objectName} ({objectType}) backup failed, last update {lastUpdated} on cluster {cluster.name}"
+
+  - id: RBK-BACKUP-CANCELED
+    title: Canceled backup activity in the last 7 days
+    kind: broken
+    category: BCK
+    severity: medium
+    entity: backup-activity
+    refresh: 12h
+    why: "A canceled snapshot is usually a manual stop or a window that expired mid-run; it produces no failure alert, so a cancelled backup looks like no backup with nothing red."
+    fix: "Find who cancelled it in the audit log and why; widen the backup window if the job is running out of time."
+    refs: [NIST-800-53:CP-9]
+    query:
+      protocol: graphql
+      document: |
+        query($after: String) {
+          activitySeriesConnection(first: 200, after: $after, filters: {lastActivityType: [BACKUP], lastActivityStatus: [CANCELED], startTimeGt: "{DAYS_AGO:7}"}) {
+            nodes { activitySeriesId objectName objectType lastActivityType lastActivityStatus severity startTime lastUpdated cluster { id name } }
+            pageInfo { hasNextPage endCursor }
+          }
+        }
+      items: data.activitySeriesConnection.nodes
+      paging: { cursor: data.activitySeriesConnection.pageInfo.endCursor, hasNext: data.activitySeriesConnection.pageInfo.hasNextPage, variable: after }
+      maxPages: 50
+      key: activitySeriesId
+      name: objectName
+    each: any
+    evidence: "{objectName} ({objectType}) backup canceled, last update {lastUpdated} on cluster {cluster.name}"
+
+  - id: RBK-BACKUP-WARNING
+    title: Recurring backup warnings in the last 30 days
+    kind: misconfigured
+    category: BCK
+    severity: low
+    entity: backup-activity
+    refresh: 7d
+    why: "Repeated warnings (quiescing failed, CBT reset, slow RBS) are failures in slow motion that never trigger an alert; a backup that only ever warns is one step from missing its point."
+    fix: "Per message: fix VMware Tools and quiescing on the guest, reset CBT, or relieve host load on the RBS host."
+    refs: [NIST-800-53:SI-4, NIST-800-53:CP-9]
+    query:
+      protocol: graphql
+      document: |
+        query($after: String) {
+          activitySeriesConnection(first: 200, after: $after, filters: {lastActivityType: [BACKUP], lastActivityStatus: [WARNING], startTimeGt: "{DAYS_AGO:30}"}) {
+            nodes { activitySeriesId objectName objectType lastActivityType lastActivityStatus severity startTime lastUpdated cluster { id name } }
+            pageInfo { hasNextPage endCursor }
+          }
+        }
+      items: data.activitySeriesConnection.nodes
+      paging: { cursor: data.activitySeriesConnection.pageInfo.endCursor, hasNext: data.activitySeriesConnection.pageInfo.hasNextPage, variable: after }
+      maxPages: 50
+      key: activitySeriesId
+      name: objectName
+    each: any
+    evidence: "{objectName} ({objectType}) backup warning, last update {lastUpdated} on cluster {cluster.name}"
+
+  - id: RBK-ARCHIVE-FAILED
+    title: Failed archival activity in the last 7 days
+    kind: broken
+    category: AVL
+    severity: high
+    entity: backup-activity
+    refresh: 12h
+    why: "Archival is the off-site copy - the one that survives a fire or ransomware on the LAN. The cluster stays green while long-term copies silently stop, so an archival failure is only visible in the event stream."
+    fix: "Check the archival target's state, its credentials or bucket policy, and the network path; raise a Rubrik case if the queue does not drain."
+    refs: [NIST-800-53:CP-9(5)]
+    query:
+      protocol: graphql
+      document: |
+        query($after: String) {
+          activitySeriesConnection(first: 200, after: $after, filters: {lastActivityType: [ARCHIVE], lastActivityStatus: [FAILURE], startTimeGt: "{DAYS_AGO:7}"}) {
+            nodes { activitySeriesId objectName objectType lastActivityType lastActivityStatus severity startTime lastUpdated cluster { id name } }
+            pageInfo { hasNextPage endCursor }
+          }
+        }
+      items: data.activitySeriesConnection.nodes
+      paging: { cursor: data.activitySeriesConnection.pageInfo.endCursor, hasNext: data.activitySeriesConnection.pageInfo.hasNextPage, variable: after }
+      maxPages: 50
+      key: activitySeriesId
+      name: objectName
+    each: any
+    evidence: "{objectName} ({objectType}) archival failed, last update {lastUpdated} on cluster {cluster.name}"
+
+  - id: RBK-REPLICATION-FAILED
+    title: Failed replication activity in the last 7 days
+    kind: broken
+    category: AVL
+    severity: high
+    entity: backup-activity
+    refresh: 12h
+    why: "Replication is the second-site copy; failures accumulate quietly as lag, and at failover the replicated copy is older than anyone assumed. Nothing turns red when a replication pair falls behind."
+    fix: "Check the target cluster's state and the inter-cluster link; review bandwidth and the replication window, and open a case if it stays stuck."
+    refs: [NIST-800-53:CP-9(6), NIST-800-53:CP-6]
+    query:
+      protocol: graphql
+      document: |
+        query($after: String) {
+          activitySeriesConnection(first: 200, after: $after, filters: {lastActivityType: [REPLICATION], lastActivityStatus: [FAILURE], startTimeGt: "{DAYS_AGO:7}"}) {
+            nodes { activitySeriesId objectName objectType lastActivityType lastActivityStatus severity startTime lastUpdated cluster { id name } }
+            pageInfo { hasNextPage endCursor }
+          }
+        }
+      items: data.activitySeriesConnection.nodes
+      paging: { cursor: data.activitySeriesConnection.pageInfo.endCursor, hasNext: data.activitySeriesConnection.pageInfo.hasNextPage, variable: after }
+      maxPages: 50
+      key: activitySeriesId
+      name: objectName
+    each: any
+    evidence: "{objectName} ({objectType}) replication failed, last update {lastUpdated} on cluster {cluster.name}"
+
+  - id: RBK-RECOVERY-FAILED
+    title: Failed recovery activity in the last 30 days
+    kind: broken
+    category: BCK
+    severity: medium
+    entity: backup-activity
+    refresh: 1d
+    why: "A failed restore is the only test that matters; a pattern of them means the snapshots or the target environment are not actually restorable, which is the worst thing to learn during a real incident."
+    fix: "Read the message; retry on a different ESXi host or datastore, and open a Rubrik case if recoveries keep failing for the same reason."
+    refs: [NIST-800-53:CP-10, NIST-800-53:CP-4]
+    query:
+      protocol: graphql
+      document: |
+        query($after: String) {
+          activitySeriesConnection(first: 200, after: $after, filters: {lastActivityType: [RECOVERY], lastActivityStatus: [FAILURE], startTimeGt: "{DAYS_AGO:30}"}) {
+            nodes { activitySeriesId objectName objectType lastActivityType lastActivityStatus severity startTime lastUpdated cluster { id name } }
+            pageInfo { hasNextPage endCursor }
+          }
+        }
+      items: data.activitySeriesConnection.nodes
+      paging: { cursor: data.activitySeriesConnection.pageInfo.endCursor, hasNext: data.activitySeriesConnection.pageInfo.hasNextPage, variable: after }
+      maxPages: 50
+      key: activitySeriesId
+      name: objectName
+    each: any
+    evidence: "{objectName} ({objectType}) recovery failed, last update {lastUpdated} on cluster {cluster.name}"
+
+  - id: RBK-LOG-BACKUP-FAILED
+    title: Failed log backup in the last day
+    kind: broken
+    category: BCK
+    severity: high
+    entity: backup-activity
+    refresh: 6h
+    why: "Log backup failures break point-in-time recovery for a database while its daily snapshot stays green, so the recovery point silently slips to the last full backup."
+    fix: "Check RBS on the database host and the recovery model; a log chain broken by another backup tool means two products are protecting the same instance."
+    refs: [NIST-800-53:CP-9]
+    query:
+      protocol: graphql
+      document: |
+        query($after: String) {
+          activitySeriesConnection(first: 200, after: $after, filters: {lastActivityType: [LOG_BACKUP], lastActivityStatus: [FAILURE], startTimeGt: "{DAYS_AGO:1}"}) {
+            nodes { activitySeriesId objectName objectType lastActivityType lastActivityStatus severity startTime lastUpdated cluster { id name } }
+            pageInfo { hasNextPage endCursor }
+          }
+        }
+      items: data.activitySeriesConnection.nodes
+      paging: { cursor: data.activitySeriesConnection.pageInfo.endCursor, hasNext: data.activitySeriesConnection.pageInfo.hasNextPage, variable: after }
+      maxPages: 50
+      key: activitySeriesId
+      name: objectName
+    each: any
+    evidence: "{objectName} ({objectType}) log backup failed, last update {lastUpdated} on cluster {cluster.name}"
+
+  - id: RBK-NO-RECOVERY-TEST
+    title: No successful recovery in the last 90 days
+    kind: missing
+    category: BCK
+    severity: high
+    entity: instance
+    refresh: 7d
+    why: "A backup never restored is a hypothesis. Rubrik logs every recovery, so the restore-test obligation can be proven from the activity log; no successful recovery in 90 days means the restore path is unproven."
+    fix: "Schedule a quarterly recovery test (Live Mount, Instant Recovery or Export) to an isolated network and record the elapsed time."
+    refs: [NIST-800-53:CP-4, NIST-800-53:CP-10, CIS-Controls-v8:11.5]
+    query:
+      protocol: graphql
+      document: |
+        query($after: String) {
+          activitySeriesConnection(first: 200, after: $after, filters: {lastActivityType: [RECOVERY], lastActivityStatus: [SUCCESS], startTimeGt: "{DAYS_AGO:90}"}) {
+            nodes { activitySeriesId objectName objectType lastActivityType lastActivityStatus startTime lastUpdated cluster { id name } }
+            pageInfo { hasNextPage endCursor }
+          }
+        }
+      items: data.activitySeriesConnection.nodes
+      paging: { cursor: data.activitySeriesConnection.pageInfo.endCursor, hasNext: data.activitySeriesConnection.pageInfo.hasNextPage, variable: after }
+      maxPages: 50
+      key: activitySeriesId
+      name: objectName
+    count: none
+    evidence: "no successful Rubrik recovery in the last 90 days"
+
+  - id: RBK-ANOMALY-OPEN
+    title: Backup anomaly (Radar) detected in the last 7 days
+    kind: broken
+    lens: security
+    category: MON
+    severity: high
+    entity: backup-activity
+    refresh: 6h
+    why: "Ransomware encryption shows first as a change-rate anomaly in backups; Radar is the product's main detection control, and an unreviewed anomaly is a possible ongoing encryption."
+    fix: "Investigate with the system owner; isolate the resource and treat it as an incident if encryption is confirmed."
+    refs: [NIST-800-53:SI-4, NIST-800-53:IR-4, CIS-Controls-v8:13.1]
+    query:
+      protocol: graphql
+      document: |
+        query($after: String) {
+          activitySeriesConnection(first: 200, after: $after, filters: {lastActivityType: [ANOMALY], startTimeGt: "{DAYS_AGO:7}"}) {
+            nodes { activitySeriesId objectName objectType lastActivityType lastActivityStatus severity startTime lastUpdated cluster { id name } }
+            pageInfo { hasNextPage endCursor }
+          }
+        }
+      items: data.activitySeriesConnection.nodes
+      paging: { cursor: data.activitySeriesConnection.pageInfo.endCursor, hasNext: data.activitySeriesConnection.pageInfo.hasNextPage, variable: after }
+      maxPages: 50
+      key: activitySeriesId
+      name: objectName
+    each: any
+    evidence: "{objectName} ({objectType}) anomaly {lastActivityStatus} at {lastUpdated} on cluster {cluster.name}"
+
+  - id: RBK-SYSTEM-FAILURE
+    title: System or hardware fault event in the last 7 days
+    kind: broken
+    category: MON
+    severity: high
+    entity: backup-activity
+    refresh: 12h
+    why: "Node, disk, network and service faults appear in the system event stream before they become an SLA compliance problem; caught here they are a maintenance task rather than a missed recovery point."
+    fix: "Triage each event: hardware faults to Rubrik support under contract, service faults to a support case."
+    refs: [NIST-800-53:CP-2, NIST-800-53:SI-4]
+    query:
+      protocol: graphql
+      document: |
+        query($after: String) {
+          activitySeriesConnection(first: 200, after: $after, filters: {lastActivityType: [SYSTEM], lastActivityStatus: [FAILURE], startTimeGt: "{DAYS_AGO:7}"}) {
+            nodes { activitySeriesId objectName objectType lastActivityType lastActivityStatus severity startTime lastUpdated cluster { id name } }
+            pageInfo { hasNextPage endCursor }
+          }
+        }
+      items: data.activitySeriesConnection.nodes
+      paging: { cursor: data.activitySeriesConnection.pageInfo.endCursor, hasNext: data.activitySeriesConnection.pageInfo.hasNextPage, variable: after }
+      maxPages: 50
+      key: activitySeriesId
+      name: objectName
+    each: any
+    evidence: "{objectName} system event {lastActivityStatus} at {lastUpdated} on cluster {cluster.name}"

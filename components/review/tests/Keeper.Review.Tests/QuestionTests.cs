@@ -52,7 +52,7 @@ public sealed class QuestionTests : IDisposable
     {
         var names = ReviewComponent.Questions.Load().Select(q => q.Name).ToList();
 
-        foreach (var question in new[] { "broken", "misconfigured", "missing", "blind-spots", "changed", "inventory", "expiring", "licences", "rules", "history" })
+        foreach (var question in new[] { "correct", "posture", "broken", "misconfigured", "missing", "blind-spots", "changed", "inventory", "expiring", "licences", "rules", "history" })
             Assert.Contains(question, names);
     }
 

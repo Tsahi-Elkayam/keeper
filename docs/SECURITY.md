@@ -14,7 +14,7 @@ that estate's weaknesses. This page says how each is protected, and what is not 
     `unicodePwd`, `msDS-ManagedPassword`, ...) are refused when a rule is loaded and dropped if returned.
   - `file` reads only inside the Keeper home's `imports\`, with XML external entities off.
   - `store` opens the store read-only and refuses the tables that hold secrets, keys or the write audit.
-- **Write only its own store**, and only through `keeper-qm`. Every write is a request with a reason
+- **Write only its own store**, and only through `keeper qm`. Every write is a request with a reason
   and the submitting user, applied in a transaction and kept (`keeper writes`).
 - **Change nothing in the store's shape without asking.** `keeper db init` / `migrate` and
   `keeper setup` are dry runs unless `--apply`; a migration backs the store up first.

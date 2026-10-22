@@ -1,8 +1,6 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
-    <OutputType>Exe</OutputType>
-    <AssemblyName>keeper-rank</AssemblyName>
-    <RootNamespace>Keeper.Cli.Rank</RootNamespace>
+    <AssemblyName>Keeper.Cli.Rank</AssemblyName>
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="..\Keeper.Rank\Keeper.Rank.csproj" />

@@ -1757,3 +1757,484 @@ rules:
         - { field: port, op: eq, value: 1433 }
         - { field: ip_address, op: notin, value: ['127.0.0.1', '::1'] }
     evidence: "{instance}: listening on {ip_address}:{port}"
+
+  # ---- fixed server roles, database users and public (added) -----------------------------------
+
+  - id: SQL-FIXED-SERVER-ROLE-MEMBER
+    title: Member of a powerful fixed server role
+    kind: misconfigured
+    lens: security
+    category: IAM
+    severity: medium
+    entity: login
+    refresh: 7d
+    why: bulkadmin, dbcreator, diskadmin, processadmin and setupadmin each grant a broad, instance-wide capability (bulk load from any file, create and own any database, manage files, kill any session, manage linked servers and startup); membership grows and is rarely reviewed beside sysadmin.
+    fix: Remove the member or move it to a role that matches its job; accepted members go in the allow pattern.
+    refs: [NIST-800-53:AC-6, CIS-Controls-v8:5.4]
+    query:
+      protocol: sql
+      text: |-
+        SELECT CAST(SERVERPROPERTY('ServerName') AS nvarchar(256)) + N'/' + r.name + N'/' + m.name AS target,
+               r.name AS role_name, m.name AS member_name, m.type_desc, m.is_disabled
+        FROM sys.server_role_members AS rm
+        JOIN sys.server_principals AS r ON r.principal_id = rm.role_principal_id
+        JOIN sys.server_principals AS m ON m.principal_id = rm.member_principal_id
+        WHERE r.name IN (N'bulkadmin', N'dbcreator', N'diskadmin', N'processadmin', N'setupadmin')
+          AND m.name NOT LIKE N'NT SERVICE\%' AND m.name NOT LIKE N'NT AUTHORITY\%'
+      key: target
+      name: member_name
+    each:
+      all:
+        - { field: is_disabled, op: eq, value: 0 }
+        - { field: member_name, op: notmatch, value: '^$', threshold: sql.fixed-server-role-allow-pattern }
+    evidence: "{target}: {member_name} ({type_desc}) in {role_name}"
+
+  - id: SQL-DB-ORPHANED-USER
+    title: Database user with no matching server login
+    kind: broken
+    lens: both
+    category: IAM
+    severity: medium
+    entity: database-user
+    refresh: 7d
+    why: An orphaned user (its SID matches no login) is a user whose login was dropped, usually a departed administrator's Windows account or a login lost in a database move; it breaks the application that connected as it and leaves permissions mapped to nobody.
+    fix: Drop the user if it is truly unused, or remap it to the correct login with ALTER USER. Users of a contained database are not orphans and are not listed here.
+    refs: [NIST-800-53:AC-2, CIS-MSSQL:4.4]
+    query:
+      protocol: sql
+      databases: all
+      text: |-
+        SELECT CAST(SERVERPROPERTY('ServerName') AS nvarchar(256)) + N'/' + DB_NAME() + N'/' + dp.name AS target,
+               dp.name AS user_name, dp.type_desc, dp.create_date
+        FROM sys.database_principals AS dp
+        WHERE dp.type IN ('S', 'U', 'G')
+          AND dp.authentication_type <> 2
+          AND dp.sid IS NOT NULL
+          AND dp.principal_id > 4
+          AND dp.name NOT IN (N'dbo', N'guest', N'sys', N'INFORMATION_SCHEMA')
+          AND SUSER_SNAME(dp.sid) IS NULL
+      key: target
+      name: user_name
+    each: any
+    evidence: "{target}: user {user_name} ({type_desc}) maps to no login"
+
+  - id: SQL-DB-GUEST-ENABLED
+    title: guest user has CONNECT in a user database
+    kind: misconfigured
+    lens: security
+    category: IAM
+    severity: medium
+    entity: database
+    refresh: 7d
+    why: With CONNECT granted to guest, any login that reaches the instance enters the database without being a user of it and gets whatever public holds there; guest needs CONNECT only in master and msdb.
+    fix: REVOKE CONNECT FROM guest in the user database. The system databases where guest must keep it are not read here.
+    refs: [CIS-MSSQL:4.4, NIST-800-53:AC-6]
+    query:
+      protocol: sql
+      databases: user
+      text: |-
+        SELECT CAST(SERVERPROPERTY('ServerName') AS nvarchar(256)) + N'/' + DB_NAME() AS target,
+               DB_NAME() AS database_name
+        FROM sys.database_permissions AS perm
+        WHERE perm.grantee_principal_id = USER_ID(N'guest')
+          AND perm.permission_name = N'CONNECT' AND perm.state_desc = N'GRANT' AND perm.class = 0
+      key: target
+      name: database_name
+    each: any
+    evidence: "{target}: guest has CONNECT"
+
+  - id: SQL-DB-PUBLIC-PERMISSION
+    title: Object or schema permission granted to public
+    kind: misconfigured
+    lens: security
+    category: IAM
+    severity: medium
+    entity: permission
+    refresh: 7d
+    why: Every user of a database is a member of public, so an object or schema permission granted to it is granted to everyone in the database, outside any role review; these grants are never a default.
+    fix: Revoke the permission from public and grant it to the specific database role that needs it.
+    refs: [CIS-MSSQL:4.5, NIST-800-53:AC-6]
+    query:
+      protocol: sql
+      databases: all
+      text: |-
+        SELECT CAST(SERVERPROPERTY('ServerName') AS nvarchar(256)) + N'/' + DB_NAME() + N'/' + perm.class_desc
+                 + N'/' + perm.permission_name + N'/' + CAST(perm.major_id AS nvarchar(20)) AS target,
+               perm.class_desc, perm.permission_name, perm.state_desc
+        FROM sys.database_permissions AS perm
+        WHERE perm.grantee_principal_id = 0 AND perm.state IN ('G', 'W') AND perm.class IN (1, 3)
+      key: target
+    each: any
+    evidence: "{target}: public granted {permission_name} on {class_desc}"
+
+  # ---- database options and surface area (added) -----------------------------------------------
+
+  - id: SQL-DB-OWNERSHIP-CHAINING
+    title: Cross-database ownership chaining on at the database level
+    kind: misconfigured
+    lens: security
+    category: CFG
+    severity: medium
+    entity: database
+    refresh: 7d
+    why: With DB_CHAINING on, a module in this database can reach objects in another database owned by the same login without a permission check, which lets a low-privilege user cross database boundaries.
+    fix: Turn DB_CHAINING off (ALTER DATABASE ... SET DB_CHAINING OFF) and sign modules that must cross databases. msdb has it on by design and is not reported.
+    refs: [CIS-MSSQL:2.10, NIST-800-53:AC-6]
+    query:
+      protocol: sql
+      text: |-
+        SELECT CAST(SERVERPROPERTY('ServerName') AS nvarchar(256)) + N'/' + d.name AS target,
+               d.name AS database_name, d.database_id, d.is_db_chaining_on, d.state_desc
+        FROM sys.databases AS d
+        WHERE d.source_database_id IS NULL
+      key: target
+      name: database_name
+    each:
+      all:
+        - { field: database_id, op: gt, value: 4 }
+        - { field: is_db_chaining_on, op: eq, value: 1 }
+    evidence: "{target}: cross-database ownership chaining on"
+
+  - id: SQL-CLR-ASSEMBLY-UNSAFE
+    title: CLR assembly with EXTERNAL_ACCESS or UNSAFE permission
+    kind: misconfigured
+    lens: security
+    category: CFG
+    severity: high
+    entity: assembly
+    refresh: 7d
+    why: An EXTERNAL_ACCESS or UNSAFE assembly runs .NET code that can reach the file system, the network and unmanaged memory under the service account; it is a direct path from the engine to the host.
+    fix: Read what the assembly does; remove it or rebuild it as SAFE, and keep 'clr strict security' on so unsigned unsafe code cannot load.
+    refs: [CIS-MSSQL:2.5, NIST-800-53:CM-7, MITRE-ATTACK:T1505]
+    query:
+      protocol: sql
+      databases: all
+      text: |-
+        SELECT CAST(SERVERPROPERTY('ServerName') AS nvarchar(256)) + N'/' + DB_NAME() + N'/' + a.name AS target,
+               a.name AS assembly_name, a.permission_set_desc, a.clr_name
+        FROM sys.assemblies AS a
+        WHERE a.is_user_defined = 1 AND a.permission_set_desc <> N'SAFE_ACCESS'
+      key: target
+      name: assembly_name
+    each: any
+    evidence: "{target}: assembly {assembly_name} is {permission_set_desc}"
+
+  - id: SQL-ENDPOINT-NONSTANDARD
+    title: Non-default server endpoint started
+    kind: misconfigured
+    lens: security
+    category: CFG
+    severity: low
+    entity: endpoint
+    refresh: 7d
+    why: A started endpoint beyond the built-in TSQL ones (database mirroring, Service Broker, SOAP) is extra listening surface; a mirroring-type endpoint is also what an availability group uses, so it is expected only where AG or mirroring runs.
+    fix: Drop the endpoint if nothing uses it, or put the sanctioned ones (the availability group's mirroring endpoint) in the allow pattern.
+    refs: [NIST-800-53:CM-7, CIS-MSSQL:2.11]
+    query:
+      protocol: sql
+      text: |-
+        SELECT CAST(SERVERPROPERTY('ServerName') AS nvarchar(256)) + N'/' + e.name AS target,
+               e.name AS endpoint_name, e.type_desc, e.protocol_desc, e.state_desc
+        FROM sys.endpoints AS e
+        WHERE e.endpoint_id > 5
+      key: target
+      name: endpoint_name
+    each:
+      all:
+        - { field: state_desc, op: eq, value: STARTED }
+        - { field: endpoint_name, op: notmatch, value: '^$', threshold: sql.endpoint-allow-pattern }
+    evidence: "{target}: {type_desc} endpoint ({protocol_desc}), {state_desc}"
+
+  - id: SQL-LINKED-SERVER-RPC-OUT
+    title: Linked server with RPC Out enabled
+    kind: misconfigured
+    lens: security
+    category: CFG
+    severity: medium
+    entity: linked-server
+    refresh: 7d
+    why: RPC Out lets a local caller run stored procedures on the remote server, including its xp_cmdshell and other surface area, with the mapped remote login's rights; it turns a linked server into a lateral-movement path.
+    fix: Turn RPC Out off unless an application documents a need for it; pair it with a least-privilege remote login rather than a stored administrator login.
+    refs: [NIST-800-53:AC-6, NIST-800-53:CM-7, MITRE-ATTACK:T1210]
+    query:
+      protocol: sql
+      text: |-
+        SELECT CAST(SERVERPROPERTY('ServerName') AS nvarchar(256)) + N'/' + s.name AS target,
+               s.name AS linked_server, s.product, s.provider, s.is_rpc_out_enabled, s.is_data_access_enabled
+        FROM sys.servers AS s
+        WHERE s.is_linked = 1 AND s.is_rpc_out_enabled = 1
+      key: target
+      name: linked_server
+    each: any
+    evidence: "{target}: RPC Out enabled ({product}/{provider})"
+
+  - id: SQL-AGENT-JOB-OS-COMMAND
+    title: Enabled Agent job runs operating-system commands or scripts
+    kind: misconfigured
+    lens: security
+    category: CFG
+    severity: high
+    entity: job
+    refresh: 7d
+    why: A CmdExec, PowerShell or ActiveScripting job step runs operating-system commands as the Agent service account (or a proxy), which is a command-execution and persistence path that bypasses the engine's permissions.
+    fix: Read the step; replace OS commands with a least-privilege proxy where they are needed, and put sanctioned maintenance jobs in the allow pattern.
+    refs: [NIST-800-53:CM-7, MITRE-ATTACK:T1059]
+    query:
+      protocol: sql
+      text: |-
+        SELECT CAST(SERVERPROPERTY('ServerName') AS nvarchar(256)) + N'/' + j.name + N'/' + CAST(s.step_id AS nvarchar(10)) AS target,
+               j.name AS job_name, j.enabled, s.step_id, s.step_name, s.subsystem, SUSER_SNAME(j.owner_sid) AS owner_name
+        FROM msdb.dbo.sysjobs AS j
+        JOIN msdb.dbo.sysjobsteps AS s ON s.job_id = j.job_id
+        WHERE s.subsystem IN (N'CmdExec', N'PowerShell', N'ActiveScripting')
+      key: target
+      name: job_name
+    each:
+      all:
+        - { field: enabled, op: eq, value: 1 }
+        - { field: job_name, op: notmatch, value: '^$', threshold: sql.os-command-job-allow-pattern }
+    evidence: "{target}: step {step_name} runs {subsystem} as {owner_name}"
+
+  # ---- server configuration options (added) ----------------------------------------------------
+
+  - id: SQL-CFG-REMOTE-ADMIN-CONNECTIONS
+    title: Remote dedicated administrator connection enabled
+    kind: misconfigured
+    lens: security
+    category: CFG
+    severity: low
+    entity: instance
+    refresh: 7d
+    why: The remote dedicated administrator connection lets an administrator log in over the network even when the engine is otherwise unresponsive; off a failover cluster it is extra reachable surface that only a sysadmin should have.
+    fix: Turn 'remote admin connections' off with sp_configure on stand-alone instances; keep it on only where a failover cluster instance needs the remote DAC.
+    refs: [CIS-MSSQL:2.4, NIST-800-53:CM-7]
+    query:
+      protocol: sql
+      text: |-
+        SELECT CAST(SERVERPROPERTY('ServerName') AS nvarchar(256)) AS instance_name,
+               CAST(value_in_use AS bigint) AS value_in_use
+        FROM sys.configurations WHERE name = N'remote admin connections'
+      key: instance
+    each: { field: value_in_use, op: eq, value: 1 }
+    evidence: "{instance}: remote admin connections enabled"
+
+  - id: SQL-CFG-CONTAINED-DB-AUTH
+    title: Contained database authentication enabled at the instance
+    kind: misconfigured
+    lens: security
+    category: IAM
+    severity: low
+    entity: instance
+    refresh: 7d
+    why: With this option on, databases can hold their own users that authenticate inside the database, outside the instance login policy and the sa and role reviews; it should be on only where a contained database or an availability group needs it.
+    fix: Turn 'contained database authentication' off with sp_configure where no contained database or availability group requires it. SQL-DB-CONTAINED lists the databases that actually use it.
+    refs: [CIS-MSSQL:2.12, NIST-800-53:IA-5]
+    query:
+      protocol: sql
+      text: |-
+        SELECT CAST(SERVERPROPERTY('ServerName') AS nvarchar(256)) AS instance_name,
+               CAST(value_in_use AS bigint) AS value_in_use
+        FROM sys.configurations WHERE name = N'contained database authentication'
+      key: instance
+    each: { field: value_in_use, op: eq, value: 1 }
+    evidence: "{instance}: contained database authentication enabled"
+
+  - id: SQL-CFG-CLR-STRICT-OFF
+    title: CLR strict security turned off
+    kind: misconfigured
+    lens: security
+    category: CFG
+    severity: medium
+    entity: instance
+    refresh: 7d
+    why: CLR strict security (SQL Server 2017 and later) treats every assembly as UNSAFE unless it is signed and trusted; with it off, an EXTERNAL_ACCESS or UNSAFE assembly can load without a signature, which is the usual way CLR is abused. Instances before 2017 do not have the option and are not reported.
+    fix: Turn 'clr strict security' back on with sp_configure and sign the assemblies that must load.
+    refs: [CIS-MSSQL:2.5, NIST-800-53:CM-7, MITRE-ATTACK:T1505]
+    query:
+      protocol: sql
+      text: |-
+        SELECT CAST(SERVERPROPERTY('ServerName') AS nvarchar(256)) AS instance_name,
+               CAST(value_in_use AS bigint) AS value_in_use
+        FROM sys.configurations WHERE name = N'clr strict security'
+      key: instance
+    each: { field: value_in_use, op: eq, value: 0 }
+    evidence: "{instance}: clr strict security off"
+
+  - id: SQL-CFG-MAXDOP-UNSET
+    title: Max degree of parallelism left at zero on a many-core host
+    kind: misconfigured
+    category: HLT
+    severity: low
+    entity: instance
+    refresh: 7d
+    why: With MAXDOP at 0 on a host with many cores, one query can take every scheduler, so a single heavy statement stalls the whole instance; Microsoft guidance is a bounded value, not 0, past a handful of cores.
+    fix: Set 'max degree of parallelism' to a value sized for the cores and NUMA layout (Microsoft's guidance table), and set 'cost threshold for parallelism' above the default 5.
+    refs: [NIST-800-53:SC-5]
+    query:
+      protocol: sql
+      text: |-
+        SELECT CAST(SERVERPROPERTY('ServerName') AS nvarchar(256)) AS instance_name,
+               (SELECT CAST(value_in_use AS int) FROM sys.configurations WHERE name = N'max degree of parallelism') AS maxdop,
+               (SELECT cpu_count FROM sys.dm_os_sys_info) AS cpu_count
+      key: instance
+    each:
+      all:
+        - { field: maxdop, op: eq, value: 0 }
+        - { field: cpu_count, op: gt, value: 8, threshold: sql.maxdop-cores-min }
+    evidence: "{instance}: MAXDOP 0 on {cpu_count} cores"
+
+  # ---- database health options and files (added) -----------------------------------------------
+
+  - id: SQL-DB-AUTO-STATS-OFF
+    title: Automatic statistics turned off
+    kind: misconfigured
+    category: HLT
+    severity: medium
+    entity: database
+    refresh: 7d
+    why: With auto-create or auto-update statistics off, the optimizer works from missing or stale row estimates and produces bad plans that get slower as the data grows, unless a job updates statistics in their place.
+    fix: Turn AUTO_CREATE_STATISTICS and AUTO_UPDATE_STATISTICS on, or confirm a statistics-maintenance job covers the database and record why they are off.
+    refs: [NIST-800-53:CM-6]
+    query:
+      protocol: sql
+      text: |-
+        SELECT CAST(SERVERPROPERTY('ServerName') AS nvarchar(256)) + N'/' + d.name AS target,
+               d.name AS database_name, d.database_id, d.is_auto_create_stats_on, d.is_auto_update_stats_on, d.state_desc
+        FROM sys.databases AS d
+        WHERE d.source_database_id IS NULL
+      key: target
+      name: database_name
+    each:
+      all:
+        - { field: database_id, op: gt, value: 4 }
+        - { field: state_desc, op: eq, value: ONLINE }
+        - any:
+            - { field: is_auto_create_stats_on, op: eq, value: 0 }
+            - { field: is_auto_update_stats_on, op: eq, value: 0 }
+    evidence: "{target}: auto-create {is_auto_create_stats_on}, auto-update {is_auto_update_stats_on}"
+
+  - id: SQL-DB-COMPAT-LEVEL-OLD
+    title: Database compatibility level far behind the engine
+    kind: misconfigured
+    category: LCM
+    severity: low
+    entity: database
+    refresh: 7d
+    why: A compatibility level several versions behind the engine keeps the database on an old query optimizer and old behaviours, hides regressions until a future upgrade forces the change, and blocks features that depend on a current level.
+    fix: Test the application against a current compatibility level and raise it; a level held low for a vendor requirement goes in the record with the reason.
+    refs: [NIST-800-53:CM-6]
+    query:
+      protocol: sql
+      text: |-
+        SELECT CAST(SERVERPROPERTY('ServerName') AS nvarchar(256)) + N'/' + d.name AS target,
+               d.name AS database_name, d.database_id, d.compatibility_level, d.state_desc
+        FROM sys.databases AS d
+        WHERE d.source_database_id IS NULL
+      key: target
+      name: database_name
+    each:
+      all:
+        - { field: database_id, op: gt, value: 4 }
+        - { field: state_desc, op: eq, value: ONLINE }
+        - { field: compatibility_level, op: lt, value: 110, threshold: sql.min-compat-level }
+    evidence: "{target}: compatibility level {compatibility_level}"
+
+  - id: SQL-DB-FILE-AUTOGROWTH-PERCENT
+    title: Database file grows by a percentage
+    kind: misconfigured
+    category: HLT
+    severity: low
+    entity: database-file
+    refresh: 7d
+    why: Percentage autogrowth makes each growth larger than the last, so the growth event takes longer and stalls writes more as the file gets bigger, and a log file that grows this way ends up with excessive virtual log files.
+    fix: Set autogrowth to a fixed size sensible for the file, and pre-size files to their expected size so growth is rare.
+    refs: [NIST-800-53:CP-2]
+    query:
+      protocol: sql
+      text: |-
+        SELECT CAST(SERVERPROPERTY('ServerName') AS nvarchar(256)) + N'/' + DB_NAME(mf.database_id) + N'/' + mf.name AS target,
+               DB_NAME(mf.database_id) AS database_name, mf.name AS file_name, mf.type_desc, mf.is_percent_growth, mf.growth
+        FROM sys.master_files AS mf
+        WHERE mf.database_id > 4
+      key: target
+      name: database_name
+    each: { field: is_percent_growth, op: eq, value: 1 }
+    evidence: "{target}: {type_desc} file grows by {growth}%"
+
+  - id: SQL-DB-FILE-GROWTH-DISABLED
+    title: Database file cannot grow
+    kind: misconfigured
+    category: AVL
+    severity: medium
+    entity: database-file
+    refresh: 1d
+    why: A file with autogrowth disabled fails the next write that needs space (error 1105 for data, 9002 for the log) even when the volume has room, which takes the database down. Only a deliberately fixed read-only filegroup is a safe exception.
+    fix: Set a fixed autogrowth increment and a sensible max size, or confirm the file is a read-only filegroup that is full by design.
+    refs: [NIST-800-53:SC-5]
+    query:
+      protocol: sql
+      text: |-
+        SELECT CAST(SERVERPROPERTY('ServerName') AS nvarchar(256)) + N'/' + DB_NAME(mf.database_id) + N'/' + mf.name AS target,
+               DB_NAME(mf.database_id) AS database_name, mf.name AS file_name, mf.type_desc, mf.growth, mf.max_size
+        FROM sys.master_files AS mf
+        WHERE mf.database_id > 4
+      key: target
+      name: database_name
+    each: { field: growth, op: eq, value: 0 }
+    evidence: "{target}: {type_desc} file has autogrowth disabled (max_size {max_size})"
+
+  - id: SQL-DB-COLLATION-MISMATCH
+    title: Database collation differs from the server collation
+    kind: misconfigured
+    category: CFG
+    severity: low
+    entity: database
+    refresh: 7d
+    why: When a database collation differs from the server collation, temporary tables and joins against tempdb can fail with collation-conflict errors, and comparisons behave differently across databases; some vendor databases require their own collation, so this is a review item, not always a fault.
+    fix: Confirm the collation is the one the application needs and record it; align it with the server where nothing requires otherwise.
+    refs: [NIST-800-53:CM-6]
+    query:
+      protocol: sql
+      text: |-
+        SELECT CAST(SERVERPROPERTY('ServerName') AS nvarchar(256)) + N'/' + d.name AS target,
+               d.name AS database_name, d.database_id, d.collation_name,
+               CAST(SERVERPROPERTY('Collation') AS nvarchar(128)) AS server_collation, d.state_desc
+        FROM sys.databases AS d
+        WHERE d.source_database_id IS NULL
+      key: target
+      name: database_name
+    each:
+      all:
+        - { field: database_id, op: gt, value: 4 }
+        - { field: state_desc, op: eq, value: ONLINE }
+        - { field: collation_name, op: exists }
+        - { field: collation_name, op: ne, value: { field: server_collation } }
+    evidence: "{target}: database collation {collation_name}, server {server_collation}"
+
+  # ---- job notification (added) ----------------------------------------------------------------
+
+  - id: SQL-AGENT-JOB-NO-NOTIFY
+    title: Enabled Agent job does not notify on failure
+    kind: missing
+    category: MON
+    severity: medium
+    entity: job
+    refresh: 7d
+    why: A job with no failure notification fails silently; a nightly backup or integrity job can fail for weeks and the first anyone hears of it is a failed restore. This is the per-job gap even when an operator exists.
+    fix: Set the job to e-mail an operator on failure (notify on failure, with an operator), and make sure Database Mail and the operator's mailbox work.
+    refs: [NIST-800-53:SI-4, NIST-800-53:IR-6]
+    query:
+      protocol: sql
+      text: |-
+        SELECT CAST(SERVERPROPERTY('ServerName') AS nvarchar(256)) + N'/' + j.name AS target,
+               j.name AS job_name, j.enabled, j.notify_level_email, j.notify_email_operator_id
+        FROM msdb.dbo.sysjobs AS j
+      key: target
+      name: job_name
+    each:
+      all:
+        - { field: enabled, op: eq, value: 1 }
+        - any:
+            - { field: notify_level_email, op: notin, value: [2, 3] }
+            - { field: notify_email_operator_id, op: eq, value: 0 }
+    evidence: "{target}: failure e-mail level {notify_level_email}, operator {notify_email_operator_id}"

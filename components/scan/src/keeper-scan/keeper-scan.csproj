@@ -1,8 +1,6 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
-    <OutputType>Exe</OutputType>
-    <AssemblyName>keeper-scan</AssemblyName>
-    <RootNamespace>Keeper.Cli.Scan</RootNamespace>
+    <AssemblyName>Keeper.Cli.Scan</AssemblyName>
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="..\Keeper.Scan\Keeper.Scan.csproj" />

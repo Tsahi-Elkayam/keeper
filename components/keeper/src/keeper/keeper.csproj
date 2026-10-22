@@ -4,8 +4,27 @@
     <AssemblyName>keeper</AssemblyName>
     <RootNamespace>Keeper.Cli</RootNamespace>
   </PropertyGroup>
+  <!-- The one binary: every verb is a library beside its component, run in this process. -->
   <ItemGroup>
     <ProjectReference Include="..\..\..\common\src\Keeper.Common\Keeper.Common.csproj" />
     <ProjectReference Include="..\..\..\home\src\Keeper.Home\Keeper.Home.csproj" />
+    <ProjectReference Include="..\keeper-run\keeper-run.csproj" />
+    <ProjectReference Include="..\keeper-qm\keeper-qm.csproj" />
+    <ProjectReference Include="..\keeper-query\keeper-query.csproj" />
+    <ProjectReference Include="..\keeper-db\keeper-db.csproj" />
+    <ProjectReference Include="..\..\..\scan\src\keeper-scan\keeper-scan.csproj" />
+    <ProjectReference Include="..\..\..\scan\src\keeper-certs\keeper-certs.csproj" />
+    <ProjectReference Include="..\..\..\scan\src\keeper-rules\keeper-rules.csproj" />
+    <ProjectReference Include="..\..\..\review\src\keeper-load\keeper-load.csproj" />
+    <ProjectReference Include="..\..\..\review\src\keeper-track\keeper-track.csproj" />
+    <ProjectReference Include="..\..\..\review\src\keeper-decide\keeper-decide.csproj" />
+    <ProjectReference Include="..\..\..\review\src\keeper-system\keeper-system.csproj" />
+    <ProjectReference Include="..\..\..\review\src\keeper-register\keeper-register.csproj" />
+    <ProjectReference Include="..\..\..\review\src\keeper-config\keeper-config.csproj" />
+    <ProjectReference Include="..\..\..\rank\src\keeper-rank\keeper-rank.csproj" />
+    <ProjectReference Include="..\..\..\report\src\keeper-today\keeper-today.csproj" />
+    <ProjectReference Include="..\..\..\report\src\keeper-report\keeper-report.csproj" />
+    <ProjectReference Include="..\..\..\push\src\keeper-push\keeper-push.csproj" />
+    <ProjectReference Include="..\..\..\integrations\src\keeper-integration\keeper-integration.csproj" />
   </ItemGroup>
 </Project>

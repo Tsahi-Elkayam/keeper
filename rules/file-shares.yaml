@@ -1,0 +1,210 @@
+schema: keeper.rules/1
+system: file-shares
+name: File shares (live share permissions, over SMB)
+integration: cim
+# One share enumeration per file server, read in-process as the Windows user Keeper runs as, through a
+# cim integration whose auth is negotiate (the smb runner refuses anything else). The query is
+# `read: shares, acl: true`: one row per share - host, name, type (disk/printer/ipc/...), special
+# (the admin/hidden $ flag), remark - and, for every DISK share whose security descriptor could be
+# read, path and an acl array of { identity (a SID), account (when the host can name it), type
+# allow/deny, rights FullControl/Change/Read or a hex mask, mask }. A disk share with no acl field is
+# one whose permissions could not be read: unknown, never "no permissions" (FILESHARE-SHARE-ACL-UNREADABLE).
+# Rows carry `host`; the key is "{host}|{name}" so every share is its own finding, and min_rows makes a
+# zero-row read partial (every SMB server answers with at least IPC$). Share names in this estate may be
+# Hebrew, so nothing keys off the name's characters.
+#
+# The runner also offers read: share-acl (one named share) and read: ntfs (one path = share\folder), but
+# both need a literal share or path. The NTFS folder checks from the legacy catalogue (broad-write,
+# orphaned SIDs, broken inheritance, explicit-ACE sprawl, share-vs-NTFS mismatch, owners) walk a share's
+# folder tree and name tenant paths, which a generic rule cannot do - they are in docs/backlog/file-shares.md.
+targets:
+  # File servers resolve from the store (computers earlier scans saw): a server operating system that
+  # logged on recently. A tenant that keeps a file-server group can narrow this in its own copy.
+  entity: computer
+  field: dNSHostName
+  where:
+    all:
+      - { field: operatingSystem, op: match, value: 'Server' }
+      - { field: lastLogonTimestamp, op: age-lt, value: 30 }
+defaults:
+  lens: security
+  refresh: 7d
+  entity: share
+
+rules:
+
+  # ---- the read itself ---------------------------------------------------------------------------
+
+  - id: FILESHARE-SHARE-ACL-UNREADABLE
+    title: A disk share's permissions could not be read
+    kind: missing
+    category: IAM
+    severity: medium
+    why: Reading a share's security descriptor needs administrator rights on the file server; when it fails the share is unknown, never "open" or "locked down", and none of the broad-permission rules can judge it. A whole host that cannot be reached shows as an unknown target in coverage instead.
+    fix: Give the scanning account administrator rights on the host (or confirm it over an admin session), then re-scan; a share that still fails has a damaged or non-standard descriptor.
+    refs: [NIST-800-53:AC-6]
+    query:
+      protocol: smb
+      read: shares
+      acl: true
+      key: "{host}|{name}"
+      name: name
+      min_rows: 1
+    each:
+      all:
+        - { field: type, op: eq, value: disk }
+        - { field: acl, op: absent }
+    evidence: "{host}: share {name} is a disk share whose permissions could not be read"
+
+  # ---- open and weak share permissions -----------------------------------------------------------
+
+  - id: FILESHARE-SHARE-BROAD-FULLCONTROL
+    title: Share grants Full Control to a broad principal
+    kind: misconfigured
+    category: IAM
+    severity: high
+    why: Share-level Full Control for Everyone, Authenticated Users, Domain Users, local Users, Domain Computers or anonymous removes the second permission layer entirely - a principal with share Full Control can also change the share ACL - so every NTFS mistake below it is immediately exploitable by most of the organisation.
+    fix: Replace the broad Full Control with Authenticated Users Change (or named department groups), and let NTFS carry the fine-grained rights. A share with no security descriptor at all gives Everyone Full Control and is caught here.
+    refs: [NIST-800-53:AC-3, NIST-800-53:AC-6, CIS-CSC-v8:3.3]
+    query:
+      protocol: smb
+      read: shares
+      acl: true
+      key: "{host}|{name}"
+      name: name
+      min_rows: 1
+    each:
+      all:
+        - { field: special, op: eq, value: false }
+        - element:
+            of: acl
+            match: any
+            where:
+              all:
+                - { field: type, op: eq, value: allow }
+                - { field: rights, op: eq, value: FullControl }
+                - { field: identity, op: sid-in, value: [everyone, authenticated-users, domain-users, builtin-users, domain-computers, anonymous] }
+    evidence: "{host}: share {name} ({path}) grants Full Control to a broad principal"
+
+  - id: FILESHARE-SHARE-BROAD-CHANGE
+    title: Share grants Change (write) to a broad principal
+    kind: misconfigured
+    category: IAM
+    severity: medium
+    why: Share-level Change lets Everyone, Authenticated Users, Domain Users, local Users, Domain Computers or anonymous write and delete through the share; ransomware spreads exactly as far as the compromised account can write, and a broad write grant is the widest possible blast radius.
+    fix: Scope write access to the department group that owns the data; keep broad principals at Read, or off the share ACL and on NTFS only.
+    refs: [NIST-800-53:AC-3, CIS-CSC-v8:3.3]
+    query:
+      protocol: smb
+      read: shares
+      acl: true
+      key: "{host}|{name}"
+      name: name
+      min_rows: 1
+    each:
+      all:
+        - { field: special, op: eq, value: false }
+        - element:
+            of: acl
+            match: any
+            where:
+              all:
+                - { field: type, op: eq, value: allow }
+                - { field: rights, op: eq, value: Change }
+                - { field: identity, op: sid-in, value: [everyone, authenticated-users, domain-users, builtin-users, domain-computers, anonymous] }
+    evidence: "{host}: share {name} ({path}) grants Change to a broad principal"
+
+  - id: FILESHARE-SHARE-EVERYONE-PRESENT
+    title: Everyone or anonymous is on a share ACL
+    kind: misconfigured
+    category: IAM
+    severity: medium
+    why: Everyone includes guest and, where anonymous access is not locked down, null sessions; anonymous is worse still. Even read-only, Everyone on a share ACL is the setting CIS has you replace with Authenticated Users so that an unauthenticated user cannot reach the data. Full Control and Change by these principals are reported by the broad-permission rules; this one catches read-level and any non-standard grant.
+    fix: Remove Everyone and anonymous from the share ACL; grant Authenticated Users or named groups instead, and lock down anonymous access on the server.
+    refs: [NIST-800-53:AC-3, CIS-CSC-v8:3.3]
+    query:
+      protocol: smb
+      read: shares
+      acl: true
+      key: "{host}|{name}"
+      name: name
+      min_rows: 1
+    each:
+      all:
+        - { field: special, op: eq, value: false }
+        - element:
+            of: acl
+            match: any
+            where:
+              all:
+                - { field: type, op: eq, value: allow }
+                - { field: identity, op: sid-in, value: [everyone, anonymous] }
+    evidence: "{host}: share {name} ({path}) has Everyone or anonymous on its ACL"
+
+  # ---- exposure and placement --------------------------------------------------------------------
+
+  - id: FILESHARE-SHARE-HIDDEN-NONADMIN
+    title: Hidden ($) share that is not an administrative share
+    kind: misconfigured
+    category: CFG
+    severity: low
+    why: A share whose name ends in $ is hidden from browsing but reachable by anyone who knows the name; the ones Windows creates (ADMIN$, C$, IPC$, print$) carry the special flag, so a hidden share without it is one someone made by hand - where vendor tools, old migrations and personal stashes live unaudited.
+    fix: Document the share's purpose and owner, or remove it; review its permissions like any other share.
+    refs: [NIST-800-53:CM-7, NIST-800-53:CM-8]
+    query:
+      protocol: smb
+      read: shares
+      acl: true
+      key: "{host}|{name}"
+      name: name
+      min_rows: 1
+    each:
+      all:
+        - { field: special, op: eq, value: false }
+        - { field: name, op: match, value: '\$$' }
+    evidence: "{host}: hidden share {name} ({remark}) is not an administrative share"
+
+  - id: FILESHARE-SHARE-ON-SYSTEM-DRIVE
+    title: Share hosted on the system drive
+    kind: misconfigured
+    category: CFG
+    severity: medium
+    lens: both
+    why: Data shared from the system drive (C:) fills the operating-system volume (updates, logging and the server itself fail when it is full) and is routinely skipped by data-volume backups and shadow-copy schedules, so the files have no previous-versions safety net. Only disk shares whose path could be read are judged; the system drive is assumed to be C:.
+    fix: Move the data to a data volume and repoint the share; keep the system drive for the operating system.
+    refs: [NIST-800-53:CP-9]
+    query:
+      protocol: smb
+      read: shares
+      acl: true
+      key: "{host}|{name}"
+      name: name
+      min_rows: 1
+    each:
+      all:
+        - { field: special, op: eq, value: false }
+        - { field: path, op: match, value: '^[Cc]:\\' }
+    evidence: "{host}: share {name} is hosted on the system drive ({path})"
+
+  - id: FILESHARE-SHARE-UNSANCTIONED
+    title: Share is not on the organisation's sanctioned list
+    kind: misconfigured
+    category: CST
+    severity: medium
+    lens: both
+    why: A share that no one documented is a data store with an unknown owner and unreviewed permissions; it may have appeared since the last review. Until the tenant records which share names are sanctioned, this cannot be judged, so the rule stays not-configured rather than passing against nothing.
+    fix: Set the threshold to a regular expression matching the sanctioned share names (for example '^(Data|Home|Dept.*|Profiles)$'); investigate, document or remove every share that does not match.
+    refs: [NIST-800-53:CM-8, NIST-800-53:CM-3]
+    query:
+      protocol: smb
+      read: shares
+      acl: true
+      key: "{host}|{name}"
+      name: name
+      min_rows: 1
+    each:
+      all:
+        - { field: special, op: eq, value: false }
+        - { field: type, op: eq, value: disk }
+        - { field: name, op: notmatch, value: '^$', threshold: file-shares.sanctioned-share-pattern, required: true }
+    evidence: "{host}: share {name} ({path}) is not on the sanctioned-share list"

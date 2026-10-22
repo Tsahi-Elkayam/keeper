@@ -1,0 +1,295 @@
+schema: keeper.rules/1
+system: power-platform
+name: Power Platform (admin - environments and DLP)
+integration: power-platform
+# Endpoint: https://api.bap.microsoft.com (the Business Application Platform admin API). The integration
+# obtains the token for resource https://service.powerapps.com/; rules only name GET paths relative to
+# the endpoint. This type is GET-only (it answers no read-POST), and a stored credential only ever goes to
+# api.bap.microsoft.com, so this file can read exactly two families the BAP admin API serves with a GET:
+#   - the environment list  /providers/Microsoft.BusinessAppPlatform/scopes/admin/environments
+#   - the data policies      /providers/PowerPlatform.Governance/v2/policies
+# Everything the legacy catalogue reached through POST listTenantSettings (trial/self-service signup,
+# guest maker, share-with-everyone, environment-creation limits, routing, AI/Copilot, capacity alerts),
+# through api.powerapps.com / api.flow.microsoft.com (app and flow sprawl, sharing, orphaned flows,
+# connections and connectors), through the per-environment Dataverse Web API (auditing, system users,
+# bots, org settings, IP firewall), through api.powerplatform.com (tenant capacity, Power Pages) and
+# through api.powerbi.com / Graph (Power BI tenant settings, licences, capacity) is in
+# docs/backlog/power-platform.md: each needs a read-POST this type does not answer, or a different Power
+# type/host, or a per-environment Dataverse token, or a cross-query/cross-host join.
+#
+# GENERIC: no environment id, display name, maker, region or count is hard-coded; a tenant's own values
+# (agreed region, naming pattern) come from thresholds with required: true, so the rule is "not
+# configured" (n/a, never a silent pass) until the tenant sets them.
+#
+# BAP environment fields are under properties.*; v2 data-policy fields are at the row root
+# (environmentType, connectorGroups, lastModifiedTime) - as the legacy method columns read them.
+defaults:
+  lens: both
+  refresh: 1d
+rules:
+
+  # ---- environments (one request lists them all; one finding per environment) ----------------
+
+  - id: PP-ENV-NONE
+    title: The review identity sees no Power Platform environments
+    kind: missing
+    lens: maintenance
+    category: MON
+    severity: medium
+    entity: instance
+    refresh: 7d
+    why: With no environment visible, every environment rule in this file reads nothing and the whole file looks clean. A tenant always has at least the default environment, so an empty read is a lost permission, not a fact.
+    fix: Give the review identity the Power Platform Administrator role (PIM) so the BAP admin environments API answers, then rerun.
+    refs: [NIST-800-53:CA-7]
+    query:
+      protocol: http
+      path: /providers/Microsoft.BusinessAppPlatform/scopes/admin/environments
+      params: { api-version: "2021-04-01" }
+      key: name
+      name: properties.displayName
+    count: none
+    evidence: "no environments returned by the BAP admin environments API"
+
+  - id: PP-ENV-STATE-NOT-HEALTHY
+    title: Environment is not Ready and Enabled
+    kind: broken
+    lens: maintenance
+    category: AVL
+    severity: high
+    entity: environment
+    why: An environment in admin mode, disabled or still preparing stops every app, flow and the Dataverse CRM it holds; a runtime that is not Enabled stops its asynchronous jobs silently.
+    fix: Exit admin mode / re-enable the environment in the Power Platform admin center; where a sandbox is disabled on purpose, record the reason so the tenant can override this rule for it.
+    refs: [NIST-800-53:CP-2]
+    query:
+      protocol: http
+      path: /providers/Microsoft.BusinessAppPlatform/scopes/admin/environments
+      params: { api-version: "2021-04-01" }
+      key: name
+      name: properties.displayName
+    each:
+      any:
+        - { field: properties.states.management.id, op: ne, value: Ready }
+        - { field: properties.states.runtime.id, op: ne, value: Enabled }
+    evidence: "{properties.displayName}: management {properties.states.management.id}, runtime {properties.states.runtime.id}"
+
+  - id: PP-ENV-DATAVERSE-NO-SECURITY-GROUP
+    title: Non-default Dataverse environment has no security group
+    kind: misconfigured
+    lens: security
+    category: IAM
+    severity: medium
+    entity: environment
+    why: Without a security group bound to it, every licensed user in the tenant is auto-provisioned into the environment and can reach whatever Dataverse data its roles allow; the group is the only gate on who gets in.
+    fix: Bind a security group to the environment and keep its membership to the intended user population.
+    refs: [NIST-800-53:AC-3, NIST-800-53:AC-6]
+    query:
+      protocol: http
+      path: /providers/Microsoft.BusinessAppPlatform/scopes/admin/environments
+      params: { api-version: "2021-04-01" }
+      key: name
+      name: properties.displayName
+    each:
+      all:
+        - { field: properties.isDefault, op: ne, value: true }
+        - { field: properties.linkedEnvironmentMetadata, op: exists }
+        - { field: properties.linkedEnvironmentMetadata.securityGroupId, op: empty }
+    evidence: "{properties.displayName} ({properties.environmentSku}): no security group bound"
+
+  - id: PP-ENV-PRODUCTION-NOT-MANAGED
+    title: Production environment is not a Managed Environment
+    kind: misconfigured
+    lens: security
+    category: CFG
+    severity: medium
+    entity: environment
+    why: Managed Environments add sharing limits, usage insights, solution-checker enforcement and longer backups; a production environment carrying business or citizen data without them has none of those guardrails.
+    fix: Enable Managed Environments on the production environment (check the premium-licence implication for its users first).
+    refs: [NIST-800-53:CM-6, NIST-800-53:AC-21]
+    query:
+      protocol: http
+      path: /providers/Microsoft.BusinessAppPlatform/scopes/admin/environments
+      params: { api-version: "2021-04-01" }
+      key: name
+      name: properties.displayName
+    each:
+      all:
+        - { field: properties.environmentSku, op: eq, value: Production }
+        - { field: properties.governanceConfiguration.protectionLevel, op: ne, value: Standard }
+    evidence: "{properties.displayName}: production, protectionLevel {properties.governanceConfiguration.protectionLevel}"
+
+  - id: PP-ENV-DEFAULT-NOT-MANAGED
+    title: Default environment is not a Managed Environment
+    kind: misconfigured
+    lens: security
+    category: CFG
+    severity: medium
+    entity: environment
+    why: The default environment has the widest maker population - every licensed user can build in it - so sharing limits and usage insights matter there most; left unmanaged it is the tenant's biggest ungoverned maker surface.
+    fix: Enable Managed Environments on the default environment and set a sharing limit on it.
+    refs: [NIST-800-53:CM-6, NIST-800-53:AC-21]
+    query:
+      protocol: http
+      path: /providers/Microsoft.BusinessAppPlatform/scopes/admin/environments
+      params: { api-version: "2021-04-01" }
+      key: name
+      name: properties.displayName
+    each:
+      all:
+        - { field: properties.isDefault, op: eq, value: true }
+        - { field: properties.governanceConfiguration.protectionLevel, op: ne, value: Standard }
+    evidence: "{properties.displayName}: default environment, protectionLevel {properties.governanceConfiguration.protectionLevel}"
+
+  - id: PP-ENV-PRODUCTION-BACKUP-RETENTION-SHORT
+    title: Production environment keeps fewer than 28 days of system backups
+    kind: misconfigured
+    lens: both
+    category: BCK
+    severity: medium
+    entity: environment
+    why: Microsoft keeps 7 days of restore points by default and 28 for Managed or qualifying production environments; with only 7 days a corruption found after a week is unrecoverable from the platform's own backups.
+    fix: Enable Managed Environments or confirm the production qualification so the environment keeps 28 days of restore points.
+    refs: [NIST-800-53:CP-9]
+    query:
+      protocol: http
+      path: /providers/Microsoft.BusinessAppPlatform/scopes/admin/environments
+      params: { api-version: "2021-04-01" }
+      key: name
+      name: properties.displayName
+    each:
+      all:
+        - { field: properties.environmentSku, op: eq, value: Production }
+        - { field: properties.retentionPeriod, op: ne, value: P28D }
+    evidence: "{properties.displayName}: production, retention {properties.retentionPeriod}"
+
+  - id: PP-ENV-TRIAL-STALE
+    title: Trial environment older than 30 days
+    kind: misconfigured
+    lens: maintenance
+    category: HYG
+    severity: low
+    entity: environment
+    refresh: 7d
+    why: Trial environments expire and lose their data, and in the meantime count fully against the shared Dataverse capacity pool; one older than its trial window is both a data-loss surprise and wasted capacity.
+    fix: Delete the trial environment, or convert it to a supported type if its data must be kept.
+    refs: [NIST-800-53:CM-8]
+    query:
+      protocol: http
+      path: /providers/Microsoft.BusinessAppPlatform/scopes/admin/environments
+      params: { api-version: "2021-04-01" }
+      key: name
+      name: properties.displayName
+    each:
+      all:
+        - { field: properties.environmentSku, op: eq, value: Trial }
+        - { field: properties.createdTime, op: age-gt, value: 30, threshold: power-platform.trial-max-age-days }
+    evidence: "{properties.displayName}: trial created {properties.createdTime}"
+
+  - id: PP-ENV-REGION-UNAPPROVED
+    title: Environment is not in the agreed geography
+    kind: misconfigured
+    lens: security
+    category: CFG
+    severity: low
+    entity: environment
+    refresh: 7d
+    why: Citizen and business data must stay in the geography agreed with the data-protection owner; a default or sandbox environment created elsewhere moves that data out of region unnoticed.
+    fix: Recreate the out-of-region environment in the agreed geography; record the agreed region in the threshold so this rule can judge it.
+    refs: [NIST-800-53:SA-9]
+    query:
+      protocol: http
+      path: /providers/Microsoft.BusinessAppPlatform/scopes/admin/environments
+      params: { api-version: "2021-04-01" }
+      key: name
+      name: properties.displayName
+    each: { field: properties.azureRegion, op: ne, value: europe, threshold: power-platform.agreed-region, required: true }
+    evidence: "{properties.displayName}: region {properties.azureRegion}"
+
+  - id: PP-ENV-NAME-NONCONFORMING
+    title: Environment name does not follow the naming convention
+    kind: misconfigured
+    lens: maintenance
+    category: HYG
+    severity: low
+    entity: environment
+    refresh: 7d
+    why: A consistent environment-name convention keeps policy scoping, capacity reports and ownership readable; a stray name hides which environment a finding or an alert is about.
+    fix: Rename the environment to the agreed convention, or record a documented exception; set the convention as a regular expression in the threshold so this rule can judge it.
+    refs: [NIST-800-53:CM-8]
+    query:
+      protocol: http
+      path: /providers/Microsoft.BusinessAppPlatform/scopes/admin/environments
+      params: { api-version: "2021-04-01" }
+      key: name
+      name: properties.displayName
+    each: { field: properties.displayName, op: notmatch, value: '^$', threshold: power-platform.environment-name-pattern, required: true }
+    evidence: "{properties.displayName}: does not match the naming convention"
+
+  # ---- data policies (DLP) -------------------------------------------------------------------
+  # v2/policies returns one row per data policy; its fields are at the row root. environmentType is
+  # AllEnvironments, OnlyEnvironments or ExceptEnvironments; connectorGroups classify connectors into
+  # Confidential (business), General (non-business) and Blocked.
+
+  - id: PP-DLP-NO-TENANT-WIDE-POLICY
+    title: No data policy covers all environments
+    kind: missing
+    lens: security
+    category: CFG
+    severity: high
+    entity: instance
+    why: Without a policy scoped to all environments, any environment that no other policy names can freely combine Dataverse with HTTP, consumer storage or any other connector, so municipal data can be moved out through an unreviewed connector. An empty read is treated as "none exists", never as a pass.
+    fix: Create a tenant-wide data policy with AllEnvironments scope (the CISO reviews the connector classification); where ExceptEnvironments is used instead, make sure every excepted environment is covered by another policy.
+    refs: [NIST-800-53:AC-4, NIST-800-53:SC-7]
+    query:
+      protocol: http
+      path: /providers/PowerPlatform.Governance/v2/policies
+      params: { api-version: "2021-04-01" }
+      key: name
+      name: displayName
+    count: { op: lt, value: 1, where: { field: environmentType, op: eq, value: AllEnvironments } }
+    evidence: "{count} data policy with environmentType AllEnvironments (a tenant-wide policy is required)"
+
+  - id: PP-DLP-HTTP-CONNECTOR-NOT-BLOCKED
+    title: Data policy does not block the HTTP and web connectors
+    kind: misconfigured
+    lens: security
+    category: CFG
+    severity: medium
+    entity: policy
+    why: The HTTP, HTTP with Microsoft Entra and web-content connectors are the generic exfiltration path - a flow can POST any Dataverse record to any URL. Classified as business or non-business rather than blocked, they let a maker move data straight out of the tenant.
+    fix: Move the HTTP, HTTP with Entra and web-content connectors into the Blocked group in this policy (and block consumer-storage connectors and custom-connector URL patterns with them).
+    refs: [NIST-800-53:AC-4, NIST-800-53:SC-7]
+    query:
+      protocol: http
+      path: /providers/PowerPlatform.Governance/v2/policies
+      params: { api-version: "2021-04-01" }
+      key: name
+      name: displayName
+    each:
+      element:
+        of: connectorGroups
+        match: any
+        where:
+          all:
+            - { field: classification, op: ne, value: Blocked }
+            - { field: "connectors[].id", op: match, value: 'shared_(webcontents|http|httpwithazuread)(\b|$)' }
+    evidence: "{displayName}: an HTTP/web connector is classified as something other than Blocked"
+
+  - id: PP-DLP-POLICY-CHANGED-RECENT
+    title: Data policy changed in the last 7 days
+    kind: misconfigured
+    lens: security
+    category: CFG
+    severity: medium
+    entity: policy
+    refresh: 1d
+    why: A loosened data policy is invisible to users and permanent until someone notices; a recent change to a DLP policy should map to an approved request, because moving a connector out of Blocked quietly reopens the exfiltration path.
+    fix: Confirm the change matches an approved ticket; revert any connector-group change that was not approved.
+    refs: [NIST-800-53:CM-3, NIST-800-53:CM-5]
+    query:
+      protocol: http
+      path: /providers/PowerPlatform.Governance/v2/policies
+      params: { api-version: "2021-04-01" }
+      key: name
+      name: displayName
+    each: { field: lastModifiedTime, op: age-lt, value: 7, threshold: power-platform.dlp-change-review-days }
+    evidence: "{displayName}: last modified {lastModifiedTime} by {lastModifiedBy.displayName}"

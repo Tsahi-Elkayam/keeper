@@ -1,8 +1,6 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
-    <OutputType>Exe</OutputType>
-    <AssemblyName>keeper-db</AssemblyName>
-    <RootNamespace>Keeper.Cli.Db</RootNamespace>
+    <AssemblyName>Keeper.Cli.Db</AssemblyName>
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="..\Keeper.Composition\Keeper.Composition.csproj" />

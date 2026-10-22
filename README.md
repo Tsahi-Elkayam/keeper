@@ -73,29 +73,31 @@ A scan reads; it never changes the system it reads. Keeper writes only its own s
 
 Every change needs `--reason "<why>"`; `--now` applies it straight away.
 
-## Binaries
+## One binary
 
-Each verb is its own binary beside `keeper.exe`, so each process holds only the credential it needs:
+`keeper.exe` is the only executable; everything else is a verb and its flags (`keeper <verb> --help`).
+Every verb runs inside that one process - Keeper never starts another program.
 
-| Binary | Job |
+| Verb | Job |
 |---|---|
-| `keeper` | The front door: `keeper <verb>` runs `keeper-<verb>`; `setup`, `help` |
-| `keeper-run` | The daily loop above |
-| `keeper-scan` | One system through one integration; writes a verified run folder |
-| `keeper-load`, `keeper-track`, `keeper-rank` | Run folders into the store; findings; today's ranking |
-| `keeper-qm` | The queue manager: the only writer of the store |
-| `keeper-query` | Questions, read-only |
-| `keeper-today`, `keeper-report` | Today's list; reports (text, Markdown, HTML) |
-| `keeper-decide`, `keeper-system`, `keeper-register` | Decisions, systems, registers |
-| `keeper-integration` | Integrations and their encrypted secrets |
-| `keeper-rules` | `validate`, `list`, `explain`, `load` |
-| `keeper-push` | Tickets out, ticket state back |
-| `keeper-db` | The store: `status`, `init`, `migrate`, `backup` (dry run unless `--apply`) |
+| `keeper setup`, `keeper help` | Create the home; list the verbs |
+| `keeper run` | The daily loop above |
+| `keeper scan` | One system through one integration; writes a verified run folder |
+| `keeper load`, `keeper track`, `keeper rank` | Run folders into the store; findings; today's ranking |
+| `keeper qm` | The queue manager: the only writer of the store |
+| `keeper query` | Questions, read-only (`keeper <question>` for short) |
+| `keeper today`, `keeper report` | Today's list; reports (text, Markdown, HTML) |
+| `keeper decide`, `keeper system`, `keeper register`, `keeper config` | Decisions, systems, registers, config files |
+| `keeper integration` | Integrations and their encrypted secrets |
+| `keeper rules` | `validate`, `list`, `explain`, `load` |
+| `keeper certs` | Which certificates servers present |
+| `keeper push` | Tickets out, ticket state back |
+| `keeper db` | The store: `status`, `init`, `migrate`, `backup` (dry run unless `--apply`) |
 
 ## Design rules
 
-- **One job per binary**, composed through files: each stage writes a file, the next verifies it.
-- **One writer.** Only `keeper-qm` writes the store; everything else queues a request with a reason,
+- **One job per verb**, composed through files: each stage writes a file, the next verifies it.
+- **One writer.** Only `keeper qm` writes the store; everything else queues a request with a reason,
   applied in a transaction and audited (`keeper writes`).
 - **Read-only towards systems.** Runners refuse writes: HTTP is GET only, GraphQL refuses mutations,
   SQL accepts one SELECT and rolls back, CIM accepts WQL SELECT, LDAP only searches. Secret attributes
@@ -111,12 +113,12 @@ Each verb is its own binary beside `keeper.exe`, so each process holds only the 
 
 | Path | What |
 |---|---|
-| `components\<component>\src` | One folder per library and per binary; `tests\` beside it |
+| `components\<component>\src` | One folder per library; `keeper-<verb>\` holds that verb; `tests\` beside it |
 | `components\common`, `contracts`, `store`, `queue`, `query`, `home` | The shared base: arguments, records, SQLite, the queue, questions, the Keeper home |
 | `components\rules`, `runners`, `scan` | The rule language, the read-only runners (ldap, graph, http, graphql, sql, cim, tls, file, store), the scanner |
 | `components\review`, `rank`, `report`, `push` | Findings and registers, today's ranking, reports, tickets |
 | `components\vault`, `integrations` | Encrypted secrets; how Keeper reaches each system |
-| `components\keeper` | The composed binaries: `keeper`, `keeper-run`, `keeper-db`, `keeper-qm`, `keeper-query` |
+| `components\keeper` | The `keeper` binary (dispatch, setup) and the verbs composed over every component: `run`, `db`, `qm`, `query` |
 | `rules\` | The generic rule packs, one file per system type |
 | `docs\` | `ARCHITECTURE.md`, `RULES.md` (the rule format), `SECURITY.md`, `backlog\` (checks not yet rules, and why) |
 | `build\<runtime>\` | The binaries and the rules (`build.ps1` output; git ignores it) |

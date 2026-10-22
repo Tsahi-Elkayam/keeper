@@ -63,7 +63,7 @@ public sealed class RequestCli
     public string Positional(int index, string what) =>
         Cli.At(index) ?? throw new ArgumentException($"Missing {what}.");
 
-    /// <summary>Queues the request; with --now also runs the queue manager beside this binary.</summary>
+    /// <summary>Queues the request; with --now also runs the queue manager.</summary>
     public int Submit<T>(string kind, T payload, string done) where T : notnull
     {
         var reason = Reason;
@@ -75,7 +75,7 @@ public sealed class RequestCli
             return ExitCodes.Ok;
         }
         string[] qmArgs = Cli.Get("settings") is { } settings ? ["run", "--settings", Path.GetFullPath(settings)] : ["run"];
-        return Siblings.Run("keeper-qm", qmArgs);
+        return Commands.Run("qm", qmArgs);
     }
 
     /// <summary>A finding by its key or a unique prefix of at least 6 characters.</summary>

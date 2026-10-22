@@ -405,3 +405,311 @@ rules:
       key: host
     each: { field: exists, op: eq, value: false }
     evidence: "{host}: no event forwarding subscription manager configured"
+
+  # ====================================================================== host health and lifecycle ===
+  # Server-side health of the tier-0 sync host, read over CIM and the registry. The cloud side of sync
+  # (sync age, PHS staleness, provisioning errors, soft/hard match, writeback, accidental-delete) is in
+  # entra.yaml under ENTRA-SYNC-* and is not repeated here.
+  - id: ECSYNC-DISK-SPACE-LOW
+    title: A fixed volume on the sync server is low on free space
+    kind: broken
+    category: HLT
+    severity:
+      field: FreeSpace
+      ranges: [ { max: 2147483648, value: critical } ]
+      default: high
+    entity: volume
+    why: "The sync database, its run history and the wizard trace logs all grow on the system volume; a volume that fills stops the ADSync service and (on LocalDB) the database with no cloud-side warning. The rule lists each fixed drive under the free-space floor (critical below 2 GB)."
+    fix: "Free space on the volume (clear run history, move co-hosted application data off the system drive); grow the disk if growth is real."
+    refs: ["NIST-800-53:CP-2", "NIST-800-53:SC-5"]
+    query:
+      protocol: cim
+      wql: SELECT DeviceID, Size, FreeSpace, VolumeName FROM Win32_LogicalDisk WHERE DriveType = 3
+      key: "{host}|{DeviceID}"
+    each: { field: FreeSpace, op: lt, value: 10737418240, threshold: entra-connect.disk-free-min-bytes }
+    evidence: "{host}: {DeviceID} ({VolumeName}) has {FreeSpace} bytes free of {Size}"
+
+  - id: ECSYNC-OS-UNSUPPORTED
+    title: Sync server operating system is older than the supported minimum
+    kind: broken
+    category: LCM
+    severity: high
+    entity: sync-server
+    why: "Entra Connect Sync is supported only on Windows Server 2016 (build 14393) and later; an older OS blocks the next engine upgrade, which the version deadline makes unavoidable, and runs a tier-0 role on an unsupported platform. The default minimum build is 14393 (Server 2016)."
+    fix: "Build a replacement sync server on a current, supported OS as a staging server, switch over in a change window, then retire the old host."
+    refs: ["NIST-800-53:SA-22", "NIST-800-53:SI-2"]
+    query:
+      protocol: cim
+      wql: SELECT Caption, Version, BuildNumber FROM Win32_OperatingSystem
+      key: host
+    each: { field: BuildNumber, op: lt, value: 14393, threshold: entra-connect.min-os-build }
+    evidence: "{host}: {Caption} (build {BuildNumber}, version {Version})"
+
+  - id: ECSYNC-UPTIME-HIGH
+    title: Sync server has not rebooted within the patch cycle
+    kind: misconfigured
+    category: HLT
+    severity: medium
+    entity: sync-server
+    lens: maintenance
+    why: "A tier-0 server that has not rebooted for longer than a patch cycle has not applied its cumulative updates, and a server part-way through an automatic engine upgrade that never rebooted is left half-upgraded. The default line is 45 days of uptime."
+    fix: "Reboot in the maintenance window once no sync cycle is running; confirm pending updates install (ECSYNC-REBOOT-PENDING)."
+    refs: ["NIST-800-53:SI-2", "NIST-800-53:CP-2"]
+    query:
+      protocol: cim
+      wql: SELECT LastBootUpTime FROM Win32_OperatingSystem
+      key: host
+    each: { field: LastBootUpTime, op: age-gt, value: 45, threshold: entra-connect.max-uptime-days }
+    evidence: "{host}: last boot {LastBootUpTime}"
+
+  - id: ECSYNC-REBOOT-PENDING
+    title: Sync server has a pending reboot from servicing
+    kind: misconfigured
+    category: LCM
+    severity: medium
+    entity: sync-server
+    lens: maintenance
+    why: "A Component Based Servicing reboot-pending flag means updates (which on a tier-0 box are security-critical) are staged but not active, and an automatic engine upgrade must not run on a host with a pending reboot. The flag is the RebootPending key that servicing creates and clears."
+    fix: "Reboot in the maintenance window when no sync cycle is running."
+    refs: ["NIST-800-53:SI-2"]
+    query:
+      protocol: registry
+      path: SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending
+      key: host
+    each: { field: exists, op: eq, value: true }
+    evidence: "{host}: Component Based Servicing reports a pending reboot"
+
+  # ============================================================================= event logs ===
+  - id: ECSYNC-HEALTH-AGENT-APPLOG-ERRORS
+    title: Connect Health sync agent logged errors or warnings in the last day
+    kind: broken
+    category: HLT
+    severity:
+      field: level
+      map: { '1': high, '2': high, '3': medium }
+      default: medium
+    entity: event
+    lens: maintenance
+    why: "The Connect Health agent carries sync errors and alerts to the portal; its own errors and warnings (the AzureADConnectHealthSyncMonitor and AzureADConnectHealthSyncInsights sources) mean the portal view of sync health is stale or wrong while the engine itself may look fine. One finding per host, source and event id."
+    fix: "Read the event text, repair or upgrade the Connect Health agent (it ships with the engine), and confirm the agent resumes reporting to the portal."
+    refs: ["NIST-800-53:SI-4", "NIST-800-53:AU-6"]
+    query:
+      protocol: eventlog
+      log: Application
+      providers: [AzureADConnectHealthSyncMonitor, AzureADConnectHealthSyncInsights]
+      days: 1
+      max: 2000
+      key: "{host}|{provider}|{id}"
+    each: { field: level, op: in, value: [1, 2, 3] }
+    evidence: "{host}: {provider} event {id} (level {level}) at {time}"
+
+  # ======================================================================== identity and access ===
+  - id: ECSYNC-LOCAL-ADMIN-UNEXPECTED
+    title: Member of the sync server's local Administrators group is not on the approved list
+    kind: misconfigured
+    category: IAM
+    severity: high
+    entity: local-group-member
+    lens: security
+    why: "A local administrator on the sync server can read the engine's encryption keys and the connector credentials, so local admin here equals control of the AD connector account (DCSync) and the Entra sync identity at once: it is tier-0 power. Until the approved members are recorded in the threshold pattern, every member is listed for review. Installations that grant admin through a domain group still show that group here."
+    fix: "Keep local Administrators to the built-in account and the approved tier-0 admin group only; remove vendor, helpdesk, tier-1 and service accounts, then record the approved members as the pattern."
+    refs: ["NIST-800-53:AC-6(5)", "NIST-800-53:AC-2", "CIS-Controls-v8:5.4"]
+    query:
+      protocol: cim
+      wql: SELECT GroupComponent, PartComponent FROM Win32_GroupUser WHERE GroupComponent = "Win32_Group.Domain='{HOST}',Name='Administrators'"
+      key: "{host}|{PartComponent}"
+    each: { field: PartComponent, op: notmatch, value: '(?!)', threshold: entra-connect.approved-local-admin-pattern }
+    evidence: "{host}: local Administrators member {PartComponent}"
+
+  - id: ECSYNC-ADSYNC-PASSWORDSET-MEMBER-UNEXPECTED
+    title: Member of the sync engine's ADSyncPasswordSet group is not on the approved list
+    kind: misconfigured
+    category: IAM
+    severity: high
+    entity: local-group-member
+    lens: security
+    why: "ADSyncPasswordSet lets a member set passwords through the sync engine, and ADSyncBrowse (its sibling) reads every connector-space attribute including personal data; a member who is not a reviewed tier-0 administrator is an unmonitored path to change or read identity data. Until the approved members are recorded in the threshold pattern, every member is listed for review. Installations that use domain groups have no local group and return no rows."
+    fix: "Keep the group empty or to the approved tier-0 administrators; remove leavers and day-to-day accounts, then record the approved members as the pattern."
+    refs: ["NIST-800-53:AC-6", "NIST-800-53:AC-2", "CIS-Controls-v8:5.4"]
+    query:
+      protocol: cim
+      wql: SELECT GroupComponent, PartComponent FROM Win32_GroupUser WHERE GroupComponent = "Win32_Group.Domain='{HOST}',Name='ADSyncPasswordSet'"
+      key: "{host}|{PartComponent}"
+    each: { field: PartComponent, op: notmatch, value: '(?!)', threshold: entra-connect.approved-passwordset-pattern }
+    evidence: "{host}: ADSyncPasswordSet member {PartComponent}"
+
+  - id: ECSYNC-SERVICE-ACCOUNT-NOT-HARDENED
+    title: Sync engine service runs as a stored-password account
+    kind: misconfigured
+    category: IAM
+    severity: medium
+    entity: service
+    lens: security
+    why: "The default virtual service account (NT SERVICE\\ADSync) or a group managed service account has no reusable password; a plain domain user account as the ADSync service identity is a stored, long-lived credential that unlocks the engine's encryption keys. The default pattern accepts the virtual account, LocalSystem and any gMSA (a name ending in $)."
+    fix: "Changing the service identity to the virtual service account or a gMSA is a reinstall with the custom option; plan it. Record an approved service-account pattern if a reviewed account is in use."
+    refs: ["NIST-800-53:IA-5", "NIST-800-53:AC-6"]
+    query:
+      protocol: cim
+      wql: SELECT Name, StartName FROM Win32_Service WHERE Name = 'ADSync'
+      key: "{host}|{Name}"
+    each: { field: StartName, op: notmatch, value: '^(NT SERVICE\\ADSync|LocalSystem|NT AUTHORITY\\SYSTEM|.+\$)$', threshold: entra-connect.approved-service-account-pattern }
+    evidence: "{host}: ADSync runs as {StartName}"
+
+  # ======================================================================== host hardening ===
+  - id: ECSYNC-TLS12-NOT-ENFORCED
+    title: TLS 1.2 strong cryptography is not enforced for the .NET engine
+    kind: misconfigured
+    category: AUT
+    severity: high
+    entity: sync-server
+    lens: security
+    why: "Microsoft requires TLS 1.2 for Entra Connect; without SchUseStrongCrypto and SystemDefaultTlsVersions set to 1, the .NET engine can negotiate older protocols and then fails when the cloud service refuses them. The rule reads the 64-bit .NET key and fires when either value is missing or not 1."
+    fix: "Set SchUseStrongCrypto and SystemDefaultTlsVersions to 1 under the .NET v4.0.30319 keys (and the WOW6432Node key) per the Microsoft TLS 1.2 enforcement page, then reboot in the window."
+    refs: ["NIST-800-53:SC-8", "NIST-800-53:SC-13"]
+    query:
+      protocol: registry
+      path: SOFTWARE\Microsoft\.NETFramework\v4.0.30319
+      values: [SchUseStrongCrypto, SystemDefaultTlsVersions]
+      key: host
+    each:
+      any:
+        - { field: SchUseStrongCrypto, op: absent }
+        - { field: SchUseStrongCrypto, op: ne, value: 1 }
+        - { field: SystemDefaultTlsVersions, op: absent }
+        - { field: SystemDefaultTlsVersions, op: ne, value: 1 }
+    evidence: "{host}: SchUseStrongCrypto = {SchUseStrongCrypto}, SystemDefaultTlsVersions = {SystemDefaultTlsVersions}"
+
+  - id: ECSYNC-LSA-PROTECTION-OFF
+    title: LSA protection (RunAsPPL) is not enabled on the sync server
+    kind: misconfigured
+    category: AUT
+    severity: medium
+    entity: sync-server
+    lens: security
+    why: "Without LSA protection, lsass on the sync server can be opened and its secrets dumped by code running as local admin - on a tier-0 server that is the tier-0 credentials. RunAsPPL 1 (or 2 with UEFI lock) runs lsass as a protected process. The rule fires when the value is missing or not 1 or 2."
+    fix: "Set RunAsPPL under the tier-0 server policy after testing with the engine, then reboot in the window."
+    refs: ["NIST-800-53:SC-39", "MITRE-ATTACK:T1003.001"]
+    query:
+      protocol: registry
+      path: SYSTEM\CurrentControlSet\Control\Lsa
+      values: [RunAsPPL, LmCompatibilityLevel]
+      key: host
+    each:
+      any:
+        - { field: RunAsPPL, op: absent }
+        - { field: RunAsPPL, op: notin, value: [1, 2] }
+    evidence: "{host}: RunAsPPL = {RunAsPPL}"
+
+  - id: ECSYNC-WDIGEST-CLEARTEXT-CREDENTIALS
+    title: WDigest cleartext credential caching is enabled on the sync server
+    kind: misconfigured
+    category: AUT
+    severity: high
+    entity: sync-server
+    lens: security
+    why: "WDigest UseLogonCredential set to 1 makes lsass cache cleartext passwords, so a memory dump of the tier-0 sync server yields plaintext tier-0 credentials. Modern Windows defaults it off; an explicit 1 (left by old hardening or malware) re-enables it."
+    fix: "Remove the UseLogonCredential value or set it to 0 under the tier-0 server policy, then reboot in the window."
+    refs: ["NIST-800-53:IA-5", "MITRE-ATTACK:T1003.001"]
+    query:
+      protocol: registry
+      path: SYSTEM\CurrentControlSet\Control\SecurityProviders\WDigest
+      values: [UseLogonCredential]
+      key: host
+    each: { field: UseLogonCredential, op: eq, value: 1 }
+    evidence: "{host}: WDigest UseLogonCredential = {UseLogonCredential}"
+
+  - id: ECSYNC-NTLM-LMCOMPAT-WEAK
+    title: NTLM compatibility level on the sync server allows LM or NTLMv1
+    kind: misconfigured
+    category: AUT
+    severity: medium
+    entity: sync-server
+    lens: security
+    why: "LmCompatibilityLevel below 5 lets the tier-0 sync server send or accept LM and NTLMv1 responses, which are trivially relayed or cracked - a coercion of this host then yields a usable authentication. Level 5 sends NTLMv2 only and refuses LM and NTLMv1."
+    fix: "Set LmCompatibilityLevel to 5 under the tier-0 server policy (confirm no legacy dependency first)."
+    refs: ["NIST-800-53:IA-5", "NIST-800-53:AC-17"]
+    query:
+      protocol: registry
+      path: SYSTEM\CurrentControlSet\Control\Lsa
+      values: [LmCompatibilityLevel, RunAsPPL]
+      key: host
+    each: { field: LmCompatibilityLevel, op: lt, value: 5 }
+    evidence: "{host}: LmCompatibilityLevel = {LmCompatibilityLevel}"
+
+  - id: ECSYNC-SMB1-ENABLED
+    title: SMBv1 server is enabled on the sync server
+    kind: misconfigured
+    category: AUT
+    severity: high
+    entity: sync-server
+    lens: security
+    why: "SMBv1 on a tier-0 server adds a legacy, relay- and exploit-prone protocol to the identity plane for no benefit. The rule fires when the LanmanServer SMB1 value is explicitly 1; modern servers set it to 0 or remove the feature."
+    fix: "Set the LanmanServer SMB1 value to 0 and remove the SMB 1.0/CIFS feature, then reboot in the window."
+    refs: ["NIST-800-53:CM-7", "NIST-800-53:SC-7"]
+    query:
+      protocol: registry
+      path: SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters
+      values: [SMB1]
+      key: host
+    each: { field: SMB1, op: eq, value: 1 }
+    evidence: "{host}: LanmanServer SMB1 = {SMB1}"
+
+  - id: ECSYNC-SPOOLER-RUNNING
+    title: Print Spooler is running on the sync server
+    kind: misconfigured
+    category: AUT
+    severity: medium
+    entity: service
+    lens: security
+    why: "The Print Spooler on a tier-0 server is a coercion surface (PrinterBug / spooler RPC) that can force the host to authenticate to an attacker and be relayed; a sync server never needs to print. The rule fires when Spooler is running or not set to disabled start."
+    fix: "Stop the Print Spooler service and set it to disabled by the tier-0 server policy."
+    refs: ["NIST-800-53:CM-7", "MITRE-ATTACK:T1187"]
+    query:
+      protocol: cim
+      wql: SELECT Name, DisplayName, State, StartMode FROM Win32_Service WHERE Name = 'Spooler'
+      key: "{host}|{Name}"
+    each:
+      any:
+        - { field: State, op: eq, value: Running }
+        - { field: StartMode, op: ne, value: Disabled }
+    evidence: "{host}: Spooler {State}, start {StartMode}"
+
+  - id: ECSYNC-FIREWALL-DOMAIN-PROFILE-OFF
+    title: Windows Firewall domain profile is turned off by policy on the sync server
+    kind: misconfigured
+    category: AUT
+    severity: medium
+    entity: sync-server
+    lens: security
+    why: "A tier-0 server should enforce a host firewall so RDP and WinRM are reachable only from the admin network; a policy that sets EnableFirewall to 0 on the domain profile removes that control and leaves any upstream filter as the only one. Estates that enforce an equivalent host firewall (a third-party endpoint firewall) accept the finding."
+    fix: "Remove the EnableFirewall = 0 setting, or enforce an equivalent tier-0 host firewall that scopes inbound management to the admin network."
+    refs: ["NIST-800-53:SC-7", "NIST-800-53:AC-17"]
+    query:
+      protocol: registry
+      path: SOFTWARE\Policies\Microsoft\WindowsFirewall\DomainProfile
+      values: [EnableFirewall]
+      key: host
+    each: { field: EnableFirewall, op: eq, value: 0 }
+    evidence: "{host}: WindowsFirewall DomainProfile EnableFirewall = {EnableFirewall}"
+
+  # ============================================================================ certificates ===
+  - id: ECSYNC-MACHINE-CERT-EXPIRING
+    title: A certificate in the sync server's machine store is expiring or expired
+    kind: broken
+    category: PKI
+    severity:
+      daysLeft: notAfter
+      ranges: [ { max: 0, value: high }, { max: 14, value: medium } ]
+      default: low
+    entity: certificate
+    why: "The Connect Health and authentication agents, and co-hosted products, keep client and server certificates in the machine personal store; an expired one silently stops an agent reporting to the portal or a console answering. The rule reads LocalMachine\\My and flags certificates within the notice window."
+    fix: "Renew or remove the certificate before it expires; confirm the owning agent or product picks up the new one."
+    refs: ["NIST-800-53:SC-17", "NIST-800-53:SC-12"]
+    deadline: notAfter
+    query:
+      protocol: registry
+      path: SOFTWARE\Microsoft\SystemCertificates\MY
+      certificates: true
+      key: "{host}|{thumbprint}"
+    each: { field: notAfter, op: until-lt, value: 30, threshold: entra-connect.cert-notice-days }
+    evidence: "{host}: certificate {subject} (issuer {issuer}) expires {notAfter}, {daysLeft} days left"

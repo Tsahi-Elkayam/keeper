@@ -936,3 +936,211 @@ rules:
         - { field: jobId, op: absent }
         - { field: jobId, op: eq, value: 00000000-0000-0000-0000-000000000000 }
     evidence: "{name} ({platformName}) created {creationTime} has no job"
+
+  # ---- coverage guards -----------------------------------------------------------------------
+
+  - id: VEEAM-REPOSITORY-NONE
+    title: The backup server returned no repositories
+    kind: missing
+    category: BCK
+    severity: medium
+    entity: instance
+    why: A backup server with no repository has nowhere to write restore points; an empty list means the review account cannot read repositories, or nothing is being stored, and every repository rule stays silent either way.
+    fix: Give the review account the Backup Viewer role; if the list really is empty, this server stores no backups.
+    refs: [NIST-800-53:CA-7, NIST-800-53:CP-9]
+    query:
+      protocol: http
+      path: /api/v1/backupInfrastructure/repositories
+      headers: { x-api-version: 1.2-rev0 }
+      paging: offset
+      offsetParam: skip
+      limitParam: limit
+      pageSize: 200
+      items: data
+      key: id
+      name: name
+    count: none
+    evidence: "the repository list is empty"
+
+  - id: VEEAM-OBJECT-NONE
+    title: The backup server protects no objects
+    kind: missing
+    category: BCK
+    severity: medium
+    entity: instance
+    why: Jobs can exist and still protect nothing - an empty backup-object list means no machine has a restore point, or the account cannot read them; the coverage and restore-point rules then have nothing to judge and go silent.
+    fix: Confirm the jobs have run and produced restore points, and that the review account may read backup objects.
+    refs: [NIST-800-53:CP-9]
+    query:
+      protocol: http
+      path: /api/v1/backupObjects
+      headers: { x-api-version: 1.2-rev0 }
+      paging: offset
+      offsetParam: skip
+      limitParam: limit
+      pageSize: 200
+      items: data
+      key: id
+      name: name
+    count: none
+    evidence: "the protected-object list is empty"
+
+  # ---- proxies -------------------------------------------------------------------------------
+
+  - id: VEEAM-PROXY-DISABLED
+    title: Backup proxy is disabled
+    kind: misconfigured
+    category: AVL
+    severity: high
+    entity: proxy
+    why: A disabled backup proxy silently removes transport capacity; jobs fall back to a slower path or wait for a slot, and a proxy left disabled after maintenance looks like a deliberate design choice.
+    fix: Re-enable the proxy, or remove it and confirm the remaining proxies carry the load.
+    refs: [NIST-800-53:CP-9]
+    query:
+      protocol: http
+      path: /api/v1/backupInfrastructure/proxies
+      headers: { x-api-version: 1.2-rev0 }
+      paging: offset
+      offsetParam: skip
+      limitParam: limit
+      pageSize: 200
+      items: data
+      key: id
+      name: name
+    each: { field: server.isDisabled, op: eq, value: true }
+    evidence: "{name} ({type}) is disabled"
+
+  # ---- licence and build ---------------------------------------------------------------------
+
+  - id: VEEAM-LICENSE-COMMUNITY-EDITION
+    title: Backup server runs on the free Community edition
+    kind: misconfigured
+    category: LCM
+    severity: medium
+    entity: license
+    why: The free Community edition caps the estate at ten instances and leaves out the features a production estate relies on, so machines beyond the cap are silently left unprotected.
+    fix: Install a purchased Standard, Enterprise or Enterprise Plus licence sized for the estate.
+    refs: [NIST-800-53:SA-4]
+    query:
+      protocol: http
+      path: /api/v1/license
+      headers: { x-api-version: 1.2-rev0 }
+      paging: none
+      key: "-"
+    each: { field: edition, op: in, value: [Community, Free] }
+    evidence: "{edition} edition licence, type {type}"
+
+  - id: VEEAM-BUILD-UNSUPPORTED
+    title: Backup server build is below the required minimum
+    kind: broken
+    category: LCM
+    severity: high
+    entity: backup-server
+    refresh: 1d
+    why: Veeam Backup & Replication has had critical remote-code-execution flaws used by ransomware operators, and the backup server holds every stored credential; a build below the fixed version is the first target. The minimum build has no safe default - it moves with each advisory, so it is the tenant's to set.
+    fix: Upgrade to a current supported build in a change window after a fresh configuration backup.
+    refs: [NIST-800-53:SI-2, CIS-Controls-v8:7.3]
+    query:
+      protocol: http
+      path: /api/v1/serverInfo
+      headers: { x-api-version: 1.2-rev0 }
+      paging: none
+      key: "-"
+    each: { field: buildVersion, op: version-lt, value: "12.3.1.1139", threshold: veeam.min-build, required: true }
+    evidence: "build {buildVersion} is below the required minimum"
+
+  # ---- credentials and encryption keys -------------------------------------------------------
+
+  - id: VEEAM-ENCRYPTION-PASSWORD-OLD
+    title: Backup encryption password has not been rotated
+    kind: misconfigured
+    lens: security
+    category: IAM
+    severity: medium
+    entity: encryption-password
+    refresh: 7d
+    why: An encryption password that is never rotated outlives the people who knew it and keeps a leaked password able to decrypt current backups indefinitely.
+    fix: Rotate the password on the jobs that use it and record the new one in the privileged-access vault and the key-recovery set.
+    refs: [NIST-800-53:IA-5, NIST-800-53:SC-12]
+    query:
+      protocol: http
+      path: /api/v1/encryptionPasswords
+      headers: { x-api-version: 1.2-rev0 }
+      paging: offset
+      offsetParam: skip
+      limitParam: limit
+      pageSize: 200
+      items: data
+      key: id
+    each: { field: modificationTime, op: age-gt, value: 365, threshold: veeam.encryption-password-max-age-days }
+    evidence: "encryption password {hint} last changed {modificationTime}"
+
+  - id: VEEAM-CREDENTIAL-NO-DESCRIPTION
+    title: Stored credential has no description
+    kind: misconfigured
+    category: HYG
+    severity: low
+    entity: credential
+    refresh: 7d
+    why: A stored credential with no description has no stated owner or purpose, so nobody can safely rotate or remove it; undocumented credentials are where left-over access hides.
+    fix: Add a description naming the owner and where the credential is used, or delete it if it is unused.
+    refs: [NIST-800-53:IA-5]
+    query:
+      protocol: http
+      path: /api/v1/credentials
+      headers: { x-api-version: 1.2-rev0 }
+      paging: offset
+      offsetParam: skip
+      limitParam: limit
+      pageSize: 200
+      items: data
+      key: id
+      name: username
+    each: { field: description, op: empty }
+    evidence: "{username} ({type}) has no description"
+
+  # ---- notifications -------------------------------------------------------------------------
+
+  - id: VEEAM-EMAIL-NO-RECIPIENT
+    title: Failure e-mail is enabled but has no recipient
+    kind: misconfigured
+    category: MON
+    severity: medium
+    entity: backup-server
+    why: E-mail notifications that are switched on but carry no recipient address go nowhere; the server reports it is notifying while every failure mail is discarded.
+    fix: Set a monitored shared mailbox or the ticketing intake as the recipient.
+    refs: [NIST-800-53:SI-4, NIST-800-53:IR-6]
+    query:
+      protocol: http
+      path: /api/v1/generalOptions
+      headers: { x-api-version: 1.2-rev0 }
+      paging: none
+      key: "-"
+    each:
+      all:
+        - { field: emailSettings.isEnabled, op: eq, value: true }
+        - { field: emailSettings.to, op: empty }
+    evidence: "e-mail notifications on, recipient {emailSettings.to}"
+
+  # ---- configuration backup ------------------------------------------------------------------
+
+  - id: VEEAM-CONFIG-BACKUP-RETENTION-LOW
+    title: Configuration backup keeps too few restore points
+    kind: misconfigured
+    category: BCK
+    severity: low
+    entity: backup-server
+    why: A configuration backup that keeps only one or two restore points cannot recover from a corruption noticed a few days later; the clean point you need may already have rolled off.
+    fix: Raise the configuration backup's restore points to keep to ten or more.
+    refs: [NIST-800-53:CP-9]
+    query:
+      protocol: http
+      path: /api/v1/configBackup
+      headers: { x-api-version: 1.2-rev0 }
+      paging: none
+      key: "-"
+    each:
+      all:
+        - { field: isEnabled, op: eq, value: true }
+        - { field: restorePointsToKeep, op: lt, value: 10, threshold: veeam.config-backup-min-restore-points }
+    evidence: "configuration backup keeps {restorePointsToKeep} restore points"

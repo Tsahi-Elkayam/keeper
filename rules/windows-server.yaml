@@ -2323,3 +2323,447 @@ rules:
       key: "{host}|{SubjectUserName}|{recordId}"
     count: { op: ge, value: 1 }
     evidence: "{host}: Security log cleared {count} times in 30 days ({sample})"
+
+  # ---- services and local accounts: more hygiene -----------------------------------------------
+
+  - id: WINSRV-SVC-DESKTOP-INTERACT
+    title: Service is allowed to interact with the desktop
+    kind: misconfigured
+    lens: security
+    category: IAM
+    severity: medium
+    entity: service
+    why: A service marked "allow service to interact with desktop" runs as LocalSystem yet puts a window on an interactive session, the classic path for a shatter-style privilege escalation from a logged-on user to SYSTEM. Modern Windows isolates session 0, but the flag is still a sign of an old, badly packaged product.
+    fix: Clear the interact-with-desktop flag on the service; if the product needs a UI, split it into a service and a separate user-run component. List vendor exceptions in the ignore pattern.
+    refs: [NIST-800-53:AC-6, NIST-800-53:CM-7, MITRE-ATTACK:T1543.003]
+    query:
+      protocol: cim
+      wql: SELECT Name, DisplayName, StartName, DesktopInteract, State FROM Win32_Service WHERE DesktopInteract = TRUE
+      key: "{host}|{Name}"
+    each: { field: Name, op: notmatch, value: '^$', threshold: windows-server.desktop-interact-ignore-pattern }
+    evidence: "{host}: {Name} ({DisplayName}) interacts with the desktop as {StartName}"
+
+  - id: WINSRV-BUILTIN-ADMIN-ENABLED
+    title: Built-in Administrator account is enabled on the server
+    kind: misconfigured
+    lens: security
+    category: IAM
+    severity: medium
+    entity: local-account
+    why: The built-in Administrator (RID 500) has a known SID, is exempt from lockout by default, and is a shared account nobody is accountable for; left enabled it is a standing target for password spraying and pass-the-hash. The host filter keeps a domain controller from listing the domain, so DCs return nothing here.
+    fix: Disable the built-in Administrator and administer the server with named accounts; where a break-glass local account is required, give it a unique LAPS-managed password and document it.
+    refs: [NIST-800-53:AC-2, CIS-Controls-v8:5.2, MITRE-ATTACK:T1078.003]
+    query:
+      protocol: cim
+      wql: SELECT Name, SID, Disabled, PasswordExpires, PasswordRequired, FullName FROM Win32_UserAccount WHERE LocalAccount = TRUE AND Domain = '{HOST}'
+      key: "{host}|{Name}"
+    each:
+      all:
+        - { field: SID, op: match, value: '-500$' }
+        - { field: Disabled, op: eq, value: false }
+    evidence: "{host}: built-in Administrator {Name} is enabled"
+
+  - id: WINSRV-BUILTIN-ADMIN-NOT-RENAMED
+    title: Built-in Administrator account still has its default name
+    kind: misconfigured
+    lens: security
+    category: IAM
+    severity: low
+    entity: local-account
+    why: An attacker who knows the local administrator is still called "Administrator" can target it by name for password spraying; renaming it removes one free fact. This reads the RID-500 account by SID, so a renamed account does not fire.
+    fix: Rename the built-in Administrator from its default; it keeps RID 500, so also confirm it is disabled (WINSRV-BUILTIN-ADMIN-ENABLED).
+    refs: [NIST-800-53:AC-2, CIS-Controls-v8:5.2]
+    query:
+      protocol: cim
+      wql: SELECT Name, SID, Disabled, PasswordExpires, PasswordRequired, FullName FROM Win32_UserAccount WHERE LocalAccount = TRUE AND Domain = '{HOST}'
+      key: "{host}|{Name}"
+    each:
+      all:
+        - { field: SID, op: match, value: '-500$' }
+        - { field: Name, op: eq, value: Administrator }
+    evidence: "{host}: RID-500 account is still named {Name}"
+
+  - id: WINSRV-LOCAL-ACCOUNT-PWD-NEVER-EXPIRES
+    title: Enabled local account on the server has a password that never expires
+    kind: misconfigured
+    lens: security
+    category: IAM
+    severity: medium
+    entity: local-account
+    why: A local account whose password never expires keeps the same secret forever once it leaks, and local accounts are rarely rotated by any tool; these are usually an application or service account created by hand. The built-in, guest, default and defender accounts are left out.
+    fix: Set the password to expire and rotate it, or move the workload to a managed service account; disable the account if it is no longer used.
+    refs: [NIST-800-53:IA-5, CIS-Controls-v8:5.2]
+    query:
+      protocol: cim
+      wql: SELECT Name, SID, Disabled, PasswordExpires, PasswordRequired, FullName FROM Win32_UserAccount WHERE LocalAccount = TRUE AND Domain = '{HOST}'
+      key: "{host}|{Name}"
+    each:
+      all:
+        - { field: Disabled, op: eq, value: false }
+        - { field: PasswordExpires, op: eq, value: false }
+        - { field: SID, op: notmatch, value: '-(500|501|503|504)$' }
+    evidence: "{host}: local account {Name} enabled, password never expires"
+
+  # ---- firewall logging ------------------------------------------------------------------------
+
+  - id: WINSRV-FW-LOGGING-OFF
+    title: Windows Firewall profile does not log dropped packets
+    kind: misconfigured
+    lens: security
+    category: LOG
+    severity: low
+    entity: firewall-profile
+    why: With dropped-packet logging off, the host firewall keeps no record of what it blocked, so a scan, a lateral-movement attempt or a misrouted service leaves no local evidence. This reads the local store.
+    fix: Turn on logging of dropped packets for each profile by policy and point the log to a sized file or forward it to a collector.
+    refs: [NIST-800-53:AU-2, NIST-800-53:SC-7, CIS-Controls-v8:8.2]
+    query:
+      protocol: cim
+      namespace: root/StandardCimv2
+      wql: SELECT Name, Enabled, LogBlocked, LogAllowed, LogFileName, LogMaxSizeKilobytes FROM MSFT_NetFirewallProfile
+      key: "{host}|{Name}"
+    each:
+      all:
+        - { field: Enabled, op: ne, value: 0 }
+        - { field: LogBlocked, op: eq, value: 0 }
+    evidence: "{host}: {Name} profile LogBlocked = {LogBlocked}, log {LogFileName}"
+
+  # ---- Defender: cloud protection, PUA, scan age -----------------------------------------------
+
+  - id: WINSRV-DEFENDER-CLOUD-OFF
+    title: Defender cloud-delivered protection is off on the server
+    kind: misconfigured
+    lens: security
+    category: MON
+    severity: medium
+    why: With cloud-delivered protection (MAPS) disabled, Defender loses block-at-first-sight and the cloud's newest verdicts, so fast-moving malware is caught only by local signatures. Applies where Defender is the active antivirus.
+    fix: Set cloud-delivered protection to Advanced (MAPSReporting = 2) by policy and allow outbound access to the Defender cloud endpoints.
+    refs: [NIST-800-53:SI-3, CIS-Controls-v8:10.7, MITRE-ATTACK:T1562.001]
+    query:
+      protocol: cim
+      namespace: root/Microsoft/Windows/Defender
+      wql: SELECT * FROM MSFT_MpPreference
+      key: host
+    each: { field: MAPSReporting, op: eq, value: 0 }
+    evidence: "{host}: MAPSReporting = {MAPSReporting} (0 = cloud protection off)"
+
+  - id: WINSRV-DEFENDER-PUA-OFF
+    title: Defender potentially-unwanted-application protection is off on the server
+    kind: misconfigured
+    lens: security
+    category: MON
+    severity: low
+    why: PUA protection blocks bundled adware, remote-access stubs, coin miners and torrent clients that are not malware but have no place on a server; off by default, it is a cheap control.
+    fix: Set PUA protection to Block (PUAProtection = 1) by policy.
+    refs: [NIST-800-53:SI-3, CIS-Controls-v8:10.1]
+    query:
+      protocol: cim
+      namespace: root/Microsoft/Windows/Defender
+      wql: SELECT * FROM MSFT_MpPreference
+      key: host
+    each:
+      any:
+        - { field: PUAProtection, op: absent }
+        - { field: PUAProtection, op: eq, value: 0 }
+    evidence: "{host}: PUAProtection = {PUAProtection} (0 or missing = off)"
+
+  - id: WINSRV-DEFENDER-SCAN-STALE
+    title: Defender has not completed a scan recently on the server
+    kind: broken
+    lens: security
+    category: MON
+    severity: medium
+    why: Real-time protection scans what is touched, but a scheduled scan is what finds dormant malware already on disk; a quick scan that has not run in over a week means the scheduled task is broken or the server is never idle. A never-scanned server reports a very large age.
+    fix: Check the Defender scheduled scan task and the maintenance window; run a quick scan and confirm it completes.
+    refs: [NIST-800-53:SI-3, CIS-Controls-v8:10.1]
+    query:
+      protocol: cim
+      namespace: root/Microsoft/Windows/Defender
+      wql: SELECT * FROM MSFT_MpComputerStatus
+      key: host
+    each:
+      all:
+        - { field: AMServiceEnabled, op: eq, value: true }
+        - { field: QuickScanAge, op: gt, value: 7, threshold: windows-server.defender-scan-max-age-days }
+    evidence: "{host}: last quick scan {QuickScanAge} days ago, last full scan {FullScanAge} days ago"
+
+  # ---- machine certificate store (read-only, through the registry certificates view) -----------
+  # One row per certificate in the LocalMachine personal (MY) store. Self-signed certificates (the
+  # auto-renewing RDP listener certificate above all) are left out of the expiry rule.
+
+  - id: WINSRV-CERT-MACHINE-EXPIRING
+    title: Machine certificate expiring or expired in the server's personal store
+    kind: broken
+    lens: both
+    category: PKI
+    severity:
+      daysLeft: notAfter
+      ranges: [ { max: 0, value: critical }, { max: 14, value: high }, { max: 30, value: medium } ]
+      default: low
+    entity: certificate
+    deadline: notAfter
+    why: A CA-issued certificate in the LocalMachine personal store backs an application's TLS listener, LDAPS, RDP, a client-auth identity or a code-signing step; when it expires that service stops or starts failing validation, usually with no warning until the day it lapses.
+    fix: Renew or replace the certificate and its binding before the date; retire certificates no service uses any more.
+    refs: [NIST-800-53:SC-12, NIST-800-53:SC-17]
+    query:
+      protocol: registry
+      path: SOFTWARE\Microsoft\SystemCertificates\MY
+      certificates: true
+      key: "{host}|{store}|{thumbprint}"
+    each:
+      all:
+        - { field: selfSigned, op: eq, value: false }
+        - { field: notAfter, op: until-lt, value: 30, threshold: windows-server.cert-notice-days }
+    evidence: "{host}: {subject} expires {notAfter} ({daysLeft} days), issuer {issuer}"
+
+  - id: WINSRV-CERT-MACHINE-WEAK-KEY
+    title: Machine certificate with a weak RSA key in the server's personal store
+    kind: misconfigured
+    lens: security
+    category: PKI
+    severity: high
+    entity: certificate
+    why: An RSA key shorter than 2048 bits is factorable within reach of a motivated attacker, so a service presenting it can be impersonated or its traffic decrypted; 1024-bit keys are no longer trusted by browsers or by Windows chain validation.
+    fix: Reissue the certificate with a 2048-bit or stronger RSA key (or an elliptic-curve key) and replace the binding.
+    refs: [NIST-800-53:SC-12, NIST-800-53:SC-13, MITRE-ATTACK:T1552.004]
+    query:
+      protocol: registry
+      path: SOFTWARE\Microsoft\SystemCertificates\MY
+      certificates: true
+      key: "{host}|{store}|{thumbprint}"
+    each:
+      all:
+        - { field: keyAlgorithm, op: match, value: 'RSA' }
+        - { field: keySize, op: lt, value: 2048, threshold: windows-server.cert-min-rsa-key }
+    evidence: "{host}: {subject} uses a {keySize}-bit {keyAlgorithm} key"
+
+  - id: WINSRV-CERT-MACHINE-SHA1
+    title: Machine certificate signed with SHA-1 in the server's personal store
+    kind: misconfigured
+    lens: security
+    category: PKI
+    severity: medium
+    entity: certificate
+    why: SHA-1 is collision-broken, so a SHA-1-signed certificate can in principle be forged; modern clients warn on or refuse it, which breaks the service it backs as clients are updated.
+    fix: Reissue the certificate with a SHA-256 or stronger signature and replace the binding.
+    refs: [NIST-800-53:SC-13, MITRE-ATTACK:T1553.004]
+    query:
+      protocol: registry
+      path: SOFTWARE\Microsoft\SystemCertificates\MY
+      certificates: true
+      key: "{host}|{store}|{thumbprint}"
+    each: { field: signatureAlgorithm, op: match, value: '(^|[^0-9])sha1|md5|md2' }
+    evidence: "{host}: {subject} signed with {signatureAlgorithm}"
+
+  # ---- registry: time, updates, logging, LSA, print, autorun, crash dumps ----------------------
+
+  - id: WINSRV-REG-W32TIME-NOSYNC
+    title: Windows Time service set not to synchronise on the server
+    kind: misconfigured
+    lens: both
+    category: CFG
+    severity: medium
+    why: A server whose time client type is NoSync does not discipline its clock at all; it drifts until Kerberos fails for everything that authenticates against it past the five-minute skew. Domain members should be NT5DS and the PDC emulator NTP.
+    fix: Set the time client type to NT5DS (domain members) or NTP (the PDC emulator) and point it at a reliable source.
+    refs: [NIST-800-53:AU-8, NIST-800-53:SC-45]
+    query:
+      protocol: registry
+      path: SYSTEM\CurrentControlSet\Services\W32Time\Parameters
+      values: [Type, NtpServer]
+      key: host
+    each: { field: Type, op: eq, value: NoSync }
+    evidence: "{host}: W32Time Type = {Type}, source {NtpServer}"
+
+  - id: WINSRV-REG-AU-DISABLED
+    title: Automatic Updates turned off by policy on the server
+    kind: misconfigured
+    lens: both
+    category: LCM
+    severity: high
+    why: A policy that sets NoAutoUpdate stops the server detecting, downloading and installing updates on its own; unless another tool patches it, the server falls behind every month. This is distinct from the update services being disabled (WINSRV-SVC-UPDATE-DISABLED).
+    fix: Remove the policy that turns Automatic Updates off, or record which tool patches the server and on what schedule.
+    refs: [NIST-800-53:SI-2, CIS-Controls-v8:7.3]
+    query:
+      protocol: registry
+      path: SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU
+      values: [NoAutoUpdate, UseWUServer, AUOptions]
+      key: host
+    each: { field: NoAutoUpdate, op: eq, value: 1 }
+    evidence: "{host}: NoAutoUpdate = {NoAutoUpdate}, AUOptions {AUOptions}, UseWUServer {UseWUServer}"
+
+  - id: WINSRV-REG-PS-SCRIPTBLOCK-OFF
+    title: PowerShell script-block logging is not enabled on the server
+    kind: misconfigured
+    lens: security
+    category: LOG
+    severity: medium
+    why: Without script-block logging there is no record of what PowerShell actually ran, so fileless and obfuscated attacks, which lean on PowerShell, leave almost nothing to investigate. A missing value means the setting was never enabled.
+    fix: Set 'Turn on PowerShell Script Block Logging' to Enabled by policy and forward the Microsoft-Windows-PowerShell/Operational log to a collector.
+    refs: [NIST-800-53:AU-2, CIS-Controls-v8:8.8, MITRE-ATTACK:T1059.001]
+    query:
+      protocol: registry
+      path: SOFTWARE\Policies\Microsoft\Windows\PowerShell\ScriptBlockLogging
+      values: [EnableScriptBlockLogging]
+      key: host
+    each:
+      any:
+        - { field: EnableScriptBlockLogging, op: absent }
+        - { field: EnableScriptBlockLogging, op: ne, value: 1 }
+    evidence: "{host}: EnableScriptBlockLogging = {EnableScriptBlockLogging} (missing = off)"
+
+  - id: WINSRV-REG-PS-MODULE-LOGGING-OFF
+    title: PowerShell module logging is not enabled on the server
+    kind: misconfigured
+    lens: security
+    category: LOG
+    severity: low
+    why: Module logging records the pipeline of configured modules; without it the detail that distinguishes a normal administrative command from an attack is not captured. It complements script-block logging.
+    fix: Set 'Turn on Module Logging' to Enabled by policy with the module names set to '*'.
+    refs: [NIST-800-53:AU-2, CIS-Controls-v8:8.8, MITRE-ATTACK:T1059.001]
+    query:
+      protocol: registry
+      path: SOFTWARE\Policies\Microsoft\Windows\PowerShell\ModuleLogging
+      values: [EnableModuleLogging]
+      key: host
+    each:
+      any:
+        - { field: EnableModuleLogging, op: absent }
+        - { field: EnableModuleLogging, op: ne, value: 1 }
+    evidence: "{host}: EnableModuleLogging = {EnableModuleLogging} (missing = off)"
+
+  - id: WINSRV-REG-PS-TRANSCRIPTION-OFF
+    title: PowerShell transcription is not enabled on the server
+    kind: misconfigured
+    lens: security
+    category: LOG
+    severity: low
+    why: Transcription writes a full input-and-output record of every PowerShell session to a protected path; without it there is no durable trail of what an administrator or an attacker did interactively on the server.
+    fix: Set 'Turn on PowerShell Transcription' to Enabled by policy, with invocation headers on and an output directory on a write-protected collector share.
+    refs: [NIST-800-53:AU-2, CIS-Controls-v8:8.8, MITRE-ATTACK:T1059.001]
+    query:
+      protocol: registry
+      path: SOFTWARE\Policies\Microsoft\Windows\PowerShell\Transcription
+      values: [EnableTranscripting, OutputDirectory]
+      key: host
+    each:
+      any:
+        - { field: EnableTranscripting, op: absent }
+        - { field: EnableTranscripting, op: ne, value: 1 }
+    evidence: "{host}: EnableTranscripting = {EnableTranscripting} (missing = off)"
+
+  - id: WINSRV-REG-CREDGUARD-OFF
+    title: Credential Guard is not configured on the server
+    kind: misconfigured
+    lens: security
+    category: AUT
+    severity: low
+    why: Credential Guard isolates derived domain credentials in a virtualised container so a local administrator (or malware with those rights) cannot read them from LSASS; LsaCfgFlags neither 1 nor 2 means it is off. It needs virtualisation-based security and can conflict with some server roles, so treat this as a candidate to evaluate rather than an outright fault.
+    fix: After confirming the server's roles support it, enable Credential Guard by policy (LsaCfgFlags 1 with UEFI lock, or 2 without) alongside virtualisation-based security.
+    refs: [NIST-800-53:SC-39, NIST-800-53:IA-5, MITRE-ATTACK:T1003.001]
+    query:
+      protocol: registry
+      path: SYSTEM\CurrentControlSet\Control\Lsa
+      values: [LsaCfgFlags]
+      key: host
+    each:
+      any:
+        - { field: LsaCfgFlags, op: absent }
+        - { field: LsaCfgFlags, op: notin, value: [1, 2] }
+    evidence: "{host}: LsaCfgFlags = {LsaCfgFlags} (missing or 0 = off)"
+
+  - id: WINSRV-REG-ANON-ENUM
+    title: Anonymous enumeration of accounts or shares allowed on the server
+    kind: misconfigured
+    lens: security
+    category: AUT
+    severity: medium
+    why: With RestrictAnonymousSAM turned off, or Everyone folded into the anonymous token, an unauthenticated session can list local accounts and shares, which hands an attacker the user names for password spraying and the shares to probe.
+    fix: Set 'Do not allow anonymous enumeration of SAM accounts' on and 'Let Everyone permissions apply to anonymous users' off by policy.
+    refs: [NIST-800-53:AC-3, NIST-800-53:AC-6, MITRE-ATTACK:T1087.001]
+    query:
+      protocol: registry
+      path: SYSTEM\CurrentControlSet\Control\Lsa
+      values: [RestrictAnonymous, RestrictAnonymousSAM, EveryoneIncludesAnonymous]
+      key: host
+    each:
+      any:
+        - { field: RestrictAnonymousSAM, op: eq, value: 0 }
+        - { field: EveryoneIncludesAnonymous, op: eq, value: 1 }
+    evidence: "{host}: RestrictAnonymousSAM {RestrictAnonymousSAM}, RestrictAnonymous {RestrictAnonymous}, EveryoneIncludesAnonymous {EveryoneIncludesAnonymous}"
+
+  - id: WINSRV-REG-NULL-SESSION
+    title: Null-session access to shares or pipes allowed on the server
+    kind: misconfigured
+    lens: security
+    category: AUT
+    severity: medium
+    why: An explicit RestrictNullSessAccess of 0, or named null-session shares or pipes, lets an unauthenticated session reach those resources, a route for reconnaissance and relay that the server's own defaults otherwise block.
+    fix: Set 'Restrict anonymous access to Named Pipes and Shares' on and clear the null-session share and pipe lists unless a named legacy application documents the need.
+    refs: [NIST-800-53:AC-3, NIST-800-53:SC-7, MITRE-ATTACK:T1135]
+    query:
+      protocol: registry
+      path: SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters
+      values: [RestrictNullSessAccess, NullSessionShares, NullSessionPipes]
+      key: host
+    each:
+      any:
+        - { field: RestrictNullSessAccess, op: eq, value: 0 }
+        - { field: NullSessionShares, op: notempty }
+        - { field: NullSessionPipes, op: notempty }
+    evidence: "{host}: RestrictNullSessAccess {RestrictNullSessAccess}, null shares {NullSessionShares}, null pipes {NullSessionPipes}"
+
+  - id: WINSRV-REG-POINTANDPRINT-WEAK
+    title: Point and Print lets non-administrators install print drivers on the server
+    kind: misconfigured
+    lens: security
+    category: AUT
+    severity: high
+    why: 'NoWarningNoElevationOnInstall set, or driver installation not restricted to administrators, is the PrintNightmare configuration: a standard user (or a remote attacker with any credentials) can install a malicious print driver and run code as SYSTEM. A missing RestrictDriverInstallationToAdministrators keeps the patched admin-only default.'
+    fix: Remove NoWarningNoElevationOnInstall and the prompt-suppression values and leave driver installation restricted to administrators.
+    refs: [NIST-800-53:CM-7, NIST-800-53:AC-6, MITRE-ATTACK:T1068]
+    query:
+      protocol: registry
+      path: SOFTWARE\Policies\Microsoft\Windows NT\Printers\PointAndPrint
+      values: [NoWarningNoElevationOnInstall, UpdatePromptSettings, RestrictDriverInstallationToAdministrators]
+      key: host
+    each:
+      any:
+        - { field: NoWarningNoElevationOnInstall, op: eq, value: 1 }
+        - { field: UpdatePromptSettings, op: eq, value: 1 }
+        - { field: RestrictDriverInstallationToAdministrators, op: eq, value: 0 }
+    evidence: "{host}: NoWarningNoElevationOnInstall {NoWarningNoElevationOnInstall}, RestrictDriverInstallationToAdministrators {RestrictDriverInstallationToAdministrators}"
+
+  - id: WINSRV-REG-AUTORUN-ON
+    title: AutoRun and AutoPlay are not fully disabled on the server
+    kind: misconfigured
+    lens: security
+    category: AUT
+    severity: low
+    why: When AutoRun is not disabled for every drive type, inserting or mapping removable or network media can run code automatically; on a server, where media is usually mounted by an administrator, that runs with high privilege. The disabled-for-all value is 255.
+    fix: Set 'Turn off Autoplay' to Enabled for all drives by policy (NoDriveTypeAutoRun = 255).
+    refs: [NIST-800-53:CM-7, CIS-Controls-v8:10.3, MITRE-ATTACK:T1091]
+    query:
+      protocol: registry
+      path: SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer
+      values: [NoDriveTypeAutoRun, NoAutorun]
+      key: host
+    each:
+      any:
+        - { field: NoDriveTypeAutoRun, op: absent }
+        - { field: NoDriveTypeAutoRun, op: ne, value: 255 }
+    evidence: "{host}: NoDriveTypeAutoRun = {NoDriveTypeAutoRun} (255 = all drives disabled), NoAutorun {NoAutorun}"
+
+  - id: WINSRV-REG-CRASHDUMP-DISABLED
+    title: Crash dump collection is turned off on the server
+    kind: misconfigured
+    category: HLT
+    severity: low
+    why: With crash dumps disabled, a bugcheck leaves nothing to analyse, so a repeating blue screen (WINSRV-EVT-BUGCHECK) cannot be traced to the driver, firmware or hardware causing it.
+    fix: Set the crash dump type to at least Kernel memory dump (CrashDumpEnabled 2, or 7 for automatic) and keep enough free space on the dump volume.
+    refs: [NIST-800-53:SI-4]
+    query:
+      protocol: registry
+      path: SYSTEM\CurrentControlSet\Control\CrashControl
+      values: [CrashDumpEnabled, AutoReboot]
+      key: host
+    each: { field: CrashDumpEnabled, op: eq, value: 0 }
+    evidence: "{host}: CrashDumpEnabled = {CrashDumpEnabled} (0 = none), AutoReboot {AutoReboot}"

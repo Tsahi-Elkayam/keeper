@@ -179,7 +179,10 @@ can neither mark entities gone nor resolve findings, when:
   again. Then the lower count is accepted, so a real clean-up resolves a few days later. `store` and `file` reads are not
   compared: Keeper's own store and another tool's report cannot lose sight of rows.
 
-A partial read of a `count` rule can still fail (its count is a floor), but never pass. An entity is
+A partial read's count is a floor, so only what more rows could not change is judged: a count over a
+`gt`/`ge` limit fails, a count already at or above an `lt`/`le` limit passes ("no policy sets X" is answered
+by the one policy found setting it). The rest - too few for `lt`/`le`, not enough for `gt`/`ge`, `eq`, `ne`,
+and shares - is unknown, never missing and never a pass. An entity is
 gone only when every read that ever returned it - each rule system, query and host - read cleanly
 without it in that system's newest scan, so one failed read hides only its own entities. A host the
 newest scan no longer reads at all, while it read the query's other hosts, is retired. A per-host key
@@ -197,7 +200,7 @@ is *not configured* (n/a, with the setting to make), never a pass that compared 
 
 | Protocol | Fields | Rows |
 |---|---|---|
-| `ldap` | `base`: domain (default), config, schema, root, or a DN (macros allowed). `scope`: subtree (default), onelevel, base. `filter` (required, macros below). `attributes`: list. `pageSize`. | One per entry, plus `distinguishedName`. FILETIME attributes (pwdLastSet, lastLogonTimestamp, accountExpires, LAPS expiry...) become ISO dates; 0 and never-expires stay as they are. whenCreated/whenChanged become ISO. maxPwdAge-style durations become days. objectSid/objectGUID become text. Multi-valued attributes are arrays. `nTSecurityDescriptor` is read without its SACL (owner, group and DACL are what any user may read) and becomes { owner, group, protected, noDacl, dacl: [ { trustee (a SID), type: allow / deny / allow-object / deny-object, mask, rights (GenericAll, WriteDacl, WriteOwner, GenericWrite, WriteProperty, ExtendedRight, ...), objectType and objectTypeName (DS-Replication-Get-Changes-All, member, msDS-KeyCredentialLink, User-Force-Change-Password, ...), inheritedObjectType, inherited } ] } - judged with `element` over `nTSecurityDescriptor.dacl` and `sid-in`. |
+| `ldap` | `base`: domain (default), config, schema, root, or a DN (macros allowed). `scope`: subtree (default), onelevel, base. `filter` (required, macros below). `attributes`: list. `pageSize`. | One per entry, plus `distinguishedName`. FILETIME attributes (pwdLastSet, lastLogonTimestamp, accountExpires, LAPS expiry...) become ISO dates; 0 and never-expires stay as they are. whenCreated/whenChanged become ISO. maxPwdAge-style durations become days. objectSid/objectGUID become text. Multi-valued attributes are arrays. `nTSecurityDescriptor` is read without its SACL (owner, group and DACL are what any user may read) and becomes { owner, group, protected, noDacl, dacl: [ { trustee (a SID), type: allow / deny / allow-object / deny-object, mask, rights (GenericAll, WriteDacl, WriteOwner, GenericWrite, WriteProperty, ExtendedRight, ...), objectType and objectTypeName (DS-Replication-Get-Changes-All, member, msDS-KeyCredentialLink, User-Force-Change-Password, ...), inheritedObjectType and inheritedObjectTypeName (the child class an inheritable entry is for), inherited, inheritOnly (the entry applies to children only, not to this object), containerInherit } ] } - judged with `element` over `nTSecurityDescriptor.dacl` and `sid-in`. |
 | `graph` | `path` (required, e.g. /users), `version`: v1.0 (default) or beta, `select`: list, `filter`, `expand`, `top`, `search`, `consistency`: eventual, `items` (default value), `maxPages`, `prefer` (a Prefer header; never respond-async), `missing`: empty (a 404 is an answer with no rows). | One per item. |
 | `http` | `path` (required, relative to the endpoint's own path), `params`: mapping, `items`: path to the array (default: OData value, or the root), `format`: json (default) or xml (`items` is then an XPath; namespaces are ignored), `method`: get (default) or post with a `body` mapping - post only on the paths the integration type answers as reads (Check Point `/web_api/show-*`, Azure Resource Graph); `paging`: auto (default: @odata.nextLink or ARM nextLink), odata, link, offset, cursor (`cursorField` in the answer, `cursorParam` in the next request), body-offset (`offsetField`/`limitField` in the body), body-cursor (`cursorField` -> `cursorBody`), none; `pageSize`, `offsetParam`, `limitParam` (offset paging, defaults sysparm_offset/sysparm_limit), `maxPages`, `headers` (never credentials), `missing`: empty, `capture_headers`: list (response headers as `_headers.<name>`), `map`: true (an object's keys as rows of `key` and `value`). | One per item. |
 | `graphql` | `document` (required, a query), `path` (default /graphql), `variables`: mapping, `items`: path to the array, `paging`: { cursor, hasNext, variable }, `maxPages`. | One per item. |
@@ -274,6 +277,7 @@ Secrets in URLs are masked like secret fields: a signed URL's `sig=`, `X-Amz-Sig
 | `cloud-apps` | http | Defender for Cloud Apps: alerts, activities, entities, files, discovered apps (their list POSTs only) |
 | `key-vault` | http | One vault's metadata (endpoint `https://<vault>.vault.azure.net`, no path; not Managed HSM): lists, versions, dates, certificate policies. Every page's whole path is checked; the path that returns a secret's value is refused before anything is sent. Give the scanning identity the Key Vault Reader role, which cannot read values either |
 | `aws` | aws | AWS: signed here (SigV4, no SDK, no aws.exe). Endpoint = the home region; identity = an access key id (secret `secretAccessKey`); `accounts` + `roleName` read each account through its read-only role (STS AssumeRole, an hour), `regions` the regional reads; `aws-assume-role` assumes `roleArn` first. Give the roles SecurityAudit or ReadOnlyAccess: Keeper only reads, and checks every action against its allow-list. IAM Roles Anywhere is not built yet. Never run against an account yet |
+| `gcp` | http | Google Cloud through Cloud Asset Inventory's ListAssets - the only path it reads (`path: /assets`). Endpoint = the scope: `https://cloudasset.googleapis.com/v1/organizations/<n>`, `.../folders/<n>` or `.../projects/<id>`. Auth `gcp-service-account`: identity = the service account's email, secret `privateKey` = the `private_key` value of its key file (pasted as one line, `\n` and all). The token asks only for the `cloud-platform.read-only` scope, so it cannot change anything whatever the account's roles; grant Cloud Asset Viewer (and Security Reviewer) on the scope. Instance startup scripts, user data and function environments come back as "set". Not yet run against an organisation. See "Google Cloud" below |
 | `exchange-online`, `purview` | http | Exchange Online and Security & Compliance through the REST endpoint their PowerShell module calls (endpoint `.../adminapi/beta/<tenant id>`, exactly; `path: /InvokeCommand`, `body: { CmdletInput: { CmdletName: Get-Mailbox, Parameters: {...} } }`). Get- cmdlets only, the name checked before every page, and never a parameter that makes one do more than read (GetMailboxLog, NotificationEmailAddresses, IncludeCredential); nothing else is sent. Not yet run against a tenant |
 | `sccm` | http, sql | SCCM AdminService, or the site database read-only |
 | `cim` | cim | Windows servers and workstations |
@@ -284,6 +288,31 @@ Secrets in URLs are masked like secret fields: a signed URL's `sig=`, `X-Amz-Sig
 | `files` | file | Reports other tools wrote into imports\ |
 | `keeper` | store | Keeper's own registers |
 | `http` | http | Any other JSON API |
+
+## Google Cloud
+
+Every GCP rule reads Cloud Asset Inventory: one asset type per query, its full configuration as Google's
+own API returns it under `resource.data`, across every project under the endpoint's scope.
+
+```yaml
+    query:
+      protocol: http
+      path: /assets
+      params: { assetTypes: compute.googleapis.com/Firewall, contentType: RESOURCE, pageSize: 1000 }
+      paging: cursor
+      cursorField: nextPageToken
+      cursorParam: pageToken
+      items: assets
+      key: name                      # //compute.googleapis.com/projects/<p>/global/firewalls/<f>
+      name: resource.data.name
+```
+
+`contentType` chooses what each asset carries: `RESOURCE` (`resource.data`, `resource.location`,
+`resource.parent`), `IAM_POLICY` (`iamPolicy.bindings[]` with `role` and `members`, `iamPolicy.auditConfigs`),
+`ORG_POLICY` (`orgPolicy[]`: `constraint`, `booleanPolicy.enforced`, `listPolicy`) or `ACCESS_POLICY`. Every
+asset also has `assetType`, `updateTime` and `ancestors` (projects/<n>, folders/<n>, organizations/<n>). An
+asset type the scope has none of returns no rows - give a `count` rule `min_rows` only where the type always
+exists (projects: `cloudresourcemanager.googleapis.com/Project`).
 
 ## Expiry rules
 

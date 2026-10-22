@@ -864,7 +864,7 @@ rules:
       attributes: [sAMAccountName, displayName, sIDHistory]
       key: sAMAccountName
       name: displayName
-    each: { field: sIDHistory, op: match, value: '-(498|500|512|516|518|519|520|521)$|^S-1-5-32-5(44|48|49|50|51)$' }
+    each: { field: sIDHistory, op: match, value: '^S-1-5-21-\d+-\d+-\d+-(498|500|512|516|518|519|520|521|526|527)$|^S-1-5-32-5(44|48|49|50|51)$' }
     evidence: "{sAMAccountName} - sIDHistory {sIDHistory}"
 
   - id: AD-USER-PRIMARY-GROUP
@@ -873,12 +873,12 @@ rules:
     category: IAM
     severity: low
     entity: user
-    why: Primary group membership is not listed in the group's member attribute, so it hides from most membership reviews.
+    why: Primary group membership is not listed in the group's member attribute, so it hides from most membership reviews. Administrative primary groups are reported by AD-USER-PRIMARY-GROUP-PRIVILEGED instead, so each account has one finding.
     fix: Set the primary group back to Domain Users (RID 513) and grant the group by normal membership.
     refs: [PINGCASTLE:S-PrimaryGroup]
     query:
       protocol: ldap
-      filter: '(&{USER}{ENABLED}(!{UAC:2048})(!(primaryGroupID=513)))'
+      filter: '(&{USER}{ENABLED}(!{UAC:2048})(!(primaryGroupID=513))(!(primaryGroupID=512))(!(primaryGroupID=516))(!(primaryGroupID=518))(!(primaryGroupID=519))(!(primaryGroupID=520))(!(primaryGroupID=521))(!(primaryGroupID=526))(!(primaryGroupID=527)))'
       attributes: [sAMAccountName, displayName, primaryGroupID]
       key: sAMAccountName
       name: displayName
@@ -1512,7 +1512,7 @@ rules:
       protocol: ldap
       scope: base
       filter: '(objectClass=domainDNS)'
-      attributes: [name, minPwdLength, pwdHistoryLength, pwdProperties, lockoutThreshold, ms-DS-MachineAccountQuota, msDS-Behavior-Version, gPLink, maxPwdAge, minPwdAge, wellKnownObjects]
+      attributes: [name, minPwdLength, pwdHistoryLength, pwdProperties, lockoutThreshold, ms-DS-MachineAccountQuota, msDS-Behavior-Version, gPLink, maxPwdAge, minPwdAge, wellKnownObjects, lockoutDuration, msDS-LogonTimeSyncInterval]
       key: distinguishedName
       name: name
     each: { field: ms-DS-MachineAccountQuota, op: gt, value: 0, threshold: ad.machine-account-quota-max }
@@ -1531,7 +1531,7 @@ rules:
       protocol: ldap
       scope: base
       filter: '(objectClass=domainDNS)'
-      attributes: [name, minPwdLength, pwdHistoryLength, pwdProperties, lockoutThreshold, ms-DS-MachineAccountQuota, msDS-Behavior-Version, gPLink, maxPwdAge, minPwdAge, wellKnownObjects]
+      attributes: [name, minPwdLength, pwdHistoryLength, pwdProperties, lockoutThreshold, ms-DS-MachineAccountQuota, msDS-Behavior-Version, gPLink, maxPwdAge, minPwdAge, wellKnownObjects, lockoutDuration, msDS-LogonTimeSyncInterval]
       key: distinguishedName
       name: name
     each: { field: minPwdLength, op: lt, value: 14, threshold: ad.min-password-length }
@@ -1550,7 +1550,7 @@ rules:
       protocol: ldap
       scope: base
       filter: '(objectClass=domainDNS)'
-      attributes: [name, minPwdLength, pwdHistoryLength, pwdProperties, lockoutThreshold, ms-DS-MachineAccountQuota, msDS-Behavior-Version, gPLink, maxPwdAge, minPwdAge, wellKnownObjects]
+      attributes: [name, minPwdLength, pwdHistoryLength, pwdProperties, lockoutThreshold, ms-DS-MachineAccountQuota, msDS-Behavior-Version, gPLink, maxPwdAge, minPwdAge, wellKnownObjects, lockoutDuration, msDS-LogonTimeSyncInterval]
       key: distinguishedName
       name: name
     each: { field: pwdHistoryLength, op: lt, value: 24, threshold: ad.password-history-min }
@@ -1569,7 +1569,7 @@ rules:
       protocol: ldap
       scope: base
       filter: '(objectClass=domainDNS)'
-      attributes: [name, minPwdLength, pwdHistoryLength, pwdProperties, lockoutThreshold, ms-DS-MachineAccountQuota, msDS-Behavior-Version, gPLink, maxPwdAge, minPwdAge, wellKnownObjects]
+      attributes: [name, minPwdLength, pwdHistoryLength, pwdProperties, lockoutThreshold, ms-DS-MachineAccountQuota, msDS-Behavior-Version, gPLink, maxPwdAge, minPwdAge, wellKnownObjects, lockoutDuration, msDS-LogonTimeSyncInterval]
       key: distinguishedName
       name: name
     each: { field: lockoutThreshold, op: eq, value: 0 }
@@ -1588,7 +1588,7 @@ rules:
       protocol: ldap
       scope: base
       filter: '(objectClass=domainDNS)'
-      attributes: [name, minPwdLength, pwdHistoryLength, pwdProperties, lockoutThreshold, ms-DS-MachineAccountQuota, msDS-Behavior-Version, gPLink, maxPwdAge, minPwdAge, wellKnownObjects]
+      attributes: [name, minPwdLength, pwdHistoryLength, pwdProperties, lockoutThreshold, ms-DS-MachineAccountQuota, msDS-Behavior-Version, gPLink, maxPwdAge, minPwdAge, wellKnownObjects, lockoutDuration, msDS-LogonTimeSyncInterval]
       key: distinguishedName
       name: name
     each:
@@ -1610,7 +1610,7 @@ rules:
       protocol: ldap
       scope: base
       filter: '(objectClass=domainDNS)'
-      attributes: [name, minPwdLength, pwdHistoryLength, pwdProperties, lockoutThreshold, ms-DS-MachineAccountQuota, msDS-Behavior-Version, gPLink, maxPwdAge, minPwdAge, wellKnownObjects]
+      attributes: [name, minPwdLength, pwdHistoryLength, pwdProperties, lockoutThreshold, ms-DS-MachineAccountQuota, msDS-Behavior-Version, gPLink, maxPwdAge, minPwdAge, wellKnownObjects, lockoutDuration, msDS-LogonTimeSyncInterval]
       key: distinguishedName
       name: name
     each: { field: pwdProperties, op: flag, value: 16 }
@@ -1630,7 +1630,7 @@ rules:
       protocol: ldap
       scope: base
       filter: '(objectClass=domainDNS)'
-      attributes: [name, minPwdLength, pwdHistoryLength, pwdProperties, lockoutThreshold, ms-DS-MachineAccountQuota, msDS-Behavior-Version, gPLink, maxPwdAge, minPwdAge, wellKnownObjects]
+      attributes: [name, minPwdLength, pwdHistoryLength, pwdProperties, lockoutThreshold, ms-DS-MachineAccountQuota, msDS-Behavior-Version, gPLink, maxPwdAge, minPwdAge, wellKnownObjects, lockoutDuration, msDS-LogonTimeSyncInterval]
       key: distinguishedName
       name: name
     each: { field: msDS-Behavior-Version, op: lt, value: 7, threshold: ad.min-functional-level }
@@ -1649,7 +1649,7 @@ rules:
       protocol: ldap
       scope: base
       filter: '(objectClass=domainDNS)'
-      attributes: [name, minPwdLength, pwdHistoryLength, pwdProperties, lockoutThreshold, ms-DS-MachineAccountQuota, msDS-Behavior-Version, gPLink, maxPwdAge, minPwdAge, wellKnownObjects]
+      attributes: [name, minPwdLength, pwdHistoryLength, pwdProperties, lockoutThreshold, ms-DS-MachineAccountQuota, msDS-Behavior-Version, gPLink, maxPwdAge, minPwdAge, wellKnownObjects, lockoutDuration, msDS-LogonTimeSyncInterval]
       key: distinguishedName
       name: name
     each:
@@ -1693,7 +1693,7 @@ rules:
       protocol: ldap
       scope: base
       filter: '(objectClass=domainDNS)'
-      attributes: [name, minPwdLength, pwdHistoryLength, pwdProperties, lockoutThreshold, ms-DS-MachineAccountQuota, msDS-Behavior-Version, gPLink, maxPwdAge, minPwdAge, wellKnownObjects]
+      attributes: [name, minPwdLength, pwdHistoryLength, pwdProperties, lockoutThreshold, ms-DS-MachineAccountQuota, msDS-Behavior-Version, gPLink, maxPwdAge, minPwdAge, wellKnownObjects, lockoutDuration, msDS-LogonTimeSyncInterval]
       key: distinguishedName
       name: name
     each:
@@ -1715,7 +1715,7 @@ rules:
       protocol: ldap
       scope: base
       filter: '(objectClass=domainDNS)'
-      attributes: [name, minPwdLength, pwdHistoryLength, pwdProperties, lockoutThreshold, ms-DS-MachineAccountQuota, msDS-Behavior-Version, gPLink, maxPwdAge, minPwdAge, wellKnownObjects]
+      attributes: [name, minPwdLength, pwdHistoryLength, pwdProperties, lockoutThreshold, ms-DS-MachineAccountQuota, msDS-Behavior-Version, gPLink, maxPwdAge, minPwdAge, wellKnownObjects, lockoutDuration, msDS-LogonTimeSyncInterval]
       key: distinguishedName
       name: name
     each: { field: minPwdAge, op: eq, value: 0 }
@@ -1734,7 +1734,7 @@ rules:
       protocol: ldap
       scope: base
       filter: '(objectClass=domainDNS)'
-      attributes: [name, minPwdLength, pwdHistoryLength, pwdProperties, lockoutThreshold, ms-DS-MachineAccountQuota, msDS-Behavior-Version, gPLink, maxPwdAge, minPwdAge, wellKnownObjects]
+      attributes: [name, minPwdLength, pwdHistoryLength, pwdProperties, lockoutThreshold, ms-DS-MachineAccountQuota, msDS-Behavior-Version, gPLink, maxPwdAge, minPwdAge, wellKnownObjects, lockoutDuration, msDS-LogonTimeSyncInterval]
       key: distinguishedName
       name: name
     each: { field: lockoutThreshold, op: gt, value: 10, threshold: ad.lockout-threshold-max }
@@ -1754,7 +1754,7 @@ rules:
       protocol: ldap
       scope: base
       filter: '(objectClass=domainDNS)'
-      attributes: [name, minPwdLength, pwdHistoryLength, pwdProperties, lockoutThreshold, ms-DS-MachineAccountQuota, msDS-Behavior-Version, gPLink, maxPwdAge, minPwdAge, wellKnownObjects]
+      attributes: [name, minPwdLength, pwdHistoryLength, pwdProperties, lockoutThreshold, ms-DS-MachineAccountQuota, msDS-Behavior-Version, gPLink, maxPwdAge, minPwdAge, wellKnownObjects, lockoutDuration, msDS-LogonTimeSyncInterval]
       key: distinguishedName
       name: name
     each: { field: wellKnownObjects, op: match, value: '^B:32:AA312825768811D1ADED00C04FD8D5CD:CN=Computers,' }
@@ -1774,7 +1774,7 @@ rules:
       protocol: ldap
       scope: base
       filter: '(objectClass=domainDNS)'
-      attributes: [name, minPwdLength, pwdHistoryLength, pwdProperties, lockoutThreshold, ms-DS-MachineAccountQuota, msDS-Behavior-Version, gPLink, maxPwdAge, minPwdAge, wellKnownObjects]
+      attributes: [name, minPwdLength, pwdHistoryLength, pwdProperties, lockoutThreshold, ms-DS-MachineAccountQuota, msDS-Behavior-Version, gPLink, maxPwdAge, minPwdAge, wellKnownObjects, lockoutDuration, msDS-LogonTimeSyncInterval]
       key: distinguishedName
       name: name
     each: { field: wellKnownObjects, op: match, value: '^B:32:A9D1CA15768811D1ADED00C04FD8D5CD:CN=Users,' }
@@ -2646,7 +2646,7 @@ rules:
     query:
       protocol: ldap
       filter: '(|(objectClass=msDS-GroupManagedServiceAccount)(objectClass=msDS-ManagedServiceAccount))'
-      attributes: [sAMAccountName, lastLogonTimestamp, whenCreated, userAccountControl, msDS-ManagedPasswordInterval, servicePrincipalName]
+      attributes: [sAMAccountName, lastLogonTimestamp, whenCreated, userAccountControl, msDS-ManagedPasswordInterval, servicePrincipalName, adminCount, memberOf, msDS-AllowedToDelegateTo, msDS-SupportedEncryptionTypes]
       key: sAMAccountName
     each:
       all:
@@ -2668,7 +2668,7 @@ rules:
     query:
       protocol: ldap
       filter: '(|(objectClass=msDS-GroupManagedServiceAccount)(objectClass=msDS-ManagedServiceAccount))'
-      attributes: [sAMAccountName, lastLogonTimestamp, whenCreated, userAccountControl, msDS-ManagedPasswordInterval, servicePrincipalName]
+      attributes: [sAMAccountName, lastLogonTimestamp, whenCreated, userAccountControl, msDS-ManagedPasswordInterval, servicePrincipalName, adminCount, memberOf, msDS-AllowedToDelegateTo, msDS-SupportedEncryptionTypes]
       key: sAMAccountName
     each: { field: msDS-ManagedPasswordInterval, op: gt, value: 30, threshold: ad.gmsa-max-interval-days }
     evidence: "{sAMAccountName} - password interval {msDS-ManagedPasswordInterval} days"
@@ -2686,7 +2686,7 @@ rules:
     query:
       protocol: ldap
       filter: '(|(objectClass=msDS-GroupManagedServiceAccount)(objectClass=msDS-ManagedServiceAccount))'
-      attributes: [sAMAccountName, lastLogonTimestamp, whenCreated, userAccountControl, msDS-ManagedPasswordInterval, servicePrincipalName]
+      attributes: [sAMAccountName, lastLogonTimestamp, whenCreated, userAccountControl, msDS-ManagedPasswordInterval, servicePrincipalName, adminCount, memberOf, msDS-AllowedToDelegateTo, msDS-SupportedEncryptionTypes]
       key: sAMAccountName
     count: none
     evidence: "{count} managed service accounts found"
@@ -3308,6 +3308,50 @@ rules:
     each: { field: fSMORoleOwner, op: match, value: '(\\0A|\n)DEL:' }
     evidence: "Schema master {fSMORoleOwner}"
 
+  - id: AD-FSMO-DELETED-OWNER-DOMAINDNSZONES
+    title: Infrastructure role of the domain DNS partition held by a deleted domain controller
+    kind: broken
+    lens: maintenance
+    category: AVL
+    severity: high
+    entity: domain
+    why: Each DNS application partition has its own infrastructure role. Held by a removed DC, the partition's references to deleted objects are never cleaned up, and later domain controller or DNS changes that need the role fail. Demoting a DC rarely moves this role, so it is often left behind.
+    fix: Move the role to a live domain controller by setting the partition's fSMORoleOwner to that DC's NTDS Settings object (Microsoft's documented fix for orphaned application-partition roles).
+    refs: [NIST-800-53:CP-10]
+    refresh: 7d
+    query:
+      protocol: ldap
+      base: 'CN=Infrastructure,DC=DomainDnsZones,{DOMAINDN}'
+      scope: base
+      filter: '(objectClass=infrastructureUpdate)'
+      attributes: [fSMORoleOwner]
+      key: distinguishedName
+      min_rows: 1
+    each: { field: fSMORoleOwner, op: match, value: '(\\0A|\n)DEL:' }
+    evidence: "DomainDnsZones infrastructure role {fSMORoleOwner}"
+
+  - id: AD-FSMO-DELETED-OWNER-FORESTDNSZONES
+    title: Infrastructure role of the forest DNS partition held by a deleted domain controller
+    kind: broken
+    lens: maintenance
+    category: AVL
+    severity: high
+    entity: domain
+    why: Each DNS application partition has its own infrastructure role. Held by a removed DC, the partition's references to deleted objects are never cleaned up, and later domain controller or DNS changes that need the role fail. Demoting a DC rarely moves this role, so it is often left behind.
+    fix: Move the role to a live domain controller by setting the partition's fSMORoleOwner to that DC's NTDS Settings object (Microsoft's documented fix for orphaned application-partition roles).
+    refs: [NIST-800-53:CP-10]
+    refresh: 7d
+    query:
+      protocol: ldap
+      base: 'CN=Infrastructure,DC=ForestDnsZones,{ROOTDN}'
+      scope: base
+      filter: '(objectClass=infrastructureUpdate)'
+      attributes: [fSMORoleOwner]
+      key: distinguishedName
+      min_rows: 1
+    each: { field: fSMORoleOwner, op: match, value: '(\\0A|\n)DEL:' }
+    evidence: "ForestDnsZones infrastructure role {fSMORoleOwner}"
+
   # ---------------------------------------------------------------- object hygiene
 
   - id: AD-HYG-CONFLICT-OBJECTS
@@ -3465,7 +3509,7 @@ rules:
       protocol: ldap
       scope: base
       filter: '(objectClass=domainDNS)'
-      attributes: [name, minPwdLength, pwdHistoryLength, pwdProperties, lockoutThreshold, ms-DS-MachineAccountQuota, msDS-Behavior-Version, gPLink, maxPwdAge, minPwdAge, wellKnownObjects]
+      attributes: [name, minPwdLength, pwdHistoryLength, pwdProperties, lockoutThreshold, ms-DS-MachineAccountQuota, msDS-Behavior-Version, gPLink, maxPwdAge, minPwdAge, wellKnownObjects, lockoutDuration, msDS-LogonTimeSyncInterval]
       key: distinguishedName
       name: name
     each: { field: gPLink, op: match, value: ';[23]\]' }
@@ -3490,7 +3534,7 @@ rules:
       name: displayName
     each:
       all:
-        - { field: cn, op: in, value: ['{31B2F340-016F-11D2-945F-00C04FB984F9}', '{6AC1786C-016F-11D2-945F-00C04FB984F9}'] }
+        - { field: cn, op: in, value: ['{31B2F340-016D-11D2-945F-00C04FB984F9}', '{6AC1786C-016F-11D2-945F-00C04FB984F9}'] }
         - { field: flags, op: flag, value: 2 }
     evidence: "{displayName} ({cn}) - flags {flags}"
 
@@ -3726,3 +3770,1285 @@ rules:
       key: distinguishedName
     count: some
     evidence: "{count} FRS subscriber objects, for example {sample}"
+
+  # ---------------------------------------------------------------- dangerous permissions (nTSecurityDescriptor)
+
+  # These rules read the decoded security descriptor of a few crown-jewel objects and look for a
+  # dangerous allow entry held by a principal outside the directory administrators. The default
+  # holders of full control on these objects are only the builtin Administrators, Domain Admins,
+  # Enterprise Admins and SYSTEM; a legitimate extra principal (a synchronisation account, a
+  # delegated administrator) goes in the threshold so it is expected rather than reported every scan.
+  # Object type is required absent so the many scoped property and extended-right defaults do not
+  # match - only rights over the whole object fire. SID names and rids match in any domain, so the
+  # rules are language-independent.
+
+  - id: AD-ACL-DCSYNC
+    title: Replication (DCSync) rights granted to a non-tier-0 principal
+    category: AUT
+    severity: critical
+    entity: domain
+    why: Any principal holding the Replicating Directory Changes All extended right on the domain head can pull every account password hash from a domain controller (a DCSync attack), which is full domain compromise. Only domain controllers, the directory administrators and the directory-synchronisation account should hold it.
+    fix: Remove the replication right from any principal that is not a domain controller or a tier-0 administrator, and add a legitimate synchronisation account to the threshold ad.acl-trusted-replicators so it is expected.
+    refs: [MITRE-ATTACK:T1003.006, NIST-800-53:AC-6, PINGCASTLE:P-DCSync]
+    refresh: 7d
+    query:
+      protocol: ldap
+      scope: base
+      filter: '(objectClass=domainDNS)'
+      attributes: [name, nTSecurityDescriptor]
+      key: distinguishedName
+      name: name
+    each:
+      element:
+        of: nTSecurityDescriptor.dacl
+        match: any
+        where:
+          all:
+            - { field: type, op: in, value: [allow, allow-object] }
+            - { field: objectTypeName, op: eq, value: DS-Replication-Get-Changes-All }
+            - { field: trustee, op: sid-notin, value: [builtin-administrators, domain-admins, enterprise-admins, domain-controllers, enterprise-domain-controllers, local-system] }
+            - { field: trustee, op: sid-notin, value: [], threshold: ad.acl-trusted-replicators }
+    evidence: "{name} - the Replicating Directory Changes All right is held outside the default replication principals"
+
+  - id: AD-ACL-DOMAIN-DANGEROUS-ACE
+    title: Full control or write rights over the domain object held by a non-administrator
+    category: IAM
+    severity: critical
+    entity: domain
+    why: Full control, Write DACL, Write Owner, generic write or all extended rights over the domain object lets a non-administrator grant itself any right on the domain, the replication rights used for DCSync among them. The default holders are the directory administrators and SYSTEM only.
+    fix: Remove the dangerous right from the principal, or record a legitimate one in the threshold ad.acl-trusted-writers, and treat an entry nobody recognises as an incident.
+    refs: [MITRE-ATTACK:T1222.001, NIST-800-53:AC-6, NIST-800-53:AC-3]
+    refresh: 7d
+    query:
+      protocol: ldap
+      scope: base
+      filter: '(objectClass=domainDNS)'
+      attributes: [name, nTSecurityDescriptor]
+      key: distinguishedName
+      name: name
+    each:
+      element:
+        of: nTSecurityDescriptor.dacl
+        match: any
+        where:
+          all:
+            - { field: type, op: in, value: [allow, allow-object] }
+            - { field: objectType, op: absent }
+            - any:
+                - { field: rights, op: contains, value: GenericAll }
+                - { field: rights, op: contains, value: WriteDacl }
+                - { field: rights, op: contains, value: WriteOwner }
+                - { field: rights, op: contains, value: GenericWrite }
+                - { field: rights, op: contains, value: ExtendedRight }
+            - { field: trustee, op: sid-notin, value: [builtin-administrators, domain-admins, enterprise-admins, local-system] }
+            - { field: trustee, op: sid-notin, value: [], threshold: ad.acl-trusted-writers }
+    evidence: "{name} - a dangerous allow entry over the domain object is held by a non-administrator"
+
+  - id: AD-ACL-DOMAIN-OWNER-NONADMIN
+    title: Domain object owned by a non-administrator
+    category: IAM
+    severity: high
+    entity: domain
+    why: The owner of the domain object can always rewrite its permissions regardless of the current DACL, so an owner that is not a directory administrator is an undocumented path to full domain control.
+    fix: Reset the owner of the domain head to the directory administrators group, record any legitimate owner in the threshold ad.acl-trusted-writers, and find out how it was changed.
+    refs: [MITRE-ATTACK:T1222.001, NIST-800-53:AC-6]
+    refresh: 7d
+    query:
+      protocol: ldap
+      scope: base
+      filter: '(objectClass=domainDNS)'
+      attributes: [name, nTSecurityDescriptor]
+      key: distinguishedName
+      name: name
+    each:
+      all:
+        - { field: nTSecurityDescriptor.owner, op: sid-notin, value: [builtin-administrators, domain-admins, enterprise-admins, local-system] }
+        - { field: nTSecurityDescriptor.owner, op: sid-notin, value: [], threshold: ad.acl-trusted-writers }
+    evidence: "{name} - domain object owner {nTSecurityDescriptor.owner}"
+
+  - id: AD-ACL-DOMAIN-NULL-DACL
+    title: Domain object has a null DACL
+    category: IAM
+    severity: critical
+    entity: domain
+    why: A null DACL on the domain object means every right is granted to everyone, so any account can take over the domain. It is almost always a mistake or sabotage, never a normal state.
+    fix: Restore the standard permissions on the domain head from a known-good domain or a backup, and treat it as an incident.
+    refs: [NIST-800-53:AC-6, NIST-800-53:AC-3]
+    refresh: 7d
+    query:
+      protocol: ldap
+      scope: base
+      filter: '(objectClass=domainDNS)'
+      attributes: [name, nTSecurityDescriptor]
+      key: distinguishedName
+      name: name
+    each: { field: nTSecurityDescriptor.noDacl, op: eq, value: true }
+    evidence: "{name} - the domain object has a null DACL (everyone has full control)"
+
+  - id: AD-ADMINSDHOLDER-DANGEROUS-ACE
+    title: Full control or write rights over AdminSDHolder held by a non-administrator
+    category: IAM
+    severity: critical
+    entity: domain
+    why: Permissions on AdminSDHolder are stamped onto every protected account and group every hour, so full control, generic write or all extended rights held there by a non-administrator is a standing backdoor over all administrators that survives their own permission resets. A scoped permission change needs the comparison that AD-ADMINSDHOLDER-RECENTLY-CHANGED signals.
+    fix: Remove the entry unless it is a documented product requirement, record legitimate writers in the threshold ad.acl-trusted-writers, and treat an unrecognised one as an incident.
+    refs: [MITRE-ATTACK:T1098, NIST-800-53:AC-6, NIST-800-53:AU-12]
+    refresh: 7d
+    query:
+      protocol: ldap
+      base: 'CN=AdminSDHolder,CN=System,{DOMAINDN}'
+      scope: base
+      filter: '(objectClass=container)'
+      attributes: [cn, nTSecurityDescriptor]
+      key: distinguishedName
+      name: cn
+    each:
+      element:
+        of: nTSecurityDescriptor.dacl
+        match: any
+        where:
+          all:
+            - { field: type, op: in, value: [allow, allow-object] }
+            - { field: objectType, op: absent }
+            - any:
+                - { field: rights, op: contains, value: GenericAll }
+                - { field: rights, op: contains, value: WriteDacl }
+                - { field: rights, op: contains, value: WriteOwner }
+                - { field: rights, op: contains, value: GenericWrite }
+                - { field: rights, op: contains, value: ExtendedRight }
+            - { field: trustee, op: sid-notin, value: [builtin-administrators, domain-admins, enterprise-admins, local-system] }
+            - { field: trustee, op: sid-notin, value: [], threshold: ad.acl-trusted-writers }
+    evidence: "{cn} - a dangerous allow entry over AdminSDHolder is held by a non-administrator"
+
+  - id: AD-ADMINSDHOLDER-OWNER-NONADMIN
+    title: AdminSDHolder owned by a non-administrator
+    category: IAM
+    severity: high
+    entity: domain
+    why: The owner of AdminSDHolder can rewrite its permissions whatever the DACL says, and those permissions flow to every administrator every hour, so a non-administrator owner is a path to control of all privileged accounts.
+    fix: Reset the owner of AdminSDHolder to the directory administrators group, record any legitimate owner in the threshold ad.acl-trusted-writers, and find out how it changed.
+    refs: [MITRE-ATTACK:T1098, NIST-800-53:AC-6]
+    refresh: 7d
+    query:
+      protocol: ldap
+      base: 'CN=AdminSDHolder,CN=System,{DOMAINDN}'
+      scope: base
+      filter: '(objectClass=container)'
+      attributes: [cn, nTSecurityDescriptor]
+      key: distinguishedName
+      name: cn
+    each:
+      all:
+        - { field: nTSecurityDescriptor.owner, op: sid-notin, value: [builtin-administrators, domain-admins, enterprise-admins, local-system] }
+        - { field: nTSecurityDescriptor.owner, op: sid-notin, value: [], threshold: ad.acl-trusted-writers }
+    evidence: "{cn} - AdminSDHolder owner {nTSecurityDescriptor.owner}"
+
+  - id: AD-GPO-DANGEROUS-ACE
+    title: Group Policy object editable by a principal outside the policy administrators
+    lens: both
+    category: IAM
+    severity: high
+    entity: gpo
+    why: Write access to a Group Policy object lets a principal change settings and scripts that run as SYSTEM on every computer the policy applies to. Edit rights should belong to the policy administrators, not to individual users or broad groups.
+    fix: Remove the write permission from the principal, delegate Group Policy editing through a reviewed administrative group, and record a legitimate editor in the threshold ad.acl-trusted-writers.
+    refs: [MITRE-ATTACK:T1484.001, NIST-800-53:AC-6(1), CIS-Controls-v8:5.4]
+    refresh: 7d
+    query:
+      protocol: ldap
+      base: 'CN=Policies,CN=System,{DOMAINDN}'
+      scope: onelevel
+      filter: '(objectClass=groupPolicyContainer)'
+      attributes: [cn, displayName, nTSecurityDescriptor]
+      key: cn
+      name: displayName
+    each:
+      element:
+        of: nTSecurityDescriptor.dacl
+        match: any
+        where:
+          all:
+            - { field: type, op: in, value: [allow, allow-object] }
+            - { field: objectType, op: absent }
+            - { field: inherited, op: eq, value: false }
+            - any:
+                - { field: rights, op: contains, value: GenericAll }
+                - { field: rights, op: contains, value: WriteDacl }
+                - { field: rights, op: contains, value: WriteOwner }
+                - { field: rights, op: contains, value: GenericWrite }
+                - { field: rights, op: contains, value: WriteProperty }
+            - { field: trustee, op: sid-notin, value: [builtin-administrators, domain-admins, enterprise-admins, local-system, creator-owner] }
+            - { field: trustee, op: sid-notin, value: [], threshold: ad.acl-trusted-writers }
+    evidence: "{displayName} ({cn}) - edit rights are held by a principal outside the policy administrators"
+
+  - id: AD-GPO-OWNER-NONADMIN
+    title: Group Policy object owned by a principal outside the policy administrators
+    lens: both
+    category: IAM
+    severity: medium
+    entity: gpo
+    why: The owner of a Group Policy object can always rewrite its permissions and therefore edit it, so an owner outside the policy administrators can change settings that run on every computer in scope. A GPO a user made through delegated Group Policy creation keeps that user as owner.
+    fix: Reset the owner to the policy administrators group, and record any legitimate owner in the threshold ad.acl-trusted-writers.
+    refs: [MITRE-ATTACK:T1484.001, NIST-800-53:AC-6]
+    refresh: 7d
+    query:
+      protocol: ldap
+      base: 'CN=Policies,CN=System,{DOMAINDN}'
+      scope: onelevel
+      filter: '(objectClass=groupPolicyContainer)'
+      attributes: [cn, displayName, nTSecurityDescriptor]
+      key: cn
+      name: displayName
+    each:
+      all:
+        - { field: nTSecurityDescriptor.owner, op: sid-notin, value: [builtin-administrators, domain-admins, enterprise-admins, local-system, creator-owner] }
+        - { field: nTSecurityDescriptor.owner, op: sid-notin, value: [], threshold: ad.acl-trusted-writers }
+    evidence: "{displayName} ({cn}) - owner {nTSecurityDescriptor.owner}"
+
+  - id: AD-OU-NO-DELETE-PROTECTION
+    title: Organisational units without accidental-deletion protection
+    lens: maintenance
+    category: HYG
+    severity: low
+    entity: domain
+    why: An organisational unit without the accidental-deletion protection (a deny of Delete Subtree to Everyone) can be removed in one action, taking every account, computer and policy under it with it. Objects whose security descriptor cannot be read are not counted.
+    fix: Turn on protect from accidental deletion for the organisational units that matter, and set ad.unprotected-ous-max to the number the estate accepts.
+    refs: [NIST-800-53:CM-8, NIST-800-53:CP-9]
+    refresh: 7d
+    query:
+      protocol: ldap
+      filter: '(objectClass=organizationalUnit)'
+      attributes: [ou, nTSecurityDescriptor]
+      key: distinguishedName
+      name: ou
+    count:
+      op: gt
+      value: 0
+      threshold: ad.unprotected-ous-max
+      where:
+        # The protection is the OU's own explicit deny of Delete and Delete Subtree to Everyone. An inherited or
+        # object-specific deny to Everyone (other products add those to every OU) is not it.
+        not:
+          element:
+            of: nTSecurityDescriptor.dacl
+            match: any
+            where:
+              all:
+                - { field: type, op: eq, value: deny }
+                - { field: trustee, op: sid-in, value: [everyone] }
+                - { field: inherited, op: eq, value: false }
+                - { field: rights, op: contains, value: Delete }
+                - { field: rights, op: contains, value: DeleteTree }
+                - { field: rights, op: contains, value: DeleteTree }
+    evidence: "{count} organisational units have no accidental-deletion protection, for example {sample}"
+
+  # ---------------------------------------------------------------- privileged groups outside the protected set
+
+  # Key Admins and Group Policy Creator Owners are not stamped with adminCount, so the adminCount rules
+  # above never see them, yet both confer domain-wide power. Found by their English default names (the
+  # localisation caveat at the top of the file applies).
+
+  - id: AD-GROUP-KEY-ADMINS-SIZE
+    title: Key Admins or Enterprise Key Admins has members
+    category: IAM
+    severity: high
+    entity: group
+    why: Members of Key Admins and Enterprise Key Admins can write the key credential link attribute across the directory, which lets them register alternate logon keys (shadow credentials) for other accounts and then authenticate as them. Both groups are empty by default.
+    fix: Empty the groups unless a documented service needs them, and grant that service only the specific rights it requires. Nested members are counted.
+    refs: [MITRE-ATTACK:T1098, NIST-800-53:AC-6(5)]
+    query:
+      protocol: ldap
+      filter: '(&{USER}{ENABLED}(|(memberOf:1.2.840.113556.1.4.1941:=CN=Key Admins,CN=Users,{DOMAINDN})(memberOf:1.2.840.113556.1.4.1941:=CN=Enterprise Key Admins,CN=Users,{ROOTDN})))'
+      attributes: [sAMAccountName, displayName]
+      key: sAMAccountName
+      name: displayName
+    count: { op: gt, value: 0, threshold: ad.key-admins-max }
+    evidence: "{count} enabled members of the key-admin groups (nested included): {sample}"
+
+  - id: AD-GROUP-GPCO-SIZE
+    title: Group Policy Creator Owners has members
+    category: IAM
+    severity: medium
+    entity: group
+    why: Members of Group Policy Creator Owners can create Group Policy objects and fully control the ones they create, which is enough to push settings and scripts to the computers those policies are linked to. The group is usually empty or holds the delegated Group Policy administrators.
+    fix: Keep only the delegated Group Policy administrators in the group, and grant everyone else narrower rights. Nested members are counted.
+    refs: [MITRE-ATTACK:T1484.001, NIST-800-53:AC-6(5)]
+    query:
+      protocol: ldap
+      filter: '(&{USER}{ENABLED}(memberOf:1.2.840.113556.1.4.1941:=CN=Group Policy Creator Owners,CN=Users,{DOMAINDN}))'
+      attributes: [sAMAccountName, displayName]
+      key: sAMAccountName
+      name: displayName
+    count: { op: gt, value: 0, threshold: ad.gpco-members-max }
+    evidence: "{count} enabled members (nested included): {sample}"
+
+  # ---------------------------------------------------------------- computer primary group
+
+  - id: AD-COMP-PRIMARY-GROUP
+    title: Enabled computer with a non-default primary group
+    category: IAM
+    severity: medium
+    entity: computer
+    why: A computer normally has Domain Computers as its primary group (domain controllers have Domain Controllers, read-only ones Read-only Domain Controllers). Any other primary group is a membership that does not appear in the group's member list and so escapes most reviews, and it can hide a privileged grant.
+    fix: Set the primary group back to Domain Computers and grant any extra group by ordinary membership.
+    refs: [MITRE-ATTACK:T1078, NIST-800-53:AC-6]
+    query:
+      protocol: ldap
+      filter: '(&{COMPUTER}{ENABLED}(!(primaryGroupID=515))(!(primaryGroupID=516))(!(primaryGroupID=521)))'
+      attributes: [sAMAccountName, dNSHostName, primaryGroupID]
+      key: sAMAccountName
+      name: dNSHostName
+    each: any
+    evidence: "{dNSHostName} ({sAMAccountName}) - primaryGroupID {primaryGroupID}"
+
+  # ---------------------------------------------------------------- hygiene: secrets in free-text fields and object consistency
+
+  # description, info and comment are readable by every authenticated user. The rules below mask those
+  # fields: the scan keeps "set" instead of the text, and evidence never names it.
+
+  - id: AD-USER-PASSWORD-IN-TEXT-FIELD
+    title: User account whose description or notes look like they hold a password
+    category: IAM
+    severity: high
+    entity: user
+    why: Description, notes and comment fields can be read by every user in the domain, so a password written there is effectively published to the whole organisation. The pattern needs a password word, a separator (an equals sign, a colon or the word "is") and a value of four or more characters, and skips notes such as "managed by LAPS", "see vault" or "reset via helpdesk"; tune it with ad.text-field-password-pattern.
+    fix: Remove the text from the field, change the password it named, and keep credentials in a password vault instead of directory attributes.
+    refs: [NIST-800-53:IA-5(7), NIST-800-53:SC-28, MITRE-ATTACK:T1552]
+    mask: [description, info, comment]
+    query:
+      protocol: ldap
+      filter: '(&{USER}(|(description=*pass*)(description=*pwd*)(description=*pw:*)(description=*pw=*)(description=*pw *)(description=*kennwort*)(description=*wachtwoord*)(description=*contrase*)(description=*senha*)(description=*סיסמה*)(description=*סיסמא*)(description=*ססמה*)(description=*סיסמת*)(info=*pass*)(info=*pwd*)(info=*pw:*)(info=*pw=*)(info=*pw *)(info=*kennwort*)(info=*wachtwoord*)(info=*contrase*)(info=*senha*)(info=*סיסמה*)(info=*סיסמא*)(info=*ססמה*)(info=*סיסמת*){IFATTR:comment|(comment=*pass*)(comment=*pwd*)(comment=*pw:*)(comment=*pw=*)(comment=*pw *)(comment=*kennwort*)(comment=*wachtwoord*)(comment=*contrase*)(comment=*senha*)(comment=*סיסמה*)(comment=*סיסמא*)(comment=*ססמה*)(comment=*סיסמת*)}))'
+      attributes: [sAMAccountName, displayName, userAccountControl, description, info, comment]
+      key: sAMAccountName
+      name: displayName
+    each:
+      any:
+        - all:
+            - { field: description, op: exists }
+            - { field: description, op: match, value: '(?i)(?:\b(?:passw(?:or)?d|pwd|pw|kennwort|wachtwoord|contrase(?:ñ|n)a|senha|mot de passe)|(?<![֐-׿])[והבלש]{0,2}(?:סיסמה|סיסמא|ססמה|סיסמת\s+\S+))\s*(?:=|:|\bis\b)\s*(?!(?:never|not|n/a|none|unknown|expire[sd]?|reset|managed|stored|in|via|see|set|required|change[sd]?|vault|laps|keeper)\b)(?!\*{3,})\S{4,}', threshold: ad.text-field-password-pattern }
+        - all:
+            - { field: info, op: exists }
+            - { field: info, op: match, value: '(?i)(?:\b(?:passw(?:or)?d|pwd|pw|kennwort|wachtwoord|contrase(?:ñ|n)a|senha|mot de passe)|(?<![֐-׿])[והבלש]{0,2}(?:סיסמה|סיסמא|ססמה|סיסמת\s+\S+))\s*(?:=|:|\bis\b)\s*(?!(?:never|not|n/a|none|unknown|expire[sd]?|reset|managed|stored|in|via|see|set|required|change[sd]?|vault|laps|keeper)\b)(?!\*{3,})\S{4,}', threshold: ad.text-field-password-pattern }
+        - all:
+            - { field: comment, op: exists }
+            - { field: comment, op: match, value: '(?i)(?:\b(?:passw(?:or)?d|pwd|pw|kennwort|wachtwoord|contrase(?:ñ|n)a|senha|mot de passe)|(?<![֐-׿])[והבלש]{0,2}(?:סיסמה|סיסמא|ססמה|סיסמת\s+\S+))\s*(?:=|:|\bis\b)\s*(?!(?:never|not|n/a|none|unknown|expire[sd]?|reset|managed|stored|in|via|see|set|required|change[sd]?|vault|laps|keeper)\b)(?!\*{3,})\S{4,}', threshold: ad.text-field-password-pattern }
+    evidence: "{sAMAccountName} - a free-text field looks like it holds a password (value not shown)"
+
+  - id: AD-COMP-PASSWORD-IN-TEXT-FIELD
+    title: Computer account whose description or notes look like they hold a password
+    category: IAM
+    severity: high
+    entity: computer
+    why: Computer descriptions are readable by every user in the domain and often name the local administrator or a service password for the machine, which then works for anyone who reads it. The pattern is the one AD-USER-PASSWORD-IN-TEXT-FIELD uses (ad.text-field-password-pattern).
+    fix: Remove the text, change the password it named (manage local administrator passwords with LAPS), and keep credentials in a password vault.
+    refs: [NIST-800-53:IA-5(7), NIST-800-53:SC-28, MITRE-ATTACK:T1552]
+    mask: [description, info]
+    query:
+      protocol: ldap
+      filter: '(&{COMPUTER}(|(description=*pass*)(description=*pwd*)(description=*pw:*)(description=*pw=*)(description=*pw *)(description=*kennwort*)(description=*wachtwoord*)(description=*contrase*)(description=*senha*)(description=*סיסמה*)(description=*סיסמא*)(description=*ססמה*)(description=*סיסמת*)(info=*pass*)(info=*pwd*)(info=*pw:*)(info=*pw=*)(info=*pw *)(info=*kennwort*)(info=*wachtwoord*)(info=*contrase*)(info=*senha*)(info=*סיסמה*)(info=*סיסמא*)(info=*ססמה*)(info=*סיסמת*)))'
+      attributes: [sAMAccountName, dNSHostName, description, info]
+      key: sAMAccountName
+      name: dNSHostName
+    each:
+      any:
+        - all:
+            - { field: description, op: exists }
+            - { field: description, op: match, value: '(?i)(?:\b(?:passw(?:or)?d|pwd|pw|kennwort|wachtwoord|contrase(?:ñ|n)a|senha|mot de passe)|(?<![֐-׿])[והבלש]{0,2}(?:סיסמה|סיסמא|ססמה|סיסמת\s+\S+))\s*(?:=|:|\bis\b)\s*(?!(?:never|not|n/a|none|unknown|expire[sd]?|reset|managed|stored|in|via|see|set|required|change[sd]?|vault|laps|keeper)\b)(?!\*{3,})\S{4,}', threshold: ad.text-field-password-pattern }
+        - all:
+            - { field: info, op: exists }
+            - { field: info, op: match, value: '(?i)(?:\b(?:passw(?:or)?d|pwd|pw|kennwort|wachtwoord|contrase(?:ñ|n)a|senha|mot de passe)|(?<![֐-׿])[והבלש]{0,2}(?:סיסמה|סיסמא|ססמה|סיסמת\s+\S+))\s*(?:=|:|\bis\b)\s*(?!(?:never|not|n/a|none|unknown|expire[sd]?|reset|managed|stored|in|via|see|set|required|change[sd]?|vault|laps|keeper)\b)(?!\*{3,})\S{4,}', threshold: ad.text-field-password-pattern }
+    evidence: "{sAMAccountName} - a free-text field looks like it holds a password (value not shown)"
+
+  - id: AD-COMP-CLEARTEXT-PASSWORD-ATTRIBUTE
+    title: Computer carries a legacy password attribute
+    category: IAM
+    severity: high
+    entity: computer
+    why: userPassword, unixUserPassword and similar legacy attributes may hold a password in clear or weakly protected form, and on computer objects they are usually left behind by an old provisioning or UNIX integration tool. AD-USER-CLEARTEXT-PASSWORD-ATTRIBUTE covers user accounts.
+    fix: Clear the attribute, change any password it held, and retire the tool that wrote it.
+    refs: [NIST-800-53:IA-5(1), PingCastle:A-UnixPwd]
+    query:
+      protocol: ldap
+      filter: '(&{COMPUTER}(|(userPassword=*){IFATTR:unixUserPassword|(unixUserPassword=*)}{IFATTR:msSFU30Password|(msSFU30Password=*)}))'
+      attributes: [sAMAccountName, dNSHostName]
+      key: sAMAccountName
+      name: dNSHostName
+    each: any
+    evidence: "{sAMAccountName} - a legacy password attribute is populated (value not read)"
+
+  - id: AD-OBJ-SIDHISTORY
+    title: Group or computer carries SID history
+    category: IAM
+    severity: medium
+    entity: domain
+    why: SID history gives a group or computer the access of another identity without that access appearing in any membership list, so permission reviews miss it. AD-USER-SIDHISTORY covers user accounts.
+    fix: Re-permission resources to the current SIDs, then clear sIDHistory once the migration it served is complete.
+    refs: [MITRE-ATTACK:T1134.005, NIST-800-53:AC-6, PingCastle:S-SIDHistory]
+    query:
+      protocol: ldap
+      filter: '(&(sIDHistory=*)(|(objectClass=group)(objectCategory=computer)))'
+      attributes: [sAMAccountName, objectClass, sIDHistory]
+      key: distinguishedName
+      name: sAMAccountName
+    each: any
+    evidence: "{distinguishedName} - sIDHistory {sIDHistory}"
+
+  - id: AD-OBJ-SIDHISTORY-PRIVILEGED
+    title: Group or computer whose SID history holds a privileged SID
+    category: IAM
+    severity: critical
+    entity: domain
+    why: A privileged well-known SID in a group's or computer's SID history makes every member, or the machine, an administrator without any visible membership. It has no place outside a supervised migration.
+    fix: Clear the privileged SID from sIDHistory now, review what the object was used for since it was written, and find out who wrote it.
+    refs: [MITRE-ATTACK:T1134.005, NIST-800-53:AC-6]
+    query:
+      protocol: ldap
+      filter: '(&(sIDHistory=*)(|(objectClass=group)(objectCategory=computer)))'
+      attributes: [sAMAccountName, objectClass, sIDHistory]
+      key: distinguishedName
+      name: sAMAccountName
+    each: { field: sIDHistory, op: match, value: '^S-1-5-21-\d+-\d+-\d+-(498|500|512|516|518|519|520|521|526|527)$|^S-1-5-32-5(44|48|49|50|51)$' }
+    evidence: "{distinguishedName} - sIDHistory {sIDHistory}"
+
+  - id: AD-USER-PRIMARY-GROUP-PRIVILEGED
+    title: User account whose primary group is an administrative group
+    category: IAM
+    severity: high
+    entity: user
+    why: Primary group membership does not appear in the group's member list, so an account whose primary group is Domain Admins, Enterprise Admins, Schema Admins, Domain Controllers or a key-admin group holds those rights while membership reviews show nothing. AD-USER-PRIMARY-GROUP lists every other non-default primary group at low severity.
+    fix: Set the primary group back to Domain Users (RID 513) and, if the access is needed, grant it by ordinary reviewed membership.
+    refs: [NIST-800-53:AC-6, NIST-800-53:AC-2(7), PingCastle:S-PrimaryGroup]
+    query:
+      protocol: ldap
+      filter: '(&{USER}(!{UAC:2048})(|(primaryGroupID=512)(primaryGroupID=516)(primaryGroupID=518)(primaryGroupID=519)(primaryGroupID=520)(primaryGroupID=521)(primaryGroupID=526)(primaryGroupID=527)))'
+      attributes: [sAMAccountName, displayName, primaryGroupID, userAccountControl]
+      key: sAMAccountName
+      name: displayName
+    each: any
+    evidence: "{sAMAccountName} - primaryGroupID {primaryGroupID}"
+
+  - id: AD-COMP-DC-PRIMARY-GROUP-NON-DC
+    title: Computer that is not a domain controller has a domain controller primary group
+    category: IAM
+    severity: critical
+    entity: computer
+    why: A computer whose primary group is Domain Controllers or Read-only Domain Controllers gets the directory replication rights of a domain controller, while it does not appear in that group's member list. A member server or workstation must never hold that.
+    fix: Set the computer's primary group back to Domain Computers (RID 515), check whether it should be a domain controller at all, and find out who changed it.
+    refs: [NIST-800-53:AC-6, MITRE-ATTACK:T1003.006, PingCastle:S-C-PrimaryGroup]
+    query:
+      protocol: ldap
+      filter: '(&{COMPUTER}(|(primaryGroupID=516)(primaryGroupID=521))(!{UAC:8192})(!{UAC:67108864}))'
+      attributes: [sAMAccountName, dNSHostName, primaryGroupID, userAccountControl]
+      key: sAMAccountName
+      name: dNSHostName
+    each: any
+    evidence: "{sAMAccountName} - primaryGroupID {primaryGroupID}, userAccountControl {userAccountControl}"
+
+  - id: AD-DC-PRIMARY-GROUP-WRONG
+    title: Domain controller account with an unexpected primary group
+    kind: broken
+    lens: both
+    category: CFG
+    severity: medium
+    entity: computer
+    why: A writable domain controller belongs to Domain Controllers (RID 516) and a read-only one to Read-only Domain Controllers (RID 521) through its primary group. Any other value means the account was edited by hand or the promotion did not finish, and the DC may lack the permissions its role needs.
+    fix: Set the primary group to 516 for a writable DC or 521 for a read-only DC, and check replication and the DC's security group memberships afterwards.
+    refs: [NIST-800-53:CM-6]
+    query:
+      protocol: ldap
+      filter: '(&{COMPUTER}(|(&{UAC:8192}(!(primaryGroupID=516)))(&{UAC:67108864}(!(primaryGroupID=521)))))'
+      attributes: [sAMAccountName, dNSHostName, primaryGroupID, userAccountControl]
+      key: sAMAccountName
+      name: dNSHostName
+    each: any
+    evidence: "{dNSHostName} - primaryGroupID {primaryGroupID}, userAccountControl {userAccountControl}"
+
+  - id: AD-DC-UAC-INCONSISTENT
+    title: Domain controller account with inconsistent account flags
+    lens: both
+    category: CFG
+    severity: medium
+    entity: computer
+    why: A writable domain controller account carries SERVER_TRUST_ACCOUNT and TRUSTED_FOR_DELEGATION and nothing that changes how its password works. A workstation-account flag, a missing delegation flag or "password never expires" on a DC means the object was edited by hand and no longer matches what the system expects.
+    fix: Restore the standard flags (532480 for a writable DC; read-only DCs carry PARTIAL_SECRETS_ACCOUNT and WORKSTATION_TRUST_ACCOUNT) and find out what changed them.
+    refs: [NIST-800-53:CM-6, NIST-800-53:IA-5(1)]
+    query:
+      protocol: ldap
+      filter: '(&{COMPUTER}{ENABLED})'
+      attributes: [sAMAccountName, dNSHostName, operatingSystem, operatingSystemVersion, lastLogonTimestamp, userAccountControl, pwdLastSet, whenCreated, adminCount, servicePrincipalName, msDS-SupportedEncryptionTypes, msDS-AllowedToDelegateTo, msDS-AllowedToActOnBehalfOfOtherIdentity, ms-Mcs-AdmPwdExpirationTime, msLAPS-PasswordExpirationTime, objectSid]
+      key: sAMAccountName
+      name: dNSHostName
+    each:
+      any:
+        - all:
+            - { field: userAccountControl, op: flag, value: 8192 }
+            - any:
+                - { field: userAccountControl, op: noflag, value: 524288 }
+                - { field: userAccountControl, op: flag, value: 4096 }
+                - { field: userAccountControl, op: flag, value: 65536 }
+        - all:
+            - { field: userAccountControl, op: flag, value: 67108864 }
+            - { field: userAccountControl, op: flag, value: 65536 }
+    evidence: "{dNSHostName} - userAccountControl {userAccountControl}"
+
+  # ---------------------------------------------------------------- Kerberos encryption and domain settings (gaps)
+
+  - id: AD-USER-DES-ENCTYPE
+    title: User account that still allows DES Kerberos encryption
+    category: AUT
+    severity: medium
+    entity: user
+    why: DES is broken and turned off in current Windows; an account whose encryption types still include it keeps a weak key type enabled and signals configuration nobody has reviewed. Accounts restricted to DES alone are reported by AD-USER-DES-ONLY.
+    fix: Remove the DES bits (1 and 2) from msDS-SupportedEncryptionTypes, allow AES (24), and change the password so AES keys exist.
+    refs: [NIST-800-53:SC-13, PingCastle:S-DesEnabled]
+    query:
+      protocol: ldap
+      filter: '(&{USER}{ENABLED}(msDS-SupportedEncryptionTypes=*))'
+      attributes: [sAMAccountName, displayName, msDS-SupportedEncryptionTypes]
+      key: sAMAccountName
+      name: displayName
+    each:
+      any:
+        - { field: msDS-SupportedEncryptionTypes, op: flag, value: 1 }
+        - { field: msDS-SupportedEncryptionTypes, op: flag, value: 2 }
+    evidence: "{sAMAccountName} - msDS-SupportedEncryptionTypes {msDS-SupportedEncryptionTypes}"
+
+  - id: AD-COMP-DES-ENCTYPE
+    title: Computer that still allows DES Kerberos encryption
+    category: AUT
+    severity: medium
+    entity: computer
+    why: A computer whose encryption types include DES keeps a broken algorithm enabled for its service tickets; current Windows no longer uses it, so it only adds weakness.
+    fix: Remove DES from the computer's supported encryption types (by the Kerberos encryption-type policy or msDS-SupportedEncryptionTypes) and allow AES.
+    refs: [NIST-800-53:SC-13, PingCastle:S-DesEnabled]
+    query:
+      protocol: ldap
+      filter: '(&{COMPUTER}{ENABLED})'
+      attributes: [sAMAccountName, dNSHostName, operatingSystem, operatingSystemVersion, lastLogonTimestamp, userAccountControl, pwdLastSet, whenCreated, adminCount, servicePrincipalName, msDS-SupportedEncryptionTypes, msDS-AllowedToDelegateTo, msDS-AllowedToActOnBehalfOfOtherIdentity, ms-Mcs-AdmPwdExpirationTime, msLAPS-PasswordExpirationTime, objectSid]
+      key: sAMAccountName
+      name: dNSHostName
+    each:
+      any:
+        - { field: msDS-SupportedEncryptionTypes, op: flag, value: 1 }
+        - { field: msDS-SupportedEncryptionTypes, op: flag, value: 2 }
+    evidence: "{dNSHostName} - msDS-SupportedEncryptionTypes {msDS-SupportedEncryptionTypes}"
+
+  - id: AD-COMP-DES-ONLY
+    title: Computer account limited to DES Kerberos keys
+    category: AUT
+    severity: high
+    entity: computer
+    why: USE_DES_KEY_ONLY restricts the account to an algorithm current Windows has disabled, so it either fails to authenticate or forces the weakest tickets. AD-USER-DES-ONLY covers user accounts.
+    fix: Clear USE_DES_KEY_ONLY on the computer account, allow AES and let the machine password rotate.
+    refs: [NIST-800-53:SC-13, PingCastle:S-DesEnabled]
+    query:
+      protocol: ldap
+      filter: '(&{COMPUTER}{ENABLED})'
+      attributes: [sAMAccountName, dNSHostName, operatingSystem, operatingSystemVersion, lastLogonTimestamp, userAccountControl, pwdLastSet, whenCreated, adminCount, servicePrincipalName, msDS-SupportedEncryptionTypes, msDS-AllowedToDelegateTo, msDS-AllowedToActOnBehalfOfOtherIdentity, ms-Mcs-AdmPwdExpirationTime, msLAPS-PasswordExpirationTime, objectSid]
+      key: sAMAccountName
+      name: dNSHostName
+    each: { field: userAccountControl, op: flag, value: 2097152 }
+    evidence: "{dNSHostName} - USE_DES_KEY_ONLY set"
+
+  - id: AD-COMP-NO-PREAUTH
+    title: Computer account that does not require Kerberos pre-authentication
+    category: AUT
+    severity: high
+    entity: computer
+    why: Without pre-authentication the domain controller answers anyone who asks with data protected by the account's key, which lets that key be guessed offline. Computer accounts never need the exception. AD-USER-ASREP-ROASTABLE covers user accounts.
+    fix: Clear "do not require Kerberos preauthentication" (DONT_REQ_PREAUTH) on the computer account.
+    refs: [NIST-800-53:IA-2, MITRE-ATTACK:T1558.004, PingCastle:S-NoPreAuth]
+    query:
+      protocol: ldap
+      filter: '(&{COMPUTER}{ENABLED})'
+      attributes: [sAMAccountName, dNSHostName, operatingSystem, operatingSystemVersion, lastLogonTimestamp, userAccountControl, pwdLastSet, whenCreated, adminCount, servicePrincipalName, msDS-SupportedEncryptionTypes, msDS-AllowedToDelegateTo, msDS-AllowedToActOnBehalfOfOtherIdentity, ms-Mcs-AdmPwdExpirationTime, msLAPS-PasswordExpirationTime, objectSid]
+      key: sAMAccountName
+      name: dNSHostName
+    each: { field: userAccountControl, op: flag, value: 4194304 }
+    evidence: "{dNSHostName} - DONT_REQ_PREAUTH set"
+
+  - id: AD-DOM-LOGON-SYNC-INTERVAL
+    title: Last-logon timestamp is updated less often than the default
+    lens: both
+    category: MON
+    severity: medium
+    entity: domain
+    why: lastLogonTimestamp is what every stale-account rule reads. With msDS-LogonTimeSyncInterval above the 14-day default it is refreshed less often, so active accounts look idle and the account-hygiene results become unreliable. Unset means the 14-day default and passes; other non-default values are not judged.
+    fix: Clear msDS-LogonTimeSyncInterval on the domain object (or set it to 14 or less) and allow a full interval before trusting stale-account results again.
+    refs: [NIST-800-53:AC-2(3), NIST-800-53:AU-12]
+    refresh: 7d
+    query:
+      protocol: ldap
+      scope: base
+      filter: '(objectClass=domainDNS)'
+      attributes: [name, minPwdLength, pwdHistoryLength, pwdProperties, lockoutThreshold, ms-DS-MachineAccountQuota, msDS-Behavior-Version, gPLink, maxPwdAge, minPwdAge, wellKnownObjects, lockoutDuration, msDS-LogonTimeSyncInterval]
+      key: distinguishedName
+      name: name
+    each:
+      all:
+        - { field: msDS-LogonTimeSyncInterval, op: exists }
+        - { field: msDS-LogonTimeSyncInterval, op: gt, value: 14, threshold: ad.logon-sync-interval-max-days }
+    evidence: "{name} - msDS-LogonTimeSyncInterval {msDS-LogonTimeSyncInterval} days"
+
+  - id: AD-DOM-LOCKOUT-ADMIN-UNLOCK
+    title: Locked-out accounts stay locked until an administrator unlocks them
+    lens: both
+    category: AVL
+    severity: low
+    entity: domain
+    why: With the lockout duration set to "until unlocked", a burst of bad passwords against many accounts - from a misconfigured service or a hostile source - locks people out until the helpdesk frees each one by hand.
+    fix: Set a lockout duration of about 15 minutes in the root-linked password policy so locked accounts recover on their own while guessing stays slow.
+    refs: [NIST-800-53:AC-7]
+    refresh: 7d
+    query:
+      protocol: ldap
+      scope: base
+      filter: '(objectClass=domainDNS)'
+      attributes: [name, minPwdLength, pwdHistoryLength, pwdProperties, lockoutThreshold, ms-DS-MachineAccountQuota, msDS-Behavior-Version, gPLink, maxPwdAge, minPwdAge, wellKnownObjects, lockoutDuration, msDS-LogonTimeSyncInterval]
+      key: distinguishedName
+      name: name
+    each:
+      all:
+        - { field: lockoutThreshold, op: gt, value: 0 }
+        - { field: lockoutDuration, op: eq, value: never }
+    evidence: "{name} - lockoutThreshold {lockoutThreshold}, lockoutDuration {lockoutDuration}"
+
+  # ---------------------------------------------------------------- privileged and builtin groups (gaps)
+
+  - id: AD-GROUP-ADMINISTRATORS-SIZE
+    title: Builtin Administrators holds more enabled accounts than expected
+    category: IAM
+    severity: high
+    entity: group
+    why: Every enabled account that is a member of the domain's Administrators group, directly or through Domain Admins, Enterprise Admins or any other nested group, has full control of every domain controller. The number should be small and known; AD-GROUP-DOMAIN-ADMINS-SIZE counts Domain Admins alone.
+    fix: Remove standing members who do not need domain-controller-level rights. The default of 10 is only a starting point; set ad.administrators-max to the number the estate has agreed. Nested members are counted.
+    refs: [NIST-800-53:AC-6(5), CIS-Controls-v8:5.4, PingCastle:P-AdminNum]
+    query:
+      protocol: ldap
+      filter: '(&{USER}{ENABLED}(memberOf:1.2.840.113556.1.4.1941:=CN=Administrators,CN=Builtin,{DOMAINDN}))'
+      attributes: [sAMAccountName, displayName]
+      key: sAMAccountName
+      name: displayName
+    count: { op: gt, value: 10, threshold: ad.administrators-max }
+    evidence: "{count} enabled accounts in Administrators (nested included): {sample}"
+
+  - id: AD-GROUP-DC-REMOTE-ACCESS-MEMBERS
+    title: Builtin group that grants remote access to domain controllers has members
+    category: IAM
+    severity: medium
+    entity: group
+    why: Builtin groups apply to every domain controller. Members of Remote Desktop Users, Remote Management Users and Distributed COM Users can reach the DCs remotely, which widens the set of people who can sign in to tier-0 servers. The groups are empty by default; broad principals in them are reported by AD-GROUP-BUILTIN-BROAD-MEMBER.
+    fix: Empty the groups and give administrators remote access to domain controllers through a dedicated, reviewed tier-0 group.
+    refs: [NIST-800-53:AC-17, NIST-800-53:AC-6(5), CIS-Controls-v8:5.4]
+    query:
+      protocol: ldap
+      filter: '(|(objectSid=S-1-5-32-555)(objectSid=S-1-5-32-580)(objectSid=S-1-5-32-562))'
+      attributes: [cn, member]
+      key: cn
+    each: { field: member, op: notempty }
+    evidence: "{cn} members - {member}"
+
+  - id: AD-GROUP-DC-FEATURE-ADMIN-MEMBERS
+    title: Builtin group that administers a domain controller feature has members
+    category: IAM
+    severity: medium
+    entity: group
+    why: Network Configuration Operators, Cryptographic Operators, Hyper-V Administrators and Storage Replica Administrators each control part of every domain controller (network settings, cryptographic operations, virtual machines, replicated storage). Membership is rarely reviewed, yet it reaches tier-0 servers. The groups are empty by default.
+    fix: Empty the groups unless a documented task on the domain controllers needs them, and record the members that stay.
+    refs: [NIST-800-53:AC-6(5), CIS-Controls-v8:5.4]
+    query:
+      protocol: ldap
+      filter: '(|(objectSid=S-1-5-32-556)(objectSid=S-1-5-32-569)(objectSid=S-1-5-32-578)(objectSid=S-1-5-32-582))'
+      attributes: [cn, member]
+      key: cn
+    each: { field: member, op: notempty }
+    evidence: "{cn} members - {member}"
+
+  - id: AD-GROUP-DC-LOG-READERS-MEMBERS
+    title: Builtin group that reads domain controller logs or performance data has members
+    lens: both
+    category: IAM
+    severity: low
+    entity: group
+    why: Event Log Readers and Performance Log Users apply to every domain controller, so their members read DC event logs and performance data, which reveal account names, logon sources and activity patterns. Monitoring products sometimes need this; individual users rarely do.
+    fix: Keep only the monitoring service accounts that need the access and record them; remove everyone else.
+    refs: [NIST-800-53:AC-6, NIST-800-53:AU-9]
+    query:
+      protocol: ldap
+      filter: '(|(objectSid=S-1-5-32-573)(objectSid=S-1-5-32-559))'
+      attributes: [cn, member]
+      key: cn
+    each: { field: member, op: notempty }
+    evidence: "{cn} members - {member}"
+
+  - id: AD-GROUP-TRUST-BUILDERS-MEMBERS
+    title: Incoming Forest Trust Builders has members
+    category: IAM
+    severity: medium
+    entity: group
+    why: Members of Incoming Forest Trust Builders can create incoming one-way forest trusts to this forest, which opens a new authentication path without a forest administrator. The group is empty by default.
+    fix: Empty the group and create trusts only as a planned change by the forest administrators.
+    refs: [NIST-800-53:AC-20, NIST-800-53:AC-6(5)]
+    query:
+      protocol: ldap
+      filter: '(objectSid=S-1-5-32-557)'
+      attributes: [cn, member]
+      key: cn
+    each: { field: member, op: notempty }
+    evidence: "{cn} members - {member}"
+
+  - id: AD-GROUP-CERT-PUBLISHERS-USERS
+    title: Cert Publishers has user accounts as members
+    category: IAM
+    severity: medium
+    entity: group
+    why: Cert Publishers is meant for certification authority computers; its members can publish certificates to user objects and to the PKI containers in the directory. A user account in it holds PKI rights nobody intended.
+    fix: Remove user accounts from Cert Publishers and keep only the enterprise CA computer accounts. Nested members are counted.
+    refs: [NIST-800-53:AC-6, NIST-800-53:SC-17]
+    query:
+      protocol: ldap
+      filter: '(&{USER}(memberOf:1.2.840.113556.1.4.1941:=CN=Cert Publishers,CN=Users,{DOMAINDN}))'
+      attributes: [sAMAccountName, displayName]
+      key: sAMAccountName
+      name: displayName
+    count: { op: gt, value: 0, threshold: ad.cert-publishers-users-max }
+    evidence: "{count} user accounts in Cert Publishers (nested included): {sample}"
+
+  - id: AD-GROUP-EXCHANGE-PERMISSIONS-USERS
+    title: User accounts in an Exchange permission group that can change domain permissions
+    category: IAM
+    severity: high
+    entity: group
+    why: Exchange Windows Permissions and Exchange Trusted Subsystem hold broad write rights over the domain, in older Exchange deployments including the right to change the domain object's permissions. They should contain only Exchange servers; a user account in them holds those rights directly. No rows where Exchange was never installed.
+    fix: Remove user accounts from both groups, apply the current Exchange permission hardening (Exchange split permissions or the published permission fixes), and keep membership to the Exchange server computers.
+    refs: [NIST-800-53:AC-6(5), MITRE-ATTACK:T1222.001, PingCastle:P-ExchangePrivEsc]
+    query:
+      protocol: ldap
+      filter: '(&{USER}(|(memberOf:1.2.840.113556.1.4.1941:=CN=Exchange Windows Permissions,OU=Microsoft Exchange Security Groups,{ROOTDN})(memberOf:1.2.840.113556.1.4.1941:=CN=Exchange Trusted Subsystem,OU=Microsoft Exchange Security Groups,{ROOTDN})))'
+      attributes: [sAMAccountName, displayName]
+      key: sAMAccountName
+      name: displayName
+    count: { op: gt, value: 0, threshold: ad.exchange-permission-users-max }
+    evidence: "{count} user accounts in the Exchange permission groups (nested included): {sample}"
+
+  - id: AD-RODC-ALLOWED-GROUP-MEMBERS
+    title: Allowed RODC Password Replication Group has members
+    category: IAM
+    severity: medium
+    entity: group
+    why: Members of this domain-wide group may have their passwords cached on every read-only DC, so a single stolen branch-office DC gives up all of them. Per-site groups on each RODC's own allow list are the intended design; the domain-wide group is empty by default. It matters mainly where read-only DCs exist.
+    fix: Empty the group and allow password caching through a site-specific group on each read-only DC instead.
+    refs: [NIST-800-53:AC-6, NIST-800-53:PE-3, PingCastle:P-RODCAllowedGroup]
+    refresh: 7d
+    query:
+      protocol: ldap
+      base: 'CN=Allowed RODC Password Replication Group,CN=Users,{DOMAINDN}'
+      scope: base
+      filter: '(objectClass=group)'
+      attributes: [cn, member]
+      key: cn
+    each: { field: member, op: notempty }
+    evidence: "{cn} members - {member}"
+
+  - id: AD-RODC-DENIED-GROUP-INCOMPLETE
+    title: Denied RODC Password Replication Group lost a default member
+    category: IAM
+    severity: low
+    entity: group
+    why: The group keeps the passwords of administrators, domain controllers and krbtgt from ever being cached on a read-only DC. With Domain Admins, Enterprise Admins, Schema Admins, Domain Controllers or krbtgt removed from it, those secrets can be cached if an allow list ever covers them. It matters most where read-only DCs exist.
+    fix: Add the missing defaults back (Cert Publishers, Domain Admins, Domain Controllers, Enterprise Admins, Group Policy Creator Owners, Read-only Domain Controllers, Schema Admins and krbtgt).
+    refs: [NIST-800-53:AC-6, PingCastle:P-RODCDeniedGroup]
+    refresh: 7d
+    query:
+      protocol: ldap
+      base: 'CN=Denied RODC Password Replication Group,CN=Users,{DOMAINDN}'
+      scope: base
+      filter: '(objectClass=group)'
+      attributes: [cn, member]
+      key: cn
+    each:
+      any:
+        - { field: member, op: absent }
+        - not: { field: member, op: match, value: '^CN=Domain Admins,' }
+        - not: { field: member, op: match, value: '^CN=Domain Controllers,' }
+        - not: { field: member, op: match, value: '^CN=krbtgt,' }
+    evidence: "{cn} members - '{member}'"
+
+  - id: AD-PRIV-LOCKED-OUT-RECENTLY
+    title: Privileged account locked out in the last day
+    category: MON
+    severity: medium
+    entity: user
+    why: An administrator account that locks out has had repeated wrong passwords - a stale credential stored on some host, or someone guessing at the account. Either one deserves a look the same day. The query reads lockouts of the last 7 days, so ad.privileged-lockout-window-days above 7 has no effect.
+    fix: Find the source in the lockout events on the PDC emulator; remove the stored credential if it is a service, or block the source and change the password if nobody recognises it.
+    refs: [NIST-800-53:AC-7, NIST-800-53:SI-4, MITRE-ATTACK:T1110]
+    query:
+      protocol: ldap
+      filter: '(&{USER}{ENABLED}(adminCount=1)(lockoutTime>={FT:7}))'
+      attributes: [sAMAccountName, displayName, lockoutTime]
+      key: sAMAccountName
+      name: displayName
+    each: { field: lockoutTime, op: age-lt, value: 1, threshold: ad.privileged-lockout-window-days }
+    evidence: "{sAMAccountName} - locked out {lockoutTime}"
+
+  # ---------------------------------------------------------------- object permissions (gaps)
+
+  # Directory servers store "full control" and "write all properties" as their component rights
+  # (WriteDacl, WriteOwner, WriteProperty...) rather than as the generic bits, so the rules below match
+  # those rights. Tier-0 here means the builtin Administrators, Domain Admins, Enterprise Admins and
+  # SYSTEM; a legitimate delegated principal goes in ad.acl-trusted-writers so it is expected.
+
+  - id: AD-ACL-DOMAIN-WRITE-ALL-PROPERTIES
+    title: Write access to every attribute of the domain object held outside tier 0
+    category: IAM
+    severity: high
+    entity: domain
+    why: Write access to all attributes of the domain object lets the holder change domain-wide settings such as the machine account quota, linked policies and lockout values. By default only the directory administrators hold it. Full control and permission changes are reported by AD-ACL-DOMAIN-DANGEROUS-ACE.
+    fix: Remove the permission from the principal, delegate only the specific attribute that is needed, and record a legitimate holder in ad.acl-trusted-writers.
+    refs: [NIST-800-53:AC-6, NIST-800-53:AC-3, MITRE-ATTACK:T1222.001]
+    refresh: 7d
+    query:
+      protocol: ldap
+      scope: base
+      filter: '(objectClass=domainDNS)'
+      attributes: [name, nTSecurityDescriptor]
+      key: distinguishedName
+      name: name
+    each:
+      element:
+        of: nTSecurityDescriptor.dacl
+        match: any
+        where:
+          all:
+            - { field: type, op: in, value: [allow, allow-object] }
+            - { field: objectType, op: absent }
+            - { field: inheritOnly, op: eq, value: false }
+            - { field: rights, op: contains, value: WriteProperty }
+            - { field: trustee, op: sid-notin, value: [builtin-administrators, domain-admins, enterprise-admins, local-system, enterprise-domain-controllers, domain-controllers, self] }
+            - { field: trustee, op: sid-notin, value: [], threshold: ad.acl-trusted-writers }
+    evidence: "{name} - write access to all attributes of the domain object is held outside tier 0"
+
+  - id: AD-ACL-DOMAIN-GPLINK-WRITE
+    title: Permission to link Group Policy at the domain root held outside tier 0
+    category: IAM
+    severity: high
+    entity: domain
+    why: Whoever can write gPLink on the domain object can link any Group Policy object to the whole domain, which changes settings on every computer and user. An inheritable entry also reaches the gPLink of every OU below.
+    fix: Remove the gPLink permission from the principal at the domain root, delegate policy linking on specific OUs to a reviewed group, and record a legitimate holder in ad.acl-trusted-writers.
+    refs: [NIST-800-53:AC-6, NIST-800-53:CM-5, MITRE-ATTACK:T1484.001]
+    refresh: 7d
+    query:
+      protocol: ldap
+      scope: base
+      filter: '(objectClass=domainDNS)'
+      attributes: [name, nTSecurityDescriptor]
+      key: distinguishedName
+      name: name
+    each:
+      element:
+        of: nTSecurityDescriptor.dacl
+        match: any
+        where:
+          all:
+            - { field: type, op: in, value: [allow, allow-object] }
+            - { field: objectTypeName, op: eq, value: gPLink }
+            - { field: rights, op: contains, value: WriteProperty }
+            - { field: trustee, op: sid-notin, value: [builtin-administrators, domain-admins, enterprise-admins, local-system] }
+            - { field: trustee, op: sid-notin, value: [], threshold: ad.acl-trusted-writers }
+    evidence: "{name} - permission to write gPLink on the domain object is held outside tier 0"
+
+  - id: AD-ACL-DOMAIN-KEYCRED-WRITE
+    title: Permission to write alternate logon keys across the domain held outside the key-admin groups
+    category: IAM
+    severity: critical
+    entity: domain
+    why: Write access to msDS-KeyCredentialLink granted at the domain object is inherited by user and computer accounts throughout the domain, and lets the holder register a logon key for those accounts and sign in as them. By default only Key Admins, Enterprise Key Admins and the directory administrators hold it.
+    fix: Remove the permission from the principal; Windows Hello for Business and device registration need only the default key-admin entries. Record a legitimate holder in ad.acl-trusted-writers.
+    refs: [NIST-800-53:AC-6, NIST-800-53:IA-5, MITRE-ATTACK:T1098]
+    refresh: 7d
+    query:
+      protocol: ldap
+      scope: base
+      filter: '(objectClass=domainDNS)'
+      attributes: [name, nTSecurityDescriptor]
+      key: distinguishedName
+      name: name
+    each:
+      element:
+        of: nTSecurityDescriptor.dacl
+        match: any
+        where:
+          all:
+            - { field: type, op: in, value: [allow, allow-object] }
+            - { field: objectTypeName, op: eq, value: msDS-KeyCredentialLink }
+            - { field: rights, op: contains, value: WriteProperty }
+            - { field: trustee, op: sid-notin, value: [builtin-administrators, domain-admins, enterprise-admins, local-system, key-admins, enterprise-key-admins, self] }
+            - { field: trustee, op: sid-notin, value: [], threshold: ad.acl-trusted-writers }
+    evidence: "{name} - write access to msDS-KeyCredentialLink is granted at the domain object outside the key-admin groups"
+
+  - id: AD-ACL-DOMAIN-ACCOUNT-ATTR-WRITE
+    title: Permission to change delegation, SPN or account-control attributes across the domain held outside tier 0
+    category: IAM
+    severity: high
+    entity: domain
+    why: Write access granted at the domain object to msDS-AllowedToActOnBehalfOfOtherIdentity, servicePrincipalName or userAccountControl is inherited by accounts throughout the domain. These attributes decide who may delegate to a computer, which accounts have service tickets, and whether pre-authentication and delegation flags apply, so the holder can weaken any account below. Directory synchronisation accounts and Exchange permission groups commonly hold some of these rights by design.
+    fix: Remove the permission from the principal at the domain root and delegate these attributes, where truly needed, only on the OU that holds the accounts concerned. Put the SID of a legitimate holder - typically the directory synchronisation account - in ad.acl-trusted-writers.
+    refs: [NIST-800-53:AC-6, MITRE-ATTACK:T1222.001, MITRE-ATTACK:T1558]
+    refresh: 7d
+    query:
+      protocol: ldap
+      scope: base
+      filter: '(objectClass=domainDNS)'
+      attributes: [name, nTSecurityDescriptor]
+      key: distinguishedName
+      name: name
+    each:
+      element:
+        of: nTSecurityDescriptor.dacl
+        match: any
+        where:
+          all:
+            - { field: type, op: in, value: [allow, allow-object] }
+            - { field: objectTypeName, op: in, value: [msDS-AllowedToActOnBehalfOfOtherIdentity, servicePrincipalName, userAccountControl] }
+            - { field: rights, op: contains, value: WriteProperty }
+            - { field: trustee, op: sid-notin, value: [builtin-administrators, domain-admins, enterprise-admins, local-system, self] }
+            - { field: trustee, op: sid-notin, value: [], threshold: ad.acl-trusted-writers }
+    evidence: "{name} - write access to a delegation, SPN or account-control attribute is granted at the domain object outside tier 0"
+
+  - id: AD-ACL-DOMAIN-RESET-OR-MEMBERSHIP
+    title: Password-reset or group-membership rights across the domain held outside tier 0
+    category: IAM
+    severity: high
+    entity: domain
+    why: The reset-password right or write access to group membership granted at the domain object is inherited by every user and group below it, so the holder can take over any account or join any group that is not protected separately. Helpdesk delegations belong on the OUs that hold ordinary users. Directory synchronisation accounts with password writeback, and Exchange permission groups, commonly hold these rights at the root by design.
+    fix: Remove the permission at the domain root and delegate password resets and membership changes on specific OUs to reviewed groups. Put the SID of a legitimate holder - typically the synchronisation account used for password writeback - in ad.acl-trusted-writers.
+    refs: [NIST-800-53:AC-6, NIST-800-53:AC-2, MITRE-ATTACK:T1098]
+    refresh: 7d
+    query:
+      protocol: ldap
+      scope: base
+      filter: '(objectClass=domainDNS)'
+      attributes: [name, nTSecurityDescriptor]
+      key: distinguishedName
+      name: name
+    each:
+      element:
+        of: nTSecurityDescriptor.dacl
+        match: any
+        where:
+          all:
+            - { field: type, op: in, value: [allow, allow-object] }
+            - any:
+                - all:
+                    - { field: objectTypeName, op: eq, value: User-Force-Change-Password }
+                    - { field: rights, op: contains, value: ExtendedRight }
+                - all:
+                    - { field: objectTypeName, op: eq, value: member }
+                    - { field: rights, op: contains, value: WriteProperty }
+            - { field: trustee, op: sid-notin, value: [builtin-administrators, domain-admins, enterprise-admins, local-system] }
+            - { field: trustee, op: sid-notin, value: [], threshold: ad.acl-trusted-writers }
+    evidence: "{name} - reset-password or membership rights are granted at the domain object outside tier 0"
+
+  - id: AD-ADMINSDHOLDER-TAKEOVER-RIGHT
+    title: AdminSDHolder grants a non-administrator write or reset rights over protected accounts
+    category: IAM
+    severity: critical
+    entity: domain
+    why: The AdminSDHolder permissions are copied every hour onto every protected account and group. An entry there letting a non-administrator write all attributes, reset passwords, change membership or write logon keys, SPNs, delegation or account flags gives that principal control of every administrator. AD-ADMINSDHOLDER-DANGEROUS-ACE covers full control and permission changes.
+    fix: Remove the entry from AdminSDHolder; the change reaches the protected objects at the next protection cycle. Record a legitimate holder in ad.acl-trusted-writers and review how the entry was added.
+    refs: [NIST-800-53:AC-6, NIST-800-53:AU-12, MITRE-ATTACK:T1098]
+    refresh: 7d
+    query:
+      protocol: ldap
+      base: 'CN=AdminSDHolder,CN=System,{DOMAINDN}'
+      scope: base
+      filter: '(objectClass=container)'
+      attributes: [cn, nTSecurityDescriptor]
+      key: distinguishedName
+      name: cn
+    each:
+      element:
+        of: nTSecurityDescriptor.dacl
+        match: any
+        where:
+          all:
+            - { field: type, op: in, value: [allow, allow-object] }
+            - any:
+                - all:
+                    - { field: objectType, op: absent }
+                    - { field: rights, op: contains, value: WriteProperty }
+                - all:
+                    - { field: objectTypeName, op: eq, value: User-Force-Change-Password }
+                    - { field: rights, op: contains, value: ExtendedRight }
+                - all:
+                    - { field: objectTypeName, op: in, value: [member, msDS-KeyCredentialLink, servicePrincipalName, msDS-AllowedToActOnBehalfOfOtherIdentity, userAccountControl] }
+                    - any:
+                        - { field: rights, op: contains, value: WriteProperty }
+                        - { field: rights, op: contains, value: Self }
+            - { field: trustee, op: sid-notin, value: [builtin-administrators, domain-admins, enterprise-admins, local-system, self] }
+            - { field: trustee, op: sid-notin, value: [], threshold: ad.acl-trusted-writers }
+    evidence: "{cn} - a non-administrator holds write or reset rights that are copied to every protected account"
+
+  - id: AD-OU-ACL-BROAD-WRITE
+    title: Organisational unit grants write rights to everyone or every user
+    category: IAM
+    severity: high
+    entity: domain
+    why: An explicit entry on an OU giving Everyone, Authenticated Users, Domain Users, Domain Computers, Users or Anonymous the right to write, create, delete or reset passwords lets any account change the objects in that OU, and through them the people and computers they belong to. Inherited entries are left to the rule on the parent.
+    fix: Remove the entry and grant the task to a specific, reviewed group on the OU.
+    refs: [NIST-800-53:AC-6, NIST-800-53:AC-3, MITRE-ATTACK:T1222.001]
+    refresh: 7d
+    query:
+      protocol: ldap
+      filter: '(objectClass=organizationalUnit)'
+      attributes: [ou, nTSecurityDescriptor]
+      key: distinguishedName
+      name: ou
+    each:
+      element:
+        of: nTSecurityDescriptor.dacl
+        match: any
+        where:
+          all:
+            - { field: type, op: in, value: [allow, allow-object] }
+            - { field: inheritOnly, op: ne, value: true }
+            - { field: inherited, op: eq, value: false }
+            - { field: trustee, op: sid-in, value: [everyone, anonymous, authenticated-users, domain-users, domain-computers, builtin-users] }
+            - any:
+                - { field: rights, op: contains, value: GenericAll }
+                - { field: rights, op: contains, value: GenericWrite }
+                - { field: rights, op: contains, value: WriteDacl }
+                - { field: rights, op: contains, value: WriteOwner }
+                - { field: rights, op: contains, value: WriteProperty }
+                - { field: rights, op: contains, value: CreateChild }
+                - { field: rights, op: contains, value: DeleteChild }
+                - { field: rights, op: contains, value: DeleteTree }
+                - all:
+                    - { field: rights, op: contains, value: ExtendedRight }
+                    - any:
+                        - { field: objectType, op: absent }
+                        - { field: objectTypeName, op: eq, value: User-Force-Change-Password }
+    evidence: "{distinguishedName} - an explicit entry gives a broad principal write rights"
+
+  - id: AD-OU-ACL-PERMISSION-CHANGE-NONADMIN
+    title: Organisational unit lets a principal outside tier 0 change its permissions
+    lens: both
+    category: IAM
+    severity: medium
+    entity: domain
+    why: WriteDacl or WriteOwner on an OU (both part of full control) lets the holder grant itself any right over everything in the OU, so the delegation is as wide as the OU itself. Delegations of this size should be few and documented. Inherited entries are left to the rule on the parent.
+    fix: Replace full control with the specific rights the delegated task needs, or record the principal in ad.acl-trusted-writers.
+    refs: [NIST-800-53:AC-6, NIST-800-53:AC-6(7)]
+    refresh: 7d
+    query:
+      protocol: ldap
+      filter: '(objectClass=organizationalUnit)'
+      attributes: [ou, nTSecurityDescriptor]
+      key: distinguishedName
+      name: ou
+    each:
+      element:
+        of: nTSecurityDescriptor.dacl
+        match: any
+        where:
+          all:
+            - { field: type, op: in, value: [allow, allow-object] }
+            - { field: inheritOnly, op: ne, value: true }
+            - { field: inherited, op: eq, value: false }
+            - any:
+                - { field: rights, op: contains, value: WriteDacl }
+                - { field: rights, op: contains, value: WriteOwner }
+            - { field: trustee, op: sid-notin, value: [builtin-administrators, domain-admins, enterprise-admins, local-system] }
+            - { field: trustee, op: sid-notin, value: [], threshold: ad.acl-trusted-writers }
+    evidence: "{distinguishedName} - an explicit entry lets a principal outside tier 0 change the OU's permissions"
+
+  - id: AD-DC-OWNER-NONADMIN
+    title: Domain controller computer object owned by a principal outside tier 0
+    category: IAM
+    severity: high
+    entity: computer
+    why: The owner of a domain controller's computer object can always rewrite its permissions, and control of that object is control of the domain controller. Pre-staged accounts often keep the user who created them as owner.
+    fix: Reset the owner to Domain Admins, and record a legitimate owner in ad.acl-trusted-writers.
+    refs: [NIST-800-53:AC-6, PingCastle:P-DCOwner]
+    refresh: 7d
+    query:
+      protocol: ldap
+      filter: '(&{COMPUTER}(|{UAC:8192}{UAC:67108864}))'
+      attributes: [sAMAccountName, dNSHostName, userAccountControl, nTSecurityDescriptor]
+      key: sAMAccountName
+      name: dNSHostName
+    each:
+      all:
+        - { field: nTSecurityDescriptor.owner, op: sid-notin, value: [builtin-administrators, domain-admins, enterprise-admins, local-system] }
+        - { field: nTSecurityDescriptor.owner, op: sid-notin, value: [], threshold: ad.acl-trusted-writers }
+    evidence: "{dNSHostName} - owner {nTSecurityDescriptor.owner}"
+
+  - id: AD-DC-ACL-DANGEROUS
+    title: Domain controller computer object writable by a principal outside tier 0
+    category: IAM
+    severity: critical
+    entity: computer
+    why: Full control, permission changes, write access to all attributes, or write access to the delegation, logon-key, SPN or account-control attributes of a domain controller's computer object lets the holder take over that DC. Only the directory administrators and the system's own default entries should hold such rights.
+    fix: Domain controller objects are usually protected by AdminSDHolder, so an entry made directly on the object is reset within the hour unless it comes from AdminSDHolder itself - check AD-ADMINSDHOLDER-TAKEOVER-RIGHT first, then remove the entry where it is defined (the DC object, the Domain Controllers OU or AdminSDHolder). Record a legitimate holder in ad.acl-trusted-writers.
+    refs: [NIST-800-53:AC-6, NIST-800-53:AC-3, MITRE-ATTACK:T1222.001]
+    refresh: 7d
+    query:
+      protocol: ldap
+      filter: '(&{COMPUTER}(|{UAC:8192}{UAC:67108864}))'
+      attributes: [sAMAccountName, dNSHostName, userAccountControl, nTSecurityDescriptor]
+      key: sAMAccountName
+      name: dNSHostName
+    each:
+      element:
+        of: nTSecurityDescriptor.dacl
+        match: any
+        where:
+          all:
+            - { field: type, op: in, value: [allow, allow-object] }
+            - { field: inheritOnly, op: ne, value: true }
+            - any:
+                - { field: rights, op: contains, value: GenericAll }
+                - { field: rights, op: contains, value: GenericWrite }
+                - { field: rights, op: contains, value: WriteDacl }
+                - { field: rights, op: contains, value: WriteOwner }
+                - all:
+                    - { field: objectType, op: absent }
+                    - { field: rights, op: contains, value: WriteProperty }
+                - all:
+                    - { field: objectTypeName, op: in, value: [msDS-KeyCredentialLink, msDS-AllowedToActOnBehalfOfOtherIdentity, servicePrincipalName, userAccountControl] }
+                    - { field: rights, op: contains, value: WriteProperty }
+            - { field: trustee, op: sid-notin, value: [builtin-administrators, domain-admins, enterprise-admins, local-system, self, creator-owner, enterprise-domain-controllers, domain-controllers, key-admins, enterprise-key-admins, account-operators, S-1-5-32-560, S-1-5-32-561] }
+            - { field: trustee, op: sid-notin, value: [], threshold: ad.acl-trusted-writers }
+    evidence: "{dNSHostName} - a principal outside tier 0 holds write rights over the domain controller object"
+
+  # ---------------------------------------------------------------- trusts and managed service accounts (gaps)
+
+  - id: AD-TRUST-DOWNLEVEL
+    title: Trust of the pre-Active Directory (downlevel) type
+    lens: both
+    category: LCM
+    severity: medium
+    entity: trust
+    why: A downlevel trust is either to a Windows NT-style domain or one created by NetBIOS name only. It supports only older authentication, has no Kerberos and none of the forest trust protections, and usually points at a domain that was retired or never modernised.
+    fix: Confirm the partner domain still exists; remove the trust, or recreate it by DNS name as an Active Directory trust with SID filtering.
+    refs: [NIST-800-53:AC-20, NIST-800-53:SA-22, PingCastle:T-Downlevel]
+    refresh: 7d
+    query:
+      protocol: ldap
+      filter: '(objectClass=trustedDomain)'
+      attributes: [cn, trustPartner, flatName, trustDirection, trustType, trustAttributes, msDS-SupportedEncryptionTypes, whenCreated, whenChanged]
+      key: cn
+      name: trustPartner
+    each: { field: trustType, op: eq, value: 1 }
+    evidence: "{trustPartner} - trustType {trustType}, direction {trustDirection}"
+
+  - id: AD-TRUST-REALM-NO-AES
+    title: Kerberos realm trust without AES encryption
+    category: AUT
+    severity: medium
+    entity: trust
+    why: A trust to a non-Windows Kerberos realm uses the encryption types set on the trust; with none set, or none of them AES, referral tickets use RC4 or DES, both weak. AD-TRUST-NO-AES covers Active Directory trusts.
+    fix: Set AES encryption types on the realm trust (on both sides) and retire DES and RC4 keys for it.
+    refs: [NIST-800-53:SC-13, NIST-800-53:AC-20]
+    refresh: 7d
+    query:
+      protocol: ldap
+      filter: '(objectClass=trustedDomain)'
+      attributes: [cn, trustPartner, flatName, trustDirection, trustType, trustAttributes, msDS-SupportedEncryptionTypes, whenCreated, whenChanged]
+      key: cn
+      name: trustPartner
+    each:
+      all:
+        - { field: trustType, op: eq, value: 3 }
+        - any:
+            - { field: msDS-SupportedEncryptionTypes, op: absent }
+            - all:
+                - { field: msDS-SupportedEncryptionTypes, op: noflag, value: 8 }
+                - { field: msDS-SupportedEncryptionTypes, op: noflag, value: 16 }
+    evidence: "{trustPartner} - realm trust, msDS-SupportedEncryptionTypes '{msDS-SupportedEncryptionTypes}'"
+
+  - id: AD-GMSA-PRIVILEGED
+    title: Managed service account in a protected group
+    category: IAM
+    severity: high
+    entity: user
+    why: A managed service account with adminCount=1 is, or was, in an administrative group, so every host allowed to retrieve its password effectively holds those administrative rights. Services rarely need more than specific delegated permissions.
+    fix: Take the account out of protected groups and grant only the rights the service needs; review which hosts may retrieve its password.
+    refs: [NIST-800-53:AC-6(5), CIS-Controls-v8:5.4]
+    query:
+      protocol: ldap
+      filter: '(|(objectClass=msDS-GroupManagedServiceAccount)(objectClass=msDS-ManagedServiceAccount))'
+      attributes: [sAMAccountName, lastLogonTimestamp, whenCreated, userAccountControl, msDS-ManagedPasswordInterval, servicePrincipalName, adminCount, memberOf, msDS-AllowedToDelegateTo, msDS-SupportedEncryptionTypes]
+      key: sAMAccountName
+    each: { field: adminCount, op: eq, value: 1 }
+    evidence: "{sAMAccountName} - adminCount=1, member of {memberOf}"
+
+  - id: AD-GMSA-UNCONSTRAINED-DELEGATION
+    title: Managed service account trusted for unconstrained delegation
+    category: AUT
+    severity: critical
+    entity: user
+    why: Users who authenticate to a service running as this account hand it reusable tickets, so control of any host that runs the service means the ability to act as those users anywhere. The user and computer delegation rules do not read managed service accounts.
+    fix: Remove TRUSTED_FOR_DELEGATION and configure constrained or resource-based delegation to the named services that need it.
+    refs: [NIST-800-53:AC-6, MITRE-ATTACK:T1558, PingCastle:P-UnconstrainedDelegation]
+    query:
+      protocol: ldap
+      filter: '(|(objectClass=msDS-GroupManagedServiceAccount)(objectClass=msDS-ManagedServiceAccount))'
+      attributes: [sAMAccountName, lastLogonTimestamp, whenCreated, userAccountControl, msDS-ManagedPasswordInterval, servicePrincipalName, adminCount, memberOf, msDS-AllowedToDelegateTo, msDS-SupportedEncryptionTypes]
+      key: sAMAccountName
+    each: { field: userAccountControl, op: flag, value: 524288 }
+    evidence: "{sAMAccountName} - TRUSTED_FOR_DELEGATION set"
+
+  - id: AD-GMSA-PROTOCOL-TRANSITION
+    title: Managed service account allowed to delegate with protocol transition
+    category: AUT
+    severity: high
+    entity: user
+    why: Protocol transition lets the account obtain tickets as any user to its delegation targets without that user signing in, so the targets are exposed to whoever controls a host running the service.
+    fix: Remove protocol transition unless the design needs it and keep the delegation targets to the minimum.
+    refs: [NIST-800-53:AC-6, MITRE-ATTACK:T1558]
+    query:
+      protocol: ldap
+      filter: '(|(objectClass=msDS-GroupManagedServiceAccount)(objectClass=msDS-ManagedServiceAccount))'
+      attributes: [sAMAccountName, lastLogonTimestamp, whenCreated, userAccountControl, msDS-ManagedPasswordInterval, servicePrincipalName, adminCount, memberOf, msDS-AllowedToDelegateTo, msDS-SupportedEncryptionTypes]
+      key: sAMAccountName
+    each:
+      all:
+        - { field: userAccountControl, op: flag, value: 16777216 }
+        - { field: msDS-AllowedToDelegateTo, op: notempty }
+    evidence: "{sAMAccountName} - protocol transition to {msDS-AllowedToDelegateTo}"
+
+  - id: AD-GMSA-DELEGATION-SENSITIVE-SPN
+    title: Managed service account delegates to a directory or Kerberos service
+    category: AUT
+    severity: high
+    entity: user
+    why: Delegation to ldap, gc or krbtgt services lets the account act as users against the directory itself, which against a domain controller amounts to control of the domain.
+    fix: Remove ldap/, gc/ and krbtgt/ entries from msDS-AllowedToDelegateTo unless a documented design needs them.
+    refs: [NIST-800-53:AC-6, MITRE-ATTACK:T1558]
+    query:
+      protocol: ldap
+      filter: '(|(objectClass=msDS-GroupManagedServiceAccount)(objectClass=msDS-ManagedServiceAccount))'
+      attributes: [sAMAccountName, lastLogonTimestamp, whenCreated, userAccountControl, msDS-ManagedPasswordInterval, servicePrincipalName, adminCount, memberOf, msDS-AllowedToDelegateTo, msDS-SupportedEncryptionTypes]
+      key: sAMAccountName
+    each: { field: msDS-AllowedToDelegateTo, op: match, value: '^(ldap|gc|krbtgt)/' }
+    evidence: "{sAMAccountName} - delegates to {msDS-AllowedToDelegateTo}"
+
+  - id: AD-GMSA-NO-AES
+    title: Managed service account with Kerberos encryption types that exclude AES
+    category: AUT
+    severity: medium
+    entity: user
+    why: An explicit encryption-type value without AES pins the service's tickets to RC4 or DES, both weak, even though its password is long and rotated.
+    fix: Set msDS-SupportedEncryptionTypes on the account to AES only (24) and confirm the hosts using it support AES.
+    refs: [NIST-800-53:SC-13, MS-KB:5021131]
+    query:
+      protocol: ldap
+      filter: '(|(objectClass=msDS-GroupManagedServiceAccount)(objectClass=msDS-ManagedServiceAccount))'
+      attributes: [sAMAccountName, lastLogonTimestamp, whenCreated, userAccountControl, msDS-ManagedPasswordInterval, servicePrincipalName, adminCount, memberOf, msDS-AllowedToDelegateTo, msDS-SupportedEncryptionTypes]
+      key: sAMAccountName
+    each:
+      all:
+        - { field: msDS-SupportedEncryptionTypes, op: gt, value: 0 }
+        - { field: msDS-SupportedEncryptionTypes, op: noflag, value: 8 }
+        - { field: msDS-SupportedEncryptionTypes, op: noflag, value: 16 }
+    evidence: "{sAMAccountName} - msDS-SupportedEncryptionTypes {msDS-SupportedEncryptionTypes}"

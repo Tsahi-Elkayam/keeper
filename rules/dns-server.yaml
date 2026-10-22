@@ -1,0 +1,719 @@
+schema: keeper.rules/1
+system: dns-server
+name: Microsoft DNS - server settings (live, over CIM)
+integration: cim
+
+# The Windows DNS Server role as each server reports it: the legacy DNS WMI provider (root/MicrosoftDNS,
+# classes MicrosoftDNS_Server and MicrosoftDNS_Zone), the DNS service's registry parameters and the DNS
+# Server event log. Targets are domain controllers that logged on
+# within 30 days - where Microsoft DNS almost always runs. A DC that does not run the DNS role answers
+# the WMI reads with an error (unknown, never a pass) and the registry reads with exists = false (n/a).
+# Member servers that run DNS are not targeted; scan them by adding a second integration of this pack.
+# Classes are read with SELECT *, so a property a server version lacks is n/a for its rule instead of
+# failing the whole query. Settings the legacy provider does not expose (response rate limiting, DNSSEC
+# validation, query resolution policies, the audit and analytic channel state) are in docs\backlog\dns.md.
+targets:
+  entity: computer
+  field: dNSHostName
+  where:
+    all:
+      - { field: userAccountControl, op: flag, value: 8192 }
+      - { field: lastLogonTimestamp, op: age-lt, value: 30 }
+defaults:
+  lens: security
+  refresh: 1d
+  entity: dns-server
+rules:
+
+  # ---- service and directory link ---------------------------------------------------------------
+
+  - id: DNS-SRV-SERVICE-DOWN
+    title: DNS Server service is stopped or disabled
+    kind: broken
+    lens: maintenance
+    category: AVL
+    severity: high
+    why: Clients and other domain controllers that list this server first wait for it to time out before trying the next one; logons, Group Policy and replication slow down or fail across its site.
+    fix: Start the service and read the DNS Server log for why it stopped; if the role is no longer wanted here, remove it and take the address out of DHCP and static client settings.
+    refs: [NIST-800-53:SC-22, NIST-800-53:CP-8]
+    query:
+      protocol: cim
+      wql: SELECT Name, State, StartMode FROM Win32_Service WHERE Name = 'DNS'
+      key: host
+    each:
+      any:
+        - { field: State, op: ne, value: Running }
+        - { field: StartMode, op: eq, value: Disabled }
+    evidence: "{host}: DNS service is {State} ({StartMode})"
+
+  - id: DNS-SRV-DS-UNAVAILABLE
+    title: DNS server reports the directory as unavailable
+    kind: broken
+    lens: maintenance
+    category: AVL
+    severity: high
+    why: An AD-integrated DNS server that cannot reach the directory cannot load or update its AD-integrated zones; it answers from a stale copy or not at all, and dynamic registrations are lost.
+    fix: Check the domain controller's own directory service and replication health and the DNS Server log (events 4000-4016), then restart the DNS service.
+    refs: [NIST-800-53:SC-22]
+    query:
+      protocol: cim
+      namespace: root/MicrosoftDNS
+      wql: SELECT * FROM MicrosoftDNS_Server
+      key: host
+    each: { field: DsAvailable, op: eq, value: false }
+    evidence: "{host}: DsAvailable = {DsAvailable}"
+
+  # ---- recursion and forwarding ----------------------------------------------------------------
+
+  - id: DNS-SRV-RECURSION-ON-AUTHORITATIVE
+    title: Recursion enabled on a server meant to be authoritative only
+    kind: misconfigured
+    category: CFG
+    severity: medium
+    why: A server that only publishes zones (for example one reachable from outside, or a dedicated authoritative tier) and still recurses resolves arbitrary names for whoever asks, which opens it to cache poisoning and to use in amplification attacks.
+    fix: Turn recursion off on these servers (DNS Manager, Advanced, Disable recursion) and set threshold.dns.authoritative-only-host-pattern to their names.
+    refs: [NIST-800-53:SC-20, NIST-800-53:SC-21, NIST-800-53:SC-5]
+    query:
+      protocol: cim
+      namespace: root/MicrosoftDNS
+      wql: SELECT * FROM MicrosoftDNS_Server
+      key: host
+    each:
+      all:
+        - { field: host, op: match, value: '^$', threshold: dns.authoritative-only-host-pattern, required: true }
+        - { field: NoRecursion, op: eq, value: false }
+    evidence: "{host}: NoRecursion = {NoRecursion}"
+
+  - id: DNS-SRV-FORWARDERS-NONE
+    title: DNS server resolves external names through root hints only
+    kind: missing
+    lens: both
+    category: CFG
+    severity: low
+    why: Root hints with no forwarders is the Windows default, so this fires on a default install. Without forwarders the domain controller itself queries the internet's root and top-level servers, so DCs need direct outbound DNS, external lookups bypass any filtering resolver the organisation pays for, and resolution depends on the DC's own cache hygiene.
+    fix: Forward to the organisation's approved resolvers (two or more); if root hints are a deliberate design, record the exception.
+    refs: [NIST-800-53:SC-21, NIST-800-53:SC-7]
+    query:
+      protocol: cim
+      namespace: root/MicrosoftDNS
+      wql: SELECT * FROM MicrosoftDNS_Server
+      key: host
+    each:
+      any:
+        - { field: Forwarders, op: absent }
+        - { field: Forwarders, op: empty }
+    evidence: "{host}: no forwarders configured"
+
+  - id: DNS-SRV-FORWARDER-UNAPPROVED
+    title: DNS server forwards to a resolver outside the approved list
+    kind: misconfigured
+    category: CFG
+    severity: medium
+    why: Every external name the organisation looks up goes to the forwarder, which sees the full query stream and can answer anything. A forwarder nobody approved - a public resolver set during troubleshooting, a decommissioned appliance, an ISP default - bypasses filtering and logging and leaks internal names.
+    fix: Set threshold.dns.approved-forwarders to the organisation's resolver addresses (comma-separated) and replace any other forwarder on the server.
+    refs: [NIST-800-53:SC-21, NIST-800-53:SC-7]
+    query:
+      protocol: cim
+      namespace: root/MicrosoftDNS
+      wql: SELECT * FROM MicrosoftDNS_Server
+      key: host
+    each: { field: Forwarders, op: notin, value: [], threshold: dns.approved-forwarders, required: true }
+    evidence: "{host}: forwarders {Forwarders}"
+
+  - id: DNS-SRV-FORWARDER-OUTSIDE-NETWORK
+    title: DNS server forwards straight to an address outside the internal networks
+    kind: misconfigured
+    category: CFG
+    severity: low
+    why: A forwarder outside the organisation's own address space means every external lookup, with the internal names that leak in them, leaves the network from the domain controller itself. That can be a deliberate design (a contracted filtering resolver); often it is a public resolver set by hand.
+    fix: Forward to the internal resolver tier or to the contracted resolvers; set threshold.dns.internal-networks to the organisation's ranges, and list contracted resolvers there too if they are deliberate.
+    refs: [NIST-800-53:SC-7, NIST-800-53:SC-21]
+    query:
+      protocol: cim
+      namespace: root/MicrosoftDNS
+      wql: SELECT * FROM MicrosoftDNS_Server
+      key: host
+    each: { field: Forwarders, op: notin-cidr, value: [10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10, 127.0.0.0/8, 'fc00::/7', '::1/128'], threshold: dns.internal-networks }
+    evidence: "{host}: forwarders {Forwarders}"
+
+  - id: DNS-SRV-FORWARDER-SINGLE
+    title: DNS server has a single forwarder
+    kind: misconfigured
+    lens: maintenance
+    category: AVL
+    severity: low
+    why: With one forwarder, its outage or a slow path to it stops external name resolution for every client of this server (or makes it fall back to root hints, if those are allowed).
+    fix: Add a second approved forwarder.
+    refs: [NIST-800-53:CP-8, NIST-800-53:SC-22]
+    query:
+      protocol: cim
+      namespace: root/MicrosoftDNS
+      wql: SELECT * FROM MicrosoftDNS_Server
+      key: host
+    each: { field: Forwarders, op: size-eq, value: 1 }
+    evidence: "{host}: only forwarder {Forwarders}"
+
+  # ---- cache and response hardening ------------------------------------------------------------
+
+  - id: DNS-SRV-CACHE-POLLUTION-OFF
+    title: Cache pollution protection is off
+    kind: misconfigured
+    category: CFG
+    severity: medium
+    why: Without it the server caches records from a response even when they lie outside the zone the answering server is responsible for, so a malicious or compromised server can plant answers for unrelated names in the cache.
+    fix: Turn on "Secure cache against pollution" (DNS Manager, Advanced).
+    refs: [NIST-800-53:SC-20, NIST-800-53:SC-21, MITRE-ATTACK:T1557]
+    query:
+      protocol: cim
+      namespace: root/MicrosoftDNS
+      wql: SELECT * FROM MicrosoftDNS_Server
+      key: host
+    each: { field: SecureResponses, op: eq, value: false }
+    evidence: "{host}: SecureResponses = {SecureResponses}"
+
+  - id: DNS-SRV-ROUND-ROBIN-OFF
+    title: Round robin is turned off
+    kind: misconfigured
+    lens: maintenance
+    category: AVL
+    severity: low
+    why: With round robin off, every client gets a name's addresses in the same order and lands on the first one, so services published under several addresses do not share load.
+    fix: Turn round robin back on unless an application depends on a fixed order; record that exception.
+    refs: [NIST-800-53:CM-6]
+    query:
+      protocol: cim
+      namespace: root/MicrosoftDNS
+      wql: SELECT * FROM MicrosoftDNS_Server
+      key: host
+    each: { field: RoundRobin, op: eq, value: false }
+    evidence: "{host}: RoundRobin = {RoundRobin}"
+
+  - id: DNS-SRV-EDNS-PROBES-OFF
+    title: EDNS probes are turned off
+    kind: misconfigured
+    lens: maintenance
+    category: CFG
+    severity: low
+    why: This setting controls whether the server puts an EDNS OPT record in the queries it sends. Without it, the server cannot tell the servers it queries that it handles UDP messages larger than 512 bytes, so large answers (DNSSEC-signed ones above all) are truncated and retried over TCP, or fail where TCP 53 is blocked. It is usually turned off to work around an old firewall and then forgotten.
+    fix: Turn EDNS probes back on and fix the device that dropped large UDP DNS packets.
+    refs: [NIST-800-53:CM-6]
+    query:
+      protocol: cim
+      namespace: root/MicrosoftDNS
+      wql: SELECT * FROM MicrosoftDNS_Server
+      key: host
+    each: { field: EnableEDnsProbes, op: eq, value: false }
+    evidence: "{host}: EnableEDnsProbes = {EnableEDnsProbes}"
+
+  # ---- aging and scavenging (server) -----------------------------------------------------------
+
+  - id: DNS-SRV-SCAVENGING-OFF
+    title: DNS server does not scavenge stale records
+    kind: misconfigured
+    lens: maintenance
+    category: HYG
+    severity: low
+    why: >-
+      Aging only marks records; a server with scavenging enabled has to delete them. When no server
+      scavenges, names of retired machines stay forever and point at addresses later reused by other
+      machines. Scavenging is off by default, and one scavenging server per domain (per set of
+      replicated zones) is enough - so this is judged per server: enable it on one and record the others
+      as exceptions. Whether no server of the domain scavenges at all is not judged here (backlog).
+    fix: Enable scavenging (every 7 days is typical) on one DNS server per set of zones, after aging has been on for longer than the no-refresh plus refresh interval.
+    refs: [NIST-800-53:CM-8]
+    refresh: 7d
+    query:
+      protocol: cim
+      namespace: root/MicrosoftDNS
+      wql: SELECT * FROM MicrosoftDNS_Server
+      key: host
+    each: { field: ScavengingInterval, op: eq, value: 0 }
+    evidence: "{host}: ScavengingInterval = 0 (off)"
+
+  # ---- logging ---------------------------------------------------------------------------------
+
+  - id: DNS-SRV-EVENTLOG-LEVEL-LOW
+    title: DNS Server event logging records less than errors and warnings
+    kind: misconfigured
+    lens: both
+    category: LOG
+    severity: medium
+    why: At "no events" or "errors only" the DNS Server log stops recording zone load problems, transfer failures and the warnings that precede outages. The plug-in DLL load notice (event 770) may be logged as informational, which only "All events" keeps, so DNS-EVT-PLUGIN-DLL is reliable only at level 4.
+    fix: Set event logging to "Errors and warnings" or "All events" (DNS Manager, Event Logging).
+    refs: [NIST-800-53:AU-2, NIST-800-53:AU-12]
+    query:
+      protocol: cim
+      namespace: root/MicrosoftDNS
+      wql: SELECT * FROM MicrosoftDNS_Server
+      key: host
+    each: { field: EventLogLevel, op: lt, value: 2 }
+    evidence: "{host}: EventLogLevel = {EventLogLevel} (0 none, 1 errors, 2 errors and warnings, 4 all)"
+
+  - id: DNS-SRV-EVENTLOG-SMALL
+    title: DNS Server event log is too small
+    kind: misconfigured
+    lens: maintenance
+    category: LOG
+    severity: low
+    entity: event-log
+    why: A DNS Server log that was shrunk below its default (about 16 MB) is overwritten quickly on a busy domain controller, so the events that explain a resolution outage or a plug-in load are gone before anyone looks. The default size does not fire; raise the threshold to hold servers to a larger size.
+    fix: Restore the DNS Server log to at least its default size by policy (larger is better where events are not forwarded). The threshold is in bytes.
+    refs: [NIST-800-53:AU-4]
+    query:
+      protocol: cim
+      wql: SELECT LogfileName, MaxFileSize, NumberOfRecords FROM Win32_NTEventlogFile WHERE LogfileName = 'DNS Server'
+      key: "{host}|{LogfileName}"
+    each: { field: MaxFileSize, op: lt, value: 16777216, threshold: dns.eventlog-min-bytes }
+    evidence: "{host}: DNS Server log max size {MaxFileSize} bytes"
+
+  # ---- registry parameters of the DNS service ---------------------------------------------------
+  # One row per host from SYSTEM\CurrentControlSet\Services\DNS\Parameters; a server without the role
+  # reads exists = false and is not judged. A missing value is the Windows default, which is the safe one
+  # for each setting below.
+
+  - id: DNS-REG-PLUGIN-DLL
+    title: DNS service is set to load a plug-in DLL
+    kind: misconfigured
+    category: IAM
+    severity: critical
+    why: ServerLevelPluginDll makes the DNS service load the named DLL as SYSTEM at its next start. Almost no legitimate product uses it; it is the setting a DnsAdmins member writes to take over a domain controller.
+    fix: Treat as a possible compromise - preserve the DLL and the server's logs, remove the value, restart the DNS service, and find who set it (DNS Server log events 150 and 770, directory and registry audit).
+    refs: [NIST-800-53:AC-6(5), NIST-800-53:SI-7, MITRE-ATTACK:T1574.002]
+    query:
+      protocol: registry
+      path: SYSTEM\CurrentControlSet\Services\DNS\Parameters
+      values: [ServerLevelPluginDll, SocketPoolSize, CacheLockingPercent, EnableGlobalQueryBlockList, GlobalQueryBlockList]
+      key: host
+    each:
+      all:
+        - { field: exists, op: eq, value: true }
+        - { field: ServerLevelPluginDll, op: notempty }
+    evidence: "{host}: ServerLevelPluginDll = {ServerLevelPluginDll}"
+
+  - id: DNS-REG-SOCKET-POOL-SMALL
+    title: DNS socket pool is smaller than the default
+    kind: misconfigured
+    category: CFG
+    severity: medium
+    why: The socket pool randomises the source port of outgoing queries, which is what makes forging answers for the cache hard. A smaller pool makes the port easier to guess and cache poisoning more practical.
+    fix: Restore the socket pool to at least 2500 (dnscmd /Config /SocketPoolSize), or remove the value to return to the default.
+    refs: [NIST-800-53:SC-20, NIST-800-53:SC-21]
+    query:
+      protocol: registry
+      path: SYSTEM\CurrentControlSet\Services\DNS\Parameters
+      values: [ServerLevelPluginDll, SocketPoolSize, CacheLockingPercent, EnableGlobalQueryBlockList, GlobalQueryBlockList]
+      key: host
+    each:
+      all:
+        - { field: exists, op: eq, value: true }
+        - { field: SocketPoolSize, op: exists }   # absent = the default pool: a pass, not unknown
+        - { field: SocketPoolSize, op: lt, value: 2500, threshold: dns.socket-pool-min }
+    evidence: "{host}: SocketPoolSize = {SocketPoolSize}"
+
+  - id: DNS-REG-CACHE-LOCKING-LOW
+    title: DNS cache locking is below 100 percent
+    kind: misconfigured
+    category: CFG
+    severity: medium
+    why: Cache locking stops a cached record from being overwritten until that share of its time to live has passed. Below 100 percent, a forged answer can replace a good cached record before it expires.
+    fix: Set cache locking back to 100 percent, or remove the value to return to the default.
+    refs: [NIST-800-53:SC-20, NIST-800-53:SC-21]
+    query:
+      protocol: registry
+      path: SYSTEM\CurrentControlSet\Services\DNS\Parameters
+      values: [ServerLevelPluginDll, SocketPoolSize, CacheLockingPercent, EnableGlobalQueryBlockList, GlobalQueryBlockList]
+      key: host
+    each:
+      all:
+        - { field: exists, op: eq, value: true }
+        - { field: CacheLockingPercent, op: exists }   # absent = the default 100
+        - { field: CacheLockingPercent, op: lt, value: 100, threshold: dns.cache-locking-min }
+    evidence: "{host}: CacheLockingPercent = {CacheLockingPercent}"
+
+  - id: DNS-REG-GQBL-DISABLED
+    title: Global query block list is turned off
+    kind: misconfigured
+    category: CFG
+    severity: medium
+    why: The block list stops the server answering names that are dangerous when anyone can register them - wpad and isatap by default. Turned off, a record anyone created under those names starts steering clients' proxy and tunnel traffic.
+    fix: Turn the global query block list back on (dnscmd /Config /EnableGlobalQueryBlockList 1); if WPAD is used deliberately, remove only wpad from the list.
+    refs: [NIST-800-53:SC-20, MITRE-ATTACK:T1557]
+    query:
+      protocol: registry
+      path: SYSTEM\CurrentControlSet\Services\DNS\Parameters
+      values: [ServerLevelPluginDll, SocketPoolSize, CacheLockingPercent, EnableGlobalQueryBlockList, GlobalQueryBlockList]
+      key: host
+    each:
+      all:
+        - { field: exists, op: eq, value: true }
+        - { field: EnableGlobalQueryBlockList, op: exists }   # absent = on, the default
+        - { field: EnableGlobalQueryBlockList, op: eq, value: 0 }
+    evidence: "{host}: EnableGlobalQueryBlockList = 0"
+
+  - id: DNS-REG-GQBL-NO-WPAD
+    title: Global query block list does not contain wpad
+    kind: misconfigured
+    category: CFG
+    severity: medium
+    why: With wpad off the block list, any account that can create a record named wpad in a zone (by default any authenticated user) becomes the proxy configuration source for browsers that auto-detect, and can intercept their web traffic and authentications.
+    fix: Put wpad back on the list (dnscmd /Config /GlobalQueryBlockList wpad isatap) unless the organisation publishes WPAD by that name; then record the exception and lock down the wpad node.
+    refs: [NIST-800-53:SC-20, MITRE-ATTACK:T1557]
+    query:
+      protocol: registry
+      path: SYSTEM\CurrentControlSet\Services\DNS\Parameters
+      values: [ServerLevelPluginDll, SocketPoolSize, CacheLockingPercent, EnableGlobalQueryBlockList, GlobalQueryBlockList]
+      key: host
+    each:
+      all:
+        - { field: exists, op: eq, value: true }
+        - any:
+            - { field: EnableGlobalQueryBlockList, op: absent }
+            - { field: EnableGlobalQueryBlockList, op: ne, value: 0 }
+        - { field: GlobalQueryBlockList, op: exists }
+        - { field: GlobalQueryBlockList, op: notcontains, value: wpad }
+    evidence: "{host}: GlobalQueryBlockList = {GlobalQueryBlockList}"
+
+  - id: DNS-REG-GQBL-NO-ISATAP
+    title: Global query block list does not contain isatap
+    kind: misconfigured
+    category: CFG
+    severity: low
+    why: With isatap off the block list, a record anyone registered under that name can become the IPv6 tunnel router for Windows clients that still have ISATAP enabled.
+    fix: Put isatap back on the list unless ISATAP is deliberately in use.
+    refs: [NIST-800-53:SC-20, MITRE-ATTACK:T1557]
+    query:
+      protocol: registry
+      path: SYSTEM\CurrentControlSet\Services\DNS\Parameters
+      values: [ServerLevelPluginDll, SocketPoolSize, CacheLockingPercent, EnableGlobalQueryBlockList, GlobalQueryBlockList]
+      key: host
+    each:
+      all:
+        - { field: exists, op: eq, value: true }
+        - any:
+            - { field: EnableGlobalQueryBlockList, op: absent }
+            - { field: EnableGlobalQueryBlockList, op: ne, value: 0 }
+        - { field: GlobalQueryBlockList, op: exists }
+        - { field: GlobalQueryBlockList, op: notcontains, value: isatap }
+    evidence: "{host}: GlobalQueryBlockList = {GlobalQueryBlockList}"
+
+  # ---- DNS Server event log (7-day window) -----------------------------------------------------
+
+  - id: DNS-EVT-PLUGIN-DLL
+    title: DNS service loaded or tried to load a plug-in DLL
+    kind: broken
+    category: MON
+    severity:
+      field: id
+      map: { "770": critical, "150": high }
+      default: high
+    entity: event
+    why: Event 770 says the DNS service loaded a plug-in DLL as SYSTEM; event 150 says it tried and failed. Outside a known product, either one is the trace of DnsAdmins being used to run code on a domain controller. Event 770 may be logged at the informational level, which the server records only when event logging is set to "All events" (DNS-SRV-EVENTLOG-LEVEL-LOW checks for at least errors and warnings); at a lower level a clean result here proves little. DNS-REG-PLUGIN-DLL reads the setting itself.
+    fix: Investigate as a possible compromise - identify the DLL path in the event, who set ServerLevelPluginDll, and when; remove the value and restart the service once evidence is preserved.
+    refs: [NIST-800-53:SI-4, NIST-800-53:IR-4, MITRE-ATTACK:T1574.002]
+    query:
+      protocol: eventlog
+      log: DNS Server
+      ids: [150, 770]
+      max: 200
+      key: "{host}|{id}|{recordId}"
+    each: any
+    evidence: "{host}: event {id} at {time} from {provider}"
+
+  - id: DNS-EVT-DIRECTORY-ERRORS
+    title: DNS server logged directory access errors
+    kind: broken
+    lens: maintenance
+    category: AVL
+    severity: medium
+    why: Events 4000, 4004, 4007, 4015 and 4016 mean the DNS service could not open, enumerate, read or write the directory in time; AD-integrated zones on this server are then missing, stale or not taking updates. A few 4000/4007 events are normal while a domain controller boots before the directory is ready, so only more than two in the window count.
+    fix: Check the domain controller's directory service, replication and time, then restart the DNS service; persistent 4015 often points at a damaged or unreplicated DNS partition.
+    refs: [NIST-800-53:SC-22, NIST-800-53:SI-4]
+    query:
+      protocol: eventlog
+      log: DNS Server
+      ids: [4000, 4004, 4007, 4015, 4016]
+      max: 500
+      key: "{host}|{id}|{recordId}"
+    count: { op: gt, value: 2, threshold: dns.directory-errors-max-7d }
+    evidence: "{host}: {count} directory errors in 7 days ({sample})"
+
+  # ---- zones as the server holds them ---------------------------------------------------------
+  # One row per zone per server. Auto-created reverse zones (0, 127, 255.in-addr.arpa), the cache and
+  # TrustAnchors are left out by the conditions.
+
+  - id: DNS-SRV-ZONE-NONSECURE-UPDATE
+    title: Zone accepts non-secure dynamic updates
+    kind: misconfigured
+    category: AUT
+    severity: high
+    entity: dns-zone
+    why: With non-secure updates any host that can reach the server, joined to the domain or not and without any credential, can create or overwrite records in the zone - including the names of servers and of the domain controllers.
+    fix: Set dynamic updates to "Secure only" (the zone must be AD-integrated); for devices that cannot update securely, register them through DHCP with a dedicated credential.
+    refs: [NIST-800-53:SC-20, NIST-800-53:IA-3, MITRE-ATTACK:T1557]
+    query:
+      protocol: cim
+      namespace: root/MicrosoftDNS
+      wql: SELECT * FROM MicrosoftDNS_Zone
+      key: "{host}|{Name}"
+      name: Name
+    each:
+      all:
+        - { field: Name, op: notmatch, value: '^((\.\.)?TrustAnchors|\.\..*)$' }
+        - { field: ZoneType, op: eq, value: 1 }
+        - { field: AutoCreated, op: ne, value: true }
+        - { field: AllowUpdate, op: eq, value: 1 }
+    evidence: "{host}: zone {Name} AllowUpdate = 1 (non-secure and secure)"
+
+  - id: DNS-SRV-ZONE-XFR-ANY
+    title: Zone can be transferred to any server
+    kind: misconfigured
+    category: CFG
+    severity: high
+    entity: dns-zone
+    why: Anyone who can reach the server can download the whole zone in one request - every host name and address in it, which maps the network for an attacker in seconds.
+    fix: Allow transfers only to listed servers or to the zone's name servers, or turn transfers off for AD-integrated zones that have no non-AD secondaries.
+    refs: [NIST-800-53:SC-20, NIST-800-53:AC-3, MITRE-ATTACK:T1590.002]
+    query:
+      protocol: cim
+      namespace: root/MicrosoftDNS
+      wql: SELECT * FROM MicrosoftDNS_Zone
+      key: "{host}|{Name}"
+      name: Name
+    each:
+      all:
+        - { field: Name, op: notmatch, value: '^((\.\.)?TrustAnchors|\.\..*)$' }
+        - { field: ZoneType, op: in, value: [1, 2] }
+        - { field: AutoCreated, op: ne, value: true }
+        - { field: SecureSecondaries, op: eq, value: 0 }
+    evidence: "{host}: zone {Name} SecureSecondaries = 0 (transfers to any server)"
+
+  - id: DNS-SRV-ZONE-XFR-NO-NOTIFY
+    title: Zone allows transfers but does not notify its secondaries
+    kind: misconfigured
+    lens: maintenance
+    category: AVL
+    severity: low
+    entity: dns-zone
+    why: When a primary zone allows transfers but sends no change notifications, its secondaries learn about changes only at their next refresh (often hours), and answer with old data until then. Judged only for file-backed zones and for AD-integrated zones that list secondary servers - other AD-integrated zones replicate through the directory and need no notify.
+    fix: Turn on notification to the zone's name servers or to the listed secondaries, or turn transfers off if the zone has no secondaries.
+    refs: [NIST-800-53:CM-6]
+    query:
+      protocol: cim
+      namespace: root/MicrosoftDNS
+      wql: SELECT * FROM MicrosoftDNS_Zone
+      key: "{host}|{Name}"
+      name: Name
+    each:
+      all:
+        - { field: Name, op: notmatch, value: '^((\.\.)?TrustAnchors|\.\..*)$' }
+        - { field: ZoneType, op: eq, value: 1 }
+        - { field: AutoCreated, op: ne, value: true }
+        - { field: SecureSecondaries, op: in, value: [0, 1, 2] }
+        - { field: Notify, op: eq, value: 0 }
+        - any:
+            - { field: DsIntegrated, op: eq, value: false }
+            - { field: SecondaryServers, op: notempty }
+    evidence: "{host}: zone {Name} SecureSecondaries = {SecureSecondaries}, Notify = 0"
+
+  - id: DNS-SRV-ZONE-NOTIFY-LIST-EMPTY
+    title: Zone notifies a server list that is empty
+    kind: misconfigured
+    lens: maintenance
+    category: AVL
+    severity: low
+    entity: dns-zone
+    why: The zone is set to notify only listed servers but lists none, so no secondary hears about changes until its own refresh.
+    fix: Add the secondaries to the notify list, or notify the zone's name servers instead.
+    refs: [NIST-800-53:CM-6]
+    query:
+      protocol: cim
+      namespace: root/MicrosoftDNS
+      wql: SELECT * FROM MicrosoftDNS_Zone
+      key: "{host}|{Name}"
+      name: Name
+    each:
+      all:
+        - { field: Name, op: notmatch, value: '^((\.\.)?TrustAnchors|\.\..*)$' }
+        - { field: ZoneType, op: eq, value: 1 }
+        - { field: Notify, op: eq, value: 2 }
+        - any:
+            - { field: NotifyServers, op: absent }
+            - { field: NotifyServers, op: empty }
+    evidence: "{host}: zone {Name} notifies listed servers, none listed"
+
+  - id: DNS-SRV-ZONE-AGING-OFF
+    title: Dynamically updated zone has aging turned off
+    kind: misconfigured
+    lens: maintenance
+    category: HYG
+    severity: low
+    entity: dns-zone
+    why: Aging is off by default on new zones, so this is common rather than urgent. Without aging, records registered by machines that are later retired or readdressed are never scavenged; the zone accumulates names that point at addresses since given to other machines, and lookups and authentications reach the wrong host.
+    fix: Turn on aging for the zone (7-day no-refresh and 7-day refresh are typical) and scavenging on one server; wait one full interval before the first scavenge.
+    refs: [NIST-800-53:CM-8]
+    refresh: 7d
+    query:
+      protocol: cim
+      namespace: root/MicrosoftDNS
+      wql: SELECT * FROM MicrosoftDNS_Zone
+      key: "{host}|{Name}"
+      name: Name
+    each:
+      all:
+        - { field: Name, op: notmatch, value: '^((\.\.)?TrustAnchors|\.\..*)$' }
+        - { field: ZoneType, op: eq, value: 1 }
+        - { field: AutoCreated, op: ne, value: true }
+        - { field: AllowUpdate, op: in, value: [1, 2] }
+        - { field: Name, op: notmatch, value: '^(TrustAnchors|_msdcs\..*)$' }
+        - { field: Aging, op: eq, value: false }
+    evidence: "{host}: zone {Name} accepts dynamic updates with aging off"
+
+  - id: DNS-SRV-ZONE-REFRESH-SHORT
+    title: Zone aging refresh interval is shorter than a day
+    kind: misconfigured
+    lens: maintenance
+    category: AVL
+    severity: medium
+    entity: dns-zone
+    why: Windows clients and domain controllers refresh their records about once a day. A refresh interval shorter than that lets scavenging delete the records of machines that are still running, and names of live servers disappear.
+    fix: Set the refresh interval to at least the longest client refresh period (7 days is the default; never under 24 hours, and longer than the DHCP lease where DHCP registers records).
+    refs: [NIST-800-53:CM-6]
+    refresh: 7d
+    query:
+      protocol: cim
+      namespace: root/MicrosoftDNS
+      wql: SELECT * FROM MicrosoftDNS_Zone
+      key: "{host}|{Name}"
+      name: Name
+    each:
+      all:
+        - { field: Name, op: notmatch, value: '^((\.\.)?TrustAnchors|\.\..*)$' }
+        - { field: ZoneType, op: eq, value: 1 }
+        - { field: Aging, op: eq, value: true }
+        - { field: RefreshInterval, op: lt, value: 24, threshold: dns.zone-refresh-min-hours }
+    evidence: "{host}: zone {Name} refresh interval {RefreshInterval} h, no-refresh {NoRefreshInterval} h"
+
+  - id: DNS-SRV-ZONE-FILE-PRIMARY
+    title: Primary zone on a domain controller is stored in a file, not in AD
+    kind: misconfigured
+    lens: both
+    category: CFG
+    severity: medium
+    entity: dns-zone
+    why: A file-backed primary has one writable copy on one server, cannot accept secure dynamic updates, has no per-record permissions, and is lost or diverges if that server fails. On a domain controller there is rarely a reason for it.
+    fix: Convert the zone to AD-integrated ("Store the zone in Active Directory") with secure-only updates, or document why it must stay file-backed.
+    refs: [NIST-800-53:SC-20, NIST-800-53:CP-9]
+    query:
+      protocol: cim
+      namespace: root/MicrosoftDNS
+      wql: SELECT * FROM MicrosoftDNS_Zone
+      key: "{host}|{Name}"
+      name: Name
+    each:
+      all:
+        - { field: Name, op: notmatch, value: '^((\.\.)?TrustAnchors|\.\..*)$' }
+        - { field: ZoneType, op: eq, value: 1 }
+        - { field: AutoCreated, op: ne, value: true }
+        - { field: Name, op: ne, value: TrustAnchors }
+        - { field: DsIntegrated, op: eq, value: false }
+    evidence: "{host}: zone {Name} is a file-backed primary ({DataFile})"
+
+  - id: DNS-SRV-ZONE-PAUSED
+    title: Zone is paused or shut down
+    kind: broken
+    lens: maintenance
+    category: AVL
+    severity: high
+    entity: dns-zone
+    why: A paused zone answers no queries and a shut-down zone failed to load; every name in it fails to resolve from this server, and clients that use it see outages the other servers do not explain.
+    fix: Resume the zone if it was paused on purpose and forgotten; for a shut-down zone, read the DNS Server log for the load or transfer error and fix it.
+    refs: [NIST-800-53:SC-22]
+    query:
+      protocol: cim
+      namespace: root/MicrosoftDNS
+      wql: SELECT * FROM MicrosoftDNS_Zone
+      key: "{host}|{Name}"
+      name: Name
+    each:
+      all:
+        - { field: Name, op: notmatch, value: '^((\.\.)?TrustAnchors|\.\..*)$' }
+        - any:
+            - { field: Paused, op: eq, value: true }
+            - { field: Shutdown, op: eq, value: true }
+    evidence: "{host}: zone {Name} Paused = {Paused}, Shutdown = {Shutdown}"
+
+  - id: DNS-SRV-ZONE-NO-MASTERS
+    title: Secondary, stub or forwarder zone has no source servers
+    kind: broken
+    lens: maintenance
+    category: AVL
+    severity: high
+    entity: dns-zone
+    why: A secondary or stub zone without master servers cannot load or refresh, and a conditional forwarder without servers cannot forward; names in the zone fail or go stale on this server.
+    fix: Set the master (or forwarder) servers for the zone, or delete the zone if it is no longer needed.
+    refs: [NIST-800-53:SC-22]
+    query:
+      protocol: cim
+      namespace: root/MicrosoftDNS
+      wql: SELECT * FROM MicrosoftDNS_Zone
+      key: "{host}|{Name}"
+      name: Name
+    each:
+      all:
+        - { field: Name, op: notmatch, value: '^((\.\.)?TrustAnchors|\.\..*)$' }
+        - { field: ZoneType, op: in, value: [2, 3, 4] }
+        - any:
+            - { field: MasterServers, op: absent }
+            - { field: MasterServers, op: empty }
+    evidence: "{host}: zone {Name} (type {ZoneType}) has no master servers"
+
+  - id: DNS-SRV-ZONE-SECONDARY-STALE
+    title: Secondary or stub zone has not reached its master recently
+    kind: broken
+    lens: maintenance
+    category: AVL
+    severity: medium
+    entity: dns-zone
+    why: >-
+      A secondary checks its master's SOA at every refresh interval, whether or not the zone changed, so a
+      last successful SOA check days ago (or never) means it cannot reach the master. It answers with old
+      data, and once the zone's expire time passes it stops answering for the zone at all. The time of the
+      last transfer is not used: it moves only when the serial changes, so a healthy static zone would look
+      stale.
+    fix: Check that the master servers are reachable on TCP 53 and allow transfers to this server, then force a transfer.
+    refs: [NIST-800-53:SC-22]
+    query:
+      protocol: cim
+      namespace: root/MicrosoftDNS
+      wql: SELECT * FROM MicrosoftDNS_Zone
+      key: "{host}|{Name}"
+      name: Name
+    each:
+      all:
+        - { field: Name, op: notmatch, value: '^((\.\.)?TrustAnchors|\.\..*)$' }
+        - { field: ZoneType, op: in, value: [2, 3] }
+        - any:
+            - { field: LastSuccessfulSoaCheck, op: eq, value: 0 }
+            - { field: LastSuccessfulSoaCheck, op: age-gt, value: 7, threshold: dns.secondary-soa-check-max-age-days, format: unix }
+    evidence: "{host}: zone {Name} last successful SOA check {LastSuccessfulSoaCheck} (Unix seconds; 0 = never)"
+
+  - id: DNS-SRV-ZONE-WINS-LOOKUP
+    title: Zone falls back to WINS lookup
+    kind: misconfigured
+    category: CFG
+    severity: low
+    entity: dns-zone
+    why: With WINS lookup on, names missing from the zone are answered from WINS, a legacy NetBIOS name service with no update security; it keeps WINS alive as a dependency and lets anything registered there appear in DNS.
+    fix: Turn off WINS lookup on the zone once nothing resolves through it, and plan the WINS decommission.
+    refs: [NIST-800-53:CM-7]
+    query:
+      protocol: cim
+      namespace: root/MicrosoftDNS
+      wql: SELECT * FROM MicrosoftDNS_Zone
+      key: "{host}|{Name}"
+      name: Name
+    each:
+      all:
+        - { field: Name, op: notmatch, value: '^((\.\.)?TrustAnchors|\.\..*)$' }
+        - { field: UseWins, op: eq, value: true }
+    evidence: "{host}: zone {Name} uses WINS lookup"

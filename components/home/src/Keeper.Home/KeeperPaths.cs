@@ -12,6 +12,13 @@ public sealed record KeeperPaths(string SettingsFile, string DataDir)
 
     public string Spool => Path.Combine(DataDir, "spool");
 
+    /// <summary>
+    /// The client's configuration AS FILES (the record): a sibling of the data folder, so home\data\ pairs
+    /// with home\config\ and clients\&lt;client&gt;\data\ with clients\&lt;client&gt;\config\. 'keeper config export/import'
+    /// move systems.yaml and (later) integrations, thresholds and overrides between here and the store.
+    /// </summary>
+    public string Config => Path.GetFullPath(Path.Combine(DataDir, "..", "config"));
+
     /// <summary>One folder per scan: rows, results, findings, coverage, run.json.</summary>
     public string Runs => Path.Combine(DataDir, "runs");
 
