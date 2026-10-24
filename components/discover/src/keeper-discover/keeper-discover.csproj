@@ -1,0 +1,10 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <ItemGroup>
+    <ProjectReference Include="..\..\..\common\src\Keeper.Common\Keeper.Common.csproj" />
+    <ProjectReference Include="..\..\..\home\src\Keeper.Home\Keeper.Home.csproj" />
+    <ProjectReference Include="..\..\..\store\src\Keeper.Store\Keeper.Store.csproj" />
+    <ProjectReference Include="..\..\..\vault\src\Keeper.Vault\Keeper.Vault.csproj" />
+    <ProjectReference Include="..\..\..\integrations\src\Keeper.Integrations\Keeper.Integrations.csproj" />
+    <ProjectReference Include="..\Keeper.Discover\Keeper.Discover.csproj" />
+  </ItemGroup>
+</Project>

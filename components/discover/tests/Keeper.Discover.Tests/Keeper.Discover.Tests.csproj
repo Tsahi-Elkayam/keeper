@@ -1,0 +1,9 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\Keeper.Discover\Keeper.Discover.csproj" />
+    <ProjectReference Include="..\..\src\keeper-discover\keeper-discover.csproj" />
+    <ProjectReference Include="..\..\..\rules\src\Keeper.Rules\Keeper.Rules.csproj" />
+    <ProjectReference Include="..\..\..\scan\src\Keeper.Scan\Keeper.Scan.csproj" />
+    <ProjectReference Include="..\..\..\runners\src\Keeper.Runners.Files\Keeper.Runners.Files.csproj" />
+  </ItemGroup>
+</Project>

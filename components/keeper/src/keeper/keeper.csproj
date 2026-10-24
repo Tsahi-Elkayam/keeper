@@ -15,6 +15,7 @@
     <ProjectReference Include="..\..\..\scan\src\keeper-scan\keeper-scan.csproj" />
     <ProjectReference Include="..\..\..\scan\src\keeper-certs\keeper-certs.csproj" />
     <ProjectReference Include="..\..\..\scan\src\keeper-rules\keeper-rules.csproj" />
+    <ProjectReference Include="..\..\..\discover\src\keeper-discover\keeper-discover.csproj" />
     <ProjectReference Include="..\..\..\review\src\keeper-load\keeper-load.csproj" />
     <ProjectReference Include="..\..\..\review\src\keeper-track\keeper-track.csproj" />
     <ProjectReference Include="..\..\..\review\src\keeper-decide\keeper-decide.csproj" />

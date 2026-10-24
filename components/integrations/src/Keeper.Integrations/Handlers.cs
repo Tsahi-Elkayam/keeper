@@ -152,6 +152,13 @@ public sealed partial class UpsertHandler : IRequestHandler
         {
             throw new RequestException("ldap endpoints are ldap://, ldaps:// or a domain name.");
         }
+        else if (type.Id == "snmp")
+        {
+            if (string.IsNullOrWhiteSpace(endpoint) || !System.Net.IPNetwork.TryParse(endpoint.Trim(), out _))
+                throw new RequestException("snmp endpoints must be the CIDR range the credential may be used in (e.g. 192.0.2.0/24).");
+            if (Payload.Text(payload, "authKind") == "snmp-v3" && string.IsNullOrWhiteSpace(Payload.Text(payload, "identity")))
+                throw new RequestException("snmp-v3 needs the USM securityName (username) as the identity.");
+        }
     }
 }
 

@@ -58,8 +58,14 @@
     <Project Path="components/scan/src/keeper-certs/keeper-certs.csproj" />
     <Project Path="components/scan/tests/Keeper.Scan.Tests/Keeper.Scan.Tests.csproj" />
   </Folder>
+  <Folder Name="/discover/">
+    <Project Path="components/discover/src/Keeper.Discover/Keeper.Discover.csproj" />
+    <Project Path="components/discover/src/keeper-discover/keeper-discover.csproj" />
+    <Project Path="components/discover/tests/Keeper.Discover.Tests/Keeper.Discover.Tests.csproj" />
+  </Folder>
   <Folder Name="/vault/">
     <Project Path="components/vault/src/Keeper.Vault/Keeper.Vault.csproj" />
+    <Project Path="components/vault/tests/Keeper.Vault.Tests/Keeper.Vault.Tests.csproj" />
   </Folder>
   <Folder Name="/integrations/">
     <Project Path="components/integrations/src/Keeper.Integrations/Keeper.Integrations.csproj" />

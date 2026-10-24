@@ -9,6 +9,8 @@ public static class Schemas
     public const string Finding = "keeper.finding/1";
     public const string Coverage = "keeper.coverage/1";
     public const string Run = "keeper.run/1";
+    public const string Inventory = "keeper.inventory/1";
+    public const string DiscoveryTargets = "keeper.discovery/1";
 }
 
 /// <summary>One entity as a query returned it. Rows are what Keeper has seen: the inventory.</summary>

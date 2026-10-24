@@ -16,12 +16,13 @@ public static class RunVerb
     {
         try
         {
-            var cli = new CliArgs(args, flags: ["scan-all", "no-scan", "dry-run", "fresh-sign-in"]);
+            var cli = new CliArgs(args, flags: ["scan-all", "no-scan", "dry-run", "fresh-sign-in", "discover"]);
             if (cli.Help)
                 return CliUsage.Print("""
                     keeper run - the daily pipeline: load rules, scan, load, track, rank, then today's list
 
                       keeper run                      scan every system that has an enabled integration (and Keeper's own registers)
+                      keeper run --discover           run 'keeper discover' first (when settings\discovery.yaml exists), then scan
                       keeper run --scan entra,intune  only these systems; each needs an enabled integration
                       keeper run --no-scan            no scans: load, track and rank what is already there
                       keeper run --dry-run            show which scans would run, and run nothing
@@ -50,6 +51,17 @@ public static class RunVerb
             {
                 Report(problems);
                 return ExitCodes.Failed;
+            }
+
+            if (cli.Has("discover") && !File.Exists(Path.Combine(paths.SettingsDir, "discovery.yaml")))
+                Console.WriteLine("discover: skipped, there is no settings\\discovery.yaml");
+            else if (cli.Has("discover"))
+            {
+                var code = Commands.Run("discover", passSettings);
+                if (code == ExitCodes.NoData)
+                    problems.Add("discover: partial or degraded discovery run");
+                else if (code != ExitCodes.Ok)
+                    problems.Add($"discover: failed (exit {code})");
             }
 
             // Rules over the store (Keeper's own health, cross-system checks) read what the other scans

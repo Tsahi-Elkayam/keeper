@@ -1,0 +1,226 @@
+schema: keeper.rules/1
+system: network
+name: Network discovery inventory
+integration: files
+# Reads data/imports/discovery/inventory.json written by `keeper discover`.
+# These rules turn discovered assets, their reachability history, and their management protocols
+# into maintenance and security findings, while putting every discovered computer row into the
+# store so other rule packs can target machines by kind.
+defaults:
+  entity: computer
+  refresh: 1d
+rules:
+  - id: NET-RECORD-NOTHING-BEHIND
+    title: Directory or DNS record has no answering machine behind it
+    kind: misconfigured
+    lens: maintenance
+    category: HYG
+    severity: low
+    why: >-
+      An Active Directory computer account or DNS record that has never answered across repeated
+      discovery scans is usually a decommissioned machine whose records were left behind. Stale
+      records clutter inventory, skew coverage percentages, and leave old names and addresses open
+      to reuse mistakes.
+    fix: >-
+      Confirm whether the machine was retired or moved. If it was retired, delete or disable the
+      computer object in Active Directory and remove its forward and reverse DNS records.
+    refs: [CIS-v8:1.1, NIST-800-53:CM-8]
+    query: { protocol: file, path: discovery/inventory.json, items: assets, key: id, name: id }
+    each:
+      all:
+        - { field: state, op: eq, value: likely-gone }
+        - { field: everAnswered, op: eq, value: false }
+        - element:
+            of: sources
+            where: { field: kind, op: in, value: [ad, dns] }
+    evidence: "{id} (addresses: {addresses}) has not answered for {misses} scans since {missingSince} and has never answered"
+
+  - id: NET-STOPPED-ANSWERING
+    title: Machine that used to answer is no longer reachable
+    kind: broken
+    lens: maintenance
+    category: AVL
+    severity: medium
+    why: >-
+      A machine that previously answered discovery probes has missed enough consecutive scans and
+      days to be marked likely-gone. Either it went down without being noticed, lost network
+      reachability from the scanner, or was retired without cleaning up its records.
+    fix: >-
+      Check whether the host is powered on and reachable, or whether a firewall or routing change
+      blocked it. If it was intentionally retired, remove its directory and DNS records or add it
+      to the exclusion list.
+    refs: [CIS-v8:1.1, NIST-800-53:CM-8]
+    query: { protocol: file, path: discovery/inventory.json, items: assets, key: id, name: id }
+    each:
+      all:
+        - { field: state, op: eq, value: likely-gone }
+        - { field: everAnswered, op: eq, value: true }
+    evidence: "{id} ({kind}) last answered on {lastSeen} and has missed {misses} scans since {missingSince}"
+
+  - id: NET-UNLISTED-MACHINE
+    title: Answering machine on the network is not in Active Directory, DNS or the target list
+    kind: missing
+    lens: both
+    category: HYG
+    severity: medium
+    why: >-
+      A device answered on an allowed network, via neighbour tables or subnet widening, but has no
+      Active Directory computer account, no DNS record, and is not listed in manual targets.
+      Unlisted machines escape directory-based patching, monitoring, and configuration packs.
+    fix: >-
+      Identify the owner and purpose of the device. Join it to the domain if appropriate, register
+      its forward and reverse DNS records, or add it to the manual targets list in
+      settings/discovery.yaml so it is tracked deliberately.
+    refs: [CIS-v8:1.1, CIS-v8:1.2, NIST-800-53:CM-8]
+    query: { protocol: file, path: discovery/inventory.json, items: assets, key: id, name: id }
+    each:
+      all:
+        - { field: state, op: eq, value: answering }
+        - not:
+            element:
+              of: sources
+              where: { field: kind, op: in, value: [ad, dns, targets] }
+    evidence: "{id} ({kind} at {addresses}) answered on {answered} without an AD record, a DNS record or a listed target"
+
+  - id: NET-NAME-UNRESOLVED
+    title: Discovered hostname does not resolve in DNS
+    kind: broken
+    lens: maintenance
+    category: CFG
+    severity: low
+    why: >-
+      A hostname from Active Directory or the manual target list could not be resolved to any IP
+      address in DNS. Neither the scanner nor operators or monitoring tools can reach the machine
+      by name.
+    fix: >-
+      Verify whether the machine is still active and register its A/AAAA record in DNS, or retire
+      the stale computer account or target entry if the machine no longer exists.
+    refs: [NIST-800-53:CM-8]
+    query: { protocol: file, path: discovery/inventory.json, items: assets, key: id, name: id }
+    each: { field: state, op: eq, value: unresolved }
+    evidence: "{id} did not resolve to an IP address in DNS"
+
+  - id: NET-SNMP-V2C-ONLY
+    title: Device is polled with cleartext SNMP v2c
+    kind: misconfigured
+    lens: security
+    category: AUT
+    severity: medium
+    why: >-
+      SNMP v2c sends its community string in cleartext over UDP, so anyone on the path can read it
+      and query device tables or, if a read-write community shares the string, alter configuration.
+    fix: >-
+      Enable SNMPv3 with authentication and encryption (authPriv, SHA-256 and AES-128) on the
+      device, bind an snmp-v3 integration in Keeper, and disable SNMP v1/v2c on the device.
+    refs: [CIS-v8:4.1, NIST-800-53:IA-2, NIST-800-53:SC-8]
+    query: { protocol: file, path: discovery/inventory.json, items: assets, key: id, name: id }
+    each: { field: snmp.version, op: eq, value: v2c }
+    evidence: "{id} ({kind}) answered SNMP v2c ({snmp.sysDescr})"
+
+  - id: NET-TELNET-OPEN
+    title: Machine accepts connections on the Telnet port (23/TCP)
+    kind: misconfigured
+    lens: security
+    category: CFG
+    severity: high
+    why: >-
+      Telnet sends passwords and session traffic in cleartext. Leaving port 23 open on a server,
+      switch, or printer exposes administrative sign-in to capture on the network.
+    fix: >-
+      Enable SSH or HTTPS management on the device, verify administrative access over the encrypted
+      channel, and disable the Telnet service or close port 23 on the device.
+    refs: [CIS-v8:4.8, NIST-800-53:CM-7, NIST-800-53:SC-8]
+    query: { protocol: file, path: discovery/inventory.json, items: assets, key: id, name: id }
+    each:
+      element:
+        of: services
+        where:
+          all:
+            - { field: port, op: eq, value: 23 }
+            - { field: state, op: eq, value: open }
+    evidence: "{id} ({kind} at {addresses}) has TCP port 23 open"
+
+  - id: NET-SMB-SIGNING-OFF
+    title: Machine offers SMB2/3 without requiring packet signing
+    kind: misconfigured
+    lens: security
+    category: CFG
+    severity: high
+    why: >-
+      When an SMB server does not require signing, an attacker on the network can relay NTLM or
+      intercepted sessions to it and run commands or read shares under the relayed identity.
+    fix: >-
+      Require SMB signing via Group Policy (Microsoft network server: Digitally sign communications
+      (always)) on Windows machines, or set 'server signing = mandatory' on Samba and NAS appliances.
+    refs: [CIS-v8:4.1, NIST-800-53:SC-8]
+    query: { protocol: file, path: discovery/inventory.json, items: assets, key: id, name: id }
+    each:
+      element:
+        of: services
+        where:
+          all:
+            - { field: service, op: eq, value: smb }
+            - { field: detail.signingRequired, op: eq, value: false }
+    evidence: "{id} ({kind} at {addresses}) negotiated SMB without requiring signing"
+
+  - id: NET-NO-MANAGEMENT-PROTOCOL
+    title: Answering machine exposes no standard management protocol
+    kind: missing
+    lens: maintenance
+    category: MON
+    severity: low
+    why: >-
+      The machine answered on the network, but exposed none of SSH, WinRM, HTTPS, or SNMP. Keeper
+      and other operations tools cannot inspect its configuration, health, or patch state deeper
+      than a port check.
+    fix: >-
+      Enable the appropriate management channel for this class of device (WinRM on Windows, SSH on
+      Linux/Unix, SNMPv3 or HTTPS on network gear and appliances) and allow the Keeper scanner to
+      reach it, or document the host if it is intentionally a closed appliance.
+    refs: [CIS-v8:1.1, NIST-800-53:CM-8]
+    query: { protocol: file, path: discovery/inventory.json, items: assets, key: id, name: id }
+    each:
+      all:
+        - { field: state, op: eq, value: answering }
+        - { field: snmp, op: absent }
+        - not:
+            element:
+              of: services
+              where: { field: service, op: in, value: [ssh, winrm, https] }
+    evidence: "{id} ({kind} at {addresses}) answered on {answered} without SSH, WinRM, HTTPS or SNMP"
+
+  - id: NET-FLAPPING
+    title: Machine repeatedly alternates between answering and missing across scans
+    kind: broken
+    lens: maintenance
+    category: HLT
+    severity: low
+    why: >-
+      An asset that keeps flipping between answering and not-answering across discovery windows
+      points to an unstable link, a duplicate IP address, an aggressive power-saving schedule, or a
+      workstation sitting in a server subnet.
+    fix: >-
+      Check switch port counters, ARP tables for duplicate MAC addresses, and host uptime. If it is
+      a client machine that sleeps outside work hours, restrict the discovery window or exclude the
+      client range.
+    refs: [NIST-800-53:SI-4]
+    query: { protocol: file, path: discovery/inventory.json, items: assets, key: id, name: id }
+    each: { field: flaps, op: ge, value: 3, threshold: discovery.flap-count }
+    evidence: "{id} ({kind} at {addresses}) changed reachability state {flaps} times in recent scans"
+
+  - id: NET-INVENTORY-OLD
+    title: Network discovery inventory file is stale
+    kind: broken
+    lens: maintenance
+    category: MON
+    severity: medium
+    why: >-
+      The discovery inventory file has not been refreshed within the expected window, so network
+      findings and the discovered computer list used by other rule packs are out of date.
+    fix: >-
+      Run `keeper discover` (or `keeper run --discover`) and check the scheduled task or cron job
+      that runs discovery, as well as any scan-window restrictions in settings/discovery.yaml.
+    refs: [CIS-v8:1.1, NIST-800-53:CM-8]
+    query: { protocol: file, path: discovery/inventory.json, items: assets, key: id, name: id }
+    each: { field: _modified, op: age-gt, value: 7, threshold: discovery.max-age }
+    evidence: "inventory file {_file} was last updated at {_modified}"

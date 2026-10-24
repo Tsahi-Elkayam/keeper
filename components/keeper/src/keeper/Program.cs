@@ -10,6 +10,7 @@ var verbs = new (string Name, string What, Func<string[], int> Run)[]
 {
     ("run", "the daily pipeline: scan, load, track, rank, then today's list", RunVerb.Run),
     ("today", "what to do today", TodayVerb.Run),
+    ("discover", "discover machines on the network and update the discovery inventory", DiscoverVerb.Run),
     ("scan", "scan one system through its integration (read-only towards it)", ScanVerb.Run),
     ("certs", "which certificates a server presents, valid or not, until when (you start it)", CertsVerb.Run),
     ("load", "queue the scans the store has not taken in", LoadVerb.Run),

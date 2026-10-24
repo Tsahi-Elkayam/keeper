@@ -75,6 +75,8 @@ public static partial class IntegrationTypes
         ["aws-access-key"] = ["secretAccessKey"],
         ["aws-assume-role"] = ["secretAccessKey"],
         ["gcp-service-account"] = ["privateKey"],
+        ["snmp-v3"] = ["authPassword", "privPassword"],
+        ["snmp-v2c"] = ["community"],
     };
 
     private static readonly string[] Windows = ["negotiate", "windows-credential"];
@@ -181,6 +183,7 @@ public static partial class IntegrationTypes
         new("cim", "Windows hosts: WMI over WinRM, the registry (read-only), event logs, file shares and NTFS permissions", ["cim", "registry", "eventlog", "smb"], Windows, []),
         new("sql", "SQL Server instances", ["sql"], ["negotiate", "basic"], []),
         new("tls", "TLS endpoints", ["tls"], ["none"], []),
+        new("snmp", "SNMP devices (UDP 161): read-only GET/GETNEXT; the endpoint is the CIDR range the credential may be used in", ["snmp"], ["snmp-v3", "snmp-v2c"], []),
         new("vcenter", "VMware vCenter REST API", ["http"], ["vcenter-session"], []),
         new("veeam", "Veeam Backup & Replication REST API", ["http"], ["oauth-password"], []),
         new("prtg", "PRTG API", ["http"], ["api-key-query", "basic"], []),
