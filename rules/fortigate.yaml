@@ -1,0 +1,137 @@
+schema: keeper.rules/1
+system: fortigate
+name: FortiGate firewall
+integration: fortigate
+
+# Reads a FortiGate's REST API (GET only, a read-only access profile, a REST API administrator's token) for the tables
+# these checks judge. Field names are FortiOS 7.x's; a build that names one differently makes the rule unknown, never a
+# pass, and the first run against your model confirms them. Not yet run against a real FortiGate.
+
+defaults:
+  lens: security
+  category: CFG
+  refresh: 1d
+  kind: misconfigured
+
+rules:
+
+  - id: FGT-ADMIN-ACCESS-OVER-CLEARTEXT
+    title: 'An interface allows management over HTTP or Telnet'
+    severity: high
+    entity: interface
+    why: 'HTTP and Telnet send the administrator login and every command in clear text, to anyone on the path.'
+    fix: 'Remove http and telnet from the interface''s allowed access; keep https and ssh, and limit them to management networks.'
+    refs: [NIST-800-53:SC-8, NIST-800-53:AC-17]
+    query: { protocol: http, path: /api/v2/cmdb/system/interface, items: results, paging: none, headers: { Accept: application/json }, key: name, name: name }
+    each: { field: allowaccess, op: match, value: '(^|\s)(http|telnet)(\s|$)' }
+    evidence: "interface {name} allows {allowaccess}"
+
+  - id: FGT-POLICY-ALLOWS-ALL
+    title: 'A policy accepts any source to any destination on any service'
+    severity: high
+    entity: policy
+    why: 'A policy from all to all on ALL services is no policy: it lets everything through and makes the rules below it irrelevant.'
+    fix: 'Replace it with policies that name the sources, destinations and services that are meant to talk.'
+    refs: [NIST-800-53:SC-7, NIST-800-53:AC-4]
+    query: { protocol: http, path: /api/v2/cmdb/firewall/policy, items: results, paging: none, headers: { Accept: application/json }, key: policyid, name: name }
+    each: { all: [ { field: status, op: eq, value: enable }, { field: action, op: eq, value: accept }, { field: 'srcaddr[].name', op: eq, value: all }, { field: 'dstaddr[].name', op: eq, value: all }, { field: 'service[].name', op: eq, value: ALL } ] }
+    evidence: "policy {policyid} ({name}) accepts all to all on ALL"
+
+  - id: FGT-POLICY-NOT-LOGGED
+    title: 'An accepting policy does not log its traffic'
+    severity: medium
+    entity: policy
+    why: 'Traffic that is allowed and not logged cannot be investigated after an incident.'
+    fix: 'Set logtraffic to utm or all on the policy, and send the logs to a log server.'
+    refs: [NIST-800-53:AU-2, NIST-800-53:AU-12]
+    query: { protocol: http, path: /api/v2/cmdb/firewall/policy, items: results, paging: none, headers: { Accept: application/json }, key: policyid, name: name }
+    each: { all: [ { field: status, op: eq, value: enable }, { field: action, op: eq, value: accept }, { field: logtraffic, op: eq, value: disable } ] }
+    evidence: "policy {policyid} ({name}) does not log"
+
+  - id: FGT-ADMIN-NO-TRUSTED-HOST
+    title: 'An administrator can sign in from any address'
+    severity: high
+    entity: admin
+    why: 'Without a trusted host the account can be used from anywhere the management interface is reachable.'
+    fix: 'Set trusthost1 to the management network (and more trusted hosts if needed) for the administrator.'
+    refs: [NIST-800-53:AC-3, NIST-800-53:AC-17]
+    query: { protocol: http, path: /api/v2/cmdb/system/admin, items: results, paging: none, headers: { Accept: application/json }, key: name, name: name }
+    each: { any: [ { field: trusthost1, op: absent }, { field: trusthost1, op: eq, value: '0.0.0.0 0.0.0.0' } ] }
+    evidence: "administrator {name} has no trusted host"
+
+  - id: FGT-ADMIN-NO-TWO-FACTOR
+    title: 'An administrator signs in with a password alone'
+    severity: medium
+    entity: admin
+    why: 'One stolen or guessed password is then all it takes to administer the firewall.'
+    fix: 'Set two-factor to fortitoken, email or sms for the administrator, or use a remote server that enforces it.'
+    refs: [NIST-800-53:IA-2, CIS-Controls-v8:6.5]
+    query: { protocol: http, path: /api/v2/cmdb/system/admin, items: results, paging: none, headers: { Accept: application/json }, key: name, name: name }
+    each: { field: 'two-factor', op: eq, value: disable }
+    evidence: "administrator {name} has no second factor"
+
+  - id: FGT-ADMIN-DEFAULT-ACCOUNT
+    title: 'The default admin account is still in use'
+    severity: low
+    entity: admin
+    why: 'Everyone knows the name of the default account, so half of a guessing attack is already done.'
+    fix: 'Create a named administrator for each person, and rename or remove the default admin account.'
+    refs: [NIST-800-53:IA-2, NIST-800-53:AC-2]
+    query: { protocol: http, path: /api/v2/cmdb/system/admin, items: results, paging: none, headers: { Accept: application/json }, key: name, name: name }
+    each: { field: name, op: eq, value: admin }
+    evidence: "the default admin account exists"
+
+  - id: FGT-STRONG-CRYPTO-OFF
+    title: 'Strong cryptography is not enforced for management and VPN'
+    severity: medium
+    entity: global
+    why: 'Without strong-crypto the firewall still offers old TLS versions and weak ciphers.'
+    fix: 'Run: config system global, set strong-crypto enable, end.'
+    refs: [NIST-800-53:SC-13, NIST-800-53:SC-8]
+    query: { protocol: http, path: /api/v2/cmdb/system/global, items: results, paging: none, headers: { Accept: application/json }, key: admintimeout, name: hostname }
+    each: { field: 'strong-crypto', op: eq, value: disable }
+    evidence: "strong-crypto is disabled"
+
+  - id: FGT-ADMIN-TIMEOUT-LONG
+    title: 'An idle management session stays open for a long time'
+    severity: low
+    entity: global
+    why: 'A session left open on a shared screen is a session for whoever finds it.'
+    fix: 'Set admintimeout to 15 minutes or less (config system global).'
+    refs: [NIST-800-53:AC-12]
+    query: { protocol: http, path: /api/v2/cmdb/system/global, items: results, paging: none, headers: { Accept: application/json }, key: admintimeout, name: hostname }
+    each: { field: admintimeout, op: gt, value: 15, threshold: fortigate.max-admin-timeout }
+    evidence: "admintimeout is {admintimeout} minutes"
+
+  - id: FGT-SNMP-COMMUNITY-IN-USE
+    title: 'SNMP v1 or v2c communities are configured'
+    severity: medium
+    entity: snmp
+    why: 'A community string is the only password SNMP v1 and v2c have, and it travels in clear text.'
+    fix: 'Remove the communities and use SNMPv3 users with authentication and encryption.'
+    refs: [NIST-800-53:IA-5, NIST-800-53:SC-8]
+    query: { protocol: http, path: /api/v2/cmdb/system/snmp/community, items: results, paging: none, headers: { Accept: application/json }, key: id, name: name }
+    each: { field: status, op: eq, value: enable }
+    evidence: "an SNMP community is enabled"
+
+  - id: FGT-NTP-NOT-SYNCED
+    title: 'The firewall does not synchronise its clock'
+    severity: low
+    entity: global
+    why: 'Without a time source the logs of the firewall cannot be lined up with anything else.'
+    fix: 'Enable ntpsync and point it at your time servers (config system ntp).'
+    refs: [NIST-800-53:AU-8]
+    query: { protocol: http, path: /api/v2/cmdb/system/ntp, items: results, paging: none, headers: { Accept: application/json }, key: ntpsync, name: ntpsync }
+    each: { field: ntpsync, op: eq, value: disable }
+    evidence: "ntpsync is disabled"
+
+  - id: FGT-IPSEC-WEAK-PROPOSAL
+    title: 'A VPN tunnel offers weak encryption, hashes or key exchange groups'
+    severity: high
+    entity: tunnel
+    why: 'DES, 3DES, MD5 and SHA-1, and Diffie-Hellman groups 1, 2 and 5, are broken or too small for current use.'
+    fix: 'Offer aes256 or aes128-gcm with sha256 or better and a group of 14 or higher, in both phases, with the peer.'
+    refs: [NIST-800-53:SC-13, NIST-800-53:SC-8]
+    query: { protocol: http, path: /api/v2/cmdb/vpn.ipsec/phase1-interface, items: results, paging: none, headers: { Accept: application/json }, key: name, name: name }
+    each: { any: [ { field: proposal, op: match, value: '(^|[\s-])(des|3des)(-|\s|$)|-(md5|sha1)(\s|$)' }, { field: dhgrp, op: match, value: '(^|\s)(1|2|5)(\s|$)' } ] }
+    evidence: "tunnel {name}: proposal {proposal}, group {dhgrp}"

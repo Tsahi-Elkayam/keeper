@@ -470,6 +470,31 @@ public sealed class IntegrationTests : IDisposable
     }
 
     [Fact]
+    public void A_fortigate_integration_is_an_https_api_with_a_bearer_token_and_may_trust_its_own_certificate()
+    {
+        Submit("integrations.upsert", new { integrationId = "edge-fw", type = "fortigate", endpoint = "https://198.51.100.1", authKind = "bearer" });
+        Submit("integrations.upsert", new { integrationId = "edge-fw2", type = "fortigate", endpoint = "http://198.51.100.2", authKind = "bearer" });
+
+        var report = Drain();
+        Assert.Equal((1, 1), (report.Done, report.Failed));   // https is accepted, cleartext is refused
+        Assert.NotNull(Find("edge-fw"));
+        Assert.Null(Find("edge-fw2"));
+    }
+
+    [Fact]
+    public void What_a_fortigate_integration_may_read_never_includes_backups_keys_certificates_or_api_users()
+    {
+        var paths = IntegrationTypes.Find("fortigate")!.ReadPaths;
+
+        Assert.Contains("/api/v2/cmdb/firewall/policy", paths);
+        Assert.Contains("/api/v2/cmdb/system/admin", paths);
+        foreach (var forbidden in new[] { "backup", "config/", "api-user", "certificate", "key", "password", "ssh", "license", "revision", "download", "restore" })
+            Assert.DoesNotContain(paths, p => p.Contains(forbidden, StringComparison.OrdinalIgnoreCase));
+        Assert.DoesNotContain(paths, p => p.Contains('*', StringComparison.Ordinal));
+        Assert.All(paths, p => Assert.StartsWith("/api/v2/", p, StringComparison.Ordinal));
+    }
+
+    [Fact]
     public void Implicit_integrations_need_no_configuration()
     {
         using var connection = _db.OpenReadOnly();

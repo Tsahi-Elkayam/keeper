@@ -196,6 +196,20 @@ public static partial class IntegrationTypes
                 "/apis/certificates.k8s.io/v1/certificatesigningrequests",
             ],
         },
+        // FortiOS REST. Reading is GET only; what a rule may read is the configuration tables its checks judge and the
+        // system status - never a configuration backup (which holds keys), API users, certificates or licence data.
+        new("fortigate", "A FortiGate firewall's REST API (https://<host>), read-only: the configuration tables its rules judge and system status - never a configuration backup, certificate or key; option caCertificate trusts a device certificate", ["http"], ["bearer"], [])
+        {
+            ReadPaths =
+            [
+                "/api/v2/monitor/system/status", "/api/v2/monitor/vpn/ipsec",
+                "/api/v2/cmdb/system/global", "/api/v2/cmdb/system/interface", "/api/v2/cmdb/system/admin", "/api/v2/cmdb/system/accprofile",
+                "/api/v2/cmdb/system/snmp/community", "/api/v2/cmdb/system/ntp", "/api/v2/cmdb/system/dns",
+                "/api/v2/cmdb/firewall/policy", "/api/v2/cmdb/firewall/address",
+                "/api/v2/cmdb/vpn.ipsec/phase1-interface", "/api/v2/cmdb/vpn.ipsec/phase2-interface",
+                "/api/v2/cmdb/log.syslogd/setting",
+            ],
+        },
         new("checkpoint", "Check Point management API (show- commands only, on a read-only session)", ["http"], ["session-login"], [])
         {
             ReadPosts = ["/web_api/show-*", "/web_api/v*/show-*"],

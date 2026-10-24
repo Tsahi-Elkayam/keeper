@@ -77,6 +77,12 @@ that estate's weaknesses. This page says how each is protected, and what is not 
   `docker ps` the account needs the Docker socket, which on its own is root-level power over the machine: give the scan
   its own account, on its own, and know that Keeper only ever lists and inspects. Environment values and command lines of
   containers are scrubbed before they are stored.
+- **Network device configurations are scrubbed on the way in.** Backups of Cisco-style devices hold passwords, type 7
+  hashes, SNMP communities and routing and AAA keys. They are replaced while the file is read, before any row exists
+  (`enable secret 5 set`; a well-known default community shows as `<default>`, which is the finding), so a row, result,
+  finding or stored run never holds one. The backup files themselves are the operator's and still do: keep their
+  folder (including `imports/network-config`) private. FortiGate is read over REST from a short list of tables; the
+  configuration backup, API users and certificates are not on it.
 - **The store is not encrypted as a whole.** Findings, evidence and `row_seen` (every attribute of
   every scanned object) are plain SQLite, protected by the folder's access list only. Whole-database
   encryption is deferred.
