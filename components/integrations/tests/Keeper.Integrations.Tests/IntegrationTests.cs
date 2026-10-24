@@ -540,6 +540,28 @@ public sealed class IntegrationTests : IDisposable
         Assert.Equal("office-printers", IntegrationStore.Resolve(connection, "printer", null).Id);
     }
 
+    [Theory]
+    [InlineData("discovery", "printer", true)]
+    [InlineData("discovery", "linux-unix, printer", true)]
+    [InlineData("discovery", "Printer", true)]
+    [InlineData("discovery", "", false)]                  // from discovery, but of what?
+    [InlineData("discovery", "toaster", false)]           // not a kind discovery assigns
+    [InlineData("the-internet", "printer", false)]        // not a source
+    public void Targets_from_discovery_need_a_known_kind_and_a_known_source(string from, string kind, bool accepted)
+    {
+        UpsertPrinters(options: new { targetsFrom = from, targetsKind = kind });
+
+        Assert.Equal(accepted ? 1 : 0, Drain().Done);
+    }
+
+    [Fact]
+    public void A_kind_without_a_source_is_refused_as_a_likely_mistake()
+    {
+        UpsertPrinters(options: new { targetsKind = "printer" });
+
+        Assert.Equal(1, Drain().Failed);
+    }
+
     [Fact]
     public void Implicit_integrations_need_no_configuration()
     {

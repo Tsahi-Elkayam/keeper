@@ -244,6 +244,7 @@ public static class IntegrationVerb
                            param=..  headers.<name>=..  tls=trust (sql)  allowHttp=true (only if you accept cleartext)
                            cimProtocol=auto|wsman|dcom (cim: WinRM, then DCOM for hosts WinRM cannot reach)
                            port=22  hostKeys.<host>=SHA256:<fingerprint>[,SHA256:...]  acceptAnyHostKey=true (ssh; the host key is then not verified)
+                           targetsFrom=discovery  targetsKind=printer[,linux-unix,...]  (take the targets from what 'keeper discover' found, inside the scope)
                 """, asked);
     }
 }

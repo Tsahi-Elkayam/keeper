@@ -132,6 +132,8 @@ public static class Ui
                 """),
             ["neverScanned"] = Rows(connection,
                 "SELECT system, COUNT(*) AS rules FROM rule WHERE system NOT IN (SELECT DISTINCT system FROM rule_standing) GROUP BY system ORDER BY rules DESC;"),
+            // Standings are read through the rule catalogue: scans loaded without 'keeper rules load' have results but show nothing.
+            ["catalogueMissing"] = Sql.Scalar(connection, "SELECT EXISTS (SELECT 1 FROM result) AND NOT EXISTS (SELECT 1 FROM rule);") is 1L,
         };
 
         // The default encoder escapes < > & ' " and every non-ASCII character, so the JSON is inert inside the page.
@@ -761,7 +763,9 @@ const views = {
   overview() {
     const intro = D.systems.length
       ? `Keeper ran ${fmt(totals.checks)} checks on ${D.systems.length} system${D.systems.length === 1 ? "" : "s"}. ${fmt(totals.correct)} found the configuration correct, ${fmt(totals.should)} found something to configure, ${fmt(totals.broken)} found something broken, and ${fmt(totals.unchecked)} could not check. Behind them: ${fmt(openObjects)} open findings across ${fmt(D.checks.length)} checks.`
-      : "No scan has results yet. Run 'keeper run' to scan, then build this page again.";
+      : D.catalogueMissing
+        ? "Scans have results, but the rule catalogue is not loaded, so passed checks cannot be counted. Run 'keeper rules load' then 'keeper qm run' ('keeper run' does both), then build this page again."
+        : "No scan has results yet. Run 'keeper run' to scan, then build this page again.";
     const tiles = h("div", { class: "grid tiles" }, ST.slice(0, 4).map(x => {
       const go = () => { if (x.key === "correct") show("passed"); else if (x.key === "unchecked") show("coverage"); else { state.kind = x.key === "broken" ? "broken" : "should"; show("findings"); } };
       return h("div", { class: "card tile", tabindex: "0", role: "button", onclick: go, onkeydown: e => { if (e.key === "Enter") go(); } },
@@ -1163,7 +1167,7 @@ const TABS = [
 
 function render() {
   const nav = document.getElementById("nav"); nav.replaceChildren(...TABS.map(([k, l]) => h("button", { "aria-current": state.tab === k ? "page" : null, onclick: () => show(k) }, l)));
-  document.getElementById("main").replaceChildren(...views[state.tab](), h("div", { class: "foot" }, `Generated ${D.generated} by keeper · read-only · nothing in this page was fetched from anywhere`));
+  document.getElementById("main").replaceChildren(...views[state.tab]().flat().filter(n => n != null && n !== false), h("div", { class: "foot" }, `Generated ${D.generated} by keeper · read-only · nothing in this page was fetched from anywhere`));
 }
 
 document.getElementById("sub").textContent = [D.tenant, D.generated].filter(Boolean).join(" · ");

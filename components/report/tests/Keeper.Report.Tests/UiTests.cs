@@ -41,6 +41,39 @@ public sealed class UiTests : IDisposable
     }
 
     [Fact]
+    public void Results_without_a_loaded_rule_catalogue_are_not_reported_as_no_scan_at_all()
+    {
+        using (var connection = Db.OpenReadWrite())
+        {
+            Sql.Execute(connection,
+                """
+                INSERT INTO result (instance, rule_id, entity_type, entity_key, state, ttl_minutes, at)
+                VALUES ('ex-main', 'EX-X', 'host', 'h1', 'pass', 4320, '2026-10-20T00:00:00Z');
+                """);
+        }
+
+        var page = Page();
+
+        Assert.Contains("\"catalogueMissing\":true", page, StringComparison.Ordinal);
+        Assert.Contains("rule catalogue is not loaded", page, StringComparison.Ordinal);
+        Assert.Contains("keeper rules load", page, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void A_view_that_has_nothing_to_show_in_a_section_leaves_it_out_instead_of_printing_null()
+    {
+        // The coverage view returns null for a section with no rows; appending that raw prints the word "null" on the page.
+        // (Seen in a real render. The page's script cannot run here, so the guard is checked in its source.)
+        Assert.Contains("views[state.tab]().flat().filter(n => n != null && n !== false)", Page(), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void An_empty_store_is_not_blamed_on_the_catalogue()
+    {
+        Assert.Contains("\"catalogueMissing\":false", Page(), StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void Text_from_a_scanned_system_cannot_become_markup()
     {
         using (var connection = Db.OpenReadWrite())

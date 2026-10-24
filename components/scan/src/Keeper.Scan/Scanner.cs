@@ -272,15 +272,18 @@ public sealed class Scanner(RunnerRegistry registry, TimeProvider? clock = null)
             return outcome;
         }
 
-        var targets = Targets(file, request);
+        var (targets, targetsProblem) = ResolveTargets(file, request);
         if (targets.Count == 0)
         {
-            outcome.Targets.Add(new TargetOutcome(null, "failed", "no targets: set the file's targets or the integration's targets option", 0));
+            outcome.Targets.Add(new TargetOutcome(null, "failed", targetsProblem ?? "no targets: set the file's targets or the integration's targets option (or targetsFrom=discovery)", 0));
             return outcome;
         }
+        // Discovery supplied the list and it may be short: said, so the scan is partial and not quietly smaller.
+        if (targetsProblem is not null)
+            outcome.Targets.Add(new TargetOutcome(null, "partial", targetsProblem, 0));
         // A query-wide record beside the hosts' own: it tells the tracker that a host missing from this read may
         // simply be missing from the list, not retired.
-        if (file.Targets is { List.Count: 0 } spec && request.TargetsIncomplete(spec) is { } incomplete)
+        if (file.Targets is { List.Count: 0 } spec && request.Connection.Options["targets"] is not JsonArray && request.TargetsIncomplete(spec) is { } incomplete)
             outcome.Targets.Add(new TargetOutcome(null, "partial", incomplete, 0));
 
         using var gate = new SemaphoreSlim(Math.Max(1, request.Parallelism));
@@ -305,13 +308,23 @@ public sealed class Scanner(RunnerRegistry registry, TimeProvider? clock = null)
         return outcome;
     }
 
-    private static IReadOnlyList<string> Targets(RuleFile file, ScanRequest request)
+    private (IReadOnlyList<string> Targets, string? Problem) ResolveTargets(RuleFile file, ScanRequest request)
     {
+        var options = request.Connection.Options;
+        // A list the rule author wrote into the file is their choice. A file that finds its hosts in the store (every
+        // directory-driven pack) can be pointed at named hosts by the integration: one lab machine, one host to try.
+        if (file.Targets is { List.Count: > 0 } fixedList)
+            return (fixedList.List, null);
+        if (options["targets"] is JsonArray fromOptions)
+            return (fromOptions.Select(t => Values.Text(t)).OfType<string>().Where(t => t.Length > 0).ToList(), null);
         if (file.Targets is { } spec)
-            return spec.List.Count > 0 ? spec.List : request.ResolveTargets(spec);
-        if (request.Connection.Options["targets"] is JsonArray fromOptions)
-            return fromOptions.Select(t => Values.Text(t)).OfType<string>().Where(t => t.Length > 0).ToList();
-        return string.IsNullOrWhiteSpace(request.Connection.Endpoint) ? [] : [request.Connection.Endpoint];
+            return (request.ResolveTargets(spec), null);
+        if (options["targetsFrom"]?.ToString() == "discovery" && options["targetsKind"]?.ToString() is { Length: > 0 } kinds)
+            return DiscoveryTargets.Read(request.ImportsDir, kinds, request.Connection.Endpoint, request.Connection.Type, _clock.GetUtcNow());
+        // For these types the endpoint is the scope they may talk to, not a host to read.
+        if (request.Connection.Type is "ssh" or "printer")
+            return ([], null);
+        return (string.IsNullOrWhiteSpace(request.Connection.Endpoint) ? [] : [request.Connection.Endpoint], null);
     }
 
     private RunnerContext Context(ScanRequest request, string? target) =>

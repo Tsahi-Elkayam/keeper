@@ -13,6 +13,9 @@ keeper integration set-secret office-printers community        # only for the SN
 keeper scan printers
 ```
 
+Instead of listing them, `--option targetsFrom=discovery --option targetsKind=printer` takes every answering printer
+that `keeper discover` found inside the scope (a missing, degraded or old inventory makes the scan partial and says so).
+
 The endpoint is where the integration may talk (CIDR ranges, addresses, host names, `*.suffix`); a printer outside it
 gets nothing sent. `--auth none` is enough for ports, IPP and the `public` check. One integration per community.
 

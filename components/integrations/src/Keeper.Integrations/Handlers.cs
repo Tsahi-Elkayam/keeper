@@ -11,6 +11,9 @@ namespace Keeper.Integrations;
 /// </summary>
 public sealed partial class UpsertHandler : IRequestHandler
 {
+    /// <summary>The kinds the discovery classifier assigns to an asset.</summary>
+    private static readonly string[] DiscoveredKinds = ["domain-controller", "windows", "hypervisor", "printer", "network-device", "linux-unix", "unknown"];
+
     private static readonly string[] SecretLike = ["password", "secret", "token", "apikey", "api-key", "credential", "key"];
 
     public string Kind => "integrations.upsert";
@@ -59,6 +62,20 @@ public sealed partial class UpsertHandler : IRequestHandler
             {
                 throw new RequestException(ex.Message);
             }
+        }
+        // Targets taken from what discovery found: which source, and which of the kinds discovery assigns.
+        var from = options["targetsFrom"]?.ToString();
+        var kinds = options["targetsKind"]?.ToString();
+        if (from is not null && from != "discovery")
+            throw new RequestException("Option targetsFrom must be discovery.");
+        if (from is null && kinds is not null)
+            throw new RequestException("Option targetsKind only means something with targetsFrom=discovery.");
+        if (from is not null)
+        {
+            var wanted = (kinds ?? "").Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+            var unknown = wanted.FirstOrDefault(k => !DiscoveredKinds.Contains(k, StringComparer.OrdinalIgnoreCase));
+            if (wanted.Length == 0 || unknown is not null)
+                throw new RequestException($"Option targetsKind must name what discovery found: {string.Join(", ", DiscoveredKinds)}{(unknown is null ? "" : $" ('{unknown}' is not one)")}.");
         }
         if (options["tokenUrl"] is JsonValue tokenUrl
             && (!Uri.TryCreate(tokenUrl.ToString(), UriKind.Absolute, out var tu) || tu.Scheme != "https"))

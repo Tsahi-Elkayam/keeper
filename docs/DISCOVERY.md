@@ -37,7 +37,7 @@ targets:
 exclude:
   - cidr: 192.0.2.240/28
     why: lab bench equipment
-  - name: "*-ilo.*"
+  - name: "*.ilo.example.com"
     why: out-of-band controllers polled separately
 
 gentle:
