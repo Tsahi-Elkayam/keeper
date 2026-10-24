@@ -14,10 +14,16 @@ public static class PathGuard
     /// <summary>Resolves <paramref name="relative"/> under <paramref name="folder"/>, or throws.</summary>
     public static string Resolve(string folder, string relative)
     {
-        if (string.IsNullOrWhiteSpace(relative) || Path.IsPathRooted(relative))
+        if (string.IsNullOrWhiteSpace(relative))
             throw new UnauthorizedAccessException($"'{relative}' must be a path relative to {folder}.");
 
-        var full = Path.GetFullPath(Path.Combine(folder, relative));
+        // Paths come from rules and settings written for Windows: a backslash separates folders on every OS here,
+        // so "..\x" cannot slip through where the OS itself treats a backslash as an ordinary character.
+        var normalised = relative.Replace('\\', Path.DirectorySeparatorChar);
+        if (Path.IsPathRooted(normalised))
+            throw new UnauthorizedAccessException($"'{relative}' must be a path relative to {folder}.");
+
+        var full = Path.GetFullPath(Path.Combine(folder, normalised));
         if (!IsUnder(full, folder))
             throw new UnauthorizedAccessException($"'{relative}' leaves {folder}.");
 

@@ -69,6 +69,19 @@ public sealed class CliArgs
     public string Require(string name) =>
         Get(name) is { Length: > 0 } value ? value : throw new ArgumentException($"--{name} is required.");
 
+    /// <summary>
+    /// Refuses anything the verb does not know: an unknown --option, or more positional words than
+    /// <paramref name="maxPositional"/>. A mistyped command must fail, not quietly do something else.
+    /// </summary>
+    public void RejectUnknown(IReadOnlyCollection<string> knownOptions, int maxPositional = 0)
+    {
+        var unknown = _options.Keys.Where(name => !knownOptions.Contains(name, StringComparer.OrdinalIgnoreCase)).ToList();
+        if (unknown.Count > 0)
+            throw new ArgumentException($"Unknown option {string.Join(", ", unknown.Select(n => "--" + n))}. Known: {string.Join(", ", knownOptions.Select(n => "--" + n))}.");
+        if (_positional.Count > maxPositional)
+            throw new ArgumentException($"Unexpected argument '{_positional[maxPositional]}'.");
+    }
+
     /// <summary>The positional word at <paramref name="index"/>, or null.</summary>
     public string? At(int index) => index < _positional.Count ? _positional[index] : null;
 }

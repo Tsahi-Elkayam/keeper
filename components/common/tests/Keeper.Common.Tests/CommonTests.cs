@@ -108,3 +108,35 @@ public sealed class JsonLinesTests : IDisposable
         Assert.Throws<FormatException>(() => JsonLines.Read(file).ToList());
     }
 }
+
+public sealed class CliArgsRejectUnknownTests
+{
+    [Fact]
+    public void Known_options_and_flags_pass()
+    {
+        var cli = new CliArgs(["--fresh", "--targets", "x.yaml"], flags: ["fresh"]);
+        cli.RejectUnknown(["fresh", "targets"]);
+    }
+
+    [Fact]
+    public void An_unknown_option_is_refused_by_name()
+    {
+        var cli = new CliArgs(["--plan", "--fresh"], flags: ["fresh"]);
+        var ex = Assert.Throws<ArgumentException>(() => cli.RejectUnknown(["fresh"]));
+        Assert.Contains("--plan", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void A_positional_word_is_refused_when_none_are_allowed()
+    {
+        var cli = new CliArgs(["status"]);
+        var ex = Assert.Throws<ArgumentException>(() => cli.RejectUnknown([]));
+        Assert.Contains("status", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Positional_words_up_to_the_allowed_count_pass()
+    {
+        new CliArgs(["one"]).RejectUnknown([], maxPositional: 1);
+    }
+}
