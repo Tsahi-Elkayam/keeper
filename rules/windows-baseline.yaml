@@ -7,12 +7,10 @@ integration: cim
 # deduped by (path + name + expected + operator). The CIS Operator states COMPLIANCE; each rule's
 # condition states the FAILURE, and a value that is not set counts as a finding (any: [ {absent}, ... ]).
 #
-# OS targeting: a rule carries no per-rule target (see Keeper.Rules RuleLoader RuleFields), so the
-# file-level targets below resolve ALL recently-active Windows hosts and every rule is judged on each.
-# Where a setting's expected value genuinely differs between Windows client and Windows Server, two
-# variants are emitted with distinct ids (-CLIENT / -SERVER) and the per-OS value; to stop the other
-# OS's variant being judged on a host, move those pairs into the os-specific packs (workstations.yaml /
-# windows-server.yaml) or add a per-rule target to the engine. See docs/backlog/windows-baseline.md.
+# OS targeting: the file-level targets below resolve ALL recently-active Windows hosts. Where a setting's expected
+# value genuinely differs between Windows client and Windows Server, two variants are emitted with distinct ids
+# (-CLIENT / -SERVER) and the per-OS value; each carries an `applies` condition, so a host is judged only against
+# the variant for its own kind. See docs/backlog/windows-baseline.md.
 targets:
   entity: computer
   field: dNSHostName
@@ -251,6 +249,7 @@ rules:
     title: 'Administrative Templates: System: LAPS: Configure password backup directory (Windows client)'
     category: IAM
     severity: medium
+    applies: { field: operatingSystem, op: notmatch, value: 'Server' }
     why: 'The CIS/Microsoft Windows security baseline expects SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\LAPS\BackupDirectory = 2; a value that is not set counts as not compliant.'
     fix: 'Set SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\LAPS\BackupDirectory to the baseline value (= 2) through the group policy or MDM profile that enforces the baseline, then let policy refresh.'
     refs: ['CIS-Microsoft-Windows:18.9.25.1']
@@ -262,6 +261,7 @@ rules:
     title: 'Administrative Templates: System: LAPS: Configure password backup directory (Windows Server)'
     category: IAM
     severity: medium
+    applies: { field: operatingSystem, op: match, value: 'Server' }
     why: 'The CIS/Microsoft Windows security baseline expects SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\LAPS\BackupDirectory <= 2 and not 0; a value that is not set counts as not compliant.'
     fix: 'Set SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\LAPS\BackupDirectory to the baseline value (<= 2 and not 0) through the group policy or MDM profile that enforces the baseline, then let policy refresh.'
     refs: ['CIS-Microsoft-Windows:18.9.25.1']
@@ -372,6 +372,7 @@ rules:
     title: 'Administrative Templates: System: KDC: Configure hash algorithms for certificate logon (SHA-1) (Windows client)'
     category: PKI
     severity: medium
+    applies: { field: operatingSystem, op: notmatch, value: 'Server' }
     why: 'The CIS/Microsoft Windows security baseline expects Software\Microsoft\Windows\CurrentVersion\Policies\System\KDC\Parameters\PKINITSHA1 = 0; a value that is not set counts as not compliant.'
     fix: 'Set Software\Microsoft\Windows\CurrentVersion\Policies\System\KDC\Parameters\PKINITSHA1 to the baseline value (= 0) through the group policy or MDM profile that enforces the baseline, then let policy refresh.'
     refs: ['MSFT-Security-Baseline-Windows:10731']
@@ -383,6 +384,7 @@ rules:
     title: 'Administrative Templates: System: KDC: Configure hash algorithms for certificate logon (SHA-1) (Windows Server)'
     category: PKI
     severity: medium
+    applies: { field: operatingSystem, op: match, value: 'Server' }
     why: 'The CIS/Microsoft Windows security baseline expects Software\Microsoft\Windows\CurrentVersion\Policies\System\KDC\Parameters\PKINITSHA1 = 1; a value that is not set counts as not compliant.'
     fix: 'Set Software\Microsoft\Windows\CurrentVersion\Policies\System\KDC\Parameters\PKINITSHA1 to the baseline value (= 1) through the group policy or MDM profile that enforces the baseline, then let policy refresh.'
     refs: ['MSFT-Security-Baseline-Windows:10731']
@@ -460,6 +462,7 @@ rules:
     title: 'Administrative Templates: System: Kerberos: Configure hash algorithms for certificate logon (SHA-1) (Windows client)'
     category: PKI
     severity: medium
+    applies: { field: operatingSystem, op: notmatch, value: 'Server' }
     why: 'The CIS/Microsoft Windows security baseline expects Software\Microsoft\Windows\CurrentVersion\Policies\System\Kerberos\Parameters\PKINITSHA1 = 0; a value that is not set counts as not compliant.'
     fix: 'Set Software\Microsoft\Windows\CurrentVersion\Policies\System\Kerberos\Parameters\PKINITSHA1 to the baseline value (= 0) through the group policy or MDM profile that enforces the baseline, then let policy refresh.'
     refs: ['MSFT-Security-Baseline-Windows:10736']
@@ -471,6 +474,7 @@ rules:
     title: 'Administrative Templates: System: Kerberos: Configure hash algorithms for certificate logon (SHA-1) (Windows Server)'
     category: PKI
     severity: medium
+    applies: { field: operatingSystem, op: match, value: 'Server' }
     why: 'The CIS/Microsoft Windows security baseline expects Software\Microsoft\Windows\CurrentVersion\Policies\System\Kerberos\Parameters\PKINITSHA1 = 1; a value that is not set counts as not compliant.'
     fix: 'Set Software\Microsoft\Windows\CurrentVersion\Policies\System\Kerberos\Parameters\PKINITSHA1 to the baseline value (= 1) through the group policy or MDM profile that enforces the baseline, then let policy refresh.'
     refs: ['MSFT-Security-Baseline-Windows:10736']
@@ -1879,6 +1883,7 @@ rules:
     title: 'Software\Policies\Microsoft\Windows Defender\MpEngine\MpCloudBlockLevel (Windows client)'
     category: MON
     severity: medium
+    applies: { field: operatingSystem, op: notmatch, value: 'Server' }
     why: 'The CIS/Microsoft Windows security baseline expects Software\Policies\Microsoft\Windows Defender\MpEngine\MpCloudBlockLevel = 2; a value that is not set counts as not compliant.'
     fix: 'Set Software\Policies\Microsoft\Windows Defender\MpEngine\MpCloudBlockLevel to the baseline value (= 2) through the group policy or MDM profile that enforces the baseline, then let policy refresh.'
     refs: ['MSFT-Security-Baseline-Windows:10999']
@@ -1890,6 +1895,7 @@ rules:
     title: 'Administrative Templates: Windows Components: Microsoft Defender Antivirus: MpEngine: Select cloud protection level (Windows Server)'
     category: MON
     severity: medium
+    applies: { field: operatingSystem, op: match, value: 'Server' }
     why: 'The CIS/Microsoft Windows security baseline expects Software\Policies\Microsoft\Windows Defender\MpEngine\MpCloudBlockLevel >= 2; a value that is not set counts as not compliant.'
     fix: 'Set Software\Policies\Microsoft\Windows Defender\MpEngine\MpCloudBlockLevel to the baseline value (>= 2) through the group policy or MDM profile that enforces the baseline, then let policy refresh.'
     refs: ['MSFT-Security-Baseline-Windows:10999']
@@ -2110,6 +2116,7 @@ rules:
     title: 'Software\Policies\Microsoft\Windows Defender\Spynet\DisableBlockAtFirstSeen (Windows client)'
     category: MON
     severity: medium
+    applies: { field: operatingSystem, op: notmatch, value: 'Server' }
     why: 'The CIS/Microsoft Windows security baseline expects Software\Policies\Microsoft\Windows Defender\Spynet\DisableBlockAtFirstSeen = 0; a value that is not set counts as not compliant.'
     fix: 'Set Software\Policies\Microsoft\Windows Defender\Spynet\DisableBlockAtFirstSeen to the baseline value (= 0) through the group policy or MDM profile that enforces the baseline, then let policy refresh.'
     refs: ['MSFT-Security-Baseline-Windows:10998']
@@ -2121,6 +2128,7 @@ rules:
     title: 'Administrative Templates: Windows Components: Microsoft Defender Antivirus: MAPS: Configure the ''Block at First Sight'' feature (Windows Server)'
     category: MON
     severity: medium
+    applies: { field: operatingSystem, op: match, value: 'Server' }
     why: 'The CIS/Microsoft Windows security baseline expects Software\Policies\Microsoft\Windows Defender\Spynet\DisableBlockAtFirstSeen >= 0; a value that is not set counts as not compliant.'
     fix: 'Set Software\Policies\Microsoft\Windows Defender\Spynet\DisableBlockAtFirstSeen to the baseline value (>= 0) through the group policy or MDM profile that enforces the baseline, then let policy refresh.'
     refs: ['MSFT-Security-Baseline-Windows:10998']
@@ -2154,6 +2162,7 @@ rules:
     title: 'Administrative Templates: Windows Components: Microsoft Defender Antivirus: MAPS: Send file samples when further analysis is required (Windows client)'
     category: MON
     severity: medium
+    applies: { field: operatingSystem, op: notmatch, value: 'Server' }
     why: 'The CIS/Microsoft Windows security baseline expects Software\Policies\Microsoft\Windows Defender\Spynet\SubmitSamplesConsent = 3; a value that is not set counts as not compliant.'
     fix: 'Set Software\Policies\Microsoft\Windows Defender\Spynet\SubmitSamplesConsent to the baseline value (= 3) through the group policy or MDM profile that enforces the baseline, then let policy refresh.'
     refs: ['MSFT-Security-Baseline-Windows:10974']
@@ -2165,6 +2174,7 @@ rules:
     title: 'Administrative Templates: Windows Components: Microsoft Defender Antivirus: MAPS: Send file samples when further analysis is required (Windows Server)'
     category: MON
     severity: medium
+    applies: { field: operatingSystem, op: match, value: 'Server' }
     why: 'The CIS/Microsoft Windows security baseline expects Software\Policies\Microsoft\Windows Defender\Spynet\SubmitSamplesConsent = 1; a value that is not set counts as not compliant.'
     fix: 'Set Software\Policies\Microsoft\Windows Defender\Spynet\SubmitSamplesConsent to the baseline value (= 1) through the group policy or MDM profile that enforces the baseline, then let policy refresh.'
     refs: ['MSFT-Security-Baseline-Windows:10974']
@@ -2319,6 +2329,7 @@ rules:
     title: 'Administrative Templates: Windows Components: Microsoft Defender Antivirus: Microsoft Defender Exploit Guard: ASR: Block process creations originating from PSExec and WMI commands (Policy) (Windows client)'
     category: MON
     severity: medium
+    applies: { field: operatingSystem, op: notmatch, value: 'Server' }
     why: 'The CIS/Microsoft Windows security baseline expects Software\Policies\Microsoft\Windows Defender\Windows Defender Exploit Guard\ASR\rules\d1e49aac-8f56-4280-b9ba-993a6d77406c = 2; a value that is not set counts as not compliant.'
     fix: 'Set Software\Policies\Microsoft\Windows Defender\Windows Defender Exploit Guard\ASR\rules\d1e49aac-8f56-4280-b9ba-993a6d77406c to the baseline value (= 2) through the group policy or MDM profile that enforces the baseline, then let policy refresh.'
     refs: ['MSFT-Security-Baseline-Windows:11044']
@@ -2330,6 +2341,7 @@ rules:
     title: 'Administrative Templates: Windows Components: Microsoft Defender Antivirus: Microsoft Defender Exploit Guard: ASR: Block process creations originating from PSExec and WMI commands (Policy) (Windows Server)'
     category: MON
     severity: low
+    applies: { field: operatingSystem, op: match, value: 'Server' }
     why: 'The CIS/Microsoft Windows security baseline expects Software\Policies\Microsoft\Windows Defender\Windows Defender Exploit Guard\ASR\rules\d1e49aac-8f56-4280-b9ba-993a6d77406c = 0; a value that is not set counts as not compliant.'
     fix: 'Set Software\Policies\Microsoft\Windows Defender\Windows Defender Exploit Guard\ASR\rules\d1e49aac-8f56-4280-b9ba-993a6d77406c to the baseline value (= 0) through the group policy or MDM profile that enforces the baseline, then let policy refresh.'
     refs: ['MSFT-Security-Baseline-Windows:11044']
@@ -2517,6 +2529,7 @@ rules:
     title: 'Administrative Templates: Network: DNS Client: Configure multicast DNS (mDNS) protocol (Windows client)'
     category: AUT
     severity: medium
+    applies: { field: operatingSystem, op: notmatch, value: 'Server' }
     why: 'The CIS/Microsoft Windows security baseline expects Software\Policies\Microsoft\Windows NT\DNSClient\EnableMDNS = 1; a value that is not set counts as not compliant.'
     fix: 'Set Software\Policies\Microsoft\Windows NT\DNSClient\EnableMDNS to the baseline value (= 1) through the group policy or MDM profile that enforces the baseline, then let policy refresh.'
     refs: ['CIS-Microsoft-Windows:18.6.4.1']
@@ -2528,6 +2541,7 @@ rules:
     title: 'Administrative Templates: Network: DNS Client: Configure multicast DNS (mDNS) protocol (Windows Server)'
     category: AUT
     severity: medium
+    applies: { field: operatingSystem, op: match, value: 'Server' }
     why: 'The CIS/Microsoft Windows security baseline expects Software\Policies\Microsoft\Windows NT\DNSClient\EnableMDNS = 0; a value that is not set counts as not compliant.'
     fix: 'Set Software\Policies\Microsoft\Windows NT\DNSClient\EnableMDNS to the baseline value (= 0) through the group policy or MDM profile that enforces the baseline, then let policy refresh.'
     refs: ['CIS-Microsoft-Windows:18.6.4.1']
@@ -2615,6 +2629,7 @@ rules:
     title: 'Administrative Templates: Printers: Configure RPC connection settings (RpcAuthentication) (Windows client)'
     category: AUT
     severity: medium
+    applies: { field: operatingSystem, op: notmatch, value: 'Server' }
     why: 'The CIS/Microsoft Windows security baseline expects Software\Policies\Microsoft\Windows NT\Printers\RPC\RpcAuthentication = 0; a value that is not set counts as not compliant.'
     fix: 'Set Software\Policies\Microsoft\Windows NT\Printers\RPC\RpcAuthentication to the baseline value (= 0) through the group policy or MDM profile that enforces the baseline, then let policy refresh.'
     refs: ['CIS-Microsoft-Windows:18.7.4']
@@ -2626,6 +2641,7 @@ rules:
     title: 'Administrative Templates: Printers: Configure RPC connection settings (RpcAuthentication) (Windows Server)'
     category: AUT
     severity: medium
+    applies: { field: operatingSystem, op: match, value: 'Server' }
     why: 'The CIS/Microsoft Windows security baseline expects Software\Policies\Microsoft\Windows NT\Printers\RPC\RpcAuthentication = 1; a value that is not set counts as not compliant.'
     fix: 'Set Software\Policies\Microsoft\Windows NT\Printers\RPC\RpcAuthentication to the baseline value (= 1) through the group policy or MDM profile that enforces the baseline, then let policy refresh.'
     refs: ['CIS-Microsoft-Windows:18.7.4']
@@ -4452,6 +4468,7 @@ rules:
     title: 'Administrative Templates: System: Device Guard: Kernel-mode Hardware-enforced Stack Protection (Policy) (Windows client)'
     category: CFG
     severity: medium
+    applies: { field: operatingSystem, op: notmatch, value: 'Server' }
     why: 'The CIS/Microsoft Windows security baseline expects SOFTWARE\Policies\Microsoft\Windows\DeviceGuard\ConfigureKernelShadowStacksLaunch = 1; a value that is not set counts as not compliant.'
     fix: 'Set SOFTWARE\Policies\Microsoft\Windows\DeviceGuard\ConfigureKernelShadowStacksLaunch to the baseline value (= 1) through the group policy or MDM profile that enforces the baseline, then let policy refresh.'
     refs: ['CIS-Microsoft-Windows:18.9.5.7']
@@ -4463,6 +4480,7 @@ rules:
     title: 'SOFTWARE\Policies\Microsoft\Windows\DeviceGuard\ConfigureKernelShadowStacksLaunch (Windows Server)'
     category: CFG
     severity: medium
+    applies: { field: operatingSystem, op: match, value: 'Server' }
     why: 'The CIS/Microsoft Windows security baseline expects SOFTWARE\Policies\Microsoft\Windows\DeviceGuard\ConfigureKernelShadowStacksLaunch = 0; a value that is not set counts as not compliant.'
     fix: 'Set SOFTWARE\Policies\Microsoft\Windows\DeviceGuard\ConfigureKernelShadowStacksLaunch to the baseline value (= 0) through the group policy or MDM profile that enforces the baseline, then let policy refresh.'
     refs: ['CIS-Microsoft-Windows:18.9.5.7']
@@ -4518,6 +4536,7 @@ rules:
     title: 'Administrative Templates: System: Device Guard: Credential Guard Configuration (Policy) (Windows client)'
     category: IAM
     severity: medium
+    applies: { field: operatingSystem, op: notmatch, value: 'Server' }
     why: 'The CIS/Microsoft Windows security baseline expects SOFTWARE\Policies\Microsoft\Windows\DeviceGuard\LsaCfgFlags = 1; a value that is not set counts as not compliant.'
     fix: 'Set SOFTWARE\Policies\Microsoft\Windows\DeviceGuard\LsaCfgFlags to the baseline value (= 1) through the group policy or MDM profile that enforces the baseline, then let policy refresh.'
     refs: ['CIS-Microsoft-Windows:18.9.5.5']
@@ -4529,6 +4548,7 @@ rules:
     title: 'Administrative Templates: System: Device Guard: Credential Guard Configuration (DC) (Windows Server)'
     category: IAM
     severity: medium
+    applies: { field: operatingSystem, op: match, value: 'Server' }
     why: 'The CIS/Microsoft Windows security baseline expects SOFTWARE\Policies\Microsoft\Windows\DeviceGuard\LsaCfgFlags = 0; a value that is not set counts as not compliant.'
     fix: 'Set SOFTWARE\Policies\Microsoft\Windows\DeviceGuard\LsaCfgFlags to the baseline value (= 0) through the group policy or MDM profile that enforces the baseline, then let policy refresh.'
     refs: ['CIS-Microsoft-Windows:18.9.5.5']
@@ -4593,6 +4613,7 @@ rules:
     title: 'Software\Policies\Microsoft\Windows\EventLog\Application\MaxSize (Windows client)'
     category: LOG
     severity: medium
+    applies: { field: operatingSystem, op: notmatch, value: 'Server' }
     why: 'The CIS/Microsoft Windows security baseline expects Software\Policies\Microsoft\Windows\EventLog\Application\MaxSize = 32768; a value that is not set counts as not compliant.'
     fix: 'Set Software\Policies\Microsoft\Windows\EventLog\Application\MaxSize to the baseline value (= 32768) through the group policy or MDM profile that enforces the baseline, then let policy refresh.'
     refs: ['CIS-Microsoft-Windows:18.10.26.1.2']
@@ -4604,6 +4625,7 @@ rules:
     title: 'Administrative Templates: Windows Components: Event Log Service: Application: Specify the maximum log file size (KB) (Windows Server)'
     category: LOG
     severity: medium
+    applies: { field: operatingSystem, op: match, value: 'Server' }
     why: 'The CIS/Microsoft Windows security baseline expects Software\Policies\Microsoft\Windows\EventLog\Application\MaxSize >= 32768; a value that is not set counts as not compliant.'
     fix: 'Set Software\Policies\Microsoft\Windows\EventLog\Application\MaxSize to the baseline value (>= 32768) through the group policy or MDM profile that enforces the baseline, then let policy refresh.'
     refs: ['CIS-Microsoft-Windows:18.10.26.1.2']
@@ -4626,6 +4648,7 @@ rules:
     title: 'Software\Policies\Microsoft\Windows\EventLog\Security\MaxSize (Windows client)'
     category: LOG
     severity: medium
+    applies: { field: operatingSystem, op: notmatch, value: 'Server' }
     why: 'The CIS/Microsoft Windows security baseline expects Software\Policies\Microsoft\Windows\EventLog\Security\MaxSize = 196608; a value that is not set counts as not compliant.'
     fix: 'Set Software\Policies\Microsoft\Windows\EventLog\Security\MaxSize to the baseline value (= 196608) through the group policy or MDM profile that enforces the baseline, then let policy refresh.'
     refs: ['CIS-Microsoft-Windows:18.10.26.2.2']
@@ -4637,6 +4660,7 @@ rules:
     title: 'Administrative Templates: Windows Components: Event Log Service: Security: Specify the maximum log file size (KB) (Windows Server)'
     category: LOG
     severity: medium
+    applies: { field: operatingSystem, op: match, value: 'Server' }
     why: 'The CIS/Microsoft Windows security baseline expects Software\Policies\Microsoft\Windows\EventLog\Security\MaxSize >= 196608; a value that is not set counts as not compliant.'
     fix: 'Set Software\Policies\Microsoft\Windows\EventLog\Security\MaxSize to the baseline value (>= 196608) through the group policy or MDM profile that enforces the baseline, then let policy refresh.'
     refs: ['CIS-Microsoft-Windows:18.10.26.2.2']
@@ -4681,6 +4705,7 @@ rules:
     title: 'Software\Policies\Microsoft\Windows\EventLog\System\MaxSize (Windows client)'
     category: LOG
     severity: medium
+    applies: { field: operatingSystem, op: notmatch, value: 'Server' }
     why: 'The CIS/Microsoft Windows security baseline expects Software\Policies\Microsoft\Windows\EventLog\System\MaxSize = 32768; a value that is not set counts as not compliant.'
     fix: 'Set Software\Policies\Microsoft\Windows\EventLog\System\MaxSize to the baseline value (= 32768) through the group policy or MDM profile that enforces the baseline, then let policy refresh.'
     refs: ['CIS-Microsoft-Windows:18.10.26.4.2']
@@ -4692,6 +4717,7 @@ rules:
     title: 'Administrative Templates: Windows Components: Event Log Service: System: Specify the maximum log file size (KB) (Windows Server)'
     category: LOG
     severity: medium
+    applies: { field: operatingSystem, op: match, value: 'Server' }
     why: 'The CIS/Microsoft Windows security baseline expects Software\Policies\Microsoft\Windows\EventLog\System\MaxSize >= 32768; a value that is not set counts as not compliant.'
     fix: 'Set Software\Policies\Microsoft\Windows\EventLog\System\MaxSize to the baseline value (>= 32768) through the group policy or MDM profile that enforces the baseline, then let policy refresh.'
     refs: ['CIS-Microsoft-Windows:18.10.26.4.2']
@@ -5055,6 +5081,7 @@ rules:
     title: 'Administrative Templates: Network: Lanman Workstation: Require Encryption (Windows client)'
     category: AUT
     severity: medium
+    applies: { field: operatingSystem, op: notmatch, value: 'Server' }
     why: 'The CIS/Microsoft Windows security baseline expects Software\Policies\Microsoft\Windows\LanmanWorkstation\RequireEncryption = 0; a value that is not set counts as not compliant.'
     fix: 'Set Software\Policies\Microsoft\Windows\LanmanWorkstation\RequireEncryption to the baseline value (= 0) through the group policy or MDM profile that enforces the baseline, then let policy refresh.'
     refs: ['CIS-Microsoft-Windows:18.6.8.7']
@@ -5066,6 +5093,7 @@ rules:
     title: 'Administrative Templates: Network: Lanman Workstation: Require Encryption (Windows Server)'
     category: AUT
     severity: medium
+    applies: { field: operatingSystem, op: match, value: 'Server' }
     why: 'The CIS/Microsoft Windows security baseline expects Software\Policies\Microsoft\Windows\LanmanWorkstation\RequireEncryption = 1; a value that is not set counts as not compliant.'
     fix: 'Set Software\Policies\Microsoft\Windows\LanmanWorkstation\RequireEncryption to the baseline value (= 1) through the group policy or MDM profile that enforces the baseline, then let policy refresh.'
     refs: ['CIS-Microsoft-Windows:18.6.8.7']
@@ -5264,6 +5292,7 @@ rules:
     title: 'Software\Policies\Microsoft\Windows\PowerShell\ScriptBlockLogging\EnableScriptBlockInvocationLogging (Windows client)'
     category: HYG
     severity: medium
+    applies: { field: operatingSystem, op: notmatch, value: 'Server' }
     why: 'The CIS/Microsoft Windows security baseline expects Software\Policies\Microsoft\Windows\PowerShell\ScriptBlockLogging\EnableScriptBlockInvocationLogging absent ; a value that is not set counts as not compliant.'
     fix: 'Set Software\Policies\Microsoft\Windows\PowerShell\ScriptBlockLogging\EnableScriptBlockInvocationLogging to the baseline value (absent ) through the group policy or MDM profile that enforces the baseline, then let policy refresh.'
     refs: ['MSFT-Security-Baseline-Windows:11006']
@@ -5275,6 +5304,7 @@ rules:
     title: 'Administrative Templates: Windows Components: Windows PowerShell: Turn on PowerShell Script Block Logging (Invocation) (Windows Server)'
     category: HYG
     severity: low
+    applies: { field: operatingSystem, op: match, value: 'Server' }
     why: 'The CIS/Microsoft Windows security baseline expects Software\Policies\Microsoft\Windows\PowerShell\ScriptBlockLogging\EnableScriptBlockInvocationLogging = 0; a value that is not set counts as not compliant.'
     fix: 'Set Software\Policies\Microsoft\Windows\PowerShell\ScriptBlockLogging\EnableScriptBlockInvocationLogging to the baseline value (= 0) through the group policy or MDM profile that enforces the baseline, then let policy refresh.'
     refs: ['MSFT-Security-Baseline-Windows:11006']
@@ -6216,6 +6246,7 @@ rules:
     title: 'SOFTWARE\Policies\Microsoft\WindowsFirewall\DomainProfile\Logging\LogFileSize (Windows client)'
     category: AUT
     severity: medium
+    applies: { field: operatingSystem, op: notmatch, value: 'Server' }
     why: 'The CIS/Microsoft Windows security baseline expects SOFTWARE\Policies\Microsoft\WindowsFirewall\DomainProfile\Logging\LogFileSize = 16384; a value that is not set counts as not compliant.'
     fix: 'Set SOFTWARE\Policies\Microsoft\WindowsFirewall\DomainProfile\Logging\LogFileSize to the baseline value (= 16384) through the group policy or MDM profile that enforces the baseline, then let policy refresh.'
     refs: ['CIS-Microsoft-Windows:9.1.5']
@@ -6227,6 +6258,7 @@ rules:
     title: 'Windows Firewall: Log size limit (Domain Profile, Policy) (Windows Server)'
     category: AUT
     severity: medium
+    applies: { field: operatingSystem, op: match, value: 'Server' }
     why: 'The CIS/Microsoft Windows security baseline expects SOFTWARE\Policies\Microsoft\WindowsFirewall\DomainProfile\Logging\LogFileSize >= 16384; a value that is not set counts as not compliant.'
     fix: 'Set SOFTWARE\Policies\Microsoft\WindowsFirewall\DomainProfile\Logging\LogFileSize to the baseline value (>= 16384) through the group policy or MDM profile that enforces the baseline, then let policy refresh.'
     refs: ['CIS-Microsoft-Windows:9.1.5']
@@ -6315,6 +6347,7 @@ rules:
     title: 'SOFTWARE\Policies\Microsoft\WindowsFirewall\PrivateProfile\Logging\LogFileSize (Windows client)'
     category: AUT
     severity: medium
+    applies: { field: operatingSystem, op: notmatch, value: 'Server' }
     why: 'The CIS/Microsoft Windows security baseline expects SOFTWARE\Policies\Microsoft\WindowsFirewall\PrivateProfile\Logging\LogFileSize = 16384; a value that is not set counts as not compliant.'
     fix: 'Set SOFTWARE\Policies\Microsoft\WindowsFirewall\PrivateProfile\Logging\LogFileSize to the baseline value (= 16384) through the group policy or MDM profile that enforces the baseline, then let policy refresh.'
     refs: ['CIS-Microsoft-Windows:9.2.5']
@@ -6326,6 +6359,7 @@ rules:
     title: 'Windows Firewall: Log size limit (Private Profile, Policy) (Windows Server)'
     category: AUT
     severity: medium
+    applies: { field: operatingSystem, op: match, value: 'Server' }
     why: 'The CIS/Microsoft Windows security baseline expects SOFTWARE\Policies\Microsoft\WindowsFirewall\PrivateProfile\Logging\LogFileSize >= 16384; a value that is not set counts as not compliant.'
     fix: 'Set SOFTWARE\Policies\Microsoft\WindowsFirewall\PrivateProfile\Logging\LogFileSize to the baseline value (>= 16384) through the group policy or MDM profile that enforces the baseline, then let policy refresh.'
     refs: ['CIS-Microsoft-Windows:9.2.5']
@@ -6414,6 +6448,7 @@ rules:
     title: 'SOFTWARE\Policies\Microsoft\WindowsFirewall\PublicProfile\Logging\LogFileSize (Windows client)'
     category: AUT
     severity: medium
+    applies: { field: operatingSystem, op: notmatch, value: 'Server' }
     why: 'The CIS/Microsoft Windows security baseline expects SOFTWARE\Policies\Microsoft\WindowsFirewall\PublicProfile\Logging\LogFileSize = 16384; a value that is not set counts as not compliant.'
     fix: 'Set SOFTWARE\Policies\Microsoft\WindowsFirewall\PublicProfile\Logging\LogFileSize to the baseline value (= 16384) through the group policy or MDM profile that enforces the baseline, then let policy refresh.'
     refs: ['CIS-Microsoft-Windows:9.3.7']
@@ -6425,6 +6460,7 @@ rules:
     title: 'Windows Firewall: Log size limit (Public Profile, Policy) (Windows Server)'
     category: AUT
     severity: medium
+    applies: { field: operatingSystem, op: match, value: 'Server' }
     why: 'The CIS/Microsoft Windows security baseline expects SOFTWARE\Policies\Microsoft\WindowsFirewall\PublicProfile\Logging\LogFileSize >= 16384; a value that is not set counts as not compliant.'
     fix: 'Set SOFTWARE\Policies\Microsoft\WindowsFirewall\PublicProfile\Logging\LogFileSize to the baseline value (>= 16384) through the group policy or MDM profile that enforces the baseline, then let policy refresh.'
     refs: ['CIS-Microsoft-Windows:9.3.7']
@@ -6644,6 +6680,7 @@ rules:
     title: 'Security Options: Network security: Restrict NTLM: Outgoing NTLM traffic to remote servers (Windows client)'
     category: AUT
     severity: medium
+    applies: { field: operatingSystem, op: notmatch, value: 'Server' }
     why: 'The CIS/Microsoft Windows security baseline expects System\CurrentControlSet\Control\Lsa\MSV1_0\RestrictSendingNTLMTraffic >= 1; a value that is not set counts as not compliant.'
     fix: 'Set System\CurrentControlSet\Control\Lsa\MSV1_0\RestrictSendingNTLMTraffic to the baseline value (>= 1) through the group policy or MDM profile that enforces the baseline, then let policy refresh.'
     refs: ['CIS-Microsoft-Windows:2.3.11.13']
@@ -6655,6 +6692,7 @@ rules:
     title: 'Security Options: Network security: Restrict NTLM: Outgoing NTLM traffic to remote servers (Windows Server)'
     category: AUT
     severity: medium
+    applies: { field: operatingSystem, op: match, value: 'Server' }
     why: 'The CIS/Microsoft Windows security baseline expects System\CurrentControlSet\Control\Lsa\MSV1_0\RestrictSendingNTLMTraffic = 1; a value that is not set counts as not compliant.'
     fix: 'Set System\CurrentControlSet\Control\Lsa\MSV1_0\RestrictSendingNTLMTraffic to the baseline value (= 1) through the group policy or MDM profile that enforces the baseline, then let policy refresh.'
     refs: ['CIS-Microsoft-Windows:2.3.11.13']
@@ -7216,6 +7254,7 @@ rules:
     title: 'Security option (Windows client)'
     category: CFG
     severity: medium
+    applies: { field: operatingSystem, op: notmatch, value: 'Server' }
     why: 'The CIS/Microsoft Windows security baseline expects System\CurrentControlSet\Services\LDAP\LDAPClientIntegrity = 1; a value that is not set counts as not compliant.'
     fix: 'Set System\CurrentControlSet\Services\LDAP\LDAPClientIntegrity to the baseline value (= 1) through the group policy or MDM profile that enforces the baseline, then let policy refresh.'
     refs: ['CIS-Microsoft-Windows:2.3.11.9']
@@ -7227,6 +7266,7 @@ rules:
     title: 'Security Options: Network security: LDAP client signing requirements (Windows Server)'
     category: AUT
     severity: medium
+    applies: { field: operatingSystem, op: match, value: 'Server' }
     why: 'The CIS/Microsoft Windows security baseline expects System\CurrentControlSet\Services\LDAP\LDAPClientIntegrity >= 1; a value that is not set counts as not compliant.'
     fix: 'Set System\CurrentControlSet\Services\LDAP\LDAPClientIntegrity to the baseline value (>= 1) through the group policy or MDM profile that enforces the baseline, then let policy refresh.'
     refs: ['CIS-Microsoft-Windows:2.3.11.9']
@@ -7645,6 +7685,7 @@ rules:
     title: 'MSS (Legacy): MSS: (TcpMaxDataRetransmissions) How many times unacknowledged data is retransmitted (Windows client)'
     category: AUT
     severity: medium
+    applies: { field: operatingSystem, op: notmatch, value: 'Server' }
     why: 'The CIS/Microsoft Windows security baseline expects System\CurrentControlSet\Services\Tcpip\Parameters\TcpMaxDataRetransmissions = 3; a value that is not set counts as not compliant.'
     fix: 'Set System\CurrentControlSet\Services\Tcpip\Parameters\TcpMaxDataRetransmissions to the baseline value (= 3) through the group policy or MDM profile that enforces the baseline, then let policy refresh.'
     refs: ['CIS-Microsoft-Windows:18.5.12']
@@ -7656,6 +7697,7 @@ rules:
     title: 'MSS (Legacy): MSS: (TcpMaxDataRetransmissions) How many times unacknowledged data is retransmitted (Windows Server)'
     category: AUT
     severity: medium
+    applies: { field: operatingSystem, op: match, value: 'Server' }
     why: 'The CIS/Microsoft Windows security baseline expects System\CurrentControlSet\Services\Tcpip\Parameters\TcpMaxDataRetransmissions <= 3; a value that is not set counts as not compliant.'
     fix: 'Set System\CurrentControlSet\Services\Tcpip\Parameters\TcpMaxDataRetransmissions to the baseline value (<= 3) through the group policy or MDM profile that enforces the baseline, then let policy refresh.'
     refs: ['CIS-Microsoft-Windows:18.5.12']
@@ -7689,6 +7731,7 @@ rules:
     title: 'MSS (Legacy): MSS: (TcpMaxDataRetransmissions IPv6) How many times unacknowledged data is retransmitted (Windows client)'
     category: AUT
     severity: medium
+    applies: { field: operatingSystem, op: notmatch, value: 'Server' }
     why: 'The CIS/Microsoft Windows security baseline expects System\CurrentControlSet\Services\Tcpip6\Parameters\TcpMaxDataRetransmissions = 3; a value that is not set counts as not compliant.'
     fix: 'Set System\CurrentControlSet\Services\Tcpip6\Parameters\TcpMaxDataRetransmissions to the baseline value (= 3) through the group policy or MDM profile that enforces the baseline, then let policy refresh.'
     refs: ['CIS-Microsoft-Windows:18.5.11']
@@ -7700,6 +7743,7 @@ rules:
     title: 'MSS (Legacy): MSS: (TcpMaxDataRetransmissions IPv6) How many times unacknowledged data is retransmitted (Windows Server)'
     category: AUT
     severity: medium
+    applies: { field: operatingSystem, op: match, value: 'Server' }
     why: 'The CIS/Microsoft Windows security baseline expects System\CurrentControlSet\Services\Tcpip6\Parameters\TcpMaxDataRetransmissions <= 3; a value that is not set counts as not compliant.'
     fix: 'Set System\CurrentControlSet\Services\Tcpip6\Parameters\TcpMaxDataRetransmissions to the baseline value (<= 3) through the group policy or MDM profile that enforces the baseline, then let policy refresh.'
     refs: ['CIS-Microsoft-Windows:18.5.11']

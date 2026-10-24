@@ -896,6 +896,83 @@ public sealed class ScannerTests : IDisposable
     }
 
     [Fact]
+    public async Task A_rule_is_judged_only_on_the_hosts_it_applies_to()
+    {
+        const string hosts = """
+            schema: keeper.rules/1
+            system: hosts
+            integration: cim
+            targets: { entity: computer, field: dNSHostName }
+            rules:
+              - id: EX-SERVER-ADMIN-UNEXPECTED
+                title: Unexpected local administrator on a server
+                kind: misconfigured
+                category: IAM
+                severity: high
+                entity: local-admin
+                applies: { field: operatingSystem, op: match, value: Server }
+                query: { protocol: hosts, what: admins, key: "{host}|{member}" }
+                each: { field: member, op: notin, value: [Administrator, Domain Admins] }
+              - id: EX-WORKSTATION-ADMIN-UNEXPECTED
+                title: Unexpected local administrator on a workstation
+                kind: misconfigured
+                category: IAM
+                severity: high
+                entity: local-admin
+                applies: { field: operatingSystem, op: notmatch, value: Server }
+                query: { protocol: hosts, what: admins, key: "{host}|{member}" }
+                each: { field: member, op: notin, value: [Administrator, Domain Admins] }
+              - id: EX-SERVER-ADMIN-MANY
+                title: Too many local administrators on a server
+                kind: misconfigured
+                category: IAM
+                severity: medium
+                entity: computer
+                applies: { field: operatingSystem, op: match, value: Server }
+                query: { protocol: hosts, what: admins, key: "{host}|{member}" }
+                count: { op: gt, value: 1 }
+            """;
+        var path = Path.Combine(_dir, "applies.yaml");
+        File.WriteAllText(path, hosts);
+        var registry = new RunnerRegistry([new HostsRunner()]);
+        JsonObject Os(string name) => new() { ["operatingSystem"] = name };
+
+        var report = await new Scanner(registry, new Clock(Now)).RunAsync(new ScanRequest
+        {
+            Files = [RuleLoader.LoadFile(path, "test", registry.Validators)],
+            Connection = new FilesConnection(),
+            RunsDir = Runs,
+            ImportsDir = Imports,
+            ResolveTargets = _ => ["pc1.example.org", "pc2.example.org", "pc3.example.org"],
+            // pc1 is a workstation with 4 admins, pc2 a server with 2 (both expected), pc3 has no known attributes.
+            ResolveTargetAttributes = _ => new Dictionary<string, JsonObject>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["pc1.example.org"] = Os("Windows 11 Enterprise"),
+                ["pc2.example.org"] = Os("Windows Server 2022 Standard"),
+            },
+        }, CancellationToken.None);
+
+        var findings = Read<FindingRecord>(report, RunFolder.Findings);
+        var results = Read<ResultRecord>(report, RunFolder.Results);
+
+        // The workstation's extra admins are a workstation finding only; the server rule never looks at pc1.
+        Assert.Equal(new[] { "pc1.example.org|user7", "pc1.example.org|user9" },
+            findings.Where(f => f.RuleId == "EX-WORKSTATION-ADMIN-UNEXPECTED").Select(f => f.Target).Order(StringComparer.Ordinal));
+        Assert.DoesNotContain(findings, f => f.RuleId == "EX-SERVER-ADMIN-UNEXPECTED");
+        Assert.DoesNotContain(results, r => r.RuleId == "EX-SERVER-ADMIN-UNEXPECTED" && r.EntityKey.StartsWith("pc1", StringComparison.Ordinal));
+        Assert.DoesNotContain(results, r => r.RuleId == "EX-WORKSTATION-ADMIN-UNEXPECTED" && r.EntityKey.StartsWith("pc2", StringComparison.Ordinal));
+
+        // The per-host count: pc1 has 4 admins but is not a server, so it is not judged; pc2 has 2 > 1.
+        Assert.Equal("pc2.example.org", Assert.Single(findings, f => f.RuleId == "EX-SERVER-ADMIN-MANY").Target);
+        Assert.DoesNotContain(results, r => r.RuleId == "EX-SERVER-ADMIN-MANY" && r.EntityKey == "pc1.example.org");
+
+        // pc3's kind is not known: unknown, never a pass and never silently skipped.
+        var unknown = Assert.Single(results, r => r.RuleId == "EX-SERVER-ADMIN-MANY" && r.EntityKey == "pc3.example.org");
+        Assert.Equal("unknown", unknown.State);
+        Assert.Contains("applies", unknown.Why, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task A_failed_query_makes_its_rules_unknown_never_passed()
     {
         DropAll();

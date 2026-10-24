@@ -135,8 +135,25 @@ public sealed class StoreInputs
     {
         if (spec.Entity is null || spec.Field is null)
             return spec.List;
+        return [.. new SortedSet<string>(MatchingHosts(spec, now).Select(h => h.Host), StringComparer.OrdinalIgnoreCase)];
+    }
+
+    /// <summary>The same hosts as <see cref="Targets"/>, each with the attributes it was found with (the newest read wins).</summary>
+    public IReadOnlyDictionary<string, JsonObject> TargetAttributes(TargetSpec spec, DateTimeOffset now)
+    {
+        var byHost = new Dictionary<string, JsonObject>(StringComparer.OrdinalIgnoreCase);
+        if (spec.Entity is null || spec.Field is null)
+            return byHost;
+        foreach (var (host, attrs) in MatchingHosts(spec, now))
+            byHost[host] = attrs;
+        return byHost;
+    }
+
+    private IEnumerable<(string Host, JsonObject Attrs)> MatchingHosts(TargetSpec spec, DateTimeOffset now)
+    {
+        if (spec.Entity is null || spec.Field is null)
+            yield break;
         var evaluator = new Evaluator(_ => null, now);
-        var hosts = new SortedSet<string>(StringComparer.OrdinalIgnoreCase);
         foreach (var row in Sql.Rows(_connection,
                      "SELECT rs.attrs FROM row_seen rs JOIN latest_run lr ON lr.run_id = rs.run_id WHERE rs.entity_type = :t;",
                      null, (":t", spec.Entity)))
@@ -146,9 +163,8 @@ public sealed class StoreInputs
             if (spec.Where is not null && evaluator.Each(spec.Where, attrs).Fails != true)
                 continue;
             if (Values.Text(FieldPath.First(attrs, spec.Field)) is { Length: > 0 } host)
-                hosts.Add(host);
+                yield return (host, attrs);
         }
-        return [.. hosts];
     }
 
     /// <summary>

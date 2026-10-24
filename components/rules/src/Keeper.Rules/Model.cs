@@ -127,6 +127,12 @@ public sealed record Rule
     public required QuerySpec Query { get; init; }
     public Condition? Each { get; init; }
     public CountCondition? Count { get; init; }
+
+    /// <summary>
+    /// Which target hosts the rule is judged on: a condition over the host's attributes (the same ones the file's
+    /// targets.where reads). Null means every target of the file. Needs entity-based targets.
+    /// </summary>
+    public Condition? Applies { get; init; }
     public string? Evidence { get; init; }
 
     /// <summary>A date field: the finding's deadline (when it breaks or falls due).</summary>

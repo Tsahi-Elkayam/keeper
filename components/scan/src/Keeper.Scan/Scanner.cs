@@ -24,6 +24,12 @@ public sealed record ScanRequest
     /// <summary>Hosts for per-target rules, from what earlier scans saw.</summary>
     public Func<TargetSpec, IReadOnlyList<string>> ResolveTargets { get; init; } = _ => [];
 
+    /// <summary>
+    /// The attributes of each target host (by the target's name), for the rules that say which hosts they
+    /// <c>applies</c> to. A host missing here is one the rule cannot be judged on.
+    /// </summary>
+    public Func<TargetSpec, IReadOnlyDictionary<string, JsonObject>> ResolveTargetAttributes { get; init; } = _ => new Dictionary<string, JsonObject>();
+
     /// <summary>Why the resolved host list may be missing hosts (its source read was not clean), or null.</summary>
     public Func<TargetSpec, string?> TargetsIncomplete { get; init; } = _ => null;
 
@@ -128,8 +134,22 @@ public sealed class Scanner(RunnerRegistry registry, TimeProvider? clock = null)
         }
 
         var findings = 0;
-        foreach (var (rule, _) in rules)
-            findings += Evaluate(rule, outcomes[rule.Query.Id], request, run, instance, system, observedAt);
+        var attributesByFile = new Dictionary<RuleFile, IReadOnlyDictionary<string, JsonObject>>();
+        foreach (var (rule, file) in rules)
+        {
+            Func<string?, bool?>? appliesTo = null;
+            if (rule.Applies is { } applies && file.Targets is { } spec)
+            {
+                if (!attributesByFile.TryGetValue(file, out var attributes))
+                    attributesByFile[file] = attributes = new Dictionary<string, JsonObject>(request.ResolveTargetAttributes(spec), StringComparer.OrdinalIgnoreCase);
+                var evaluator = new Evaluator(name => request.Threshold(name), _clock.GetUtcNow());
+                // true: judged here. false: this rule is not about this host. null: the host's kind is not known.
+                appliesTo = target => target is null ? true
+                    : attributes.TryGetValue(target, out var host) ? evaluator.Each(applies, host).Fails
+                    : null;
+            }
+            findings += Evaluate(rule, outcomes[rule.Query.Id], request, run, instance, system, observedAt, appliesTo);
+        }
 
         var states = outcomes.Values.Select(o => o.State).ToList();
         var status = states.All(s => s == "ok") ? "ok" : states.Any(s => s is "ok" or "partial") ? "partial" : "failed";
@@ -340,7 +360,8 @@ public sealed class Scanner(RunnerRegistry registry, TimeProvider? clock = null)
     private static bool NamesHost(string key, string target) =>
         key.Split('|').Any(part => part.Equals(target, StringComparison.OrdinalIgnoreCase));
 
-    private int Evaluate(Rule rule, QueryOutcome outcome, ScanRequest request, RunWriter run, string instance, string system, string observedAt)
+    private int Evaluate(Rule rule, QueryOutcome outcome, ScanRequest request, RunWriter run, string instance, string system, string observedAt,
+        Func<string?, bool?>? appliesTo = null)
     {
         var now = _clock.GetUtcNow();
         void Coverage(string state, string? reason, int count) => run.Coverage(new CoverageRecord
@@ -384,6 +405,29 @@ public sealed class Scanner(RunnerRegistry registry, TimeProvider? clock = null)
             return 0;
         }
 
+        // A rule that applies only to some hosts is not judged on the others; a host whose kind is not known
+        // is unknown for it - never a pass, never silently skipped.
+        bool NotJudged(string? target, string key)
+        {
+            if (appliesTo is null)
+                return false;
+            switch (appliesTo(target))
+            {
+                case true:
+                    return false;
+                case false:
+                    return true;
+                default:
+                    run.Result(new ResultRecord
+                    {
+                        Instance = instance, System = system, RuleId = rule.Id, EntityType = rule.EntityType, EntityKey = key,
+                        State = "unknown", Why = "this rule applies to some hosts only, and what kind of host this is could not be read",
+                        TtlMinutes = rule.TtlMinutes, At = observedAt,
+                    });
+                    return true;
+            }
+        }
+
         var findings = 0;
         // Whether every count of a partial read still settled its answer (see CountOne): then the rule saw enough.
         var settled = true;
@@ -396,6 +440,8 @@ public sealed class Scanner(RunnerRegistry registry, TimeProvider? clock = null)
                 var byTarget = outcome.Rows.ToLookup(r => r.Target, StringComparer.OrdinalIgnoreCase);
                 foreach (var target in outcome.Targets.Where(t => t.Target is not null))
                 {
+                    if (NotJudged(target.Target!, target.Target!))
+                        continue;
                     if (target.State == "failed")
                     {
                         run.Result(new ResultRecord
@@ -418,6 +464,8 @@ public sealed class Scanner(RunnerRegistry registry, TimeProvider? clock = null)
             foreach (var (row, target) in outcome.Rows)
             {
                 var key = KeyOf(rule.Query, row, target);
+                if (NotJudged(target, key))
+                    continue;
                 var evaluator = new Evaluator(name => request.OverrideThreshold(rule.Id, key) ?? request.Threshold(name), now) { Mask = outcome.Mask };
                 var verdict = evaluator.Each(rule.Each!, row);
                 Result(rule.EntityType, key, verdict);

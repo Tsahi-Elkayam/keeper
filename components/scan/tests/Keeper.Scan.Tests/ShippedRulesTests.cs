@@ -102,6 +102,19 @@ public sealed class ShippedRulesTests : IDisposable
         Assert.Equal(ids.Count, ids.Distinct(StringComparer.OrdinalIgnoreCase).Count());
     }
 
+    // A baseline rule written for one kind of Windows host (-CLIENT / -SERVER) must say so, or it is judged on every host
+    // and reports findings that do not apply to them.
+    [Fact]
+    public void Every_client_or_server_variant_rule_says_which_hosts_it_applies_to()
+    {
+        var variants = Shipped().Files.Where(f => f.System == "windows-baseline").SelectMany(f => f.Rules)
+            .Where(r => r.Id.EndsWith("-CLIENT", StringComparison.Ordinal) || r.Id.EndsWith("-SERVER", StringComparison.Ordinal))
+            .ToList();
+
+        Assert.NotEmpty(variants);
+        Assert.Empty(variants.Where(r => r.Applies is null).Select(r => r.Id));
+    }
+
     [Fact]
     public async Task Every_store_rule_runs_on_a_current_store_without_a_failed_query()
     {

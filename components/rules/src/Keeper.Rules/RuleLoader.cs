@@ -24,7 +24,7 @@ public static partial class RuleLoader
     private static readonly string[] DefaultFields = ["kind", "lens", "category", "severity", "refresh", "entity"];
     private static readonly string[] TargetFields = ["entity", "where", "field", "list"];
     private static readonly string[] RuleFields =
-        ["id", "title", "kind", "lens", "category", "severity", "entity", "why", "fix", "refs", "refresh", "query", "each", "count", "evidence", "deadline", "emit", "mask"];
+        ["id", "title", "kind", "lens", "category", "severity", "entity", "why", "fix", "refs", "refresh", "query", "each", "count", "applies", "evidence", "deadline", "emit", "mask"];
     private static readonly string[] EmitFields = ["check", "title", "kind", "category", "severity"];
     private static readonly string[] SeverityMapFields = ["field", "daysLeft", "ranges", "map", "default"];
     private static readonly string[] RangeFields = ["min", "max", "value"];
@@ -147,6 +147,11 @@ public static partial class RuleLoader
             }
         }
 
+        // 'applies' is judged on the target host's attributes, which only entity-based targets have.
+        if (targets is not { Entity: not null, Field: not null })
+            foreach (var withApplies in rules.Where(r => r.Applies is not null))
+                reader.Error($"rule {withApplies.Id}: 'applies' needs the file's targets to be entity and field (a host's attributes), not a list or nothing.");
+
         return errors.Count > before ? null : new RuleFile(system, name, integration, targets, rules, path, origin, Hashing.Sha256File(path));
     }
 
@@ -223,6 +228,7 @@ public static partial class RuleLoader
         if (hasCount)
             count = ReadCount(reader, countNode!, what);
 
+        var applies = fields.TryGetValue("applies", out var appliesNode) ? ReadCondition(reader, appliesNode, $"{what}.applies") : null;
         var evidence = reader.Text(fields, "evidence", what);
         var deadline = reader.Text(fields, "deadline", what);
         if (deadline is { Length: 10 } && char.IsAsciiDigit(deadline[0]) && deadline[4] == '-' && !Values.IsLiteralDate(deadline))
@@ -268,6 +274,7 @@ public static partial class RuleLoader
             Query = query ?? new QuerySpec("invalid", new JsonObject(), "-", null),
             Each = each,
             Count = count,
+            Applies = applies,
             Evidence = evidence,
             Deadline = deadline,
             SeverityBy = severityBy,

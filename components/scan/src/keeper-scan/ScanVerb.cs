@@ -64,7 +64,7 @@ public static class ScanVerb
                 SchemaManager.EnsureCurrent(connection, [ReviewComponent.Schema, Vault.Schema, IntegrationStore.Schema]);
                 record = IntegrationStore.Resolve(connection, integrationType, cli.Get("integration"));
                 if (record.Secrets.Count > 0)
-                    vault = Vault.Load(connection, KeyProtectors.Default());
+                    vault = Vault.Load(connection, KeyProtectors.Default(paths.SettingsDir));
                 inputs = new StoreInputs(connection);
                 var previous = inputs.PreviousRows(record.Id, systemName);
 
@@ -83,6 +83,7 @@ public static class ScanVerb
                     Threshold = inputs.Threshold,
                     OverrideThreshold = inputs.OverrideThreshold,
                     ResolveTargets = spec => inputs.Targets(spec, started),
+                    ResolveTargetAttributes = spec => inputs.TargetAttributes(spec, started),
                     TargetsIncomplete = inputs.TargetsIncomplete,
                     // A connection test reads one rule once; comparing it with a full scan would only confuse the result.
                     PreviousRows = test ? _ => null : item => previous.GetValueOrDefault(item),
