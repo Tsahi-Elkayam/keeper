@@ -139,11 +139,12 @@ public sealed partial class UpsertHandler : IRequestHandler
         @"^(\*\.)?[A-Za-z0-9]([A-Za-z0-9\-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9\-]*[A-Za-z0-9])?)*$",
         System.Text.RegularExpressions.RegexOptions.CultureInvariant, TimeSpan.FromSeconds(1));
 
-    private static void CheckSsh(string endpoint, JsonElement payload)
+    /// <summary>Where a credential or a probe may go: CIDR ranges, addresses, host names or *.suffix patterns, separated by commas.</summary>
+    private static void CheckScope(string endpoint)
     {
         var entries = endpoint.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
         if (entries.Length == 0)
-            throw new RequestException("ssh endpoints list where the credential may be used: CIDR ranges (192.0.2.0/24), host names or *.suffix patterns, separated by commas.");
+            throw new RequestException("the endpoint lists where this may talk: CIDR ranges (192.0.2.0/24), host names or *.suffix patterns, separated by commas.");
         foreach (var entry in entries)
         {
             var wildcard = entry.StartsWith("*.", StringComparison.Ordinal);
@@ -152,6 +153,11 @@ public sealed partial class UpsertHandler : IRequestHandler
             if (!valid)
                 throw new RequestException($"'{entry}' is not a CIDR range, an address, a host name or a *.suffix.");
         }
+    }
+
+    private static void CheckSsh(string endpoint, JsonElement payload)
+    {
+        CheckScope(endpoint);
         if (string.IsNullOrWhiteSpace(Payload.Text(payload, "identity")))
             throw new RequestException("ssh needs the account to sign in as (identity).");
         if (!payload.TryGetProperty("options", out var options) || options.ValueKind != JsonValueKind.Object)
@@ -202,6 +208,10 @@ public sealed partial class UpsertHandler : IRequestHandler
         else if (type.Id == "ssh")
         {
             CheckSsh(endpoint, payload);
+        }
+        else if (type.Id == "printer")
+        {
+            CheckScope(endpoint);
         }
         else if (type.Id == "snmp")
         {

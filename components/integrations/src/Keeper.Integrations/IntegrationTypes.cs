@@ -230,6 +230,7 @@ public static partial class IntegrationTypes
         new("files", "Reports other tools wrote into imports\\", ["file"], ["none"], []),
         new("keeper", "Keeper's own registers", ["store"], ["none"], []),
         new("ssh", "Unix hosts over SSH, read-only: the same configuration-file and command reads as the local host type; the endpoint lists where the credential may be used (CIDR ranges, host names, *.suffix), the targets option lists the hosts, and the hostKeys option pins their host keys", ["host"], ["ssh-key", "ssh-password"], []),
+        new("printer", "Network printers and multifunction devices, read-only: which services answer (connect only), IPP attributes, and the Printer-MIB over SNMP (page count, supplies, alerts); the endpoint lists where it may talk (CIDR ranges, host names, *.suffix) and the targets option lists the printers", ["printer"], ["none", "snmp-v2c"], []),
         new("host", "The machine Keeper runs on: configuration files and a fixed set of read-only commands", ["host"], ["none"], []),
         new("http", "Any other JSON API", ["http"], ["none", "negotiate", "basic", "bearer", "api-key-header", "api-key-query", "oauth-client-credentials", "session-login"], []),
     ];

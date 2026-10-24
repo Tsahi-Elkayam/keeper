@@ -494,6 +494,52 @@ public sealed class IntegrationTests : IDisposable
         Assert.All(paths, p => Assert.StartsWith("/api/v2/", p, StringComparison.Ordinal));
     }
 
+    private void UpsertPrinters(string endpoint = "192.0.2.0/24", string authKind = "snmp-v2c", object? options = null) =>
+        Submit("integrations.upsert", new { integrationId = "office-printers", type = "printer", endpoint, authKind, options = options ?? new { targets = new[] { "192.0.2.50", "192.0.2.51" } } });
+
+    [Fact]
+    public void A_printer_integration_names_the_networks_it_may_talk_to_and_takes_an_snmp_community()
+    {
+        UpsertPrinters("192.0.2.0/24, *.print.example.org");
+
+        Assert.Equal(1, Drain().Done);
+        var record = Find("office-printers")!;
+        Assert.Equal("printer", record.Type);
+        Assert.Contains("community", IntegrationTypes.SecretsFor["snmp-v2c"]);
+    }
+
+    [Fact]
+    public void A_printer_integration_can_do_without_a_community_for_ports_and_ipp()
+    {
+        UpsertPrinters(authKind: "none");
+
+        Assert.Equal(1, Drain().Done);
+    }
+
+    [Theory]
+    [InlineData("", "snmp-v2c")]                          // no scope: it could talk to anything
+    [InlineData("https://printer.example.org", "snmp-v2c")]
+    [InlineData("*", "snmp-v2c")]
+    [InlineData("192.0.2.0/24", "basic")]                 // not a sign-in a printer read uses
+    [InlineData("192.0.2.0/24", "bearer")]
+    public void A_printer_integration_without_a_scope_or_with_another_sign_in_is_refused(string endpoint, string authKind)
+    {
+        UpsertPrinters(endpoint, authKind);
+
+        Assert.Equal(1, Drain().Failed);
+        Assert.Null(Find("office-printers"));
+    }
+
+    [Fact]
+    public void Rules_for_printers_resolve_to_a_printer_integration()
+    {
+        UpsertPrinters();
+        Assert.Equal(1, Drain().Done);
+        using var connection = _db.OpenReadOnly();
+
+        Assert.Equal("office-printers", IntegrationStore.Resolve(connection, "printer", null).Id);
+    }
+
     [Fact]
     public void Implicit_integrations_need_no_configuration()
     {

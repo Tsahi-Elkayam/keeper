@@ -42,6 +42,7 @@
     <Project Path="components/runners/src/Keeper.Runners/Keeper.Runners.csproj" />
     <Project Path="components/runners/src/Keeper.Runners.Files/Keeper.Runners.Files.csproj" />
     <Project Path="components/runners/src/Keeper.Runners.Host/Keeper.Runners.Host.csproj" />
+    <Project Path="components/runners/src/Keeper.Runners.Printer/Keeper.Runners.Printer.csproj" />
     <Project Path="components/runners/src/Keeper.Runners.Http/Keeper.Runners.Http.csproj" />
     <Project Path="components/runners/src/Keeper.Runners.Ldap/Keeper.Runners.Ldap.csproj" />
     <Project Path="components/runners/src/Keeper.Runners.Sql/Keeper.Runners.Sql.csproj" />

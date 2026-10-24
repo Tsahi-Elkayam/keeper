@@ -1,0 +1,134 @@
+schema: keeper.rules/1
+system: printers-local
+name: Printers on a computer (CUPS)
+integration: host
+
+# What CUPS knows on the machine Keeper runs on, or on each host of an ssh integration (Linux and macOS): every print
+# queue with how it is attached - USB with its vendor, model and serial, or a network address by protocol - its state,
+# and whether the machine shares its printers. Pages printed through this machine (read: cups, what: pages) are
+# collected too. A password in a queue's address is replaced before any of it is stored.
+
+defaults:
+  lens: security
+  category: CFG
+  refresh: 1d
+  kind: misconfigured
+
+rules:
+
+  - id: PRN-LOCAL-REMOTE-ANY
+    title: 'CUPS accepts connections from any address'
+    severity: high
+    entity: cups
+    why: 'With remote-any the print service answers the whole network, or the Internet if the machine is reachable.'
+    fix: 'Turn it off: cupsctl --no-remote-any.'
+    refs: [NIST-800-53:SC-7, NIST-800-53:CM-7]
+    query: { protocol: host, read: cups, what: settings, optional: true, key: host, name: host }
+    each: { field: remoteAny, op: eq, value: true }
+    evidence: "{host}: CUPS accepts connections from any address"
+
+  - id: PRN-LOCAL-REMOTE-ADMIN
+    title: 'CUPS can be administered from another computer'
+    severity: high
+    entity: cups
+    why: 'Remote administration of the print service is a way to add queues, change drivers and run what they run.'
+    fix: 'Turn it off: cupsctl --no-remote-admin.'
+    refs: [NIST-800-53:AC-17, NIST-800-53:CM-7]
+    query: { protocol: host, read: cups, what: settings, optional: true, key: host, name: host }
+    each: { field: remoteAdmin, op: eq, value: true }
+    evidence: "{host}: CUPS can be administered remotely"
+
+  - id: PRN-LOCAL-SHARING-ON
+    title: 'This computer shares its printers with the network'
+    severity: medium
+    entity: cups
+    why: 'A shared printer makes this computer a print server: it accepts jobs from others and exposes the print service.'
+    fix: 'Turn sharing off if it is not intended: cupsctl --no-share-printers.'
+    refs: [NIST-800-53:CM-7, NIST-800-53:SC-7]
+    query: { protocol: host, read: cups, what: settings, optional: true, key: host, name: host }
+    each: { field: sharePrinters, op: eq, value: true }
+    evidence: "{host}: printers are shared"
+
+  - id: PRN-LOCAL-DEBUG-LOGGING
+    title: 'CUPS debug logging is on'
+    severity: low
+    entity: cups
+    why: 'Debug logs of the print service can hold the contents of print jobs.'
+    fix: 'Turn it off: cupsctl --no-debug-logging.'
+    refs: [NIST-800-53:AU-9, NIST-800-53:SI-11]
+    query: { protocol: host, read: cups, what: settings, optional: true, key: host, name: host }
+    each: { field: debugLogging, op: eq, value: true }
+    evidence: "{host}: CUPS debug logging is on"
+
+  - id: PRN-QUEUE-FILE-DEVICE
+    title: 'A print queue writes to a file'
+    severity: high
+    entity: queue
+    why: 'A file: queue writes to a path on the machine, which makes printing a way to overwrite files.'
+    fix: 'Remove the queue, or point it at a real printer.'
+    refs: [NIST-800-53:AC-6, NIST-800-53:CM-7]
+    query: { protocol: host, read: cups, what: printers, optional: true, key: "{host}|{name}", name: name }
+    each: { field: scheme, op: eq, value: file }
+    evidence: "{host}: queue {name} writes to a file"
+
+  - id: PRN-QUEUE-PASSWORD-IN-ADDRESS
+    title: 'A print queue keeps a password in its address'
+    severity: medium
+    entity: queue
+    why: 'A password in a queue''s address is stored where the print service and its administrators can read it, and travels in the job''s address.'
+    fix: 'Use a queue that signs in with Kerberos or a credential store, not one with the password in the address.'
+    refs: [NIST-800-53:IA-5]
+    query: { protocol: host, read: cups, what: printers, optional: true, key: "{host}|{name}", name: name }
+    each: { field: deviceUri, op: match, value: ':set@' }
+    evidence: "{host}: queue {name} has a password in its address"
+
+  - id: PRN-QUEUE-LEGACY-PROTOCOL
+    title: 'A print queue prints over raw or LPD'
+    severity: low
+    entity: queue
+    why: 'Raw (port 9100) and LPD printing have no sign-in and no encryption.'
+    fix: 'Use ipps:// to the printer where it supports it.'
+    refs: [NIST-800-53:SC-8, NIST-800-53:AC-3]
+    query: { protocol: host, read: cups, what: printers, optional: true, key: "{host}|{name}", name: name }
+    each: { field: scheme, op: in, value: [socket, lpd] }
+    evidence: "{host}: queue {name} prints over {scheme}"
+
+  - id: PRN-QUEUE-STOPPED
+    title: 'A print queue is stopped'
+    kind: broken
+    lens: maintenance
+    category: AVL
+    severity: low
+    entity: queue
+    why: 'A queue that is disabled or not accepting jobs holds or refuses everything sent to it.'
+    fix: 'Enable it (cupsenable, cupsaccept) or remove the queue if it is no longer used.'
+    refs: [NIST-800-53:CP-10]
+    query: { protocol: host, read: cups, what: printers, optional: true, key: "{host}|{name}", name: name }
+    each: { any: [ { field: enabled, op: eq, value: false }, { field: accepting, op: eq, value: false } ] }
+    evidence: "{host}: queue {name} is {state}"
+
+  - id: PRN-USB-ATTACHED
+    title: 'A printer is attached by USB'
+    lens: maintenance
+    category: LCM
+    severity: info
+    entity: queue
+    why: 'A USB printer is invisible to a network scan, managed by whoever sits at that computer, and bypasses the print server and its logs. Listed so it is known.'
+    fix: 'Nothing to fix if it is intended; otherwise move it to the network and the print server.'
+    refs: [NIST-800-53:CM-8]
+    query: { protocol: host, read: cups, what: printers, optional: true, key: "{host}|{name}", name: name }
+    each: { field: usb, op: eq, value: true }
+    evidence: "{host}: {vendor} {model} (serial {serial}) is attached by USB as {name}"
+
+  - id: PRN-QUEUE-UNUSED
+    title: 'A print queue has not printed anything for months'
+    severity: info
+    lens: maintenance
+    category: LCM
+    entity: printer-usage
+    why: 'A queue nobody prints to is a printer, a driver and an address that still have to be kept safe, and often a printer that is no longer there.'
+    fix: 'Remove the queue if the printer is gone or not used (lpadmin -x <queue>).'
+    refs: [NIST-800-53:CM-8, NIST-800-53:CM-7]
+    query: { protocol: host, read: cups, what: pages, optional: true, key: "{host}|{name}", name: name }
+    each: { field: lastPrinted, op: age-gt, value: 180, threshold: printer.unused-days }
+    evidence: "{host}: queue {name} last printed {lastPrinted}, {pages} pages in all"

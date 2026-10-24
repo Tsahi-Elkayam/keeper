@@ -5,6 +5,7 @@ using Keeper.Runners.Files;
 using Keeper.Runners.Gpo;
 using Keeper.Runners.Host;
 using Keeper.Runners.Http;
+using Keeper.Runners.Printer;
 using Keeper.Runners.Ldap;
 using Keeper.Runners.Smb;
 using Keeper.Runners.Sql;
@@ -31,6 +32,7 @@ public static class Runners
         new SmbRunner(),
         new FileRunner(),
         new HostRunner(),
+        new PrinterRunner(),
         new StoreRunner(),
     ]);
 }

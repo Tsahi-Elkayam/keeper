@@ -57,6 +57,11 @@ public static class HostCommands
         ["ss"] = new("ss", None, _ => ["-H", "-lntu"]),
         ["mount"] = new("mount", None, _ => []),
         // Docker: listing and inspecting only. Nothing here starts, stops, runs, copies, pulls or removes anything.
+        // CUPS: listing its queues, their state and its sharing settings. cupsctl with no argument only prints.
+        ["lpstat-devices"] = new("lpstat", None, _ => ["-v"]),
+        ["lpstat-printers"] = new("lpstat", None, _ => ["-p"]),
+        ["lpstat-accepting"] = new("lpstat", None, _ => ["-a"]),
+        ["cupsctl"] = new("cupsctl", None, _ => []),
         ["docker-ps-ids"] = new("docker", None, _ => ["ps", "--all", "--quiet", "--no-trunc"]),
         ["docker-image-ids"] = new("docker", None, _ => ["images", "--all", "--quiet", "--no-trunc"]),
         ["docker-network-ids"] = new("docker", None, _ => ["network", "ls", "--quiet", "--no-trunc"]),

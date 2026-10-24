@@ -83,6 +83,12 @@ that estate's weaknesses. This page says how each is protected, and what is not 
   finding or stored run never holds one. The backup files themselves are the operator's and still do: keep their
   folder (including `imports/network-config`) private. FortiGate is read over REST from a short list of tables; the
   configuration backup, API users and certificates are not on it.
+- **Printers are asked, never printed to.** Network printers are probed by a TCP connect and hang-up (nothing is ever
+  written to a port, because a raw print port prints it), asked about themselves with IPP Get-Printer-Attributes (no
+  other IPP operation can be built), and read with SNMP v2c GET and GETNEXT only. A printer outside the integration's
+  scope gets nothing. The `public` community check asks for one value, once. CUPS page totals keep no user name, job
+  name or address, because document titles can be sensitive, and a password in a queue's address is replaced before
+  it is stored. SNMP v2c sends its community in clear text: use a long one limited to the management network.
 - **The store is not encrypted as a whole.** Findings, evidence and `row_seen` (every attribute of
   every scanned object) are plain SQLite, protected by the folder's access list only. Whole-database
   encryption is deferred.

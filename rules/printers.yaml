@@ -1,0 +1,178 @@
+schema: keeper.rules/1
+system: printers
+name: Network printers
+integration: printer
+
+# Looks at each printer named in the integration's targets, one at a time and read-only: a TCP connect and hang-up per
+# service (nothing is ever sent to a print port, because it would print), IPP Get-Printer-Attributes, and the Printer-MIB
+# over SNMP. The information the reads collect - model, serial number, firmware, the printed page count, supply levels,
+# status - is kept with every scan, so it can be reported and compared run to run, not only judged.
+
+defaults:
+  lens: security
+  category: CFG
+  refresh: 1d
+  kind: misconfigured
+
+rules:
+
+  - id: PRN-TELNET-OPEN
+    title: 'A printer accepts Telnet'
+    severity: high
+    entity: printer
+    why: 'Telnet is an administration login that sends the password in clear text. A printer rarely needs it.'
+    fix: 'Turn Telnet off in the printer''s network settings.'
+    refs: [NIST-800-53:CM-7, NIST-800-53:SC-8]
+    query: { protocol: printer, read: ports, key: host, name: host }
+    each: { field: telnet, op: eq, value: true }
+    evidence: "{host} answers on Telnet (port 23)"
+
+  - id: PRN-FTP-OPEN
+    title: 'A printer accepts FTP'
+    severity: medium
+    entity: printer
+    why: 'FTP sends logins in clear text and is an old way to push firmware or print jobs.'
+    fix: 'Turn FTP off, or limit it to the management network.'
+    refs: [NIST-800-53:CM-7, NIST-800-53:SC-8]
+    query: { protocol: printer, read: ports, key: host, name: host }
+    each: { field: ftp, op: eq, value: true }
+    evidence: "{host} answers on FTP (port 21)"
+
+  - id: PRN-LPD-OPEN
+    title: 'A printer accepts LPD printing'
+    severity: low
+    entity: printer
+    why: 'LPD is an old protocol with no sign-in and no encryption: whoever can reach the port can print.'
+    fix: 'Turn LPD off if nothing uses it; print through IPP over TLS instead.'
+    refs: [NIST-800-53:CM-7, NIST-800-53:AC-3]
+    query: { protocol: printer, read: ports, key: host, name: host }
+    each: { field: lpd, op: eq, value: true }
+    evidence: "{host} answers on LPD (port 515)"
+
+  - id: PRN-RAW-PRINTING-OPEN
+    title: 'A printer accepts raw printing from the network'
+    severity: low
+    entity: printer
+    why: 'Port 9100 prints whatever it receives and understands printer commands, with no sign-in. It is needed by many setups, so the fix is to limit who can reach it.'
+    fix: 'Allow port 9100 only from the print server or the people who print directly, with a firewall or the printer''s access list.'
+    refs: [NIST-800-53:AC-3, NIST-800-53:SC-7]
+    query: { protocol: printer, read: ports, key: host, name: host }
+    each: { field: jetdirect, op: eq, value: true }
+    evidence: "{host} answers on raw printing (port 9100)"
+
+  - id: PRN-WEB-ADMIN-NOT-ENCRYPTED
+    title: 'A printer is managed over HTTP only'
+    severity: medium
+    entity: printer
+    why: 'The web page of the printer takes its administrator login over a connection anyone on the path can read.'
+    fix: 'Turn on HTTPS for the web page, then turn plain HTTP off or redirect it.'
+    refs: [NIST-800-53:SC-8, NIST-800-53:IA-5]
+    query: { protocol: printer, read: ports, key: host, name: host }
+    each: { all: [ { field: http, op: eq, value: true }, { field: https, op: eq, value: false } ] }
+    evidence: "{host} has a web page on HTTP and no HTTPS"
+
+  - id: PRN-SNMP-PUBLIC-COMMUNITY
+    title: 'A printer answers the SNMP community string public'
+    severity: high
+    entity: printer
+    why: 'public is the first community string anyone tries. It lets a stranger read the printer''s configuration and, on many models, change it.'
+    fix: 'Remove the public community. Use SNMPv3 with authentication and encryption, or a long private community limited to the management network.'
+    refs: [NIST-800-53:IA-5, NIST-800-53:SC-8]
+    query: { protocol: printer, read: snmp, what: public-community, key: host, name: host }
+    each: { field: answersPublicCommunity, op: eq, value: true }
+    evidence: "{host} answers SNMP community public"
+
+  - id: PRN-IPP-NO-TLS
+    title: 'A printer does not offer encrypted IPP'
+    severity: medium
+    entity: printer
+    why: 'Print jobs, with the documents in them, cross the network in clear text.'
+    fix: 'Turn on IPPS (IPP over TLS) in the printer, and print to it with ipps:// addresses.'
+    refs: [NIST-800-53:SC-8, NIST-800-53:SC-13]
+    query: { protocol: printer, read: ipp, key: host, name: host }
+    each: { field: 'uri-security-supported', op: notcontains, value: tls }
+    evidence: "{host} offers IPP without TLS"
+
+  - id: PRN-CERT-EXPIRING
+    title: 'A printer''s certificate is about to expire'
+    kind: broken
+    lens: maintenance
+    category: PKI
+    severity: medium
+    entity: printer
+    why: 'When it expires, browsers and print clients start refusing the printer or the printer is trusted without checks.'
+    fix: 'Renew the certificate (or replace the self-signed one with one from your own CA) before it expires.'
+    refs: [NIST-800-53:SC-12, NIST-800-53:SC-17]
+    query: { protocol: printer, read: ipp, scheme: ipps, key: host, name: host }
+    each: { field: tlsDaysLeft, op: lt, value: 30, threshold: printer.cert-warn-days }
+    evidence: "{host}: certificate expires in {tlsDaysLeft} days"
+
+  - id: PRN-NOT-ACCEPTING-JOBS
+    title: 'A printer is not accepting print jobs'
+    kind: broken
+    lens: maintenance
+    category: AVL
+    severity: high
+    entity: printer
+    why: 'Everything sent to it waits or fails.'
+    fix: 'Look at the printer: it is offline, in error, or an administrator stopped its queue.'
+    refs: [NIST-800-53:CP-10, NIST-800-53:SI-13]
+    query: { protocol: printer, read: ipp, key: host, name: host }
+    each: { field: 'printer-is-accepting-jobs', op: eq, value: false }
+    evidence: "{host} is not accepting jobs"
+
+  - id: PRN-ERROR-STATE
+    title: 'A printer reports a fault'
+    kind: broken
+    lens: maintenance
+    category: HLT
+    severity: high
+    entity: printer
+    why: 'The printer says it is jammed, out of paper or toner, has a door open, is offline or needs service.'
+    fix: 'Look at the printer and clear the fault; if it keeps coming back, call service.'
+    refs: [NIST-800-53:SI-13, NIST-800-53:CP-10]
+    query: { protocol: printer, read: snmp, what: info, key: host, name: host }
+    each: { field: 'errors[]', op: in, value: [jammed, noPaper, noToner, doorOpen, offline, serviceRequested] }
+    evidence: "{host} ({sysName}): {errors}"
+
+  - id: PRN-ALERT-CRITICAL
+    title: 'A printer has a critical alert'
+    kind: broken
+    lens: maintenance
+    category: HLT
+    severity: high
+    entity: alert
+    why: 'The printer raised an alert it counts as critical, and it is still active.'
+    fix: 'Read the alert on the printer''s panel or web page and deal with it.'
+    refs: [NIST-800-53:SI-13]
+    query: { protocol: printer, read: snmp, what: alerts, key: "{host}|{description}", name: description }
+    each: { field: severity, op: eq, value: critical }
+    evidence: "{host}: {description}"
+
+  - id: PRN-SUPPLY-LOW
+    title: 'A printer is nearly out of a supply'
+    kind: broken
+    lens: maintenance
+    category: AVL
+    severity: medium
+    entity: supply
+    why: 'Toner, ink or another consumable is nearly empty, so printing will stop soon.'
+    fix: 'Order and fit the replacement before it runs out.'
+    refs: [NIST-800-53:CP-2]
+    query: { protocol: printer, read: snmp, what: supplies, key: "{host}|{description}", name: description }
+    each: { all: [ { field: levelKnown, op: eq, value: true }, { field: type, op: notin, value: [wasteToner, wasteInk, wasteWax] }, { field: percent, op: lt, value: 10, threshold: printer.low-supply-percent } ] }
+    evidence: "{host}: {description} is at {percent}%"
+
+  - id: PRN-WASTE-CONTAINER-FULL
+    title: 'A printer''s waste container is nearly full'
+    kind: broken
+    lens: maintenance
+    category: AVL
+    severity: medium
+    entity: supply
+    why: 'A full waste container stops the printer, usually without much warning.'
+    fix: 'Empty or replace the waste container.'
+    refs: [NIST-800-53:CP-2]
+    query: { protocol: printer, read: snmp, what: supplies, key: "{host}|{description}", name: description }
+    each: { all: [ { field: levelKnown, op: eq, value: true }, { field: type, op: in, value: [wasteToner, wasteInk, wasteWax] }, { field: percent, op: gt, value: 90 } ] }
+    evidence: "{host}: {description} is {percent}% full"

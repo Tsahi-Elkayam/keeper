@@ -13,7 +13,9 @@ namespace Keeper.Runners.Host;
 /// </summary>
 public sealed class HostRunner(Func<RunnerContext, IHostSession>? remote = null) : IRunner
 {
-    private static readonly string[] Reads = ["facts", "file", "stat", "command", "docker", "configs"];
+    private static readonly string[] Reads = ["facts", "file", "stat", "command", "docker", "configs", "cups"];
+    private static readonly string[] CupsKinds = ["printers", "settings", "pages"];
+    private const string DefaultPageLog = "/var/log/cups/page_log";
     private static readonly string[] ConfigFormats = ["lines", "blocks", "files"];
     private const int MaxConfigFiles = 500;
     private static readonly string[] DockerKinds = ["containers", "images", "networks", "volumes", "info"];
@@ -56,6 +58,10 @@ public sealed class HostRunner(Func<RunnerContext, IHostSession>? remote = null)
             foreach (var problem in ValidateConfigs(query))
                 yield return problem;
         }
+        if (read == "cups" && !CupsKinds.Contains(query.Text("what") ?? ""))
+            yield return $"cups needs what: {string.Join(", ", CupsKinds)}";
+        if (read == "cups" && query.Text("what") == "pages" && query.Text("path") is { } logPath && HostGuards.PathProblem(logPath) is { } logProblem)
+            yield return logProblem;
         if (read == "docker" && query.Text("what") is not { } what || read == "docker" && !DockerKinds.Contains(query.Text("what")!))
             yield return $"docker needs what: {string.Join(", ", DockerKinds)}";
         if (read == "command" && HostCommands.Problem(query.Text("name"), query.List("args")) is { } commandProblem)
@@ -75,6 +81,7 @@ public sealed class HostRunner(Func<RunnerContext, IHostSession>? remote = null)
                 "command" => await Command(session, query, context, cancellationToken).ConfigureAwait(false),
                 "docker" => await Docker(session, query, cancellationToken).ConfigureAwait(false),
                 "configs" => Configs(session, query, context),
+                "cups" => await Cups(session, query, cancellationToken).ConfigureAwait(false),
                 _ => RunnerResult.Failed("host: unknown read"),
             }, cancellationToken).ConfigureAwait(false);
         }
@@ -237,6 +244,52 @@ public sealed class HostRunner(Func<RunnerContext, IHostSession>? remote = null)
         if (name.Contains('*') || name.Contains('?'))
             return session.Glob(folder, name);
         return session.FileExists(full) ? [full] : [];
+    }
+
+    /// <summary>The printers CUPS knows on this machine (USB and network queues) and its sharing settings.</summary>
+    private static async Task<RunnerResult> Cups(IHostSession session, QuerySpec query, CancellationToken cancellationToken)
+    {
+        var optional = Flag(query, "optional", false);
+        var timeout = TimeSpan.FromSeconds(30);
+
+        async Task<(IReadOnlyList<string>? Lines, RunnerResult? Stop)> Step(string name, bool tolerateFailure = false)
+        {
+            var output = await session.RunAsync(name, [], timeout, cancellationToken).ConfigureAwait(false);
+            if (!output.Found)
+                return (null, optional ? RunnerResult.Ok([]) : RunnerResult.Failed("CUPS (lpstat) is not installed on this machine"));
+            if (output.TimedOut)
+                return (null, RunnerResult.Failed($"CUPS did not answer in {timeout.TotalSeconds:0} s"));
+            // lpstat exits non-zero when there is no scheduler running or nothing to list.
+            if (output.ExitCode != 0 && !tolerateFailure)
+                return (null, RunnerResult.Failed($"CUPS could not be read (exit {output.ExitCode}){(output.Error is null ? "" : ": " + output.Error)}"));
+            return (output.Lines, null);
+        }
+
+        if (query.Text("what") == "pages")
+        {
+            var log = session.Normalize(query.Text("path") ?? DefaultPageLog);
+            if (!session.FileExists(log))
+                return optional ? RunnerResult.Ok([]) : RunnerResult.Failed($"there is no CUPS page log at {log}: nothing has been printed through this machine, or page logging is off");
+            if (session.ReadProblem(log) is { } unreadable)
+                return RunnerResult.Failed($"the CUPS page log {log} was not read: {unreadable}");
+            return RunnerResult.Ok(CupsReader.PageCounts(session.HostName, session.ReadAllText(log).Split('\n')));
+        }
+
+        if (query.Text("what") == "settings")
+        {
+            var (settings, stop) = await Step("cupsctl").ConfigureAwait(false);
+            return stop ?? RunnerResult.Ok([CupsReader.Settings(session.HostName, settings!)]);
+        }
+
+        var (devices, devicesStop) = await Step("lpstat-devices", tolerateFailure: true).ConfigureAwait(false);
+        if (devicesStop is not null)
+            return devicesStop;
+        var (states, _) = await Step("lpstat-printers", tolerateFailure: true).ConfigureAwait(false);
+        var (accepting, _) = await Step("lpstat-accepting", tolerateFailure: true).ConfigureAwait(false);
+        var rows = CupsReader.Printers(session.HostName, devices!, states ?? [], accepting ?? []);
+        foreach (var row in rows)
+            SecretProperties.Mask(row);
+        return RunnerResult.Ok(rows);
     }
 
     private static IEnumerable<string> ValidateConfigs(QuerySpec query)
