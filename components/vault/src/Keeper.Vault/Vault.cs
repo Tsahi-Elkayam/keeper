@@ -43,11 +43,14 @@ public sealed class DpapiUserProtector : IKeyProtector
 
 public static class KeyProtectors
 {
-    /// <summary>The protector for this platform. Elsewhere the vault fails closed rather than guess.</summary>
-    public static IKeyProtector Default() =>
+    /// <summary>
+    /// The protector for this platform: DPAPI on Windows, a key file beside the settings everywhere else.
+    /// <paramref name="settingsDir"/> is the folder that holds settings.json; null means the Keeper home's settings folder.
+    /// </summary>
+    public static IKeyProtector Default(string? settingsDir = null) =>
         OperatingSystem.IsWindows()
             ? new DpapiUserProtector()
-            : throw new VaultException("Secret storage needs Windows (DPAPI) in this version; on other platforms use integrations that need no stored secret.");
+            : new FileKeyProtector(Path.Combine(settingsDir ?? Path.Combine(Keeper.Home.KeeperHome.Resolve(), "settings"), "vault.key"));
 }
 
 /// <summary>A secret as stored: AES-256-GCM ciphertext, its nonce and tag, and the key it was sealed with.</summary>

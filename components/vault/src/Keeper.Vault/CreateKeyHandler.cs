@@ -14,7 +14,7 @@ public sealed class CreateKeyHandler : IRequestHandler
     {
         var payload = context.Request.Payload;
         var keyId = Payload.Required(payload, "keyId");
-        var protector = Payload.OneOf(payload, "protector", "dpapi-user");
+        var protector = Payload.OneOf(payload, "protector", "dpapi-user", "keyfile");
         byte[] wrapped;
         try
         {

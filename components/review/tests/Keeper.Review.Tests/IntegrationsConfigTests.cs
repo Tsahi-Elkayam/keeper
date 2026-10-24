@@ -107,8 +107,6 @@ public sealed class IntegrationsConfigStoreTests : IDisposable
     [Fact]
     public void Export_records_the_secret_name_but_never_its_value_or_ciphertext()
     {
-        if (!OperatingSystem.IsWindows())
-            return;   // sealing a secret needs the DPAPI protector, as elsewhere in the secret tests
         Submit("integrations.upsert", new { integrationId = "snow", type = "servicenow", endpoint = "https://example.service-now.com", authKind = "basic", identity = "keeper-reader" });
         Assert.Equal(1, Drain().Done);
 
@@ -131,8 +129,6 @@ public sealed class IntegrationsConfigStoreTests : IDisposable
     [Fact]
     public void Export_import_export_through_the_store_is_byte_identical_idempotent_and_leaves_the_vault_untouched()
     {
-        if (!OperatingSystem.IsWindows())
-            return;   // the proof seals a real secret, which needs the DPAPI protector
         Submit("integrations.upsert", new { integrationId = "snow", type = "servicenow", endpoint = "https://example.service-now.com", authKind = "basic", identity = "keeper-reader" });
         Submit("integrations.upsert", new
         {
@@ -206,7 +202,7 @@ public sealed class IntegrationsConfigStoreTests : IDisposable
     /// <summary>Seals and stores a secret the way keeper-integration set-secret does, creating the key on first use.</summary>
     private string SetSecret(string id, string name, string plaintext, string endpoint)
     {
-        var protector = Keeper.Vault.KeyProtectors.Default();
+        var protector = Keeper.Vault.KeyProtectors.Default(_dir);
         Keeper.Vault.Vault vault;
         using (var connection = _db.OpenReadOnly())
             vault = Keeper.Vault.Vault.Load(connection, protector);

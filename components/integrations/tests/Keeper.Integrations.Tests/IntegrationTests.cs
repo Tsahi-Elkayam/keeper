@@ -209,7 +209,7 @@ public sealed class IntegrationTests : IDisposable
     /// <summary>Seals like keeper-integration set-secret does, creating the vault key on first use.</summary>
     private void SetSecret(string id, string name, string plaintext, string endpoint)
     {
-        var protector = KeyProtectors.Default();
+        var protector = KeyProtectors.Default(_dir);
         Vault.Vault vault;
         using (var connection = _db.OpenReadOnly())
             vault = Vault.Vault.Load(connection, protector);
@@ -235,14 +235,12 @@ public sealed class IntegrationTests : IDisposable
     private IntegrationConnection Connect(string id)
     {
         using var connection = _db.OpenReadOnly();
-        return new IntegrationConnection(IntegrationStore.Find(connection, id)!, Vault.Vault.Load(connection, KeyProtectors.Default()));
+        return new IntegrationConnection(IntegrationStore.Find(connection, id)!, Vault.Vault.Load(connection, KeyProtectors.Default(_dir)));
     }
 
     [Fact]
     public void A_secret_is_stored_sealed_and_opens_only_through_its_integration()
     {
-        if (!OperatingSystem.IsWindows())
-            return;
         AddServiceNow();
         Assert.Equal(1, Drain().Done);
         // A demo password from the demo vault: the organisation's DLP flags one written out in the source.
@@ -261,9 +259,7 @@ public sealed class IntegrationTests : IDisposable
     [Fact]
     public void A_sealed_secret_does_not_open_for_another_integration_or_endpoint()
     {
-        if (!OperatingSystem.IsWindows())
-            return;
-        var protector = KeyProtectors.Default();
+        var protector = KeyProtectors.Default(_dir);
         var (keyId, wrapped) = Vault.Vault.NewKey(protector);
         var sealedSecret = Vault.Vault.Seal(protector, keyId, wrapped, "s3cret", IntegrationStore.Binding("snow", "password", "https://a.service-now.com"));
 
@@ -280,8 +276,6 @@ public sealed class IntegrationTests : IDisposable
     [Fact]
     public void Changing_the_endpoint_drops_the_secrets_bound_to_the_old_one()
     {
-        if (!OperatingSystem.IsWindows())
-            return;
         AddServiceNow();
         Drain();
         SetSecret("snow", "password", "pw", "https://example.service-now.com");
@@ -297,8 +291,6 @@ public sealed class IntegrationTests : IDisposable
     [Fact]
     public void A_secret_sealed_for_an_old_endpoint_is_refused()
     {
-        if (!OperatingSystem.IsWindows())
-            return;
         AddServiceNow();
         Drain();
         SetSecret("snow", "password", "pw", "https://stale.service-now.com");

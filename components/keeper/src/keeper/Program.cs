@@ -148,6 +148,11 @@ static int Setup(CliArgs cli)
         HomeSecurity.MakePrivate(folder);
     foreach (var folder in folders)
         Directory.CreateDirectory(folder);
+    // Windows folders inherit the home's access list; Unix folders do not inherit a mode, so the two that
+    // hold settings and data are made private after they exist.
+    foreach (var folder in new[] { home, Path.Combine(home, "settings"), Path.Combine(home, "data") })
+        if (HomeSecurity.Problem(folder) is not null)
+            HomeSecurity.MakePrivate(folder);
 
     if (!exists)
     {

@@ -26,7 +26,8 @@ that estate's weaknesses. This page says how each is protected, and what is not 
 - **Not in files.** Settings hold the tenant name and data path only; unknown fields are refused.
   Integrations and their secrets live in the store.
 - **Encrypted at rest.** Each secret is AES-256-GCM ciphertext. The data key is protected by Windows
-  DPAPI for the current user. The associated data binds the ciphertext to its integration, secret
+  DPAPI for the current user, or on macOS and Linux by a random key-encryption key in `vault.key` beside
+  `settings.json` (created owner-only, mode 0600; Keeper refuses to use it if others can read it). The associated data binds the ciphertext to its integration, secret
   name and endpoint, so a secret cannot be moved to another integration or pointed at another host.
   Changing an integration's endpoint drops its secrets.
 - **Entered hidden, never echoed.** `keeper integration set-secret` reads from the console with echo
@@ -60,8 +61,10 @@ that estate's weaknesses. This page says how each is protected, and what is not 
 - **The store is not encrypted as a whole.** Findings, evidence and `row_seen` (every attribute of
   every scanned object) are plain SQLite, protected by the folder's access list only. Whole-database
   encryption is deferred.
-- **DPAPI protects against other users, not against you.** Anything running as the same Windows user
-  can ask DPAPI to unwrap the data key. Run Keeper under an account used for nothing else.
+- **DPAPI and the key file protect against other users and copied stores, not against you.** Anything running
+  as the same OS user can unwrap the data key (DPAPI) or read `vault.key`. Run Keeper under an account used for
+  nothing else. A store copied or backed up without `vault.key` cannot open its secrets: back the key file up
+  separately, and if it is lost, set the secrets again.
 - **Rule results are stored as read.** A rule that returned a sensitive attribute (a description
   someone typed a password into) would keep it in the store. No shipped rule reads free-text fields
   for that reason.

@@ -4,6 +4,7 @@
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\..\..\common\src\Keeper.Common\Keeper.Common.csproj" />
+    <ProjectReference Include="..\..\..\home\src\Keeper.Home\Keeper.Home.csproj" />
     <ProjectReference Include="..\..\..\store\src\Keeper.Store\Keeper.Store.csproj" />
     <ProjectReference Include="..\..\..\queue\src\Keeper.Queue\Keeper.Queue.csproj" />
   </ItemGroup>

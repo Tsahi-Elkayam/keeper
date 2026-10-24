@@ -35,7 +35,7 @@ public static class PushVerb
             {
                 SchemaManager.EnsureCurrent(connection, [ReviewComponent.Schema, PushComponent.Schema, Vault.Schema, IntegrationStore.Schema]);
                 record = IntegrationStore.Resolve(connection, tracker, cli.Get("integration"));
-                vault = record.Secrets.Count > 0 ? Vault.Load(connection, KeyProtectors.Default()) : null;
+                vault = record.Secrets.Count > 0 ? Vault.Load(connection, KeyProtectors.Default(paths.SettingsDir)) : null;
                 plan = PushComponent.Plan(connection, tracker, cli.All("finding"));
                 refs = Sql.Rows(connection, "SELECT finding_key, ext_id FROM finding_ref WHERE tracker = :t AND closed_at IS NULL;", null, (":t", tracker));
             }

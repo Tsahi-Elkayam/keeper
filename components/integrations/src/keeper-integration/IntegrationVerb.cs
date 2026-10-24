@@ -33,7 +33,7 @@ public static class IntegrationVerb
                 "show" => Show(db, schemas, cli.At(1) ?? throw new ArgumentException("show needs an integration id.")),
                 "add" => Add(writer, cli),
                 "set" => Set(db, schemas, writer, cli),
-                "set-secret" => SetSecret(db, schemas, writer, cli),
+                "set-secret" => SetSecret(db, schemas, writer, cli, paths.SettingsDir),
                 "remove" => Remove(writer, cli),
                 _ => Usage(),
             };
@@ -161,7 +161,7 @@ public static class IntegrationVerb
             return ExitCodes.Ok;
         }
 
-        static int SetSecret(Database db, MigrationSet[] schemas, RequestWriter writer, CliArgs cli)
+        static int SetSecret(Database db, MigrationSet[] schemas, RequestWriter writer, CliArgs cli, string settingsDir)
         {
             var id = cli.At(1) ?? throw new ArgumentException("set-secret needs an integration id.");
             var name = cli.At(2) ?? throw new ArgumentException("set-secret needs a secret name (password, token or clientSecret).");
@@ -169,7 +169,7 @@ public static class IntegrationVerb
 
             IntegrationRecord record;
             Vault vault;
-            var protector = KeyProtectors.Default();
+            var protector = KeyProtectors.Default(settingsDir);
             using (var connection = db.OpenReadOnly())
             {
                 SchemaManager.EnsureCurrent(connection, schemas);
