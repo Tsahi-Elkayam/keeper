@@ -13,7 +13,9 @@ namespace Keeper.Runners.Host;
 /// </summary>
 public sealed class HostRunner(Func<RunnerContext, IHostSession>? remote = null) : IRunner
 {
-    private static readonly string[] Reads = ["facts", "file", "stat", "command", "docker"];
+    private static readonly string[] Reads = ["facts", "file", "stat", "command", "docker", "configs"];
+    private static readonly string[] ConfigFormats = ["lines", "blocks", "files"];
+    private const int MaxConfigFiles = 500;
     private static readonly string[] DockerKinds = ["containers", "images", "networks", "volumes", "info"];
     private static readonly string[] Formats = ["lines", "kv", "ini", "json", "directives"];
 
@@ -49,6 +51,11 @@ public sealed class HostRunner(Func<RunnerContext, IHostSession>? remote = null)
             if (format == "directives" && query.Text("style") is not ("nginx" or "apache"))
                 yield return "directives need style: nginx or apache";
         }
+        if (read == "configs")
+        {
+            foreach (var problem in ValidateConfigs(query))
+                yield return problem;
+        }
         if (read == "docker" && query.Text("what") is not { } what || read == "docker" && !DockerKinds.Contains(query.Text("what")!))
             yield return $"docker needs what: {string.Join(", ", DockerKinds)}";
         if (read == "command" && HostCommands.Problem(query.Text("name"), query.List("args")) is { } commandProblem)
@@ -67,6 +74,7 @@ public sealed class HostRunner(Func<RunnerContext, IHostSession>? remote = null)
                 "file" => ReadFile(session, query, context),
                 "command" => await Command(session, query, context, cancellationToken).ConfigureAwait(false),
                 "docker" => await Docker(session, query, cancellationToken).ConfigureAwait(false),
+                "configs" => Configs(session, query, context),
                 _ => RunnerResult.Failed("host: unknown read"),
             }, cancellationToken).ConfigureAwait(false);
         }
@@ -229,6 +237,90 @@ public sealed class HostRunner(Func<RunnerContext, IHostSession>? remote = null)
         if (name.Contains('*') || name.Contains('?'))
             return session.Glob(folder, name);
         return session.FileExists(full) ? [full] : [];
+    }
+
+    private static IEnumerable<string> ValidateConfigs(QuerySpec query)
+    {
+        var folder = query.Text("folder");
+        if (string.IsNullOrWhiteSpace(folder))
+        {
+            yield return "configs needs a folder: an absolute path, or imports:<folder> under the Keeper home's imports";
+        }
+        else if (folder.StartsWith("imports:", StringComparison.Ordinal))
+        {
+            var relative = folder["imports:".Length..];
+            if (relative.Length == 0 || Path.IsPathRooted(relative) || relative.Replace('\\', '/').Split('/').Any(p => p is ".." or "."))
+                yield return "imports:<folder> must be a plain folder name under imports, without . or ..";
+        }
+        else if (HostGuards.FolderProblem(folder) is { } problem)
+        {
+            yield return $"folder: {problem}";
+        }
+        if (query.Text("pattern") is { } pattern && (pattern.Contains('/') || pattern.Contains('\\') || pattern.Contains("..", StringComparison.Ordinal)))
+            yield return "pattern is a file name pattern (* and ?), not a path";
+        if ((query.Text("style") ?? "ios") != "ios")
+            yield return "style must be ios (Cisco IOS, IOS-XE, NX-OS, Arista EOS)";
+        if (!ConfigFormats.Contains(query.Text("format") ?? "lines"))
+            yield return $"format must be one of: {string.Join(", ", ConfigFormats)}";
+    }
+
+    /// <summary>
+    /// A folder of device configuration files (a backup server's, or the Keeper home's imports): one file per device,
+    /// the device's name taken from the file name. Rows carry device, host (where they were read), file and modified
+    /// (how old the backup is). A file that holds a secret is skipped and said so; the rest are still read.
+    /// </summary>
+    private static RunnerResult Configs(IHostSession session, QuerySpec query, RunnerContext context)
+    {
+        var folder = query.Text("folderSetting") is { } setting && context.Threshold(setting) is { Length: > 0 } configured ? configured : query.Text("folder")!;
+        if (folder.StartsWith("imports:", StringComparison.Ordinal))
+        {
+            if (session is not LocalHostSession)
+                return RunnerResult.Failed("imports: folders exist only on the machine Keeper runs on; name the backup server's folder");
+            folder = Path.GetFullPath(Path.Combine(context.ImportsDir, folder["imports:".Length..]));
+        }
+        else if (HostGuards.FolderProblem(folder) is { } problem)
+        {
+            return RunnerResult.Failed($"folder {folder}: {problem}");
+        }
+        folder = session.Normalize(folder);
+
+        var format = query.Text("format") ?? "lines";
+        var pattern = query.Text("pattern") ?? "*";
+        var files = session.Glob(folder, pattern);
+        if (files.Count == 0)
+            return RunnerResult.Failed($"no configuration files in {folder} matching {pattern}: nothing was read, so nothing can be judged");
+
+        var reasons = new List<string>();
+        if (files.Count > MaxConfigFiles)
+        {
+            reasons.Add($"{files.Count} files match; only the first {MaxConfigFiles} were read");
+            files = [.. files.Take(MaxConfigFiles)];
+        }
+        var rows = new List<JsonObject>();
+        foreach (var file in files)
+        {
+            var name = file[(file.LastIndexOfAny(['/', '\\']) + 1)..];
+            if (session.ReadProblem(file) is { } skipped)
+            {
+                reasons.Add($"{name} was skipped: {skipped}");
+                continue;
+            }
+            var stat = session.Stat(file);
+            var device = Path.GetFileNameWithoutExtension(name);
+            var text = session.ReadAllText(file);
+            var parsed = format == "files"
+                ? [new JsonObject { ["file"] = file, ["size"] = stat.Size, ["lines"] = text.Count(c => c == '\n') }]
+                : NetworkConfig.Parse(text, file, query.Text("style") ?? "ios", format);
+            foreach (var row in parsed)
+            {
+                row["device"] = device;
+                row["host"] = session.HostName;
+                row["modified"] = RowValues.Iso(stat.Modified);
+                rows.Add(row);
+            }
+        }
+        context.Log($"{folder}: {files.Count} files, {rows.Count} rows");
+        return reasons.Count == 0 ? RunnerResult.Ok(rows) : RunnerResult.Partial(rows, string.Join("; ", reasons));
     }
 
     /// <summary>

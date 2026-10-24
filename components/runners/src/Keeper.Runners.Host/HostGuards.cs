@@ -24,6 +24,13 @@ public static class HostGuards
         "/.docker/config.json", "/.netrc", "/.pgpass", "/.azure/", "/.config/gcloud/",
     ];
 
+    // Folders whose files are credentials or keys: a folder read never opens one of them.
+    private static readonly string[] SecretFolderMarkers =
+    [
+        "/.gnupg/", "/library/keychains/", "/ssl/private/", "/var/db/dslocal/", "/.ssh/", "/.aws/", "/.kube/", "/.docker/", "/.azure/",
+        "/.config/gcloud/", "/etc/shadow.d/", "/proc/",
+    ];
+
     private static readonly string[] SecretExtensions = [".key", ".pfx", ".p12", ".keytab", ".kdbx", ".jks", ".ppk"];
 
     private static readonly Regex ProcEnvironment = new(@"^/proc/[^/]+/(environ|mem|maps)$", RegexOptions.CultureInvariant, TimeSpan.FromSeconds(1));
@@ -38,6 +45,21 @@ public static class HostGuards
         if (path.Replace('\\', '/').Split('/').Any(s => s == ".."))
             return "path must not contain ..";
         return IsSecretPath(path) ? "that path holds secrets (credentials or keys); host reads never open it" : null;
+    }
+
+    /// <summary>Why a folder may not be read when a rule is loaded, or null: absolute, no "..", and not a folder of secrets.</summary>
+    public static string? FolderProblem(string folder)
+    {
+        if (string.IsNullOrWhiteSpace(folder))
+            return "folder is required";
+        if (!Path.IsPathRooted(folder))
+            return "folder must be absolute";
+        if (folder.Replace('\\', '/').Split('/').Any(s => s == ".."))
+            return "folder must not contain ..";
+        var normal = folder.Replace('\\', '/').TrimEnd('/').ToLowerInvariant() + "/";
+        return SecretFolderMarkers.Any(m => normal.Contains(m, StringComparison.Ordinal))
+            ? "that folder holds secrets (credentials or keys); host reads never open it"
+            : null;
     }
 
     public static bool IsSecretPath(string path)

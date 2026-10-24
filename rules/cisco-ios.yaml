@@ -1,0 +1,252 @@
+schema: keeper.rules/1
+system: cisco-ios
+name: Cisco IOS-style devices (from configuration backups)
+integration: host
+
+# Judges the running configurations of Cisco IOS, IOS-XE, NX-OS and Arista EOS devices from their backups: one file
+# per device in imports\network-config\ (or, over ssh, the backup server's folder named by the setting
+# threshold.network.config-folder; Oxidized, RANCID or a plain export all work). Nothing is sent to any device and no device
+# credential is held. Secrets are scrubbed while the files are read: a rule sees "enable secret 5 set", never the
+# hash. A backup only shows what was saved, so a stale one is itself a finding.
+
+defaults:
+  lens: security
+  category: CFG
+  refresh: 1d
+  kind: misconfigured
+
+rules:
+
+  - id: NET-IOS-VTY-NOT-SSH-ONLY
+    title: 'A remote-login line accepts more than SSH'
+    severity: high
+    entity: device
+    why: 'Telnet sends the login and every command in clear text. A vty line with no transport input ssh defaults to allowing it.'
+    fix: 'Under every line vty, set transport input ssh.'
+    refs: [NIST-800-53:SC-8, NIST-800-53:AC-17]
+    query: { protocol: host, read: configs, folder: 'imports:network-config', folderSetting: network.config-folder, format: blocks, key: "{device}|{line}", name: device }
+    each:
+      all:
+        - { field: header, op: match, value: '^line vty' }
+        - { field: body, op: notmatch, value: '(?m)^transport input ssh$' }
+    evidence: "{device}: {header} does not restrict login to SSH"
+
+  - id: NET-IOS-VTY-NO-ACCESS-CLASS
+    title: 'A remote-login line has no access list'
+    severity: medium
+    entity: device
+    why: 'Without an access-class any address that can reach the device can try to log in to it.'
+    fix: 'Add an access-class that names the management networks to every line vty, in the inbound direction.'
+    refs: [NIST-800-53:AC-3, NIST-800-53:SC-7]
+    query: { protocol: host, read: configs, folder: 'imports:network-config', folderSetting: network.config-folder, format: blocks, key: "{device}|{line}", name: device }
+    each:
+      all:
+        - { field: header, op: match, value: '^line vty' }
+        - { field: body, op: notmatch, value: '(?m)^access-class ' }
+    evidence: "{device}: {header} has no access-class"
+
+  - id: NET-IOS-ENABLE-PASSWORD
+    title: 'The enable password is stored in a form that can be read back'
+    severity: high
+    entity: device
+    why: 'enable password keeps the password in clear text or a reversible type 7 string. Anyone with the configuration can read it.'
+    fix: 'Remove enable password and set enable secret with a type 8 or 9 hash (enable algorithm-type scrypt secret).'
+    refs: [NIST-800-53:IA-5]
+    query: { protocol: host, read: configs, folder: 'imports:network-config', folderSetting: network.config-folder, format: lines, key: "{device}|{line}", name: device }
+    each:
+      all:
+        - { field: command, op: match, value: '^enable password ' }
+        - { field: negated, op: eq, value: false }
+    evidence: "{device}:{line}: {text}"
+
+  - id: NET-IOS-ENABLE-SECRET-MISSING
+    title: 'No enable secret is set'
+    kind: missing
+    severity: high
+    entity: device
+    why: 'Without an enable secret the privileged mode is protected only by whatever else is configured, or not at all.'
+    fix: 'Set enable secret with a strong password stored as a type 8 or 9 hash.'
+    refs: [NIST-800-53:IA-5, NIST-800-53:AC-3]
+    query: { protocol: host, read: configs, folder: 'imports:network-config', folderSetting: network.config-folder, format: lines, key: "{device}|{line}", name: device }
+    count:
+      op: lt
+      value: 1
+      by: device
+      where:
+        all:
+          - { field: command, op: match, value: '^enable secret ' }
+          - { field: negated, op: eq, value: false }
+
+  - id: NET-IOS-AAA-NOT-ENABLED
+    title: 'Central authentication (AAA) is not enabled'
+    kind: missing
+    severity: medium
+    entity: device
+    why: 'Without aaa new-model logins use local accounts only, with no central policy, accounting or quick removal of leavers.'
+    fix: 'Enable aaa new-model and point authentication at TACACS+ or RADIUS with a local fallback.'
+    refs: [NIST-800-53:IA-2, NIST-800-53:AU-2]
+    query: { protocol: host, read: configs, folder: 'imports:network-config', folderSetting: network.config-folder, format: lines, key: "{device}|{line}", name: device }
+    count:
+      op: lt
+      value: 1
+      by: device
+      where:
+        all:
+          - { field: command, op: match, value: '^aaa new-model' }
+          - { field: negated, op: eq, value: false }
+
+  - id: NET-IOS-SSH-V2-MISSING
+    title: 'SSH version 2 is not forced'
+    kind: missing
+    severity: high
+    entity: device
+    why: 'Without ip ssh version 2 the device also accepts SSH version 1, which has known weaknesses.'
+    fix: 'Set ip ssh version 2.'
+    refs: [NIST-800-53:SC-8, NIST-800-53:SC-13]
+    query: { protocol: host, read: configs, folder: 'imports:network-config', folderSetting: network.config-folder, format: lines, key: "{device}|{line}", name: device }
+    count:
+      op: lt
+      value: 1
+      by: device
+      where:
+        all:
+          - { field: command, op: match, value: '^ip ssh version 2' }
+          - { field: negated, op: eq, value: false }
+
+  - id: NET-IOS-SSH-V1
+    title: 'SSH version 1 is allowed'
+    severity: high
+    entity: device
+    why: 'SSH version 1 has known weaknesses and is retired.'
+    fix: 'Set ip ssh version 2.'
+    refs: [NIST-800-53:SC-8, NIST-800-53:SC-13]
+    query: { protocol: host, read: configs, folder: 'imports:network-config', folderSetting: network.config-folder, format: lines, key: "{device}|{line}", name: device }
+    each:
+      all:
+        - { field: command, op: match, value: '^ip ssh version 1' }
+        - { field: negated, op: eq, value: false }
+    evidence: "{device}:{line}: {text}"
+
+  - id: NET-IOS-PASSWORD-ENCRYPTION-OFF
+    title: 'Passwords in the configuration are not obscured'
+    kind: missing
+    severity: low
+    entity: device
+    why: 'Without service password-encryption, line and local passwords are stored in clear text in the configuration and in every backup of it.'
+    fix: 'Set service password-encryption, then move accounts to secret hashes, which it does not replace.'
+    refs: [NIST-800-53:IA-5]
+    query: { protocol: host, read: configs, folder: 'imports:network-config', folderSetting: network.config-folder, format: lines, key: "{device}|{line}", name: device }
+    count:
+      op: lt
+      value: 1
+      by: device
+      where:
+        all:
+          - { field: command, op: match, value: '^service password-encryption' }
+          - { field: negated, op: eq, value: false }
+
+  - id: NET-IOS-HTTP-SERVER
+    title: 'The plain HTTP management server is on'
+    severity: medium
+    entity: device
+    why: 'ip http server serves the web management page without encryption, with the device login in clear text.'
+    fix: 'Remove it (no ip http server) and use ip http secure-server only if web management is needed.'
+    refs: [NIST-800-53:SC-8, NIST-800-53:CM-7]
+    query: { protocol: host, read: configs, folder: 'imports:network-config', folderSetting: network.config-folder, format: lines, key: "{device}|{line}", name: device }
+    each:
+      all:
+        - { field: command, op: match, value: '^ip http server' }
+        - { field: negated, op: eq, value: false }
+    evidence: "{device}:{line}: {text}"
+
+  - id: NET-IOS-SNMP-DEFAULT-COMMUNITY
+    title: 'SNMP uses a well-known community string'
+    severity: high
+    entity: device
+    why: 'public, private and a few others are the first strings anyone tries. The community is the only password SNMP v1 and v2c have.'
+    fix: 'Remove the community. Use SNMPv3 with authentication and encryption.'
+    refs: [NIST-800-53:IA-5, NIST-800-53:SC-8]
+    query: { protocol: host, read: configs, folder: 'imports:network-config', folderSetting: network.config-folder, format: lines, key: "{device}|{line}", name: device }
+    each:
+      all:
+        - { field: command, op: match, value: '^snmp-server community <default>' }
+        - { field: negated, op: eq, value: false }
+    evidence: "{device}:{line}: {text}"
+
+  - id: NET-IOS-SNMP-WRITE-COMMUNITY
+    title: 'SNMP lets a community string change the device'
+    severity: high
+    entity: device
+    why: 'A read-write community is a password that changes the configuration over an unencrypted protocol.'
+    fix: 'Remove read-write communities. If changes by SNMP are needed, use SNMPv3 with privacy and an access list.'
+    refs: [NIST-800-53:AC-6, NIST-800-53:SC-8]
+    query: { protocol: host, read: configs, folder: 'imports:network-config', folderSetting: network.config-folder, format: lines, key: "{device}|{line}", name: device }
+    each:
+      all:
+        - { field: command, op: match, value: '^snmp-server community \S+ RW' }
+        - { field: negated, op: eq, value: false }
+    evidence: "{device}:{line}: {text}"
+
+  - id: NET-IOS-WEAK-USER-PASSWORD
+    title: 'A local account has a password that can be read back'
+    severity: medium
+    entity: device
+    why: 'username ... password keeps the password in clear text or a reversible type 7 string. username ... secret keeps a hash.'
+    fix: 'Recreate the account with secret and a type 8 or 9 hash.'
+    refs: [NIST-800-53:IA-5]
+    query: { protocol: host, read: configs, folder: 'imports:network-config', folderSetting: network.config-folder, format: lines, key: "{device}|{line}", name: device }
+    each:
+      all:
+        - { field: command, op: match, value: '^username \S+ (privilege \d+ )?password' }
+        - { field: negated, op: eq, value: false }
+    evidence: "{device}:{line}: {text}"
+
+  - id: NET-IOS-NTP-MISSING
+    title: 'No time source is configured'
+    kind: missing
+    severity: low
+    entity: device
+    why: 'Without ntp server the clock drifts, and logs and certificates lose their meaning.'
+    fix: 'Configure at least two ntp server entries.'
+    refs: [NIST-800-53:AU-8]
+    query: { protocol: host, read: configs, folder: 'imports:network-config', folderSetting: network.config-folder, format: lines, key: "{device}|{line}", name: device }
+    count:
+      op: lt
+      value: 1
+      by: device
+      where:
+        all:
+          - { field: command, op: match, value: '^ntp server ' }
+          - { field: negated, op: eq, value: false }
+
+  - id: NET-IOS-LOGGING-HOST-MISSING
+    title: 'Logs are not sent to a log server'
+    kind: missing
+    severity: low
+    entity: device
+    why: 'Logs kept only on the device are lost when it reboots or is wiped, which is when they are needed.'
+    fix: 'Set logging host to the log server.'
+    refs: [NIST-800-53:AU-4, NIST-800-53:AU-9]
+    query: { protocol: host, read: configs, folder: 'imports:network-config', folderSetting: network.config-folder, format: lines, key: "{device}|{line}", name: device }
+    count:
+      op: lt
+      value: 1
+      by: device
+      where:
+        all:
+          - { field: command, op: match, value: '^logging (host )?\d' }
+          - { field: negated, op: eq, value: false }
+
+  - id: NET-IOS-CONFIG-BACKUP-STALE
+    title: 'The saved configuration of a device is out of date'
+    kind: broken
+    lens: maintenance
+    category: BCK
+    severity: medium
+    entity: device
+    why: 'These rules judge the backup, so an old backup hides every change made since. It also means changes are not being backed up.'
+    fix: 'Check that the backup job reaches the device and runs on schedule (Oxidized, RANCID or the export script).'
+    refs: [NIST-800-53:CP-9, NIST-800-53:CM-2]
+    query: { protocol: host, read: configs, folder: 'imports:network-config', folderSetting: network.config-folder, format: files, key: device, name: device }
+    each: { field: modified, op: age-gt, value: 14, threshold: network.config-max-age-days }
+    evidence: "{device}: last saved {modified}"
