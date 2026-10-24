@@ -1,0 +1,219 @@
+schema: keeper.rules/1
+system: kubernetes
+name: Kubernetes cluster
+integration: kubernetes
+
+# Reads the cluster's API server (GET only, through a read allowlist that never includes secrets, config maps,
+# logs or exec) with a service account that holds the "view" kind of access plus read on nodes and RBAC objects.
+# Hardening rules leave kube-system alone: its components legitimately need host access.
+
+defaults:
+  lens: security
+  category: CFG
+  refresh: 1d
+  kind: misconfigured
+
+rules:
+  # ---------------------------------------------------------------- workloads (every pod, whichever controller made it)
+
+  - id: K8S-POD-PRIVILEGED
+    title: 'A container runs privileged'
+    severity: high
+    entity: pod
+    why: 'A privileged container has nearly the host''s own power. Anyone who breaks into it owns the node, and through it the cluster.'
+    fix: 'Remove "privileged: true" from the container''s securityContext; grant the one capability it needs instead, or move the work off the cluster.'
+    refs: [NIST-800-53:AC-6, CIS-Controls-v8:4.1]
+    query: { protocol: http, path: /api/v1/pods, params: { limit: "500" }, items: items, paging: cursor, cursorField: metadata.continue, cursorParam: continue, key: metadata.uid, name: metadata.name }
+    each:
+      all:
+        - not: { field: metadata.namespace, op: in, value: [kube-system] }
+        - any:
+            - element: { of: spec.containers, match: any, where: { field: securityContext.privileged, op: eq, value: true } }
+            - element: { of: spec.initContainers, match: any, where: { field: securityContext.privileged, op: eq, value: true } }
+    evidence: "{metadata.namespace}/{metadata.name} has a privileged container"
+
+  - id: K8S-POD-HOST-NAMESPACE
+    title: 'A pod shares the node''s network, process or IPC space'
+    severity: high
+    entity: pod
+    why: 'With hostNetwork, hostPID or hostIPC a pod sees the node''s traffic, its processes or its shared memory, which removes the wall between workloads and the host.'
+    fix: 'Remove hostNetwork, hostPID and hostIPC from the pod spec unless it is a node agent that truly needs them, and move such pods to kube-system or a reviewed namespace.'
+    refs: [NIST-800-53:SC-7, NIST-800-53:AC-6]
+    query: { protocol: http, path: /api/v1/pods, params: { limit: "500" }, items: items, paging: cursor, cursorField: metadata.continue, cursorParam: continue, key: metadata.uid, name: metadata.name }
+    each:
+      all:
+        - not: { field: metadata.namespace, op: in, value: [kube-system] }
+        - any:
+            - { field: spec.hostNetwork, op: eq, value: true }
+            - { field: spec.hostPID, op: eq, value: true }
+            - { field: spec.hostIPC, op: eq, value: true }
+    evidence: "{metadata.namespace}/{metadata.name} uses the host's network, PID or IPC namespace"
+
+  - id: K8S-POD-RUNTIME-SOCKET
+    title: 'A pod mounts the container runtime''s socket'
+    severity: high
+    entity: pod
+    why: 'The Docker or containerd socket is a control channel for the whole node. Whoever holds it can start a privileged container and take the node.'
+    fix: 'Remove the hostPath volume for the socket. Build images with a daemonless builder, and let the platform schedule workloads instead of the pod.'
+    refs: [NIST-800-53:AC-6, NIST-800-53:CM-7]
+    query: { protocol: http, path: /api/v1/pods, params: { limit: "500" }, items: items, paging: cursor, cursorField: metadata.continue, cursorParam: continue, key: metadata.uid, name: metadata.name }
+    each:
+      all:
+        - not: { field: metadata.namespace, op: in, value: [kube-system] }
+        - { field: 'spec.volumes[].hostPath.path', op: in, value: [/var/run/docker.sock, /run/docker.sock, /var/run/containerd/containerd.sock, /run/containerd/containerd.sock, /var/run/crio/crio.sock, /run/crio/crio.sock] }
+    evidence: "{metadata.namespace}/{metadata.name} mounts a container runtime socket"
+
+  - id: K8S-POD-HOSTPATH
+    title: 'A pod mounts a folder of the node'
+    severity: medium
+    entity: pod
+    why: 'A hostPath volume lets a pod read, and often change, files of the node it runs on, including other workloads'' data and the kubelet''s credentials.'
+    fix: 'Use a PersistentVolumeClaim, emptyDir or a projected volume instead. If a node folder is truly needed, mount it read-only and name the exact path.'
+    refs: [NIST-800-53:AC-6, NIST-800-53:CM-7]
+    query: { protocol: http, path: /api/v1/pods, params: { limit: "500" }, items: items, paging: cursor, cursorField: metadata.continue, cursorParam: continue, key: metadata.uid, name: metadata.name }
+    each:
+      all:
+        - not: { field: metadata.namespace, op: in, value: [kube-system] }
+        - { field: 'spec.volumes[].hostPath.path', op: exists }
+        - { field: 'spec.volumes[].hostPath.path', op: notin, value: [/var/run/docker.sock, /run/docker.sock, /var/run/containerd/containerd.sock, /run/containerd/containerd.sock, /var/run/crio/crio.sock, /run/crio/crio.sock] }
+    evidence: "{metadata.namespace}/{metadata.name} mounts a hostPath volume"
+
+  - id: K8S-POD-DANGEROUS-CAPABILITIES
+    title: 'A container adds a Linux capability that is close to root on the node'
+    severity: high
+    entity: pod
+    why: 'ALL, SYS_ADMIN, NET_ADMIN, SYS_PTRACE, SYS_MODULE and DAC_READ_SEARCH let a process in the container reach out of it.'
+    fix: 'Drop the capability, and drop ALL capabilities by default ("capabilities: { drop: [ALL] }") adding back only what the program is proven to need.'
+    refs: [NIST-800-53:AC-6, NIST-800-53:CM-7]
+    query: { protocol: http, path: /api/v1/pods, params: { limit: "500" }, items: items, paging: cursor, cursorField: metadata.continue, cursorParam: continue, key: metadata.uid, name: metadata.name }
+    each:
+      all:
+        - not: { field: metadata.namespace, op: in, value: [kube-system] }
+        - any:
+            - element: { of: spec.containers, match: any, where: { field: 'securityContext.capabilities.add[]', op: in, value: [ALL, SYS_ADMIN, NET_ADMIN, SYS_PTRACE, SYS_MODULE, DAC_READ_SEARCH] } }
+            - element: { of: spec.initContainers, match: any, where: { field: 'securityContext.capabilities.add[]', op: in, value: [ALL, SYS_ADMIN, NET_ADMIN, SYS_PTRACE, SYS_MODULE, DAC_READ_SEARCH] } }
+    evidence: "{metadata.namespace}/{metadata.name} adds a dangerous capability"
+
+  - id: K8S-POD-RUNS-AS-ROOT
+    title: 'A container is told to run as root'
+    severity: medium
+    entity: pod
+    why: 'Root inside a container is one flaw away from root on the node. Most programs do not need it.'
+    fix: 'Set "runAsNonRoot: true" and a numeric "runAsUser" above 0 in the securityContext, and build the image so it works as that user.'
+    refs: [NIST-800-53:AC-6]
+    query: { protocol: http, path: /api/v1/pods, params: { limit: "500" }, items: items, paging: cursor, cursorField: metadata.continue, cursorParam: continue, key: metadata.uid, name: metadata.name }
+    each:
+      all:
+        - not: { field: metadata.namespace, op: in, value: [kube-system] }
+        - any:
+            - element: { of: spec.containers, match: any, where: { field: securityContext.runAsUser, op: eq, value: 0 } }
+            - element: { of: spec.initContainers, match: any, where: { field: securityContext.runAsUser, op: eq, value: 0 } }
+    evidence: "{metadata.namespace}/{metadata.name} runs a container as user 0"
+
+  - id: K8S-POD-IMAGE-NOT-PINNED
+    title: 'A container uses the latest tag or no tag at all'
+    severity: low
+    entity: pod
+    why: '"latest" is whatever was pushed last, so the same manifest can run different code tomorrow, and a rollback cannot be told from a new release.'
+    fix: 'Pin the image to a version tag, or better to its digest (image@sha256:...), and update it deliberately.'
+    refs: [NIST-800-53:CM-2, NIST-800-53:SI-7]
+    query: { protocol: http, path: /api/v1/pods, params: { limit: "500" }, items: items, paging: cursor, cursorField: metadata.continue, cursorParam: continue, key: metadata.uid, name: metadata.name }
+    each:
+      all:
+        - not: { field: metadata.namespace, op: in, value: [kube-system] }
+        - any:
+            - element: { of: spec.containers, match: any, where: { field: image, op: match, value: '(:latest$)|(^([^/]*/)*[^/:@]+$)' } }
+            - element: { of: spec.initContainers, match: any, where: { field: image, op: match, value: '(:latest$)|(^([^/]*/)*[^/:@]+$)' } }
+    evidence: "{metadata.namespace}/{metadata.name} uses an unpinned image"
+
+  - id: K8S-POD-NO-MEMORY-LIMIT
+    title: 'A container has no memory limit'
+    severity: low
+    entity: pod
+    why: 'One container with a leak or an attacker''s miner can take all the memory of a node and starve its neighbours.'
+    fix: 'Set resources.limits.memory (and requests) on every container, sized from what the program really uses.'
+    refs: [NIST-800-53:SC-5, NIST-800-53:CM-2]
+    query: { protocol: http, path: /api/v1/pods, params: { limit: "500" }, items: items, paging: cursor, cursorField: metadata.continue, cursorParam: continue, key: metadata.uid, name: metadata.name }
+    each:
+      all:
+        - not: { field: metadata.namespace, op: in, value: [kube-system] }
+        - element: { of: spec.containers, match: any, where: { field: resources.limits.memory, op: absent } }
+    evidence: "{metadata.namespace}/{metadata.name} has a container without a memory limit"
+
+  # ---------------------------------------------------------------- nodes
+
+  - id: K8S-NODE-NOT-READY
+    title: 'A node is not ready'
+    kind: broken
+    lens: maintenance
+    category: HLT
+    severity: high
+    entity: node
+    why: 'A node that is not Ready runs no new work, and the pods on it may be gone or unreachable.'
+    fix: 'Check the kubelet and the node''s network and disk on the machine, then cordon and drain it if it cannot be repaired soon.'
+    refs: [NIST-800-53:CP-10, NIST-800-53:SI-13]
+    query: { protocol: http, path: /api/v1/nodes, items: items, paging: cursor, cursorField: metadata.continue, cursorParam: continue, key: metadata.uid, name: metadata.name }
+    each:
+      element:
+        of: status.conditions
+        match: any
+        where:
+          all:
+            - { field: type, op: eq, value: Ready }
+            - { field: status, op: ne, value: "True" }
+    evidence: "node {metadata.name} is not Ready"
+
+  # ---------------------------------------------------------------- access (RBAC)
+
+  - id: K8S-RBAC-CLUSTER-ADMIN-BINDING
+    title: 'Cluster-admin is granted to a subject beyond the built-in ones'
+    severity: high
+    category: IAM
+    entity: clusterrolebinding
+    why: 'cluster-admin can do anything anywhere in the cluster, including read every secret. Each subject that holds it is a way to take the whole cluster.'
+    fix: 'Replace the binding with a role that grants only what the subject needs, or remove it. Keep cluster-admin for a break-glass group.'
+    refs: [NIST-800-53:AC-6, CIS-Controls-v8:5.4]
+    query: { protocol: http, path: /apis/rbac.authorization.k8s.io/v1/clusterrolebindings, items: items, paging: cursor, cursorField: metadata.continue, cursorParam: continue, key: metadata.uid, name: metadata.name }
+    each:
+      all:
+        - { field: roleRef.name, op: eq, value: cluster-admin }
+        - { field: metadata.name, op: notin, value: [cluster-admin] }
+        - { field: metadata.name, op: notmatch, value: '^(system|kubeadm):' }
+    evidence: "binding {metadata.name} grants cluster-admin"
+
+  - id: K8S-RBAC-ANONYMOUS-ACCESS
+    title: 'Anonymous or unauthenticated users hold a role'
+    severity: high
+    category: IAM
+    entity: clusterrolebinding
+    why: 'Anyone who can reach the API server, with no sign-in at all, gets whatever this role allows.'
+    fix: 'Remove system:anonymous and system:unauthenticated from the binding. Only system:public-info-viewer is meant to be open.'
+    refs: [NIST-800-53:AC-3, NIST-800-53:IA-2]
+    query: { protocol: http, path: /apis/rbac.authorization.k8s.io/v1/clusterrolebindings, items: items, paging: cursor, cursorField: metadata.continue, cursorParam: continue, key: metadata.uid, name: metadata.name }
+    each:
+      all:
+        - { field: 'subjects[].name', op: in, value: [system:anonymous, system:unauthenticated] }
+        - { field: roleRef.name, op: ne, value: system:public-info-viewer }
+    evidence: "binding {metadata.name} gives role {roleRef.name} to anonymous users"
+
+  - id: K8S-RBAC-WILDCARD-ROLE
+    title: 'A role allows every action on every resource'
+    severity: high
+    category: IAM
+    entity: clusterrole
+    why: 'A role with "*" on "*" is cluster-admin under another name, and it hides in the list of roles.'
+    fix: 'Name the resources and verbs the role needs. Keep wildcards for the built-in cluster-admin role only.'
+    refs: [NIST-800-53:AC-6, CIS-Controls-v8:5.4]
+    query: { protocol: http, path: /apis/rbac.authorization.k8s.io/v1/clusterroles, items: items, paging: cursor, cursorField: metadata.continue, cursorParam: continue, key: metadata.uid, name: metadata.name }
+    each:
+      all:
+        - { field: metadata.name, op: notin, value: [cluster-admin] }
+        - { field: metadata.name, op: notmatch, value: '^system:' }
+        - element:
+            of: rules
+            match: any
+            where:
+              all:
+                - { field: 'verbs[]', op: eq, value: "*" }
+                - { field: 'resources[]', op: eq, value: "*" }
+    evidence: "role {metadata.name} allows every verb on every resource"

@@ -49,6 +49,17 @@ public sealed partial class UpsertHandler : IRequestHandler
             if (SecretLike.Any(s => lower == s || (s.Length > 5 && lower.Contains(s, StringComparison.Ordinal))))
                 throw new RequestException($"Option '{name}' looks like a secret. Secrets are set with set-secret, never as options.");
         }
+        if (options["caCertificate"] is JsonValue caCertificate)
+        {
+            try
+            {
+                CaTrust.Parse(caCertificate.ToString());
+            }
+            catch (FormatException ex)
+            {
+                throw new RequestException(ex.Message);
+            }
+        }
         if (options["tokenUrl"] is JsonValue tokenUrl
             && (!Uri.TryCreate(tokenUrl.ToString(), UriKind.Absolute, out var tu) || tu.Scheme != "https"))
             throw new RequestException("Option tokenUrl must be an https URL.");

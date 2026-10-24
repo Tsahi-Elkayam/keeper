@@ -38,7 +38,13 @@ public static class SecretProperties
         "remediationScriptContent", "recoveryKey", "bitLockerRecoveryKey",
         // Google Cloud resources: a function's or build's environment.
         "environmentVariables", "buildEnvironmentVariables", "secretEnvironmentVariables",
+        // Kubernetes keeps the whole manifest of a `kubectl apply` - env values and all - in this one annotation, as text.
+        "kubectl.kubernetes.io/last-applied-configuration",
     };
+
+    // Lists of command-line or environment strings ("--password=x", "DB_PASSWORD=x"): Kubernetes container
+    // command and args, Docker's Config.Env, Cmd and Entrypoint.
+    private static readonly HashSet<string> CommandLists = new(StringComparer.Ordinal) { "command", "args", "Env", "Cmd", "Entrypoint" };
 
     public static bool IsSecret(string property) => Names.Contains(property);
 
@@ -108,6 +114,14 @@ public static class SecretProperties
                     {
                         if (o[name] is not null && !(o[name] is JsonValue v && v.TryGetValue<string>(out var s) && s.Length == 0))
                             o[name] = "set";
+                    }
+                    else if (CommandLists.Contains(name) && o[name] is JsonArray list)
+                    {
+                        for (var i = 0; i < list.Count; i++)
+                        {
+                            if (list[i] is JsonValue item && item.TryGetValue<string>(out var line))
+                                list[i] = CredentialText.Scrub(MaskUrls(line));
+                        }
                     }
                     else if (o[name] is JsonValue value && value.TryGetValue<string>(out var text) && MaskUrls(text) is var masked && !string.Equals(masked, text, StringComparison.Ordinal))
                     {

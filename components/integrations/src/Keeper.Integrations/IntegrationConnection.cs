@@ -91,6 +91,9 @@ public sealed partial class IntegrationConnection : IConnection, IAwsConnection,
             AutomaticDecompression = DecompressionMethods.All,
             PooledConnectionLifetime = TimeSpan.FromMinutes(5),
         };
+        // A private CA for this integration only (a Kubernetes API server): its roots, not the machine's.
+        if (_record.Options["caCertificate"] is JsonValue ca && ca.TryGetValue<string>(out var pem) && pem.Length > 0)
+            handler.SslOptions.RemoteCertificateValidationCallback = CaTrust.Callback(CaTrust.Parse(pem));
         handler.Credentials = _record.AuthKind switch
         {
             "negotiate" => CredentialCache.DefaultCredentials,

@@ -399,6 +399,76 @@ public sealed class IntegrationTests : IDisposable
         Assert.False(IntegrationTypes.Satisfies("cim", "ssh"));
     }
 
+    private void UpsertKubernetes(string endpoint = "https://203.0.113.10:6443", string authKind = "bearer", object? options = null) =>
+        Submit("integrations.upsert", new { integrationId = "prod-cluster", type = "kubernetes", endpoint, authKind, options = options ?? new { } });
+
+    [Fact]
+    public void A_kubernetes_integration_is_an_https_api_server_with_a_bearer_token()
+    {
+        UpsertKubernetes();
+
+        Assert.Equal(1, Drain().Done);
+        Assert.Equal("kubernetes", Find("prod-cluster")!.Type);
+    }
+
+    [Theory]
+    [InlineData("http://203.0.113.10:8080", "bearer")]   // cleartext
+    [InlineData("https://203.0.113.10:6443", "basic")]   // not a sign-in kubernetes takes
+    public void A_kubernetes_integration_with_cleartext_or_another_sign_in_is_refused(string endpoint, string authKind)
+    {
+        UpsertKubernetes(endpoint, authKind);
+
+        Assert.Equal(1, Drain().Failed);
+    }
+
+    [Fact]
+    public void The_cluster_ca_is_taken_as_a_certificate_and_a_key_or_junk_is_refused_when_saved()
+    {
+        using var key = System.Security.Cryptography.ECDsa.Create(System.Security.Cryptography.ECCurve.NamedCurves.nistP256);
+        var request = new System.Security.Cryptography.X509Certificates.CertificateRequest("CN=Cluster CA", key, System.Security.Cryptography.HashAlgorithmName.SHA256);
+        request.CertificateExtensions.Add(new System.Security.Cryptography.X509Certificates.X509BasicConstraintsExtension(true, false, 0, true));
+        var ca = request.CreateSelfSigned(DateTimeOffset.UtcNow.AddDays(-1), DateTimeOffset.UtcNow.AddYears(1)).ExportCertificatePem();
+
+        UpsertKubernetes(options: new { caCertificate = ca });
+        Assert.Equal(1, Drain().Done);
+
+        UpsertKubernetes(options: new { caCertificate = key.ExportPkcs8PrivateKeyPem() });
+        UpsertKubernetes(options: new { caCertificate = "not a certificate" });
+        Assert.Equal(2, Drain().Failed);
+    }
+
+    [Fact]
+    public void What_a_kubernetes_integration_may_read_never_includes_secrets_logs_exec_or_tokens()
+    {
+        var paths = IntegrationTypes.Find("kubernetes")!.ReadPaths;
+
+        Assert.Contains("/api/v1/pods", paths);
+        Assert.Contains("/api/v1/nodes", paths);
+        foreach (var forbidden in new[] { "secret", "configmap", "log", "exec", "proxy", "portforward", "attach", "token" })
+            Assert.DoesNotContain(paths, p => p.Contains(forbidden, StringComparison.OrdinalIgnoreCase));
+        // Fully explicit: a wildcard could one day admit a path nobody meant to allow.
+        Assert.DoesNotContain(paths, p => p.Contains('*', StringComparison.Ordinal));
+        Assert.All(paths, p => Assert.StartsWith("/", p, StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void Different_systems_can_be_scanned_by_different_accounts_each_with_its_own_scope_and_secret()
+    {
+        void Add(string id, string endpoint, string account) => Submit("integrations.upsert",
+            new { integrationId = id, type = "ssh", endpoint, authKind = "ssh-key", identity = account, options = new { targets = new[] { "x" } } });
+        Add("site-a", "10.1.0.0/16", "scan-a");
+        Add("site-b", "*.b.example.org", "scan-b");
+        Assert.Equal(2, Drain().Done);
+        using var connection = _db.OpenReadOnly();
+
+        var a = IntegrationStore.Resolve(connection, "host", "site-a");
+        var b = IntegrationStore.Resolve(connection, "host", "site-b");
+
+        Assert.Equal(("scan-a", "10.1.0.0/16"), (a.Identity, a.Endpoint));
+        Assert.Equal(("scan-b", "*.b.example.org"), (b.Identity, b.Endpoint));
+        Assert.NotEqual(IntegrationStore.Binding("site-a", "privateKey", a.Endpoint), IntegrationStore.Binding("site-b", "privateKey", b.Endpoint));
+    }
+
     [Fact]
     public void Implicit_integrations_need_no_configuration()
     {

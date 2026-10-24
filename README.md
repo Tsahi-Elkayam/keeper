@@ -123,7 +123,7 @@ Every verb runs inside that one process - Keeper never starts another program.
 | `components\vault`, `integrations` | Encrypted secrets; how Keeper reaches each system |
 | `components\keeper` | The `keeper` binary (dispatch, setup) and the verbs composed over every component: `run`, `db`, `qm`, `query` |
 | `rules\` | The generic rule packs, one file per system type |
-| `docs\` | `ARCHITECTURE.md`, `RULES.md` (the rule format), `DISCOVERY.md`, `SECURITY.md`, `backlog\` (checks not yet rules, and why) |
+| `docs\` | `ARCHITECTURE.md`, `RULES.md` (the rule format), `DISCOVERY.md`, `KUBERNETES.md`, `SECURITY.md`, `backlog\` (checks not yet rules, and why) |
 | `build\<runtime>\` | The binaries and the rules (`build.ps1` output; git ignores it) |
 | `home\` | The Keeper home: your tenant's settings and data (git ignores it) |
 | `demo\` | A second home with sample data, for trying Keeper out (git ignores it) |

@@ -177,6 +177,25 @@ public static partial class IntegrationTypes
             EndpointPath = "/v1/*/*",
             ReadPaths = ["/v1/*/*/assets"],
         },
+        // The cluster's own API server, read with a service account that holds only the "view" kind of access. What a
+        // rule may read is a short, explicit list: workloads, nodes, RBAC and network policy. Never secrets, config maps
+        // (which hold secrets in practice), logs, exec, proxy, port-forward or a service account's token.
+        new("kubernetes", "A Kubernetes cluster's API server (https://<host>:6443), read-only: workloads, nodes, RBAC and network policy - never secrets, config maps, logs or exec; option caCertificate trusts the cluster's own CA", ["http"], ["bearer"], [])
+        {
+            ReadPaths =
+            [
+                "/version", "/api/v1/namespaces", "/api/v1/nodes", "/api/v1/pods", "/api/v1/services", "/api/v1/serviceaccounts",
+                "/api/v1/resourcequotas", "/api/v1/limitranges", "/api/v1/persistentvolumes", "/api/v1/persistentvolumeclaims",
+                "/apis/apps/v1/deployments", "/apis/apps/v1/daemonsets", "/apis/apps/v1/statefulsets", "/apis/apps/v1/replicasets",
+                "/apis/batch/v1/cronjobs", "/apis/batch/v1/jobs", "/apis/autoscaling/v2/horizontalpodautoscalers",
+                "/apis/rbac.authorization.k8s.io/v1/clusterroles", "/apis/rbac.authorization.k8s.io/v1/clusterrolebindings",
+                "/apis/rbac.authorization.k8s.io/v1/roles", "/apis/rbac.authorization.k8s.io/v1/rolebindings",
+                "/apis/networking.k8s.io/v1/networkpolicies", "/apis/networking.k8s.io/v1/ingresses",
+                "/apis/policy/v1/poddisruptionbudgets", "/apis/storage.k8s.io/v1/storageclasses",
+                "/apis/admissionregistration.k8s.io/v1/validatingwebhookconfigurations", "/apis/admissionregistration.k8s.io/v1/mutatingwebhookconfigurations",
+                "/apis/certificates.k8s.io/v1/certificatesigningrequests",
+            ],
+        },
         new("checkpoint", "Check Point management API (show- commands only, on a read-only session)", ["http"], ["session-login"], [])
         {
             ReadPosts = ["/web_api/show-*", "/web_api/v*/show-*"],

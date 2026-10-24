@@ -66,6 +66,12 @@ that estate's weaknesses. This page says how each is protected, and what is not 
   `acceptAnyHostKey` is an explicit choice that the read then records. Keeper reads over SFTP (open, stat, list - no
   write call) and runs only the fixed command table, each part single-quoted under a fixed environment. Files that
   hold credentials or keys are never opened, also behind a link, and a file that starts with a private key is refused.
+- **Kubernetes is read through a short allowlist and a private CA.** The `kubernetes` integration reads named lists
+  only - never secrets, config maps, logs, exec, proxy or tokens - and the runner refuses any other path before it
+  sends anything. A cluster's private CA is trusted for that integration alone (`caCertificate`): the machine's trust
+  store is not widened, the host name must match, and without the CA no token is sent. Pod environment values,
+  command arguments and the `last-applied-configuration` annotation (which holds the whole applied manifest, env
+  values included) are masked. See `docs/KUBERNETES.md`.
 - **The store is not encrypted as a whole.** Findings, evidence and `row_seen` (every attribute of
   every scanned object) are plain SQLite, protected by the folder's access list only. Whole-database
   encryption is deferred.

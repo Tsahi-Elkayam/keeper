@@ -25,27 +25,11 @@ public static class ConfigParsers
             if (line.Length == 0)
                 continue;
             var row = Row(file, number);
-            row["text"] = ScrubCredentials(line);
+            row["text"] = CredentialText.Scrub(line);
             rows.Add(row);
         }
         return rows;
     }
-
-    // name = value or name: value where the name says the value is a credential.
-    private static readonly System.Text.RegularExpressions.Regex Credential = new(
-        @"(?<name>[\w.\-]*(password|passwd|passphrase|secret|api[_-]?key|apitoken|access[_-]?token|auth[_-]?token|credential)[\w.\-]*)(?<sep>\s*[=:]\s*)(?<value>\S.*)$",
-        System.Text.RegularExpressions.RegexOptions.IgnoreCase | System.Text.RegularExpressions.RegexOptions.CultureInvariant, TimeSpan.FromSeconds(1));
-
-    /// <summary>A line that sets a credential keeps its name and loses its value; a path to one, or a plain setting, is left alone.</summary>
-    private static string ScrubCredentials(string line) =>
-        Credential.Replace(line, m =>
-        {
-            var name = m.Groups["name"].Value.ToLowerInvariant();
-            var value = m.Groups["value"].Value.Trim().Trim('"', '\'');
-            return LocationWords.Any(w => name.Contains(w, StringComparison.Ordinal)) || PlainSetting.IsMatch(value)
-                ? m.Value
-                : m.Groups["name"].Value + m.Groups["sep"].Value + "set";
-        });
 
     /// <summary>"Key value" or "key=value" settings (sshd_config, sysctl.conf, login.defs); # starts a comment. Rows after a Match line carry its text in "match"; before one there is no such field.</summary>
     public static List<JsonObject> Kv(string text, string file)
@@ -112,12 +96,6 @@ public static class ConfigParsers
 
     private static readonly string[] SecretWords =
         ["password", "passwd", "passphrase", "secret", "apikey", "api_key", "api_token", "apitoken", "access_token", "accesstoken", "auth_token", "authtoken", "credential"];
-    private static readonly string[] LocationWords = ["file", "path", "dir", "url"];
-
-    // PasswordAuthentication no, MaxPasswordAge 90: the setting is about passwords, it is not one.
-    private static readonly System.Text.RegularExpressions.Regex PlainSetting = new(
-        @"^(yes|no|on|off|true|false|enabled|disabled|none|required|optional|[0-9]+)$",
-        System.Text.RegularExpressions.RegexOptions.IgnoreCase | System.Text.RegularExpressions.RegexOptions.CultureInvariant, TimeSpan.FromSeconds(1));
 
     /// <summary>A setting whose name says its value is a credential keeps no value in the rows (a path to one is only a path).</summary>
     private static void SecretMask(JsonObject row)
@@ -125,8 +103,8 @@ public static class ConfigParsers
         var name = row["name"]!.ToString();
         var value = row["value"]!.ToString();
         var names = SecretProperties.IsSecret(name)
-            || SecretWords.Any(w => name.Contains(w, StringComparison.Ordinal)) && !LocationWords.Any(w => name.Contains(w, StringComparison.Ordinal));
-        if (names && value.Length > 0 && !PlainSetting.IsMatch(value))
+            || SecretWords.Any(w => name.Contains(w, StringComparison.Ordinal)) && !CredentialText.LocationWords.Any(w => name.Contains(w, StringComparison.Ordinal));
+        if (names && value.Length > 0 && !CredentialText.IsPlainSetting(value))
             row["value"] = "set";
     }
 
