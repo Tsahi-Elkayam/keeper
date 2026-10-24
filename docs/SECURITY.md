@@ -72,6 +72,11 @@ that estate's weaknesses. This page says how each is protected, and what is not 
   store is not widened, the host name must match, and without the CA no token is sent. Pod environment values,
   command arguments and the `last-applied-configuration` annotation (which holds the whole applied manifest, env
   values included) are masked. See `docs/KUBERNETES.md`.
+- **Docker is read by listing and inspecting only.** The command table has no docker command that runs, starts, stops,
+  copies, pulls or removes anything, and an inspect takes a kind and plain ids, never an option. But to run even
+  `docker ps` the account needs the Docker socket, which on its own is root-level power over the machine: give the scan
+  its own account, on its own, and know that Keeper only ever lists and inspects. Environment values and command lines of
+  containers are scrubbed before they are stored.
 - **The store is not encrypted as a whole.** Findings, evidence and `row_seen` (every attribute of
   every scanned object) are plain SQLite, protected by the folder's access list only. Whole-database
   encryption is deferred.

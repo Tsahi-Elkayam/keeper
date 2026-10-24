@@ -21,7 +21,8 @@ internal sealed class SshFakeConnection : IConnection
 }
 
 /// <summary>A machine in memory: POSIX paths, canned command output, nothing on the network.</summary>
-internal sealed class FakeSession(string host, Dictionary<string, string> files, HostCommands.Output? command = null) : IHostSession
+internal sealed class FakeSession(string host, Dictionary<string, string> files, HostCommands.Output? command = null,
+    Func<string, IReadOnlyList<string>, HostCommands.Output>? script = null) : IHostSession
 {
     public List<string> Commands { get; } = [];
 
@@ -52,7 +53,7 @@ internal sealed class FakeSession(string host, Dictionary<string, string> files,
     public Task<HostCommands.Output> RunAsync(string name, IReadOnlyList<string> args, TimeSpan timeout, CancellationToken cancellationToken)
     {
         Commands.Add($"{name} {string.Join(' ', args)}".TrimEnd());
-        return Task.FromResult(command ?? new HostCommands.Output(true, 0, ["Linux"], false, false));
+        return Task.FromResult(script?.Invoke(name, args) ?? command ?? new HostCommands.Output(true, 0, ["Linux"], false, false));
     }
 
     public void Dispose()

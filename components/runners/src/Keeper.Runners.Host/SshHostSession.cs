@@ -301,7 +301,8 @@ internal sealed class SshHostSession : IHostSession
             if (line.Trim().Length > 0)
                 lines.Add(line.TrimEnd());
         }
-        return new HostCommands.Output(true, command.ExitStatus ?? -1, lines, truncated, false);
+        var error = command.Error.Split('\n').Select(l => l.Trim()).FirstOrDefault(l => l.Length > 0);
+        return new HostCommands.Output(true, command.ExitStatus ?? -1, lines, truncated, false, error is null ? null : error[..Math.Min(error.Length, 200)]);
     }
 
     public void Dispose()

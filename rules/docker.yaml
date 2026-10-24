@@ -1,0 +1,181 @@
+schema: keeper.rules/1
+system: docker
+name: Docker engine
+integration: host
+
+# Reads Docker through its own command (list, then inspect - nothing that starts, stops or changes anything), on the
+# machine Keeper runs on or on each host of an ssh integration. The account that reads needs access to the Docker
+# socket, which on its own is root-level power: use a dedicated account, and note that Keeper only ever lists and
+# inspects. A machine without Docker has no containers and nothing is reported for it.
+
+defaults:
+  lens: security
+  category: CFG
+  refresh: 1d
+  kind: misconfigured
+
+rules:
+  - id: DOCKER-CONTAINER-PRIVILEGED
+    title: 'A container runs privileged'
+    severity: high
+    entity: container
+    why: 'A privileged container has nearly the host''s own power; anyone who breaks into it owns the machine.'
+    fix: 'Run it without --privileged and add only the single capability it needs.'
+    refs: [NIST-800-53:AC-6, CIS-Controls-v8:4.1]
+    query: { protocol: host, read: docker, what: containers, optional: true, key: Id, name: name }
+    each: { field: HostConfig.Privileged, op: eq, value: true }
+    evidence: "container {name} on {host} is privileged"
+
+  - id: DOCKER-CONTAINER-RUNTIME-SOCKET
+    title: 'A container mounts the Docker socket'
+    severity: high
+    entity: container
+    why: 'The Docker socket is a control channel for the whole machine: whoever holds it can start a privileged container and take the host.'
+    fix: 'Remove the /var/run/docker.sock mount. If a tool must talk to Docker, put a restricted socket proxy in front of it.'
+    refs: [NIST-800-53:AC-6, NIST-800-53:CM-7]
+    query: { protocol: host, read: docker, what: containers, optional: true, key: Id, name: name }
+    each: { field: 'Mounts[].Source', op: in, value: [/var/run/docker.sock, /run/docker.sock] }
+    evidence: "container {name} on {host} mounts the Docker socket"
+
+  - id: DOCKER-CONTAINER-HOST-NAMESPACE
+    title: 'A container shares the host''s network, process, IPC or UTS space'
+    severity: medium
+    entity: container
+    why: 'With the host namespaces a container sees the machine''s traffic and processes, which removes the wall between it and the host.'
+    fix: 'Run it in its own network and PID namespace (the default) and publish the ports it needs.'
+    refs: [NIST-800-53:SC-7, NIST-800-53:AC-6]
+    query: { protocol: host, read: docker, what: containers, optional: true, key: Id, name: name }
+    each:
+      any:
+        - { field: HostConfig.NetworkMode, op: eq, value: host }
+        - { field: HostConfig.PidMode, op: eq, value: host }
+        - { field: HostConfig.IpcMode, op: eq, value: host }
+        - { field: HostConfig.UTSMode, op: eq, value: host }
+    evidence: "container {name} on {host} uses a host namespace"
+
+  - id: DOCKER-CONTAINER-DANGEROUS-CAPABILITIES
+    title: 'A container adds a Linux capability that is close to root on the host'
+    severity: high
+    entity: container
+    why: 'ALL, SYS_ADMIN, NET_ADMIN, SYS_PTRACE, SYS_MODULE and DAC_READ_SEARCH let a process in the container reach out of it.'
+    fix: 'Drop the capability; drop ALL by default (--cap-drop ALL) and add back only what the program is proven to need.'
+    refs: [NIST-800-53:AC-6, NIST-800-53:CM-7]
+    query: { protocol: host, read: docker, what: containers, optional: true, key: Id, name: name }
+    each: { field: 'HostConfig.CapAdd[]', op: in, value: [ALL, SYS_ADMIN, NET_ADMIN, SYS_PTRACE, SYS_MODULE, DAC_READ_SEARCH] }
+    evidence: "container {name} on {host} adds a dangerous capability"
+
+  - id: DOCKER-CONTAINER-RUNS-AS-ROOT
+    title: 'A container runs as root'
+    severity: low
+    entity: container
+    why: 'Root inside a container is one flaw away from root on the host. Most programs do not need it.'
+    fix: 'Build the image with a USER line (or run it with --user) set to a non-root account.'
+    refs: [NIST-800-53:AC-6]
+    query: { protocol: host, read: docker, what: containers, optional: true, key: Id, name: name }
+    each:
+      any:
+        - { field: Config.User, op: empty }
+        - { field: Config.User, op: in, value: ["0", root, "0:0", "root:root"] }
+    evidence: "container {name} on {host} runs as root"
+
+  - id: DOCKER-CONTAINER-NO-MEMORY-LIMIT
+    title: 'A container has no memory limit'
+    severity: low
+    entity: container
+    why: 'One container with a leak, or an attacker''s miner, can take all the memory of the host and starve the others.'
+    fix: 'Run it with --memory (and --memory-reservation) sized from what the program really uses.'
+    refs: [NIST-800-53:SC-5, NIST-800-53:CM-2]
+    query: { protocol: host, read: docker, what: containers, optional: true, key: Id, name: name }
+    each: { field: HostConfig.Memory, op: eq, value: 0 }
+    evidence: "container {name} on {host} has no memory limit"
+
+  - id: DOCKER-CONTAINER-IMAGE-NOT-PINNED
+    title: 'A container uses the latest tag or no tag at all'
+    severity: low
+    entity: container
+    why: '"latest" is whatever was pushed last, so the same command can run different code tomorrow, and a rollback cannot be told from a release.'
+    fix: 'Pin the image to a version tag, or better to its digest (image@sha256:...), and update it deliberately.'
+    refs: [NIST-800-53:CM-2, NIST-800-53:SI-7]
+    query: { protocol: host, read: docker, what: containers, optional: true, key: Id, name: name }
+    each: { field: Config.Image, op: match, value: '(:latest$)|(^([^/]*/)*[^/:@]+$)' }
+    evidence: "container {name} on {host} uses {Config.Image}"
+
+  - id: DOCKER-CONTAINER-UNHEALTHY
+    title: 'A container reports itself unhealthy'
+    kind: broken
+    lens: maintenance
+    category: HLT
+    severity: high
+    entity: container
+    why: 'Its own health check is failing, so the service it provides is down or degraded.'
+    fix: 'Read its logs (docker logs), fix the cause, and restart it; check the health check itself if it is wrong.'
+    refs: [NIST-800-53:SI-13, NIST-800-53:CP-10]
+    query: { protocol: host, read: docker, what: containers, optional: true, key: Id, name: name }
+    each: { field: State.Health.Status, op: eq, value: unhealthy }
+    evidence: "container {name} on {host} is unhealthy"
+
+  - id: DOCKER-CONTAINER-RESTART-LOOP
+    title: 'A container keeps restarting'
+    kind: broken
+    lens: maintenance
+    category: HLT
+    severity: high
+    entity: container
+    why: 'A container that starts, fails and is started again is not serving anyone, and hides its failure behind the restart policy.'
+    fix: 'Read its logs (docker logs), fix what makes it exit, then restart it.'
+    refs: [NIST-800-53:SI-13, NIST-800-53:CP-10]
+    query: { protocol: host, read: docker, what: containers, optional: true, key: Id, name: name }
+    each:
+      any:
+        - { field: State.Restarting, op: eq, value: true }
+        - { field: RestartCount, op: gt, value: 5 }
+    evidence: "container {name} on {host} restarted {RestartCount} times"
+
+  - id: DOCKER-DAEMON-INSECURE-REGISTRY
+    title: 'Docker pulls from a registry without TLS'
+    severity: medium
+    entity: daemon
+    why: 'An insecure registry is read over plain http or with an unchecked certificate, so the images it serves can be swapped on the way.'
+    fix: 'Serve the registry over TLS with a certificate the host trusts, and remove it from "insecure-registries" in daemon.json.'
+    refs: [NIST-800-53:SC-8, NIST-800-53:SI-7]
+    query: { protocol: host, read: docker, what: info, optional: true, key: ID, name: Name }
+    each: { field: 'RegistryConfig.InsecureRegistryCIDRs[]', op: notin, value: [127.0.0.0/8, ::1/128] }
+    evidence: "{host}: Docker accepts insecure registries"
+
+  - id: DOCKER-DAEMON-NO-LIVE-RESTORE
+    title: 'Containers stop when the Docker daemon restarts'
+    severity: low
+    lens: maintenance
+    category: AVL
+    entity: daemon
+    why: 'Without live-restore, updating or restarting the daemon takes every container down with it.'
+    fix: 'Set "live-restore": true in daemon.json and restart the daemon once.'
+    refs: [NIST-800-53:CP-10]
+    query: { protocol: host, read: docker, what: info, optional: true, key: ID, name: Name }
+    each: { field: LiveRestoreEnabled, op: eq, value: false }
+    evidence: "{host}: live-restore is off"
+
+  - id: DOCKER-SOCKET-WORLD-WRITABLE
+    title: 'The Docker socket can be used by everyone on the machine'
+    severity: high
+    entity: file
+    why: 'Whoever can write the socket can start a privileged container, so a world-writable socket is root for every local user.'
+    fix: 'chmod 660 /var/run/docker.sock and keep the group "docker" to the few accounts that need it.'
+    refs: [NIST-800-53:AC-6, NIST-800-53:CM-5]
+    query: { protocol: host, read: stat, path: /var/run/docker.sock, key: path }
+    each: { field: worldWritable, op: eq, value: true }
+    evidence: "{path} has mode {mode}"
+
+  - id: DOCKER-DAEMON-CONFIG-WRITABLE
+    title: 'daemon.json can be changed by people other than its owner'
+    severity: high
+    entity: file
+    why: 'Whoever can write daemon.json decides how every container on the machine is run.'
+    fix: 'chmod 644 /etc/docker/daemon.json (the owner must be root).'
+    refs: [NIST-800-53:CM-5, NIST-800-53:AC-6]
+    query: { protocol: host, read: stat, path: /etc/docker/daemon.json, key: path }
+    each:
+      any:
+        - { field: worldWritable, op: eq, value: true }
+        - { field: groupWritable, op: eq, value: true }
+    evidence: "{path} has mode {mode}"

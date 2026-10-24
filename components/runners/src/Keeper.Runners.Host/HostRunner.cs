@@ -13,7 +13,8 @@ namespace Keeper.Runners.Host;
 /// </summary>
 public sealed class HostRunner(Func<RunnerContext, IHostSession>? remote = null) : IRunner
 {
-    private static readonly string[] Reads = ["facts", "file", "stat", "command"];
+    private static readonly string[] Reads = ["facts", "file", "stat", "command", "docker"];
+    private static readonly string[] DockerKinds = ["containers", "images", "networks", "volumes", "info"];
     private static readonly string[] Formats = ["lines", "kv", "ini", "json", "directives"];
 
     public string Protocol => "host";
@@ -48,6 +49,8 @@ public sealed class HostRunner(Func<RunnerContext, IHostSession>? remote = null)
             if (format == "directives" && query.Text("style") is not ("nginx" or "apache"))
                 yield return "directives need style: nginx or apache";
         }
+        if (read == "docker" && query.Text("what") is not { } what || read == "docker" && !DockerKinds.Contains(query.Text("what")!))
+            yield return $"docker needs what: {string.Join(", ", DockerKinds)}";
         if (read == "command" && HostCommands.Problem(query.Text("name"), query.List("args")) is { } commandProblem)
             yield return commandProblem;
     }
@@ -63,6 +66,7 @@ public sealed class HostRunner(Func<RunnerContext, IHostSession>? remote = null)
                 "stat" => RunnerResult.Ok([Stat(session, query.Text("path")!)]),
                 "file" => ReadFile(session, query, context),
                 "command" => await Command(session, query, context, cancellationToken).ConfigureAwait(false),
+                "docker" => await Docker(session, query, cancellationToken).ConfigureAwait(false),
                 _ => RunnerResult.Failed("host: unknown read"),
             }, cancellationToken).ConfigureAwait(false);
         }
@@ -225,6 +229,76 @@ public sealed class HostRunner(Func<RunnerContext, IHostSession>? remote = null)
         if (name.Contains('*') || name.Contains('?'))
             return session.Glob(folder, name);
         return session.FileExists(full) ? [full] : [];
+    }
+
+    /// <summary>
+    /// Docker's own view of the machine: containers, images, networks, volumes (each listed, then inspected in
+    /// batches - one row per object, the inspect document as docker prints it) or the daemon's info. Credentials
+    /// in environments and command lines are scrubbed with the other rows.
+    /// </summary>
+    private static async Task<RunnerResult> Docker(IHostSession session, QuerySpec query, CancellationToken cancellationToken)
+    {
+        var optional = Flag(query, "optional", false);
+        var what = query.Text("what")!;
+        var timeout = TimeSpan.FromSeconds(60);
+
+        async Task<(HostCommands.Output? Output, RunnerResult? Stop)> Step(string name, params string[] args)
+        {
+            var output = await session.RunAsync(name, args, timeout, cancellationToken).ConfigureAwait(false);
+            if (!output.Found)
+                return (null, optional ? RunnerResult.Ok([]) : RunnerResult.Failed("docker is not installed on this machine"));
+            if (output.TimedOut)
+                return (null, RunnerResult.Failed($"docker did not answer in {timeout.TotalSeconds:0} s"));
+            if (output.ExitCode != 0)
+                return (null, RunnerResult.Failed($"docker could not be read (exit {output.ExitCode}){(output.Error is null ? "" : ": " + output.Error)}"));
+            return (output, null);
+        }
+
+        List<JsonObject> Rows(string text)
+        {
+            var node = JsonNode.Parse(text);
+            return [.. (node is JsonArray array ? array.Select(n => n) : [node]).OfType<JsonObject>()
+                .Select(o => { var row = (JsonObject)o.DeepClone(); row["host"] = session.HostName; return row; })];
+        }
+
+        if (what == "info")
+        {
+            var (info, stop) = await Step("docker-info").ConfigureAwait(false);
+            if (stop is not null)
+                return stop;
+            var rows = Rows(string.Join('\n', info!.Lines));
+            foreach (var row in rows)
+                SecretProperties.Mask(row);
+            return RunnerResult.Ok(rows);
+        }
+
+        var (list, kind) = what switch
+        {
+            "containers" => ("docker-ps-ids", "container"),
+            "images" => ("docker-image-ids", "image"),
+            "networks" => ("docker-network-ids", "network"),
+            _ => ("docker-volume-names", "volume"),
+        };
+        var (listed, listStop) = await Step(list).ConfigureAwait(false);
+        if (listStop is not null)
+            return listStop;
+        var ids = listed!.Lines.Select(l => l.Trim()).Where(l => l.Length > 0).Distinct(StringComparer.Ordinal).ToList();
+
+        var result = new List<JsonObject>();
+        foreach (var batch in ids.Chunk(HostCommands.MaxInspectIds))
+        {
+            var (inspected, inspectStop) = await Step("docker-inspect", [kind, .. batch]).ConfigureAwait(false);
+            if (inspectStop is not null)
+                return inspectStop;
+            result.AddRange(Rows(string.Join('\n', inspected!.Lines)));
+        }
+        foreach (var row in result)
+        {
+            if (kind == "container" && row["Name"]?.ToString() is { } name)
+                row["name"] = name.TrimStart('/');
+            SecretProperties.Mask(row);
+        }
+        return listed.Truncated ? RunnerResult.Partial(result, "docker listed more than the read can hold; the rest was not read") : RunnerResult.Ok(result);
     }
 
     private static async Task<RunnerResult> Command(IHostSession session, QuerySpec query, RunnerContext context, CancellationToken cancellationToken)

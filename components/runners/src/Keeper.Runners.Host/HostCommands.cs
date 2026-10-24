@@ -13,11 +13,21 @@ public static class HostCommands
 {
     public const int MaxOutputBytes = 1024 * 1024;
 
+    /// <summary>How many objects one docker inspect may name.</summary>
+    public const int MaxInspectIds = 50;
+
     private static readonly Regex Name = new(@"^[A-Za-z0-9_][A-Za-z0-9_.\-]*$", RegexOptions.CultureInvariant, TimeSpan.FromSeconds(1));
     private static readonly Regex Unit = new(@"^[A-Za-z0-9_@][A-Za-z0-9_@.:\-]*$", RegexOptions.CultureInvariant, TimeSpan.FromSeconds(1));
     private static readonly Regex Domain = new(@"^[A-Za-z0-9_][A-Za-z0-9_.\-/]*$", RegexOptions.CultureInvariant, TimeSpan.FromSeconds(1));
     private static readonly Regex Key = new(@"^[A-Za-z0-9_][A-Za-z0-9_. \-]*$", RegexOptions.CultureInvariant, TimeSpan.FromSeconds(1));
     private static readonly string[] SearchPath = ["/usr/bin", "/bin", "/usr/sbin", "/sbin"];
+
+    // Where Docker puts its command on a machine that is not Linux-packaged: Homebrew, a manual install, Docker Desktop.
+    private static readonly string[] ExtraLocalPath =
+        ["/usr/local/bin", "/opt/homebrew/bin", Path.Combine(System.Environment.GetFolderPath(System.Environment.SpecialFolder.UserProfile), ".docker", "bin")];
+
+    // An id, an image id (sha256:...), a volume or network name: never an option and never a path.
+    private static readonly Regex DockerId = new(@"^[A-Za-z0-9][A-Za-z0-9_.:@\-]{0,127}$", RegexOptions.CultureInvariant, TimeSpan.FromSeconds(1));
 
     /// <summary>A command: the program, a check of the parameters (an error text or null), and the arguments it gets.</summary>
     private sealed record Command(string Program, Func<IReadOnlyList<string>, string?> Check, Func<IReadOnlyList<string>, string[]> Build);
@@ -46,6 +56,16 @@ public static class HostCommands
         ["rpm"] = new("rpm", None, _ => ["-qa", "--qf", "%{NAME}\t%{VERSION}-%{RELEASE}\n"]),
         ["ss"] = new("ss", None, _ => ["-H", "-lntu"]),
         ["mount"] = new("mount", None, _ => []),
+        // Docker: listing and inspecting only. Nothing here starts, stops, runs, copies, pulls or removes anything.
+        ["docker-ps-ids"] = new("docker", None, _ => ["ps", "--all", "--quiet", "--no-trunc"]),
+        ["docker-image-ids"] = new("docker", None, _ => ["images", "--all", "--quiet", "--no-trunc"]),
+        ["docker-network-ids"] = new("docker", None, _ => ["network", "ls", "--quiet", "--no-trunc"]),
+        ["docker-volume-names"] = new("docker", None, _ => ["volume", "ls", "--quiet"]),
+        ["docker-info"] = new("docker", None, _ => ["info", "--format", "{{json .}}"]),
+        ["docker-inspect"] = new("docker",
+            a => a.Count >= 2 && a.Count <= MaxInspectIds + 1 && a[0] is "container" or "image" or "network" or "volume" && a.Skip(1).All(DockerId.IsMatch)
+                ? null : $"takes container|image|network|volume and 1 to {MaxInspectIds} plain ids",
+            a => ["inspect", "--type", a[0], "--", .. a.Skip(1)]),
         ["defaults"] = new("defaults",
             a => a.Count == 2 && Domain.IsMatch(a[0]) && Key.IsMatch(a[1]) ? null : "takes a preference domain and a key",
             a => ["read", a[0], a[1]]),
@@ -69,7 +89,8 @@ public static class HostCommands
         return (command.Program, command.Build(args));
     }
 
-    public sealed record Output(bool Found, int ExitCode, IReadOnlyList<string> Lines, bool Truncated, bool TimedOut);
+    /// <summary><paramref name="Error"/> is the first line the command wrote to its error output, if any ("permission denied ...").</summary>
+    public sealed record Output(bool Found, int ExitCode, IReadOnlyList<string> Lines, bool Truncated, bool TimedOut, string? Error = null);
 
     /// <summary>Runs an allowed command (already checked with <see cref="Problem"/>).</summary>
     public static async Task<Output> RunAsync(string name, IReadOnlyList<string> args, TimeSpan timeout, CancellationToken cancellationToken)
@@ -124,8 +145,8 @@ public static class HostCommands
         }
         if (truncated)
             Kill(process);
-        await errors.ConfigureAwait(false);
-        return new Output(true, truncated ? 0 : process.ExitCode, lines, truncated, false);
+        var errorText = (await errors.ConfigureAwait(false)).Split('\n').Select(l => l.Trim()).FirstOrDefault(l => l.Length > 0);
+        return new Output(true, truncated ? 0 : process.ExitCode, lines, truncated, false, errorText is null ? null : errorText[..Math.Min(errorText.Length, 200)]);
     }
 
     private static void Kill(Process process)
@@ -144,6 +165,6 @@ public static class HostCommands
     {
         if (program.StartsWith('/'))
             return File.Exists(program) ? program : null;
-        return SearchPath.Select(d => Path.Combine(d, program)).FirstOrDefault(File.Exists);
+        return SearchPath.Concat(ExtraLocalPath).Select(d => Path.Combine(d, program)).FirstOrDefault(File.Exists);
     }
 }
