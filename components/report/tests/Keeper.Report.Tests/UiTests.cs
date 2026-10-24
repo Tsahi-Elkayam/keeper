@@ -60,6 +60,18 @@ public sealed class UiTests : IDisposable
     }
 
     [Fact]
+    public void The_page_carries_a_health_score_and_the_card_that_shows_it()
+    {
+        var page = Page();
+
+        Assert.Contains("\"health\":{", page, StringComparison.Ordinal);
+        Assert.Contains("\"grade\":\"-\"", page, StringComparison.Ordinal);      // nothing judged: no score, not a perfect one
+        Assert.Contains("\"provisional\":true", page, StringComparison.Ordinal);
+        Assert.Contains("\"Health score\"", page, StringComparison.Ordinal);
+        Assert.Contains("How this is calculated", page, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void A_view_that_has_nothing_to_show_in_a_section_leaves_it_out_instead_of_printing_null()
     {
         // The coverage view returns null for a section with no rows; appending that raw prints the word "null" on the page.

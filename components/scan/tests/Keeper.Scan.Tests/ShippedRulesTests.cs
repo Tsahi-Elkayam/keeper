@@ -93,6 +93,17 @@ public sealed class ShippedRulesTests : IDisposable
     }
 
     [Fact]
+    public void No_shipped_rule_reads_win32_product_because_reading_it_makes_windows_re_check_every_package()
+    {
+        var offenders = Directory.EnumerateFiles(RulesFolder, "*.yaml")
+            .Where(f => File.ReadAllText(f).Contains("Win32_Product", StringComparison.OrdinalIgnoreCase))
+            .Select(Path.GetFileName)
+            .ToList();
+
+        Assert.Empty(offenders);
+    }
+
+    [Fact]
     public void Every_shipped_rule_file_loads_and_rule_ids_are_unique_across_them()
     {
         var rules = Shipped();

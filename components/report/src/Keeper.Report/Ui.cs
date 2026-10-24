@@ -104,6 +104,7 @@ public static class Ui
             """);
 
         var (entities, estateCoverage) = BuildEntitiesAndEstate(connection, gpoNames);
+        var health = Health(connection, systems);
 
         var data = new JsonObject
         {
@@ -111,6 +112,7 @@ public static class Ui
             ["tenant"] = tenant,
             ["systems"] = systems,
             ["checks"] = checks,
+            ["health"] = health,
             ["categories"] = categories,
             ["systemSplit"] = systemSplit,
             ["entities"] = entities,
@@ -138,6 +140,36 @@ public static class Ui
 
         // The default encoder escapes < > & ' " and every non-ASCII character, so the JSON is inert inside the page.
         return Page.Replace("/*KEEPER-DATA*/", data.ToJsonString(), StringComparison.Ordinal);
+    }
+
+    /// <summary>The health score (see <see cref="HealthScore"/>) from the open checks and what was judged.</summary>
+    private static JsonObject Health(SqliteConnection connection, JsonArray systems)
+    {
+        var open = Sql.Rows(connection, "SELECT severity, COALESCE(category, '') AS category, system FROM active_finding GROUP BY check_id;")
+            .Select(r => new HealthScore.OpenCheck((string)r["severity"]!, (string)r["category"]!, (string)r["system"]!)).ToList();
+        var judgedCategories = Sql.Rows(connection,
+                """
+                SELECT DISTINCT COALESCE(r.category, '') AS category FROM rule_standing st JOIN rule r ON r.rule_id = st.rule_id
+                WHERE st.standing IN ('correct', 'should-configure', 'broken');
+                """)
+            .Select(r => (string)r["category"]!).ToList();
+        long Sum(string column) => systems.Sum(s => s?[column] is JsonValue v && v.TryGetValue<long>(out var n) ? Math.Max(0, n) : 0);
+        var score = HealthScore.Compute(open, judgedCategories,
+            new HealthScore.Coverage(Sum("correct") + Sum("should") + Sum("broken"), Sum("unchecked") + Sum("norun")));
+
+        return new JsonObject
+        {
+            ["overall"] = score.Overall,
+            ["grade"] = score.Grade,
+            ["gradeNote"] = score.GradeNote,
+            ["provisional"] = score.Provisional,
+            ["provisionalReason"] = score.ProvisionalReason,
+            ["judgedPercent"] = score.JudgedPercent,
+            ["judged"] = score.Judged,
+            ["categories"] = new JsonArray(score.Categories.Select(c => (JsonNode)new JsonObject { ["category"] = c.Category, ["health"] = c.Health, ["open"] = c.OpenChecks }).ToArray()),
+            ["systems"] = new JsonArray(score.Systems.Select(c => (JsonNode)new JsonObject { ["system"] = c.System, ["health"] = c.Health, ["open"] = c.OpenChecks }).ToArray()),
+            ["weights"] = new JsonObject(HealthScore.Weights.Select(w => KeyValuePair.Create(w.Key, (JsonNode?)w.Value))),
+        };
     }
 
     private static (JsonArray Entities, JsonObject Estate) BuildEntitiesAndEstate(
@@ -800,7 +832,34 @@ const views = {
       h("details", {}, h("summary", {}, "Table view"), h("table", { class: "data" }, h("tr", {}, h("th", {}, "Severity"), h("th", {}, "Checks"), h("th", {}, "Objects")),
         bySev.map(x => h("tr", {}, h("td", {}, x.s), h("td", { class: "n" }, x.checks), h("td", { class: "n" }, fmt(x.objects)))))));
 
-    return [h("h1", {}, "Configuration posture"), h("p", { class: "lede" }, intro), tiles,
+    const H = D.health;
+    const gradeColor = { A: "var(--good)", B: "var(--good)", C: "var(--warning)", D: "var(--serious)", E: "var(--critical)" }[H.grade] || "var(--muted)";
+    const healthBar = (name, value, open) => {
+      const row = h("div", { class: "hbar" }, h("span", { class: "meta", style: "min-width:9ch" }, name),
+        h("div", { class: "track" }, h("div", { class: "fill", style: `width:${Math.max(1.5, value)}%;background:${value >= 75 ? "var(--good)" : value >= 60 ? "var(--warning)" : "var(--critical)"}` })),
+        h("span", { class: "num" }, `${value}/100 · ${open} open`));
+      tipOn(row, `${name}: ${value} of 100, ${open} open checks`);
+      return row;
+    };
+    const weakest = [...H.categories].sort((a, b) => a.health - b.health || b.open - a.open).slice(0, 8);
+    const healthCard = h("div", { class: "card", id: "health" },
+      h("h2", {}, "Health score"),
+      H.overall == null
+        ? h("div", { class: "empty" }, H.provisionalReason || "Nothing has been judged yet, so there is no score.")
+        : h("div", { class: "grid two" },
+            h("div", {},
+              h("div", { style: "display:flex;align-items:baseline;gap:16px" },
+                h("span", { class: "value", style: `font-size:64px;line-height:1;color:${gradeColor}`, "aria-label": `Grade ${H.grade}` }, H.grade),
+                h("span", { class: "value" }, `${H.overall}/100`)),
+              H.gradeNote ? h("p", { class: "meta" }, H.gradeNote) : null,
+              h("p", { class: "meta" }, `Based on ${fmt(H.judged)} checks on ${D.systems.length} scanned system${D.systems.length === 1 ? "" : "s"} (${H.judgedPercent}% of the checks that ran gave a verdict). ${D.neverScanned.length ? `${D.neverScanned.length} catalogue systems were never scanned and are not part of this score.` : ""}`),
+              H.provisional ? h("p", { class: "pill", role: "note" }, H.provisionalReason) : null),
+            h("div", {}, h("div", { class: "meta" }, "Weakest categories"), weakest.map(c => healthBar(c.category || "(none)", c.health, c.open)))),
+      H.systems.length ? h("details", {}, h("summary", {}, "Score by system"), H.systems.map(s => healthBar(s.system, s.health, s.open))) : null,
+      h("details", {}, h("summary", {}, "How this is calculated"),
+        h("p", { class: "meta" }, `Each open check costs points by severity (${Object.entries(H.weights).map(([k, v]) => `${k} ${v}`).join(", ")}); a check counts once however many objects it failed on. A category or system scores 100 minus its points, never below 0. The overall score is the average of the categories that were judged. A 90+, B 75+, C 60+, D 40+, E below; one open critical check keeps the grade from being better than C. With fewer than 80% of checks judged the score is marked provisional.`)));
+
+    return [h("h1", {}, "Configuration posture"), h("p", { class: "lede" }, intro), healthCard, tiles,
       h("div", { class: "grid two" }, h("div", { class: "grid" }, systems), h("div", { class: "grid" }, fixFirst, sevCard))];
   },
 

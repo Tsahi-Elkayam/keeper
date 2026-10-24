@@ -53,6 +53,24 @@ could not be read is `unknown` for the rule, never a pass. `applies` needs the f
 field, because a fixed list has no attributes. Several packs can therefore share one host list and one read:
 the Windows baseline's `-CLIENT` and `-SERVER` variants are judged only on their own kind of host.
 
+`fallback_chain` (cim and registry rules only) names the transports the engine tries to reach each host for that
+rule, in order: `wsman` (WinRM) and `dcom` (RPC), also spelled `winrm` and `rpc`. Without it the engine is in
+Auto mode: the integration's `cimProtocol` (default `auto`) decides, and auto is `wsman` then `dcom`. With it the
+rule is in Manual mode and the order is the rule's own - `fallback_chain: [dcom]` reads only over RPC. A host that
+answers and refuses (access denied, a bad Kerberos ticket) ends the walk on that transport, so a wrong credential is
+never tried a second time over another route. `smb` and `registry` are refused here: a file share cannot answer a
+WQL query or a registry key. The eventlog protocol reads over its own RPC session and takes no chain. Rules with
+different chains do not share one read; the aliases do.
+
+```yaml
+  - id: WIN-EXAMPLE-RPC-ONLY
+    fallback_chain: [dcom]          # optional; cim and registry rules
+    query: { protocol: registry, path: 'SOFTWARE\Example', key: host }
+```
+
+The `cim` protocol never reads `Win32_Product` (or the `Win32_Product*` classes): reading it makes Windows
+Installer re-check, and repair, every package. The loader refuses such a query; read the Uninstall registry keys.
+
 Ids are unique across all loaded files. Unknown fields are refused, so a typo fails loudly instead of
 silently weakening a check.
 

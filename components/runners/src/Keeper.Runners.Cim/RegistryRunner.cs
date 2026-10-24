@@ -71,7 +71,7 @@ public sealed partial class RegistryRunner : IRunner
         var key = query.Text("path")!;
         try
         {
-            using var session = CimSessions.Open(host, context);
+            using var session = CimSessions.Open(host, context, query.List("fallback_chain"));
 
             if (query.Text("certificates") == "true")
                 return Certificates(session, host, hive, key, context.Now);

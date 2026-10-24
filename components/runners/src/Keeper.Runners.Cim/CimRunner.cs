@@ -32,6 +32,9 @@ public sealed partial class CimRunner : IRunner
             return "wql is required";
         if (!Select().IsMatch(wql) || wql.Contains(';'))
             return "only one WQL SELECT is allowed";
+        // Reading Win32_Product (and its Win32_Product* siblings) makes Windows Installer re-check, and so repair, every package.
+        if (InstallerClasses().IsMatch(wql))
+            return "Win32_Product is never read: it makes Windows Installer re-check every package. Read the Uninstall registry keys instead.";
         return null;
     }
 
@@ -56,7 +59,7 @@ public sealed partial class CimRunner : IRunner
             if (Expand(query.Text("wql")!, host) is not { } wql)
                 return RunnerResult.Failed($"{host}: not a host name {{HOST}} can stand for");
 
-            using var session = CimSessions.Open(host, context);
+            using var session = CimSessions.Open(host, context, query.List("fallback_chain"));
             var rows = new List<JsonObject>();
             foreach (var instance in session.QueryInstances(query.Text("namespace") ?? "root/cimv2", "WQL", wql))
             {
@@ -89,6 +92,9 @@ public sealed partial class CimRunner : IRunner
         var name = target.Split('.')[0].ToUpperInvariant();
         return HostName().IsMatch(name) ? wql.Replace("{HOST}", name, StringComparison.Ordinal) : null;
     }
+
+    [GeneratedRegex(@"Win32_Product", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)]
+    private static partial Regex InstallerClasses();
 
     [GeneratedRegex(@"^\s*select\s", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)]
     private static partial Regex Select();

@@ -24,7 +24,7 @@ public static partial class RuleLoader
     private static readonly string[] DefaultFields = ["kind", "lens", "category", "severity", "refresh", "entity"];
     private static readonly string[] TargetFields = ["entity", "where", "field", "list"];
     private static readonly string[] RuleFields =
-        ["id", "title", "kind", "lens", "category", "severity", "entity", "why", "fix", "refs", "refresh", "query", "each", "count", "applies", "evidence", "deadline", "emit", "mask"];
+        ["id", "title", "kind", "lens", "category", "severity", "entity", "why", "fix", "refs", "refresh", "query", "each", "count", "applies", "fallback_chain", "evidence", "deadline", "emit", "mask"];
     private static readonly string[] EmitFields = ["check", "title", "kind", "category", "severity"];
     private static readonly string[] SeverityMapFields = ["field", "daysLeft", "ranges", "map", "default"];
     private static readonly string[] RangeFields = ["min", "max", "value"];
@@ -312,6 +312,13 @@ public static partial class RuleLoader
         foreach (var (field, value) in map.Where(f => f.Key is not ("protocol" or "key" or "name" or "min_rows")))
             json[field] = YamlReader.ToJson(value);
 
+        // Which transports reach the host, and in what order, is the rule's own decision: it sits on the rule, and
+        // is folded into the query so two rules asking the same question by different routes do not share one read.
+        if (map.ContainsKey("fallback_chain"))
+            reader.Error(map["fallback_chain"], $"{what}.query: fallback_chain belongs on the rule, beside query, not inside it.");
+        if (fields.TryGetValue("fallback_chain", out var chainNode) && ReadChain(reader, chainNode, protocol, what) is { } chain)
+            json["fallback_chain"] = new JsonArray(chain.Select(t => (JsonNode)JsonValue.Create(t)!).ToArray());
+
         var query = new QuerySpec(protocol, json, key, name) { MinRows = minRows };
         if (protocols is not null)
         {
@@ -322,6 +329,33 @@ public static partial class RuleLoader
                     reader.Error(node, $"{what}.query: {problem}");
         }
         return query;
+    }
+
+    private static List<string>? ReadChain(YamlReader reader, YamlNode node, string protocol, string what)
+    {
+        if (!Transports.Carries(protocol))
+        {
+            reader.Error(node, $"{what}: fallback_chain only applies to the cim and registry protocols, not '{protocol}'.");
+            return null;
+        }
+        var names = reader.Strings(new Dictionary<string, YamlNode> { ["fallback_chain"] = node }, "fallback_chain", what);
+        if (names.Count == 0)
+        {
+            reader.Error(node, $"{what}: fallback_chain needs at least one transport ({string.Join(", ", Transports.Default)}).");
+            return null;
+        }
+        var chain = new List<string>();
+        foreach (var name in names)
+        {
+            var canonical = Transports.Canonical(name);
+            if (canonical is null)
+                reader.Error(node, $"{what}: fallback_chain '{name}' cannot carry a {protocol} query. Use {string.Join(" or ", Transports.Default)} (winrm and rpc are accepted as their other names); a file share (smb) cannot answer a WQL or registry read.");
+            else if (chain.Contains(canonical))
+                reader.Error(node, $"{what}: fallback_chain names {canonical} twice.");
+            else
+                chain.Add(canonical);
+        }
+        return chain;
     }
 
     private static Condition? ReadCondition(YamlReader reader, YamlNode node, string what)

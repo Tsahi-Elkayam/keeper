@@ -6,6 +6,10 @@ history and your decisions, and each morning it ranks what deserves your time.
 
 Checks are rules in YAML: one file per system type, no code. More checks means more rules.
 
+The overview page of `keeper ui` opens with a **health score**: one number and an A-E grade, built from the open checks
+by severity, per category and per system, with the formula one click away. It says how many checks it stands on and is
+marked provisional when fewer than 80% of the checks that ran gave a verdict.
+
 **Status:** every component is built and unit-tested against synthetic data. **No runner has touched
 a live system yet**, so the first real scan of each system is its real test (see *Trying it* below).
 

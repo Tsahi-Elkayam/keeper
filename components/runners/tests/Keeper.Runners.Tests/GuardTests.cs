@@ -115,6 +115,24 @@ public sealed class GuardTests
     }
 
     [Theory]
+    [InlineData("SELECT * FROM Win32_Product")]
+    [InlineData("select Name, Version from win32_product where Name like 'x%'")]
+    [InlineData("SELECT * FROM Win32_ProductSoftwareFeature")]
+    [InlineData("SELECT * FROM   WIN32_PRODUCT")]
+    public void Cim_refuses_the_windows_installer_classes_that_re_check_every_package(string wql)
+    {
+        Assert.Contains("Win32_Product", CimRunner.Problem(wql), StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData("SELECT * FROM Win32_Processor")]
+    [InlineData("SELECT * FROM Win32_Process WHERE Name = 'a.exe'")]
+    public void Cim_still_accepts_classes_that_only_start_alike(string wql)
+    {
+        Assert.Null(CimRunner.Problem(wql));
+    }
+
+    [Theory]
     [InlineData("pc01.example.org", "SELECT * FROM Win32_GroupUser WHERE GroupComponent = \"Win32_Group.Domain='PC01',Name='Administrators'\"")]
     [InlineData("PC-02", "SELECT * FROM Win32_GroupUser WHERE GroupComponent = \"Win32_Group.Domain='PC-02',Name='Administrators'\"")]
     [InlineData("pc'01.example.org", null)]
