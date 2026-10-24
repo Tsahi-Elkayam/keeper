@@ -23,11 +23,13 @@ public static class ReportVerb
                       keeper report <{string.Join("|", Reports.Names)}> [--format markdown|html|text] [--out <file>]
                         --days <n>        how far back trends and finance look (default 90)
                         --since <date>    changes since this date
+                      keeper report target <name> [--format markdown|html|text] [--out <file>]
+                                          point-in-time dossier for one server, computer, account, or entity
                       keeper report evidence [--framework <id>] [--pack [--out <folder>]]
                                           controls the rules cite and how each stands; --pack adds the scan evidence and SHA256SUMS.txt
                       keeper ui [--out <file>]  the interactive page: overview, findings with every object, correct, could not check
                     """, asked: true);
-            var name = cli.At(0) ?? throw new ArgumentException($"Which report? {string.Join(", ", Reports.Names)}, evidence, ui.");
+            var name = cli.At(0) ?? throw new ArgumentException($"Which report? {string.Join(", ", Reports.Names)}, target <name>, evidence, ui.");
             var (settings, paths) = KeeperContext.Load(cli);
             var now = DateTimeOffset.UtcNow;
 
@@ -47,6 +49,7 @@ public static class ReportVerb
             }
             var format = cli.Get("format") ?? (name is "evidence" or "trends" ? "html" : "markdown");
             var extension = format switch { "html" => "html", "text" => "txt", _ => "md" };
+            var targetArg = name is "target" or "object" ? (cli.At(1) ?? cli.Get("target")) : cli.Get("target");
 
             Document document;
             EvidenceSet? evidence = null;
@@ -61,7 +64,7 @@ public static class ReportVerb
                 else
                 {
                     var days = int.TryParse(cli.Get("days"), System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out var d) && d > 0 ? d : 90;
-                    document = Reports.Build(name, connection, now, cli.Get("since"), days);
+                    document = Reports.Build(name, connection, now, cli.Get("since"), days, targetArg);
                 }
             }
 
@@ -75,7 +78,10 @@ public static class ReportVerb
                 return ExitCodes.Ok;
             }
 
-            var file = cli.Get("out") ?? Path.Combine(paths.Reports, $"{Iso.Date(now)}-{name}.{extension}");
+            var reportSlug = name is "target" or "object" && !string.IsNullOrWhiteSpace(targetArg)
+                ? $"target-{string.Concat(targetArg.Select(c => char.IsAsciiLetterOrDigit(c) || c is '-' or '.' ? c : '_'))}"
+                : name;
+            var file = cli.Get("out") ?? Path.Combine(paths.Reports, $"{Iso.Date(now)}-{reportSlug}.{extension}");
             Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(file))!);
             File.WriteAllText(file, text, new UTF8Encoding(false));
             Console.WriteLine($"Written to {file}");

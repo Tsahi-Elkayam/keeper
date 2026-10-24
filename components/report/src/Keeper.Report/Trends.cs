@@ -58,11 +58,11 @@ public static class Trends
         var moved = systems.Where(s => s.Then is not null).Select(s => (s.Id, Change: s.Now.Open - s.Then!.Open, s.Now, s.Then)).ToList();
         sections.Add(new Section("Most improved (last 30 days)",
             moved.Where(m => m.Change < 0).OrderBy(m => m.Change).Take(5)
-                .Select(m => $"{Label(m.Id, names)}: {m.Then!.Open} -> {m.Now.Open} open ({m.Change}), serious {m.Then.Serious} -> {m.Now.Serious}").ToList(),
+                .Select(m => string.Create(CultureInfo.InvariantCulture, $"{Label(m.Id, names)}: {m.Then!.Open} -> {m.Now.Open} open ({m.Change}), serious {m.Then.Serious} -> {m.Now.Serious}")).ToList(),
             "No system has fewer open findings than 30 days ago."));
         sections.Add(new Section("Getting worse (last 30 days)",
             moved.Where(m => m.Change > 0).OrderByDescending(m => m.Change).Take(5)
-                .Select(m => $"{Label(m.Id, names)}: {m.Then!.Open} -> {m.Now.Open} open (+{m.Change}), serious {m.Then.Serious} -> {m.Now.Serious}").ToList(),
+                .Select(m => string.Create(CultureInfo.InvariantCulture, $"{Label(m.Id, names)}: {m.Then!.Open} -> {m.Now.Open} open (+{m.Change}), serious {m.Then.Serious} -> {m.Now.Serious}")).ToList(),
             "No system has more open findings than 30 days ago."));
         sections.Add(new Section("How to read this",
         [
@@ -83,15 +83,15 @@ public static class Trends
         var recent = estate.Where(d => string.CompareOrdinal(d.Date, Iso.Date(now.AddDays(-30))) > 0).ToList();
         var lines = new List<string>
         {
-            $"Open findings: {today.Open} now{Compare(today.Open, month, "30 days ago", d => d.Open)}{Compare(today.Open, quarter, "90 days ago", d => d.Open)}{Line(estate.Select(d => d.Open))}",
-            $"Critical and high: {today.Serious} now{Compare(today.Serious, month, "30 days ago", d => d.Serious)}{Line(estate.Select(d => d.Serious))}",
-            $"Last 30 days: {recent.Sum(d => d.Resolved)} resolved, {recent.Sum(d => d.Opened)} new or reopened.",
-            $"Security tier: {today.Security} open. Overdue: {today.Overdue}. Accepted risks in force: {today.Accepted}.",
+            string.Create(CultureInfo.InvariantCulture, $"Open findings: {today.Open} now{Compare(today.Open, month, "30 days ago", d => d.Open)}{Compare(today.Open, quarter, "90 days ago", d => d.Open)}{Line(estate.Select(d => d.Open))}"),
+            string.Create(CultureInfo.InvariantCulture, $"Critical and high: {today.Serious} now{Compare(today.Serious, month, "30 days ago", d => d.Serious)}{Line(estate.Select(d => d.Serious))}"),
+            string.Create(CultureInfo.InvariantCulture, $"Last 30 days: {recent.Sum(d => d.Resolved)} resolved, {recent.Sum(d => d.Opened)} new or reopened."),
+            string.Create(CultureInfo.InvariantCulture, $"Security tier: {today.Security} open. Overdue: {today.Overdue}. Accepted risks in force: {today.Accepted}."),
         };
         if (today.PassRate is { } rate)
-            lines.Add($"Checks passing: {rate:0}% now{(month?.PassRate is { } was ? $", {was:0}% 30 days ago" : "")}.");
+            lines.Add(string.Create(CultureInfo.InvariantCulture, $"Checks passing: {rate:0}% now{(month?.PassRate is { } was ? string.Create(CultureInfo.InvariantCulture, $", {was:0}% 30 days ago") : "")}."));
         if (fixTimes.Count > 0)
-            lines.Add($"Median time to fix: {fixTimes[fixTimes.Count / 2]:0} days ({fixTimes.Count} findings resolved in this period).");
+            lines.Add(string.Create(CultureInfo.InvariantCulture, $"Median time to fix: {fixTimes[fixTimes.Count / 2]:0} days ({fixTimes.Count} findings resolved in this period)."));
         return lines;
     }
 
@@ -100,10 +100,10 @@ public static class Trends
         var today = days[^1];
         var month = At(days, now.AddDays(-30));
         var recent = days.Where(d => string.CompareOrdinal(d.Date, Iso.Date(now.AddDays(-30))) > 0).ToList();
-        var pass = today.PassRate is { } rate ? $", checks passing {rate:0}%{(month?.PassRate is { } was ? $" (was {was:0}%)" : "")}" : "";
-        return $"{(name is null || name == id ? id : $"{id} - {name}")}: open {today.Open}{Compare(today.Open, month, "30 d", d => d.Open)}, " +
-               $"serious {today.Serious}{Compare(today.Serious, month, "30 d", d => d.Serious)}{Line(days.Select(d => d.Serious))}; " +
-               $"last 30 days {recent.Sum(d => d.Resolved)} fixed, {recent.Sum(d => d.Opened)} new{pass}";
+        var pass = today.PassRate is { } rate ? string.Create(CultureInfo.InvariantCulture, $", checks passing {rate:0}%{(month?.PassRate is { } was ? string.Create(CultureInfo.InvariantCulture, $" (was {was:0}%)") : "")}") : "";
+        return string.Create(CultureInfo.InvariantCulture, $"{(name is null || name == id ? id : $"{id} - {name}")}: open {today.Open}{Compare(today.Open, month, "30 d", d => d.Open)}, ") +
+               string.Create(CultureInfo.InvariantCulture, $"serious {today.Serious}{Compare(today.Serious, month, "30 d", d => d.Serious)}{Line(days.Select(d => d.Serious))}; ") +
+               string.Create(CultureInfo.InvariantCulture, $"last 30 days {recent.Sum(d => d.Resolved)} fixed, {recent.Sum(d => d.Opened)} new{pass}");
     }
 
     /// <summary>The snapshot on or just before the day, or the first one when the record starts later.</summary>
@@ -119,7 +119,7 @@ public static class Trends
         if (then is null)
             return "";
         var change = now - value(then);
-        return $", {value(then)} {label} ({(change > 0 ? "+" : "")}{change})";
+        return string.Create(CultureInfo.InvariantCulture, $", {value(then)} {label} ({(change > 0 ? "+" : "")}{change})");
     }
 
     /// <summary>Up to 16 marks, oldest left: ▁ is the period's lowest value, █ its highest.</summary>

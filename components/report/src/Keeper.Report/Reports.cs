@@ -8,9 +8,9 @@ namespace Keeper.Report;
 /// <summary>Reports for people who read rather than act: the state of the estate, security, what expires, what changed.</summary>
 public static class Reports
 {
-    public static readonly IReadOnlyList<string> Names = ["posture", "summary", "security", "expiring", "changes", "trends", "finance"];
+    public static readonly IReadOnlyList<string> Names = ["posture", "summary", "security", "expiring", "changes", "trends", "finance", "matrix", "coverage"];
 
-    public static Document Build(string name, SqliteConnection connection, DateTimeOffset now, string? since, int days = 90) => name switch
+    public static Document Build(string name, SqliteConnection connection, DateTimeOffset now, string? since, int days = 90, string? target = null) => name switch
     {
         "posture" => Posture(connection, now),
         "summary" => Summary(connection, now),
@@ -19,7 +19,10 @@ public static class Reports
         "changes" => Changes(connection, since ?? Iso.Date(now.AddDays(-30))),
         "trends" => Trends.Build(connection, now, days),
         "finance" => Finance.Build(connection, now, days),
-        _ => throw new ArgumentException($"Reports: {string.Join(", ", Names)}, evidence."),
+        "matrix" or "cross-cutting" => CrossCutting.Build(connection, now),
+        "coverage" => CoverageReport.Build(connection, now),
+        "target" or "object" => TargetReport.Build(connection, target ?? "", now),
+        _ => throw new ArgumentException($"Reports: {string.Join(", ", Names)}, target <name>, evidence."),
     };
 
     private static List<string> Lines(SqliteConnection connection, string sql, Func<Dictionary<string, object?>, string> line,
