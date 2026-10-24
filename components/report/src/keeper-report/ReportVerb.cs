@@ -21,6 +21,7 @@ public static class ReportVerb
                     keeper report - reports for people who read rather than act (read-only; writes under data\reports\)
 
                       keeper report <{string.Join("|", Reports.Names)}> [--format markdown|html|text] [--out <file>]
+                        assets also takes --format csv: one row per machine and device, for a spreadsheet
                         --days <n>        how far back trends and finance look (default 90)
                         --since <date>    changes since this date
                       keeper report target <name> [--format markdown|html|text] [--out <file>]
@@ -48,10 +49,13 @@ public static class ReportVerb
                 return ExitCodes.Ok;
             }
             var format = cli.Get("format") ?? (name is "evidence" or "trends" ? "html" : "markdown");
-            var extension = format switch { "html" => "html", "text" => "txt", _ => "md" };
+            var extension = format switch { "html" => "html", "text" => "txt", "csv" => "csv", _ => "md" };
+            if (format == "csv" && name is not ("assets" or "inventory"))
+                throw new ArgumentException("--format csv is for 'keeper report assets'. Other reports: markdown, html or text.");
             var targetArg = name is "target" or "object" ? (cli.At(1) ?? cli.Get("target")) : cli.Get("target");
 
             Document document;
+            string? csv = null;
             EvidenceSet? evidence = null;
             using (var connection = new Database(paths.Database).OpenReadOnly())
             {
@@ -61,6 +65,11 @@ public static class ReportVerb
                     evidence = EvidenceBuilder.Build(connection, cli.Get("framework"), now);
                     document = EvidenceBuilder.Document(evidence);
                 }
+                else if (format == "csv")
+                {
+                    csv = Assets.Csv(connection, now);
+                    document = new Document("", "", []);
+                }
                 else
                 {
                     var days = int.TryParse(cli.Get("days"), System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out var d) && d > 0 ? d : 90;
@@ -68,7 +77,7 @@ public static class ReportVerb
                 }
             }
 
-            var text = Render.As(document, format);
+            var text = csv ?? Render.As(document, format);
             if (evidence is not null && cli.Has("pack"))
             {
                 var label = string.Concat(evidence.Framework.Select(c => char.IsAsciiLetterOrDigit(c) || c is '-' or '.' ? c : '_'));

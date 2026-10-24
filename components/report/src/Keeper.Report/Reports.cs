@@ -8,7 +8,7 @@ namespace Keeper.Report;
 /// <summary>Reports for people who read rather than act: the state of the estate, security, what expires, what changed.</summary>
 public static class Reports
 {
-    public static readonly IReadOnlyList<string> Names = ["posture", "summary", "security", "expiring", "changes", "trends", "finance", "matrix", "coverage"];
+    public static readonly IReadOnlyList<string> Names = ["posture", "summary", "security", "expiring", "changes", "trends", "finance", "matrix", "coverage", "assets"];
 
     public static Document Build(string name, SqliteConnection connection, DateTimeOffset now, string? since, int days = 90, string? target = null) => name switch
     {
@@ -21,6 +21,7 @@ public static class Reports
         "finance" => Finance.Build(connection, now, days),
         "matrix" or "cross-cutting" => CrossCutting.Build(connection, now),
         "coverage" => CoverageReport.Build(connection, now),
+        "assets" or "inventory" => Assets.Build(connection, now),
         "target" or "object" => TargetReport.Build(connection, target ?? "", now),
         _ => throw new ArgumentException($"Reports: {string.Join(", ", Names)}, target <name>, evidence."),
     };
