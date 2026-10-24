@@ -77,6 +77,8 @@ public static partial class IntegrationTypes
         ["gcp-service-account"] = ["privateKey"],
         ["snmp-v3"] = ["authPassword", "privPassword"],
         ["snmp-v2c"] = ["community"],
+        ["ssh-key"] = ["privateKey", "passphrase"],
+        ["ssh-password"] = ["password"],
     };
 
     private static readonly string[] Windows = ["negotiate", "windows-credential"];
@@ -194,6 +196,7 @@ public static partial class IntegrationTypes
         new("rubrik", "Rubrik Security Cloud GraphQL API", ["graphql", "http"], ["oauth-client-credentials"], ["*.my.rubrik.com"]),
         new("files", "Reports other tools wrote into imports\\", ["file"], ["none"], []),
         new("keeper", "Keeper's own registers", ["store"], ["none"], []),
+        new("ssh", "Unix hosts over SSH, read-only: the same configuration-file and command reads as the local host type; the endpoint lists where the credential may be used (CIDR ranges, host names, *.suffix), the targets option lists the hosts, and the hostKeys option pins their host keys", ["host"], ["ssh-key", "ssh-password"], []),
         new("host", "The machine Keeper runs on: configuration files and a fixed set of read-only commands", ["host"], ["none"], []),
         new("http", "Any other JSON API", ["http"], ["none", "negotiate", "basic", "bearer", "api-key-header", "api-key-query", "oauth-client-credentials", "session-login"], []),
     ];
@@ -201,6 +204,14 @@ public static partial class IntegrationTypes
     public static IntegrationType? Find(string id) => All.FirstOrDefault(t => t.Id.Equals(id, StringComparison.OrdinalIgnoreCase));
 
     /// <summary>Types that need no configuration: their single implicit instance has the type's own name.</summary>
+    /// <summary>
+    /// Whether an integration of type <paramref name="integrationType"/> can run rules written for <paramref name="ruleType"/>.
+    /// Rules for the host protocol read the local machine, or each target host of an ssh integration.
+    /// </summary>
+    public static bool Satisfies(string ruleType, string integrationType) =>
+        ruleType.Equals(integrationType, StringComparison.OrdinalIgnoreCase)
+        || ruleType.Equals("host", StringComparison.OrdinalIgnoreCase) && integrationType.Equals("ssh", StringComparison.OrdinalIgnoreCase);
+
     public static bool IsImplicit(string id) => id is "files" or "keeper" or "host";
 
     public static bool IsValidId(string id) => Id().IsMatch(id) && id.Length <= 60;

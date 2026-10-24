@@ -264,7 +264,7 @@ public sealed class Scanner(RunnerRegistry registry, TimeProvider? clock = null)
         var runner = registry.Get(query.Protocol);
         var outcome = new QueryOutcome([], []);
 
-        if (!runner.PerTarget)
+        if (!runner.IsPerTarget(request.Connection))
         {
             var result = await Safe(runner, query, Context(request, null), cancellationToken).ConfigureAwait(false);
             outcome.Rows.AddRange(result.Rows.Select(r => (r, (string?)null)));

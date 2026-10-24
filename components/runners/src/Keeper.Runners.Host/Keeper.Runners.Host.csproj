@@ -1,5 +1,8 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <ItemGroup>
+    <PackageReference Include="SSH.NET" />
+  </ItemGroup>
+  <ItemGroup>
     <ProjectReference Include="..\Keeper.Runners\Keeper.Runners.csproj" />
   </ItemGroup>
 </Project>

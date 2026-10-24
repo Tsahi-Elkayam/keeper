@@ -351,6 +351,54 @@ public sealed class IntegrationTests : IDisposable
         Assert.Equal(1, Drain().Failed);
     }
 
+    private void UpsertSsh(string endpoint = "192.0.2.0/24, *.example.org", string authKind = "ssh-key", string? identity = "keeper-reader", object? options = null) =>
+        Submit("integrations.upsert", new { integrationId = "fleet", type = "ssh", endpoint, authKind, identity, options = options ?? new { targets = new[] { "192.0.2.10" } } });
+
+    [Fact]
+    public void An_ssh_integration_names_where_its_credential_may_go_and_who_signs_in()
+    {
+        UpsertSsh(options: new { port = "2222", acceptAnyHostKey = "false", hostKeys = new { web01 = "SHA256:abc" }, targets = new[] { "web01.example.org" } });
+
+        Assert.Equal(1, Drain().Done);
+        var record = Find("fleet")!;
+        Assert.Equal("ssh", record.Type);
+        Assert.Equal("keeper-reader", record.Identity);
+    }
+
+    [Theory]
+    [InlineData("", "ssh-key", "keeper-reader", null)]                       // no scope: the credential could go anywhere
+    [InlineData("https://example.org", "ssh-key", "keeper-reader", null)]    // a URL is not a scope
+    [InlineData("*", "ssh-key", "keeper-reader", null)]                      // everywhere
+    [InlineData("192.0.2.0/24", "ssh-key", null, null)]                      // nobody to sign in as
+    [InlineData("192.0.2.0/24", "basic", "keeper-reader", null)]             // not an ssh sign-in
+    [InlineData("192.0.2.0/24", "ssh-key", "keeper-reader", "{\"port\":70000}")]
+    [InlineData("192.0.2.0/24", "ssh-key", "keeper-reader", "{\"port\":\"abc\"}")]
+    [InlineData("192.0.2.0/24", "ssh-key", "keeper-reader", "{\"acceptAnyHostKey\":\"maybe\"}")]
+    [InlineData("192.0.2.0/24", "ssh-key", "keeper-reader", "{\"hostKeys\":{\"web01\":5}}")]
+    public void A_badly_scoped_or_incomplete_ssh_integration_is_refused(string endpoint, string authKind, string? identity, string? optionsJson)
+    {
+        var options = optionsJson is null ? null : System.Text.Json.JsonSerializer.Deserialize<object>(optionsJson);
+        UpsertSsh(endpoint, authKind, identity, options);
+
+        Assert.Equal(1, Drain().Failed);
+        Assert.Null(Find("fleet"));
+    }
+
+    [Fact]
+    public void Rules_written_for_the_host_protocol_can_run_through_a_named_ssh_integration_but_never_choose_one_alone()
+    {
+        UpsertSsh();
+        Assert.Equal(1, Drain().Done);
+        using var connection = _db.OpenReadOnly();
+
+        Assert.Equal("fleet", IntegrationStore.Resolve(connection, "host", "fleet").Id);
+        Assert.Equal("host", IntegrationStore.Resolve(connection, "host", null).Id);      // the local machine, as before
+        Assert.Throws<IntegrationException>(() => IntegrationStore.Resolve(connection, "ldap", "fleet"));
+        Assert.True(IntegrationTypes.Satisfies("host", "ssh"));
+        Assert.False(IntegrationTypes.Satisfies("ssh", "host"));
+        Assert.False(IntegrationTypes.Satisfies("cim", "ssh"));
+    }
+
     [Fact]
     public void Implicit_integrations_need_no_configuration()
     {

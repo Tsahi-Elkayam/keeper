@@ -25,11 +25,27 @@ public static class ConfigParsers
             if (line.Length == 0)
                 continue;
             var row = Row(file, number);
-            row["text"] = line;
+            row["text"] = ScrubCredentials(line);
             rows.Add(row);
         }
         return rows;
     }
+
+    // name = value or name: value where the name says the value is a credential.
+    private static readonly System.Text.RegularExpressions.Regex Credential = new(
+        @"(?<name>[\w.\-]*(password|passwd|passphrase|secret|api[_-]?key|apitoken|access[_-]?token|auth[_-]?token|credential)[\w.\-]*)(?<sep>\s*[=:]\s*)(?<value>\S.*)$",
+        System.Text.RegularExpressions.RegexOptions.IgnoreCase | System.Text.RegularExpressions.RegexOptions.CultureInvariant, TimeSpan.FromSeconds(1));
+
+    /// <summary>A line that sets a credential keeps its name and loses its value; a path to one, or a plain setting, is left alone.</summary>
+    private static string ScrubCredentials(string line) =>
+        Credential.Replace(line, m =>
+        {
+            var name = m.Groups["name"].Value.ToLowerInvariant();
+            var value = m.Groups["value"].Value.Trim().Trim('"', '\'');
+            return LocationWords.Any(w => name.Contains(w, StringComparison.Ordinal)) || PlainSetting.IsMatch(value)
+                ? m.Value
+                : m.Groups["name"].Value + m.Groups["sep"].Value + "set";
+        });
 
     /// <summary>"Key value" or "key=value" settings (sshd_config, sysctl.conf, login.defs); # starts a comment. Rows after a Match line carry its text in "match"; before one there is no such field.</summary>
     public static List<JsonObject> Kv(string text, string file)

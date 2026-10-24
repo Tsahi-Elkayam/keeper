@@ -11,7 +11,7 @@ namespace Keeper.Runners.Host;
 /// size, owner-writable bits of a path) or command (one from a fixed allowlist). Files that hold credentials or
 /// keys are never opened; a setting whose name says it is a credential keeps no value in the rows.
 /// </summary>
-public sealed class HostRunner : IRunner
+public sealed class HostRunner(Func<RunnerContext, IHostSession>? remote = null) : IRunner
 {
     private static readonly string[] Reads = ["facts", "file", "stat", "command"];
     private static readonly string[] Formats = ["lines", "kv", "ini", "json", "directives"];
@@ -19,6 +19,11 @@ public sealed class HostRunner : IRunner
     public string Protocol => "host";
 
     public bool PerTarget => false;
+
+    /// <summary>The local machine is one read; an ssh integration reads each of its target hosts.</summary>
+    public bool IsPerTarget(IConnection connection) => IsRemote(connection);
+
+    private static bool IsRemote(IConnection connection) => connection.Type == "ssh";
 
     public IEnumerable<string> Validate(QuerySpec query)
     {
@@ -51,96 +56,95 @@ public sealed class HostRunner : IRunner
     {
         try
         {
-            return query.Text("read") switch
+            using var session = await Task.Run(() => Open(context), cancellationToken).ConfigureAwait(false);
+            return await Task.Run(async () => query.Text("read") switch
             {
-                "facts" => RunnerResult.Ok([Facts()]),
-                "stat" => RunnerResult.Ok([Stat(query.Text("path")!)]),
-                "file" => ReadFile(query, context),
-                "command" => await Command(query, context, cancellationToken).ConfigureAwait(false),
+                "facts" => RunnerResult.Ok([Facts(session)]),
+                "stat" => RunnerResult.Ok([Stat(session, query.Text("path")!)]),
+                "file" => ReadFile(session, query, context),
+                "command" => await Command(session, query, context, cancellationToken).ConfigureAwait(false),
                 _ => RunnerResult.Failed("host: unknown read"),
-            };
+            }, cancellationToken).ConfigureAwait(false);
         }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or FormatException or JsonException)
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or FormatException or JsonException or HostSessionException)
         {
             return RunnerResult.Failed($"host read failed: {ex.Message}");
         }
+    }
+
+    private IHostSession Open(RunnerContext context)
+    {
+        if (!IsRemote(context.Connection))
+            return new LocalHostSession();
+        if (context.Target is null)
+            throw new HostSessionException("an ssh integration reads its target hosts: set the file's targets or the integration's targets option");
+        return (remote ?? SshHostSession.Open)(context);
     }
 
     /// <summary>A true/false field of the query; rule files give it as a YAML boolean, tests as text.</summary>
     private static bool Flag(QuerySpec query, string field, bool otherwise) =>
         query.Fields[field] is JsonValue v ? v.TryGetValue<bool>(out var b) ? b : v.TryGetValue<string>(out var t) ? t.Equals("true", StringComparison.OrdinalIgnoreCase) : otherwise : otherwise;
 
-    private static JsonObject Base() => new() { ["host"] = Environment.MachineName };
+    private static JsonObject Base(IHostSession session) => new() { ["host"] = session.HostName };
 
-    private static JsonObject Facts()
+    private static JsonObject Facts(IHostSession session)
     {
-        var row = Base();
-        row["os"] = OperatingSystem.IsMacOS() ? "macos" : OperatingSystem.IsLinux() ? "linux" : OperatingSystem.IsWindows() ? "windows" : "other";
-        row["kernel"] = Environment.OSVersion.VersionString;
-        row["architecture"] = RuntimeInformation.OSArchitecture.ToString().ToLowerInvariant();
-        row["uptimeSeconds"] = Environment.TickCount64 / 1000;
-        if (File.Exists("/etc/os-release"))
-        {
-            var release = ConfigParsers.Kv(File.ReadAllText("/etc/os-release"), "/etc/os-release").ToDictionary(r => r["name"]!.ToString(), r => r["value"]!.ToString(), StringComparer.Ordinal);
-            row["osId"] = release.GetValueOrDefault("id");
-            row["osVersion"] = release.GetValueOrDefault("version_id");
-            row["osName"] = release.GetValueOrDefault("pretty_name");
-        }
-        else
-        {
-            row["osVersion"] = Environment.OSVersion.Version.ToString();
-        }
+        var row = Base(session);
+        foreach (var (name, value) in session.Facts())
+            row[name] = value?.DeepClone();
         return row;
     }
 
-    private static JsonObject Stat(string path)
+    private static JsonObject Stat(IHostSession session, string path)
     {
-        var row = Base();
+        path = session.Normalize(path);
+        var stat = session.Stat(path);
+        var row = Base(session);
         row["path"] = path;
-        var info = new FileInfo(path);
-        var isLink = info.LinkTarget is not null;
-        var exists = info.Exists || Directory.Exists(path) || isLink;
-        row["exists"] = exists;
-        row["isLink"] = isLink;
-        if (!exists)
+        row["exists"] = stat.Exists;
+        row["isLink"] = stat.IsLink;
+        if (!stat.Exists)
             return row;
-        row["isDirectory"] = Directory.Exists(path);
-        row["size"] = info.Exists ? info.Length : 0;
-        row["modified"] = RowValues.Iso(File.GetLastWriteTimeUtc(path));
-        if (!OperatingSystem.IsWindows())
+        row["isDirectory"] = stat.IsDirectory;
+        row["size"] = stat.Size;
+        row["modified"] = RowValues.Iso(stat.Modified);
+        if (stat.Mode is { } mode)
         {
-            var mode = File.GetUnixFileMode(path);
-            row["mode"] = Convert.ToString((int)mode, 8);
-            row["worldWritable"] = (mode & UnixFileMode.OtherWrite) != 0;
-            row["groupWritable"] = (mode & UnixFileMode.GroupWrite) != 0;
-            row["worldReadable"] = (mode & UnixFileMode.OtherRead) != 0;
+            var bits = (UnixFileMode)mode;
+            row["mode"] = Convert.ToString(mode & 0xFFF, 8);
+            row["worldWritable"] = (bits & UnixFileMode.OtherWrite) != 0;
+            row["groupWritable"] = (bits & UnixFileMode.GroupWrite) != 0;
+            row["worldReadable"] = (bits & UnixFileMode.OtherRead) != 0;
         }
         return row;
     }
 
-    private static RunnerResult ReadFile(QuerySpec query, RunnerContext context)
+    private static RunnerResult ReadFile(IHostSession session, QuerySpec query, RunnerContext context)
     {
-        var path = Path.GetFullPath(query.Text("path")!);
+        var path = session.Normalize(query.Text("path")!);
         var optional = Flag(query, "optional", false);
-        if (!File.Exists(path))
+        if (!session.FileExists(path))
             return optional ? RunnerResult.Ok([]) : RunnerResult.Failed($"{path} does not exist");
-        if (HostGuards.ReadProblem(path) is { } problem)
+        if (session.ReadProblem(path) is { } problem)
             return RunnerResult.Failed($"{path} was not read: {problem}");
 
         var format = query.Text("format") ?? "lines";
         var reasons = new List<string>();
+        var follow = Flag(query, "follow", true);
         var rows = format switch
         {
-            "directives" => WithIncludes(path, (text, file, context) => ConfigParsers.Directives(text, file, query.Text("style")!, context), Flag(query, "follow", true), reasons),
-            "json" => Json(path, query.Text("items")),
-            "kv" => WithOccurrences(WithIncludes(path, (text, file, _) => ConfigParsers.Kv(text, file), Flag(query, "follow", true), reasons)),
-            "ini" => ConfigParsers.Ini(File.ReadAllText(path), path),
-            _ => ConfigParsers.Lines(File.ReadAllText(path), path),
+            "directives" => WithIncludes(session, path, (text, file, context) => ConfigParsers.Directives(text, file, query.Text("style")!, context), follow, reasons),
+            "json" => Json(session.ReadAllText(path), query.Text("items")),
+            "kv" => WithOccurrences(WithIncludes(session, path, (text, file, _) => ConfigParsers.Kv(text, file), follow, reasons)),
+            "ini" => ConfigParsers.Ini(session.ReadAllText(path), path),
+            _ => ConfigParsers.Lines(session.ReadAllText(path), path),
         };
         foreach (var row in rows)
         {
-            row["host"] = Environment.MachineName;
-            SecretProperties.Mask(row);
+            row["host"] = session.HostName;
+            // The parsers keep credential values out of their own rows; arbitrary JSON gets the shared masker.
+            if (format == "json")
+                SecretProperties.Mask(row);
         }
         context.Log($"{path}: {rows.Count} rows");
         return reasons.Count == 0 ? RunnerResult.Ok(rows) : RunnerResult.Partial(rows, string.Join("; ", reasons));
@@ -152,14 +156,14 @@ public sealed class HostRunner : IRunner
         return rows;
     }
 
-    private static List<JsonObject> Json(string path, string? items)
+    private static List<JsonObject> Json(string text, string? items)
     {
-        var body = JsonNode.Parse(File.ReadAllText(path), documentOptions: new JsonDocumentOptions { MaxDepth = 64, CommentHandling = JsonCommentHandling.Skip });
+        var body = JsonNode.Parse(text, documentOptions: new JsonDocumentOptions { MaxDepth = 64, CommentHandling = JsonCommentHandling.Skip });
         return [.. RowValues.ItemsOf(body, items).Select(r => (JsonObject)RowValues.Detach(r))];
     }
 
     /// <summary>The rows of a file and of what it includes (a wildcard too), each row naming its own file.</summary>
-    private static List<JsonObject> WithIncludes(string path, Func<string, string, string, List<JsonObject>> parse, bool follow, List<string> reasons)
+    private static List<JsonObject> WithIncludes(IHostSession session, string path, Func<string, string, string, List<JsonObject>> parse, bool follow, List<string> reasons)
     {
         var rows = new List<JsonObject>();
         var files = 0;
@@ -171,9 +175,9 @@ public sealed class HostRunner : IRunner
                     reasons.Add($"more than {HostGuards.MaxFiles} files are included; the rest were not read");
                 return;
             }
-            if (HostGuards.ReadProblem(file) is { } problem)
+            if (session.ReadProblem(file) is { } problem)
                 throw new IOException($"{file} was not read: {problem}");
-            foreach (var row in parse(File.ReadAllText(file), file, context))
+            foreach (var row in parse(session.ReadAllText(file), file, context))
             {
                 rows.Add(row);
                 if (!follow || row["block"] is JsonValue block && block.GetValue<bool>() || row["name"]!.ToString() is not ("include" or "includeoptional"))
@@ -181,7 +185,7 @@ public sealed class HostRunner : IRunner
                 var arguments = row["args"] is JsonArray args ? args.Select(a => a!.ToString()) : [row["value"]!.ToString()];
                 foreach (var pattern in arguments)
                 {
-                    foreach (var included in Expand(file, pattern))
+                    foreach (var included in Expand(session, file, pattern))
                     {
                         if (chain.Contains(included, StringComparer.Ordinal))
                             reasons.Add($"include loop: {included} includes itself, directly or not");
@@ -212,22 +216,21 @@ public sealed class HostRunner : IRunner
     }
 
     /// <summary>The files an include names: relative to the including file's folder, a wildcard in the last part only.</summary>
-    private static IEnumerable<string> Expand(string from, string pattern)
+    private static IEnumerable<string> Expand(IHostSession session, string from, string pattern)
     {
-        var full = Path.IsPathRooted(pattern) ? pattern : Path.Combine(Path.GetDirectoryName(from)!, pattern);
-        full = Path.GetFullPath(full);
-        var folder = Path.GetDirectoryName(full)!;
-        var name = Path.GetFileName(full);
+        var full = session.ResolveInclude(from, pattern);
+        var cut = full.LastIndexOfAny(['/', '\\']);
+        var folder = cut <= 0 ? full[..Math.Max(cut + 1, 1)] : full[..cut];
+        var name = full[(cut + 1)..];
         if (name.Contains('*') || name.Contains('?'))
-            return Directory.Exists(folder) ? Directory.GetFiles(folder, name).Order(StringComparer.Ordinal) : [];
-        return File.Exists(full) ? [full] : [];
+            return session.Glob(folder, name);
+        return session.FileExists(full) ? [full] : [];
     }
 
-    private static async Task<RunnerResult> Command(QuerySpec query, RunnerContext context, CancellationToken cancellationToken)
+    private static async Task<RunnerResult> Command(IHostSession session, QuerySpec query, RunnerContext context, CancellationToken cancellationToken)
     {
         var name = query.Text("name")!;
-        var args = query.List("args");
-        var output = await HostCommands.RunAsync(name, args, context.Timeout, cancellationToken).ConfigureAwait(false);
+        var output = await session.RunAsync(name, query.List("args"), context.Timeout, cancellationToken).ConfigureAwait(false);
         if (!output.Found)
             return Flag(query, "optional", false) ? RunnerResult.Ok([]) : RunnerResult.Failed($"{name} is not installed on this machine");
         if (output.TimedOut)
@@ -237,7 +240,7 @@ public sealed class HostRunner : IRunner
         var n = 0;
         foreach (var line in output.Lines.DefaultIfEmpty(""))
         {
-            var row = Base();
+            var row = Base(session);
             row["command"] = name;
             row["n"] = ++n;
             row["line"] = line;
@@ -247,3 +250,6 @@ public sealed class HostRunner : IRunner
         return output.Truncated ? RunnerResult.Partial(rows, $"{name} printed more than {HostCommands.MaxOutputBytes / 1024} KB; the rest was not read") : RunnerResult.Ok(rows);
     }
 }
+
+/// <summary>A machine could not be reached or read as asked (not a rule's fault, not a pass).</summary>
+public sealed class HostSessionException(string message) : Exception(message);

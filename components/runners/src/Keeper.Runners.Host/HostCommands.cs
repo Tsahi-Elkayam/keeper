@@ -62,6 +62,13 @@ public static class HostCommands
         return problem is null ? null : $"{name} {problem}";
     }
 
+    /// <summary>The program and arguments an allowed command runs with (already checked with <see cref="Problem"/>).</summary>
+    public static (string Program, string[] Arguments) Plan(string name, IReadOnlyList<string> args)
+    {
+        var command = Table[name];
+        return (command.Program, command.Build(args));
+    }
+
     public sealed record Output(bool Found, int ExitCode, IReadOnlyList<string> Lines, bool Truncated, bool TimedOut);
 
     /// <summary>Runs an allowed command (already checked with <see cref="Problem"/>).</summary>

@@ -58,6 +58,43 @@ public sealed class HostRunnerTests : IDisposable
     }
 
     [Fact]
+    public async Task Settings_that_only_sound_secret_keep_their_values_through_the_whole_runner()
+    {
+        var path = Write("nginx.conf", "http {\n  server_tokens on;\n  ssl_password_file /etc/nginx/pw.txt;\n  ssl_certificate_key /etc/nginx/site.key;\n}\n");
+
+        var result = await Run(Q(("read", "file"), ("path", path), ("format", "directives"), ("style", "nginx")));
+
+        string Value(string name) => result.Rows.Single(r => r["name"]!.ToString() == name)["value"]!.ToString();
+        Assert.Equal("on", Value("server_tokens"));
+        Assert.Equal("/etc/nginx/pw.txt", Value("ssl_password_file"));
+        Assert.Equal("/etc/nginx/site.key", Value("ssl_certificate_key"));
+    }
+
+    [Fact]
+    public async Task A_credential_written_in_a_line_by_line_read_is_not_kept()
+    {
+        var path = Write("app.env", "DB_HOST=db.example.org\nDB_PASSWORD=hunter2\napi_key: abc123\nmotd=welcome\n");
+
+        var result = await Run(Q(("read", "file"), ("path", path), ("format", "lines")));
+
+        var text = string.Join("\n", result.Rows.Select(r => r["text"]!.ToString()));
+        Assert.DoesNotContain("hunter2", text, StringComparison.Ordinal);
+        Assert.DoesNotContain("abc123", text, StringComparison.Ordinal);
+        Assert.Contains("DB_HOST=db.example.org", text, StringComparison.Ordinal);
+        Assert.Contains("motd=welcome", text, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task A_secret_inside_json_is_still_masked()
+    {
+        var path = Write("app.json", "[{\"name\":\"svc\",\"password\":\"hunter2\"}]");
+
+        var result = await Run(Q(("read", "file"), ("path", path), ("format", "json")));
+
+        Assert.DoesNotContain("hunter2", result.Rows[0].ToJsonString(), StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task A_missing_file_is_a_failed_read_unless_the_rule_says_the_software_may_be_absent()
     {
         var path = Path.Combine(_dir, "nginx.conf");

@@ -105,6 +105,12 @@ public static class IntegrationVerb
                     headers[name["headers.".Length..]] = value;
                     options["headers"] = headers;
                 }
+                else if (name.StartsWith("hostKeys.", StringComparison.Ordinal))
+                {
+                    var keys = options["hostKeys"] as JsonObject ?? [];
+                    keys[name["hostKeys.".Length..]] = value;
+                    options["hostKeys"] = keys;
+                }
                 else if (name is "targets" or "scopes")
                 {
                     options[name] = new JsonArray(value.Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries)
@@ -237,6 +243,7 @@ public static class IntegrationVerb
                   Options: targets=a,b,c  scopes=x,y  clientId=..  tenantId=..  tokenUrl=https://..  header=..  prefix=..
                            param=..  headers.<name>=..  tls=trust (sql)  allowHttp=true (only if you accept cleartext)
                            cimProtocol=auto|wsman|dcom (cim: WinRM, then DCOM for hosts WinRM cannot reach)
+                           port=22  hostKeys.<host>=SHA256:<fingerprint>[,SHA256:...]  acceptAnyHostKey=true (ssh; the host key is then not verified)
                 """, asked);
     }
 }

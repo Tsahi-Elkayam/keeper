@@ -124,6 +124,42 @@ public sealed partial class UpsertHandler : IRequestHandler
     [System.Text.RegularExpressions.GeneratedRegex(@"\Aarn:aws:iam::[0-9]{12}:role/[\w+=,.@/-]{1,128}\z")]
     private static partial System.Text.RegularExpressions.Regex RoleArn();
 
+    private static readonly System.Text.RegularExpressions.Regex SshHost = new(
+        @"^(\*\.)?[A-Za-z0-9]([A-Za-z0-9\-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9\-]*[A-Za-z0-9])?)*$",
+        System.Text.RegularExpressions.RegexOptions.CultureInvariant, TimeSpan.FromSeconds(1));
+
+    private static void CheckSsh(string endpoint, JsonElement payload)
+    {
+        var entries = endpoint.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        if (entries.Length == 0)
+            throw new RequestException("ssh endpoints list where the credential may be used: CIDR ranges (192.0.2.0/24), host names or *.suffix patterns, separated by commas.");
+        foreach (var entry in entries)
+        {
+            var wildcard = entry.StartsWith("*.", StringComparison.Ordinal);
+            var valid = System.Net.IPNetwork.TryParse(entry, out _) || System.Net.IPAddress.TryParse(entry, out _)
+                || SshHost.IsMatch(entry) && (!wildcard || entry.Length > 4 && entry[2..].Contains('.', StringComparison.Ordinal));
+            if (!valid)
+                throw new RequestException($"'{entry}' is not a CIDR range, an address, a host name or a *.suffix.");
+        }
+        if (string.IsNullOrWhiteSpace(Payload.Text(payload, "identity")))
+            throw new RequestException("ssh needs the account to sign in as (identity).");
+        if (!payload.TryGetProperty("options", out var options) || options.ValueKind != JsonValueKind.Object)
+            return;
+        if (options.TryGetProperty("port", out var port) && SshPort(port) is null)
+            throw new RequestException("Option port must be a number from 1 to 65535.");
+        if (options.TryGetProperty("hostKeys", out var keys)
+            && (keys.ValueKind != JsonValueKind.Object || keys.EnumerateObject().Any(k => k.Value.ValueKind != JsonValueKind.String)))
+            throw new RequestException("Option hostKeys maps a host name to its SHA256 fingerprint (SHA256:...).");
+        if (options.TryGetProperty("acceptAnyHostKey", out var any)
+            && !(any.ValueKind is JsonValueKind.True or JsonValueKind.False || any.ValueKind == JsonValueKind.String && any.GetString() is "true" or "false"))
+            throw new RequestException("Option acceptAnyHostKey must be true or false.");
+    }
+
+    private static int? SshPort(JsonElement port) =>
+        port.ValueKind == JsonValueKind.Number && port.TryGetInt32(out var number) && number is >= 1 and <= 65535 ? number
+        : port.ValueKind == JsonValueKind.String && int.TryParse(port.GetString(), System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out var text) && text is >= 1 and <= 65535 ? text
+        : null;
+
     private static void CheckEndpoint(IntegrationType type, string endpoint, JsonElement payload)
     {
         if (type.Protocols.Any(p => p is "http" or "graph" or "graphql"))
@@ -151,6 +187,10 @@ public sealed partial class UpsertHandler : IRequestHandler
                  && !endpoint.StartsWith("ldap://", StringComparison.OrdinalIgnoreCase) && !endpoint.StartsWith("ldaps://", StringComparison.OrdinalIgnoreCase))
         {
             throw new RequestException("ldap endpoints are ldap://, ldaps:// or a domain name.");
+        }
+        else if (type.Id == "ssh")
+        {
+            CheckSsh(endpoint, payload);
         }
         else if (type.Id == "snmp")
         {

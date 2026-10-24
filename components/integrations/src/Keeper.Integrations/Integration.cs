@@ -74,14 +74,14 @@ public static class IntegrationStore
         {
             var named = all.FirstOrDefault(i => i.Id.Equals(id, StringComparison.OrdinalIgnoreCase))
                 ?? throw new IntegrationException($"No integration '{id}'. 'keeper integration list' shows them.");
-            if (!named.Type.Equals(type, StringComparison.OrdinalIgnoreCase))
+            if (!IntegrationTypes.Satisfies(type, named.Type))
                 throw new IntegrationException($"Integration '{id}' is of type {named.Type}; these rules need {type}.");
             if (!named.Enabled)
                 throw new IntegrationException($"Integration '{id}' is disabled.");
             return named;
         }
 
-        var candidates = all.Where(i => i.Enabled && i.Type.Equals(type, StringComparison.OrdinalIgnoreCase)).ToList();
+        var candidates = all.Where(i => i.Enabled && IntegrationTypes.Satisfies(type, i.Type)).ToList();
         return candidates.Count switch
         {
             1 => candidates[0],

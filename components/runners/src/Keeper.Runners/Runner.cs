@@ -120,6 +120,9 @@ public interface IRunner
     /// <summary>True when the runner reads one host at a time (targets).</summary>
     bool PerTarget { get; }
 
+    /// <summary>Whether a query through this integration reads one host at a time; usually what <see cref="PerTarget"/> says.</summary>
+    bool IsPerTarget(IConnection connection) => PerTarget;
+
     /// <summary>Checks a query's protocol-specific fields when the rule file is loaded.</summary>
     IEnumerable<string> Validate(QuerySpec query);
 

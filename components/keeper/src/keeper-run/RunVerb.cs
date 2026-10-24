@@ -145,12 +145,14 @@ public static class RunVerb
             foreach (var system in asked ?? rules.Systems.ToArray())
             {
                 var type = rules.ForSystem(system)[0].Integration;
-                var matching = integrations.Where(i => i.Enabled && i.Type.Equals(type, StringComparison.OrdinalIgnoreCase)).ToList();
+                var matching = integrations.Where(i => i.Enabled && IntegrationTypes.Satisfies(type, i.Type)).ToList();
                 if (matching.Count > 0)
                     plan.AddRange(matching.Select(i => (system, (string?)i.Id, type)));
-                else if (IntegrationTypes.IsImplicit(type))
+                // A type that needs no configuration has its implicit instance; for host rules that is the local
+                // machine, which is read beside any ssh fleet.
+                if (IntegrationTypes.IsImplicit(type) && (matching.Count == 0 || type == "host"))
                     plan.Add((system, null, type));
-                else if (asked is not null)
+                else if (matching.Count == 0 && asked is not null)
                     throw new ArgumentException($"{system} needs a {type} integration and none is enabled. 'keeper integration add' sets one up.");
                 // Unasked systems without an integration are skipped: nobody has said how to reach them.
             }

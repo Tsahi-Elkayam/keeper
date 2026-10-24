@@ -58,6 +58,14 @@ that estate's weaknesses. This page says how each is protected, and what is not 
 
 ## Not protected yet
 
+- **SSH reads are scoped, pinned and read-only.** An `ssh` integration's endpoint lists where its credential may be
+  used (CIDR ranges, host names, `*.suffix`); a rule file cannot point it anywhere else, and a host name never matches
+  a range, so DNS is not trusted with a credential. The credential is sent only after the host's key matches a
+  fingerprint pinned in the integration's `hostKeys` option (a host may pin several, one per key algorithm); an
+  unknown host is refused with the fingerprint to check, a changed key is refused whatever else is set, and
+  `acceptAnyHostKey` is an explicit choice that the read then records. Keeper reads over SFTP (open, stat, list - no
+  write call) and runs only the fixed command table, each part single-quoted under a fixed environment. Files that
+  hold credentials or keys are never opened, also behind a link, and a file that starts with a private key is refused.
 - **The store is not encrypted as a whole.** Findings, evidence and `row_seen` (every attribute of
   every scanned object) are plain SQLite, protected by the folder's access list only. Whole-database
   encryption is deferred.

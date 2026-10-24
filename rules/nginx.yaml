@@ -1,0 +1,68 @@
+schema: keeper.rules/1
+system: nginx
+name: nginx web server
+integration: host
+
+# Reads /etc/nginx/nginx.conf and what it includes, on the machine Keeper runs on or on each host of an ssh
+# integration. A machine without nginx has no file and no rows, so nothing is reported for it. A setting counts
+# wherever it sits (http, server, location); the finding's context says where.
+
+defaults:
+  lens: security
+  category: CFG
+  refresh: 1d
+  entity: directive
+  kind: misconfigured
+
+rules:
+  - id: NGINX-OLD-TLS
+    title: nginx still offers TLS versions that are broken or retired
+    severity: high
+    why: SSLv3, TLS 1.0 and TLS 1.1 have known attacks and every current browser has dropped them. Offering them only lets an attacker steer a connection down to them.
+    fix: Set "ssl_protocols TLSv1.2 TLSv1.3;" and reload nginx. Check that no client you still need depends on the old versions first.
+    refs: [NIST-800-53:SC-8, NIST-800-53:SC-13]
+    query: { protocol: host, read: file, path: /etc/nginx/nginx.conf, format: directives, style: nginx, optional: true, key: "{file}|{line}", name: directive }
+    each:
+      all:
+        - { field: name, op: eq, value: ssl_protocols }
+        - { field: value, op: match, value: '(^|\s)(SSLv2|SSLv3|TLSv1|TLSv1\.1)(\s|$)' }
+    evidence: "{file}:{line}: ssl_protocols {value} ({context})"
+
+  - id: NGINX-AUTOINDEX-ON
+    title: nginx lists the files of a folder when there is no index page
+    severity: medium
+    why: A directory listing shows every file in the folder to anyone, including backups and configuration that were never meant to be public.
+    fix: Remove "autoindex on;" (the default is off), or limit it to a location that is meant to be browsed, and reload nginx.
+    refs: [NIST-800-53:CM-7, NIST-800-53:AC-3]
+    query: { protocol: host, read: file, path: /etc/nginx/nginx.conf, format: directives, style: nginx, optional: true, key: "{file}|{line}", name: directive }
+    each:
+      all:
+        - { field: name, op: eq, value: autoindex }
+        - { field: value, op: eq, value: "on" }
+    evidence: "{file}:{line}: autoindex on ({context})"
+
+  - id: NGINX-SERVER-TOKENS-ON
+    title: nginx tells everyone its version
+    severity: low
+    why: The version in every error page and response header tells an attacker which known flaws to try.
+    fix: Set "server_tokens off;" in the http block and reload nginx.
+    refs: [NIST-800-53:CM-7, NIST-800-53:SI-11]
+    query: { protocol: host, read: file, path: /etc/nginx/nginx.conf, format: directives, style: nginx, optional: true, key: "{file}|{line}", name: directive }
+    each:
+      all:
+        - { field: name, op: eq, value: server_tokens }
+        - { field: value, op: eq, value: "on" }
+    evidence: "{file}:{line}: server_tokens on ({context})"
+
+  - id: NGINX-CONFIG-WRITABLE
+    title: nginx.conf can be changed by people other than its owner
+    severity: high
+    why: Whoever can write nginx.conf decides what this server serves, and can point it at their own code.
+    fix: "Make the file writable by root only: chmod 644 /etc/nginx/nginx.conf (the owner must be root)."
+    refs: [NIST-800-53:CM-5, NIST-800-53:AC-6]
+    query: { protocol: host, read: stat, path: /etc/nginx/nginx.conf, key: path }
+    each:
+      any:
+        - { field: worldWritable, op: eq, value: true }
+        - { field: groupWritable, op: eq, value: true }
+    evidence: "{path} has mode {mode}"
