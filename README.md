@@ -63,8 +63,10 @@ A scan reads; it never changes the system it reads. Keeper writes only its own s
 | `keeper decide snooze <key> --until 2w` | Out of today's list until then (also `delegate --to`, `clear`, `accept`, `disable`, `threshold`, `undo`, `setting`, `attest`; `accept`, `disable` and `threshold` take `--until` too, and the finding comes back after that day) |
 | `keeper system add <ID> --name ..` | The systems findings are grouped, routed and ranked by; `map` claims entities for them |
 | `keeper register licence set <id> --expires-on ..` | Licences, contracts, vendors, key dates, initiatives: rules warn before they bite |
-| `keeper report security` | `summary`, `security`, `expiring`, `changes --since` |
+| `keeper report security` | `posture`, `summary`, `security`, `expiring`, `changes --since`, `matrix` (cross-cutting by category, widespread checks, and object hotspots), `coverage` (estate discovery, rule standing, and operational blind spots) |
+| `keeper report target <name>` | Point-in-time dossier for one server, computer, account, or IP: identity, open broken/config findings, decisions, passed checks, and blind spots |
 | `keeper certs <server>` | Which certificates a server presents on its TLS ports, valid or not, until when; `--from-ad` for every server AD knows, `--save` to keep the result as findings. Runs only when you start it |
+| `keeper discover` | Network discovery (`--dry-run`, `--fresh`, `--ignore-window`, `--targets`): probes allowed networks from `settings\discovery.yaml` and writes `data\imports\discovery\inventory.json` for `rules\network.yaml` |
 | `keeper report finance` | What falls due, decisions overdue, licences paid for and idle or over the cap, cost findings, savings - from the registers |
 | `keeper report trends` | Progress per system for management: now against 30 and 90 days ago, fixed vs new, sparklines (`keeper trend --system <ID>` for the daily rows) |
 | `keeper report evidence --framework NIST-800-53 --pack` | GRC evidence: per control, each rule's results and the scan that proved them (manifest SHA-256), accepted risks, attestations; `--pack` writes a folder with `SHA256SUMS.txt` an auditor can verify. `keeper controls` shows each control's status |
@@ -81,7 +83,8 @@ Every verb runs inside that one process - Keeper never starts another program.
 | Verb | Job |
 |---|---|
 | `keeper setup`, `keeper help` | Create the home; list the verbs |
-| `keeper run` | The daily loop above |
+| `keeper run` | The daily loop above (`--discover` runs `keeper discover` first) |
+| `keeper discover` | Network discovery (`free` or `manual` mode) -> `data\imports\discovery\inventory.json` |
 | `keeper scan` | One system through one integration; writes a verified run folder |
 | `keeper load`, `keeper track`, `keeper rank` | Run folders into the store; findings; today's ranking |
 | `keeper qm` | The queue manager: the only writer of the store |
@@ -103,7 +106,7 @@ Every verb runs inside that one process - Keeper never starts another program.
   SQL accepts one SELECT and rolls back, CIM accepts WQL SELECT, LDAP only searches. Secret attributes
   (LAPS passwords and the like) are never requested.
 - **Secrets are encrypted in the store** (AES-256-GCM, the key protected by Windows DPAPI for the
-  user), bound to their integration and endpoint, and never shown. See `docs\SECURITY.md`.
+  user, or by an owner-only key file on macOS and Linux), bound to their integration and endpoint, and never shown. See `docs\SECURITY.md`.
 - **No data is not a pass.** A query that fails makes its rules *unknown*, and what Keeper cannot see
   is a section of today's list (`blind-spots`).
 - **Seen once, checked everywhere.** A problem found on one machine or account becomes a rule over
@@ -115,12 +118,12 @@ Every verb runs inside that one process - Keeper never starts another program.
 |---|---|
 | `components\<component>\src` | One folder per library; `keeper-<verb>\` holds that verb; `tests\` beside it |
 | `components\common`, `contracts`, `store`, `queue`, `query`, `home` | The shared base: arguments, records, SQLite, the queue, questions, the Keeper home |
-| `components\rules`, `runners`, `scan` | The rule language, the read-only runners (ldap, graph, http, graphql, sql, cim, tls, file, store), the scanner |
+| `components\rules`, `runners`, `scan`, `discover` | The rule language, the read-only runners (ldap, graph, http, graphql, sql, cim, tls, file, store), the scanner, and the network discovery engine |
 | `components\review`, `rank`, `report`, `push` | Findings and registers, today's ranking, reports, tickets |
 | `components\vault`, `integrations` | Encrypted secrets; how Keeper reaches each system |
 | `components\keeper` | The `keeper` binary (dispatch, setup) and the verbs composed over every component: `run`, `db`, `qm`, `query` |
 | `rules\` | The generic rule packs, one file per system type |
-| `docs\` | `ARCHITECTURE.md`, `RULES.md` (the rule format), `SECURITY.md`, `backlog\` (checks not yet rules, and why) |
+| `docs\` | `ARCHITECTURE.md`, `RULES.md` (the rule format), `DISCOVERY.md`, `SECURITY.md`, `backlog\` (checks not yet rules, and why) |
 | `build\<runtime>\` | The binaries and the rules (`build.ps1` output; git ignores it) |
 | `home\` | The Keeper home: your tenant's settings and data (git ignores it) |
 | `demo\` | A second home with sample data, for trying Keeper out (git ignores it) |

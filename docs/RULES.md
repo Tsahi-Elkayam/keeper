@@ -33,6 +33,7 @@ rules:
     fix: Clear "password never expires"; use a gMSA for service accounts.
     refs: [NIST-800-53:IA-5]
     refresh: 1d                   # how often the result goes stale: 30m, 6h, 1d, 7d
+    applies: { field: operatingSystem, op: notmatch, value: "Server" }   # optional: only these target hosts
     query:
       filter: "(&(objectCategory=person)(objectClass=user))"
       attributes: [sAMAccountName, displayName, userAccountControl]
@@ -44,6 +45,13 @@ rules:
         - { field: userAccountControl, op: noflag, value: 2 }
     evidence: "{sAMAccountName} - password never expires"
 ```
+
+`applies` says which of the file's target hosts a rule is about: a condition over the host's attributes (the
+same ones `targets.where` reads), true means the rule is judged on that host. A rule without it is judged on
+every target. A host that does not match is not judged at all (no result, no finding); a host whose attributes
+could not be read is `unknown` for the rule, never a pass. `applies` needs the file's `targets` to be entity and
+field, because a fixed list has no attributes. Several packs can therefore share one host list and one read:
+the Windows baseline's `-CLIENT` and `-SERVER` variants are judged only on their own kind of host.
 
 Ids are unique across all loaded files. Unknown fields are refused, so a typo fails loudly instead of
 silently weakening a check.
@@ -363,6 +371,11 @@ loaded, so these rules see the same day's data.
 
 `keeper stale-users` shows the same join as counts per reason - disabled, mailbox objects, expired,
 active on-premises, active only in the cloud, new, stale - next to what domain logons alone would say.
+
+`rules/network.yaml` reads `discovery/inventory.json` (`items: assets`) written by `keeper discover`.
+Because its rules use `entity: computer`, loading a `network` scan writes every discovered asset into
+`row_seen` with its `kind`, `state`, `addresses`, and `services`, so per-host rule packs can select
+discovered machines from the store (`targets: { entity: computer, where: ... }`). See `docs/DISCOVERY.md`.
 
 ## Every problem found is checked everywhere
 

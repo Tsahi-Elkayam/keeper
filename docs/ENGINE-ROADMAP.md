@@ -37,8 +37,11 @@ modules). Each stage is built, reviewed independently and fixed until a review f
    SMB/SYSVOL file reads and a GPO parser (registry.pol, GptTmpl.inf, audit.csv, GPP with cpassword
    masked); LDAP binary attributes and per-DC reads; registry binary values and the machine certificate
    store; SQL per-database loop and allow-listed read procedures; cim/eventlog extensions.
-6. **Network** (~230): probes (tcp, http, ssh banner, ntp) and config text first; then dns (DnsClient),
-   snmp v3 GET/GETNEXT/GETBULK only (Lextm.SharpSnmpLib), tls extensions (BouncyCastle).
+6. **Network** (~230; discovery and `rules/network.yaml` built in `components/discover`, never run against a live network):
+   `keeper discover` (`free` and `manual` modes, `ProbeGate` safety gate, TCP connect, SSH/HTTP/WinRM/TLS/SMB2/LDAP
+   handshake probes, AD/DNS/SNMP neighbour sources, subnet widening, pure C# read-only SNMPv3 USM + SNMPv2c GET/GETNEXT,
+   device classifier, asset lifecycle and operational coverage in `inventory.json`); remaining vendor-specific device
+   rule packs and offline config text rules follow on top.
 7. **Other auth kinds and types** (~330): jwt-bearer service accounts (GCP, Google Admin), HMAC-signed
    requests (Duo, AnyDesk), and named vendor types with allowed hosts (each checked against the vendor).
 8. **SOAP** (134): vSphere and unified communications, allow-listed read methods only.

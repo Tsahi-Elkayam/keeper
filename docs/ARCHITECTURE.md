@@ -45,11 +45,12 @@ its time counted once, shown as one line with its number of targets.
 | `components/store` | Keeper.Store | SQLite: read-only and read-write connections, per-component migrations, backup |
 | `components/queue` | Keeper.Queue | The single writer: spool, lock, a transaction and an audit row per request |
 | `components/query` | Keeper.Query | Named read-only questions in `.sql` files, bound parameters |
-| `components/vault` | Keeper.Vault | AES-256-GCM, data key protected by the OS (DPAPI) |
+| `components/vault` | Keeper.Vault | AES-256-GCM, data key protected by the OS: DPAPI on Windows, an owner-only `vault.key` file elsewhere |
 | `components/integrations` | Keeper.Integrations | Endpoints, identities, encrypted secrets, allowed hosts |
 | `components/rules` | Keeper.Rules | Rule files: model, loader, validation, condition evaluator |
 | `components/runners` | Keeper.Runners + one project per protocol | Read-only runners: ldap, graph, http, graphql, sql, cim, tls, file, store |
 | `components/scan` | Keeper.Scan + verbs scan, rules, certs | Runs a system's rules through its runner; writes a run folder; validates rule files |
+| `components/discover` | Keeper.Discover + verb discover | Network discovery (`free` and `manual` modes): probes allowed networks via `ProbeGate` and writes `data/imports/discovery/inventory.json` |
 | `components/review` | Keeper.Review + verbs | The domain: schema, handlers, questions, load, track; decide, system, register, config |
 | `components/rank` | Keeper.Rank + verb | What to do today |
 | `components/report` | Keeper.Report + verbs | The daily list and audience reports |
@@ -71,6 +72,8 @@ Every file a stage writes is JSON Lines - one record per line, a `schema` field 
 | `keeper.finding/1` | scan | findingKey, ruleId, checkId, system, entityType, target, kind, category, severity, security, title, evidence, fix, refs, deadline, observedAt |
 | `keeper.coverage/1` | scan | source, system, scope (rule, query, target), item, state (ok, partial, failed, not-applicable), reason, count, observedAt |
 | `keeper.run/1` (run.json) | scan | runId, source, system, integration, identity, startedAt, finishedAt, status, files with SHA-256 |
+| `keeper.inventory/1` (inventory.json) | discover | generatedAt, mode, scanHealth, notes, coverage (sources, summary), assets |
+| `keeper.discovery/1` (discovery.yaml) | tenant | mode, scope, targets, exclude, gentle, approve, sources, widen, snmp, rate, staleness, windows, history |
 
 A run folder is written as `<run>.tmp` and renamed when complete. `keeper load` verifies every
 file's hash before it submits the run, and the handler verifies them again before applying.
