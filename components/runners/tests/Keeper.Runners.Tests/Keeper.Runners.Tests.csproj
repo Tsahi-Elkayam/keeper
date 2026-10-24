@@ -8,6 +8,7 @@
     <ProjectReference Include="..\..\src\Keeper.Runners.Cim\Keeper.Runners.Cim.csproj" />
     <ProjectReference Include="..\..\src\Keeper.Runners.Aws\Keeper.Runners.Aws.csproj" />
     <ProjectReference Include="..\..\src\Keeper.Runners.Gpo\Keeper.Runners.Gpo.csproj" />
+    <ProjectReference Include="..\..\src\Keeper.Runners.Host\Keeper.Runners.Host.csproj" />
     <ProjectReference Include="..\..\src\Keeper.Runners.Smb\Keeper.Runners.Smb.csproj" />
     <ProjectReference Include="..\..\..\testkit\src\Keeper.TestKit\Keeper.TestKit.csproj" />
   </ItemGroup>

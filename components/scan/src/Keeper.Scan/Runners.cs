@@ -3,6 +3,7 @@ using Keeper.Runners.Aws;
 using Keeper.Runners.Cim;
 using Keeper.Runners.Files;
 using Keeper.Runners.Gpo;
+using Keeper.Runners.Host;
 using Keeper.Runners.Http;
 using Keeper.Runners.Ldap;
 using Keeper.Runners.Smb;
@@ -29,6 +30,7 @@ public static class Runners
         new GpoRunner(),
         new SmbRunner(),
         new FileRunner(),
+        new HostRunner(),
         new StoreRunner(),
     ]);
 }

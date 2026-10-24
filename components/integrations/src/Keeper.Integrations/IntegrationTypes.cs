@@ -194,13 +194,14 @@ public static partial class IntegrationTypes
         new("rubrik", "Rubrik Security Cloud GraphQL API", ["graphql", "http"], ["oauth-client-credentials"], ["*.my.rubrik.com"]),
         new("files", "Reports other tools wrote into imports\\", ["file"], ["none"], []),
         new("keeper", "Keeper's own registers", ["store"], ["none"], []),
+        new("host", "The machine Keeper runs on: configuration files and a fixed set of read-only commands", ["host"], ["none"], []),
         new("http", "Any other JSON API", ["http"], ["none", "negotiate", "basic", "bearer", "api-key-header", "api-key-query", "oauth-client-credentials", "session-login"], []),
     ];
 
     public static IntegrationType? Find(string id) => All.FirstOrDefault(t => t.Id.Equals(id, StringComparison.OrdinalIgnoreCase));
 
     /// <summary>Types that need no configuration: their single implicit instance has the type's own name.</summary>
-    public static bool IsImplicit(string id) => id is "files" or "keeper";
+    public static bool IsImplicit(string id) => id is "files" or "keeper" or "host";
 
     public static bool IsValidId(string id) => Id().IsMatch(id) && id.Length <= 60;
 

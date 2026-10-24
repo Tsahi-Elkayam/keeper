@@ -1,0 +1,107 @@
+schema: keeper.rules/1
+system: sshd
+name: OpenSSH server on this machine
+integration: host
+
+# Reads /etc/ssh/sshd_config (and what it includes) on the machine Keeper runs on. sshd keeps the FIRST value it
+# finds for a keyword and ignores the rest, and what follows a "Match" line holds only for that match, so every
+# rule looks at occurrence 1 outside any Match block. A machine without sshd_config answers "unknown", not a pass.
+
+defaults:
+  lens: security
+  category: CFG
+  refresh: 1d
+  entity: setting
+  kind: misconfigured
+
+rules:
+  - id: SSHD-ROOT-LOGIN
+    title: SSH lets root sign in with a password
+    severity: high
+    why: Root is the one account every attacker tries first. A password for it can be guessed from anywhere sshd is reachable.
+    fix: Set "PermitRootLogin prohibit-password" (or "no") in sshd_config and reload sshd. Administer through a named account and sudo.
+    refs: [NIST-800-53:AC-6, NIST-800-53:AC-17]
+    query: { protocol: host, read: file, path: /etc/ssh/sshd_config, format: kv, key: "{file}|{line}", name: key }
+    each:
+      all:
+        - { field: name, op: eq, value: permitrootlogin }
+        - { field: occurrence, op: eq, value: 1 }
+        - { field: match, op: absent }
+        - { field: value, op: eq, value: "yes" }
+    evidence: "{file}:{line}: PermitRootLogin {value}"
+
+  - id: SSHD-EMPTY-PASSWORDS
+    title: SSH accepts accounts with an empty password
+    severity: high
+    why: An account with no password becomes a way in for anyone who can reach sshd.
+    fix: Set "PermitEmptyPasswords no" in sshd_config and reload sshd.
+    refs: [NIST-800-53:IA-5]
+    query: { protocol: host, read: file, path: /etc/ssh/sshd_config, format: kv, key: "{file}|{line}", name: key }
+    each:
+      all:
+        - { field: name, op: eq, value: permitemptypasswords }
+        - { field: occurrence, op: eq, value: 1 }
+        - { field: match, op: absent }
+        - { field: value, op: eq, value: "yes" }
+    evidence: "{file}:{line}: PermitEmptyPasswords {value}"
+
+  - id: SSHD-PASSWORD-AUTH-NOT-DISABLED
+    title: SSH password sign-in is not switched off
+    kind: missing
+    severity: medium
+    why: sshd allows passwords unless told otherwise, so every reachable account can be guessed at. Keys cannot be guessed that way.
+    fix: Set "PasswordAuthentication no" in sshd_config (after keys are in place for the people who need access) and reload sshd.
+    refs: [NIST-800-53:IA-2, NIST-800-53:IA-5]
+    query: { protocol: host, read: file, path: /etc/ssh/sshd_config, format: kv, key: "{file}|{line}", name: key }
+    count:
+      op: lt
+      value: 1
+      where:
+        all:
+          - { field: name, op: eq, value: passwordauthentication }
+          - { field: occurrence, op: eq, value: 1 }
+          - { field: match, op: absent }
+          - { field: value, op: eq, value: "no" }
+
+  - id: SSHD-MAX-AUTH-TRIES
+    title: SSH allows many sign-in attempts per connection
+    severity: low
+    why: Every extra attempt per connection makes guessing cheaper.
+    fix: Set "MaxAuthTries 4" (or lower) in sshd_config and reload sshd.
+    refs: [NIST-800-53:AC-7]
+    query: { protocol: host, read: file, path: /etc/ssh/sshd_config, format: kv, key: "{file}|{line}", name: key }
+    each:
+      all:
+        - { field: name, op: eq, value: maxauthtries }
+        - { field: occurrence, op: eq, value: 1 }
+        - { field: match, op: absent }
+        - { field: value, op: gt, value: 6 }
+    evidence: "{file}:{line}: MaxAuthTries {value}"
+
+  - id: SSHD-X11-FORWARDING
+    title: SSH forwards X11 sessions
+    severity: low
+    why: X11 forwarding gives the remote side a path onto the user's display, which is rarely needed on a server.
+    fix: Set "X11Forwarding no" in sshd_config unless graphical programs are run over ssh, and reload sshd.
+    refs: [NIST-800-53:CM-7]
+    query: { protocol: host, read: file, path: /etc/ssh/sshd_config, format: kv, key: "{file}|{line}", name: key }
+    each:
+      all:
+        - { field: name, op: eq, value: x11forwarding }
+        - { field: occurrence, op: eq, value: 1 }
+        - { field: match, op: absent }
+        - { field: value, op: eq, value: "yes" }
+    evidence: "{file}:{line}: X11Forwarding {value}"
+
+  - id: SSHD-CONFIG-WRITABLE
+    title: sshd_config can be changed by people other than its owner
+    severity: high
+    why: Whoever can write sshd_config decides who may sign in to this machine.
+    fix: "Make the file writable by root only: chmod 644 /etc/ssh/sshd_config (the owner must be root)."
+    refs: [NIST-800-53:CM-5, NIST-800-53:AC-6]
+    query: { protocol: host, read: stat, path: /etc/ssh/sshd_config, key: path }
+    each:
+      any:
+        - { field: worldWritable, op: eq, value: true }
+        - { field: groupWritable, op: eq, value: true }
+    evidence: "{path} has mode {mode}"

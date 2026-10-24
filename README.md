@@ -118,7 +118,7 @@ Every verb runs inside that one process - Keeper never starts another program.
 |---|---|
 | `components\<component>\src` | One folder per library; `keeper-<verb>\` holds that verb; `tests\` beside it |
 | `components\common`, `contracts`, `store`, `queue`, `query`, `home` | The shared base: arguments, records, SQLite, the queue, questions, the Keeper home |
-| `components\rules`, `runners`, `scan`, `discover` | The rule language, the read-only runners (ldap, graph, http, graphql, sql, cim, tls, file, store), the scanner, and the network discovery engine |
+| `components\rules`, `runners`, `scan`, `discover` | The rule language, the read-only runners (ldap, graph, http, graphql, sql, cim, tls, file, store, host), the scanner, and the network discovery engine |
 | `components\review`, `rank`, `report`, `push` | Findings and registers, today's ranking, reports, tickets |
 | `components\vault`, `integrations` | Encrypted secrets; how Keeper reaches each system |
 | `components\keeper` | The `keeper` binary (dispatch, setup) and the verbs composed over every component: `run`, `db`, `qm`, `query` |

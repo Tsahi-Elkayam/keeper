@@ -48,7 +48,7 @@ its time counted once, shown as one line with its number of targets.
 | `components/vault` | Keeper.Vault | AES-256-GCM, data key protected by the OS: DPAPI on Windows, an owner-only `vault.key` file elsewhere |
 | `components/integrations` | Keeper.Integrations | Endpoints, identities, encrypted secrets, allowed hosts |
 | `components/rules` | Keeper.Rules | Rule files: model, loader, validation, condition evaluator |
-| `components/runners` | Keeper.Runners + one project per protocol | Read-only runners: ldap, graph, http, graphql, sql, cim, tls, file, store |
+| `components/runners` | Keeper.Runners + one project per protocol | Read-only runners: ldap, graph, http, graphql, sql, cim, tls, file, store, host (this machine's files and allowlisted commands) |
 | `components/scan` | Keeper.Scan + verbs scan, rules, certs | Runs a system's rules through its runner; writes a run folder; validates rule files |
 | `components/discover` | Keeper.Discover + verb discover | Network discovery (`free` and `manual` modes): probes allowed networks via `ProbeGate` and writes `data/imports/discovery/inventory.json` |
 | `components/review` | Keeper.Review + verbs | The domain: schema, handlers, questions, load, track; decide, system, register, config |
