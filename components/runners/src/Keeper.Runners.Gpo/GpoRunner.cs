@@ -138,12 +138,14 @@ public sealed partial class GpoRunner(Func<IConnection, string>? policiesRoot = 
                 }
                 break;
             case "security":
-                if (ReadText(Path.Combine(folder, "Machine", "Microsoft", "Windows NT", "SecEdit", "GptTmpl.inf")) is { } template)
+                var securityFile = Path.Combine(folder, "Machine", "Microsoft", "Windows NT", "SecEdit", "GptTmpl.inf");
+                if (ReadText(securityFile) is { } template)
                     foreach (var row in GpoFiles.SecurityTemplate(template))
                         yield return Tagged(row, "Machine", @"Machine\Microsoft\Windows NT\SecEdit\GptTmpl.inf");
                 break;
             case "audit":
-                if (ReadText(Path.Combine(folder, "Machine", "Microsoft", "Windows NT", "Audit", "audit.csv")) is { } audit)
+                var auditFile = Path.Combine(folder, "Machine", "Microsoft", "Windows NT", "Audit", "audit.csv");
+                if (ReadText(auditFile) is { } audit)
                     foreach (var row in GpoFiles.AuditPolicy(audit))
                         yield return Tagged(row, "Machine", @"Machine\Microsoft\Windows NT\Audit\audit.csv");
                 break;
@@ -181,7 +183,8 @@ public sealed partial class GpoRunner(Func<IConnection, string>? policiesRoot = 
     {
         if (half is not null)
             row["scope"] = half.ToLowerInvariant();
-        row["_file"] = file;
+        // SYSVOL paths are Windows paths: the tag reads the same whichever OS runs the scan.
+        row["_file"] = file.Replace('/', '\\');
         return row;
     }
 

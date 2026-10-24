@@ -25,7 +25,7 @@ public sealed class GpoRunnerTests : IDisposable
 
     private void Put(string gpo, string relative, byte[] bytes)
     {
-        var path = Path.Combine(_root, gpo, relative);
+        var path = Path.Combine(_root, gpo, relative.Replace('\\', Path.DirectorySeparatorChar));
         Directory.CreateDirectory(Path.GetDirectoryName(path)!);
         File.WriteAllBytes(path, bytes);
         // Every GPO has its GPT.INI; a folder without one is a GPO that could not be read.
@@ -76,10 +76,10 @@ public sealed class GpoRunnerTests : IDisposable
     [Fact]
     public async Task Registry_pol_settings_are_rows_with_their_gpo_and_scope()
     {
-        Put(Gpo1, @"Machine\Registry.pol", Pol(
+        Put(Gpo1, Path.Combine("Machine", "Registry.pol"), Pol(
             (@"Software\Policies\Microsoft\Windows\WinRM\Service", "AllowBasic", 4, Dword(0)),
             (@"Software\Policies\Microsoft\Windows NT\Terminal Services", "**del.fDenyTSConnections", 1, Encoding.Unicode.GetBytes(" \0"))));
-        Put(Gpo2, @"User\Registry.pol", Pol((@"Software\Policies\Microsoft\Office", "Name", 1, Encoding.Unicode.GetBytes("x\0"))));
+        Put(Gpo2, Path.Combine("User", "Registry.pol"), Pol((@"Software\Policies\Microsoft\Office", "Name", 1, Encoding.Unicode.GetBytes("x\0"))));
 
         var result = await Run(("part", "registry"));
 
@@ -93,7 +93,7 @@ public sealed class GpoRunnerTests : IDisposable
     [Fact]
     public async Task Security_settings_list_privilege_rights_by_sid()
     {
-        Put(Gpo1, @"Machine\Microsoft\Windows NT\SecEdit\GptTmpl.inf", """
+        Put(Gpo1, Path.Combine("Machine", "Microsoft", "Windows NT", "SecEdit", "GptTmpl.inf"), """
             [Unicode]
             Unicode=yes
             [System Access]

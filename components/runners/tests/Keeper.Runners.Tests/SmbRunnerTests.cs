@@ -48,7 +48,14 @@ public sealed class SmbRunnerTests
         var result = await new SmbRunner().RunAsync(Context.Query("smb", "name", ("read", "shares")),
             Context.For(new FakeConnection("pc01.example.org"), "pc01.example.org"), CancellationToken.None);
 
-        Assert.Equal("failed", result.State);   // the fake is bearer: only negotiate (this process's own Windows user) reads shares
-        Assert.Contains("negotiate", result.Reason, StringComparison.Ordinal);
+        Assert.Equal("failed", result.State);
+        if (System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(System.Runtime.InteropServices.OSPlatform.Windows))
+        {
+            Assert.Contains("negotiate", result.Reason, StringComparison.Ordinal);
+        }
+        else
+        {
+            Assert.Contains("smb reads need Windows", result.Reason, StringComparison.Ordinal);
+        }
     }
 }
