@@ -17,7 +17,7 @@ namespace Keeper.Runners.Printer;
 /// page count, supplies, alerts; or whether the well-known "public" community answers). A printer is only ever talked to
 /// when the integration's scope names it.
 /// </summary>
-public sealed partial class PrinterRunner(Func<IPEndPoint, TimeSpan, CancellationToken, Task<bool>>? connect = null) : IRunner
+public sealed partial class PrinterRunner(Func<IPEndPoint, TimeSpan, CancellationToken, Task<bool>>? connect = null) : ISessionRunner
 {
     private static readonly (int Port, string Name)[] Services =
     [
@@ -35,6 +35,87 @@ public sealed partial class PrinterRunner(Func<IPEndPoint, TimeSpan, Cancellatio
     public string Protocol => "printer";
 
     public bool PerTarget => true;
+
+    /// <summary>One session per printer for the scan: one UDP socket for SNMP (and what it learned about the printer), one HTTP client for IPP.</summary>
+    public string SessionFamily => "printer";
+
+    /// <summary>How many port connections are open at once during a ports read.</summary>
+    public const int PortsAtOnce = 4;
+
+    /// <summary>A printer's open session. The IPP client is made on first use; SNMP sockets by endpoint.</summary>
+    public sealed class PrinterSession : IRunnerSession
+    {
+        private readonly Dictionary<string, SnmpV2c.Channel> _snmp = new(StringComparer.Ordinal);
+        private X509Certificate2? _certificate;
+        private readonly Lock _lock = new();
+        private HttpClient? _http;
+
+        /// <summary>The SNMP socket to this endpoint, made on first use and kept for the scan.</summary>
+        public SnmpV2c.Channel Snmp(IPEndPoint endpoint)
+        {
+            lock (_lock)
+            {
+                var key = endpoint.ToString();
+                if (!_snmp.TryGetValue(key, out var channel))
+                    _snmp[key] = channel = new SnmpV2c.Channel(endpoint);
+                return channel;
+            }
+        }
+
+        /// <summary>The IPP client: one connection (and TLS handshake) for every IPP read of the printer.</summary>
+        internal HttpClient Http(TimeSpan connectTimeout)
+        {
+            lock (_lock)
+            {
+                // The request asks a printer about itself and carries no credential and no document, so a certificate the
+                // machine does not trust (the usual self-signed one) costs nothing to accept: it is recorded instead. It is
+                // kept for the printer (the session is one printer's), because a pooled connection shakes hands once and later
+                // reads still report the certificate.
+                return _http ??= new HttpClient(new SocketsHttpHandler
+                {
+                    AllowAutoRedirect = false,
+                    UseProxy = false,
+                    ConnectTimeout = connectTimeout,
+                    SslOptions = new SslClientAuthenticationOptions
+                    {
+                        RemoteCertificateValidationCallback = (_, certificate, _, _) =>
+                        {
+                            if (certificate is not null)
+                            {
+                                lock (_lock)
+                                {
+                                    _certificate?.Dispose();
+                                    _certificate = new X509Certificate2(certificate);
+                                }
+                            }
+                            return true;
+                        },
+                    },
+                }) { Timeout = Timeout.InfiniteTimeSpan };
+            }
+        }
+
+        /// <summary>The certificate the printer last presented, or null.</summary>
+        internal X509Certificate2? Certificate()
+        {
+            lock (_lock)
+                return _certificate;
+        }
+
+        public ValueTask DisposeAsync()
+        {
+            lock (_lock)
+            {
+                foreach (var channel in _snmp.Values)
+                    channel.Dispose();
+                _snmp.Clear();
+                _certificate?.Dispose();
+                _certificate = null;
+                _http?.Dispose();
+            }
+            return ValueTask.CompletedTask;
+        }
+    }
 
     public IEnumerable<string> Validate(QuerySpec query)
     {
@@ -70,8 +151,18 @@ public sealed partial class PrinterRunner(Func<IPEndPoint, TimeSpan, Cancellatio
     private static int Number(QuerySpec query, string name, int otherwise) =>
         Field(query, name) is { } text && int.TryParse(text, out var n) ? n : otherwise;
 
+    public Task<IRunnerSession> OpenAsync(RunnerContext context, CancellationToken cancellationToken) =>
+        Task.FromResult<IRunnerSession>(new PrinterSession());
+
     public async Task<RunnerResult> RunAsync(QuerySpec query, RunnerContext context, CancellationToken cancellationToken)
     {
+        await using var session = new PrinterSession();
+        return await RunAsync(session, query, context, cancellationToken).ConfigureAwait(false);
+    }
+
+    public async Task<RunnerResult> RunAsync(IRunnerSession session, QuerySpec query, RunnerContext context, CancellationToken cancellationToken)
+    {
+        var printer = (PrinterSession)session;
         if (context.Target is not { Length: > 0 } target)
             return RunnerResult.Failed("a printer read looks at one printer: set the integration's targets option");
         if (!SshScope.Allows(target, context.Connection.Endpoint))
@@ -85,14 +176,14 @@ public sealed partial class PrinterRunner(Func<IPEndPoint, TimeSpan, Cancellatio
             return query.Text("read") switch
             {
                 "ports" => await Ports(query, context, target, address, cancellationToken).ConfigureAwait(false),
-                "ipp" => await ReadIpp(query, context, target, address, cancellationToken).ConfigureAwait(false),
-                "snmp" => await ReadSnmp(query, context, target, address, cancellationToken).ConfigureAwait(false),
+                "ipp" => await ReadIpp(printer, query, context, target, address, cancellationToken).ConfigureAwait(false),
+                "snmp" => await ReadSnmp(printer, query, context, target, address, cancellationToken).ConfigureAwait(false),
                 _ => RunnerResult.Failed("printer: unknown read"),
             };
         }
-        catch (Exception ex) when (ex is HttpRequestException or SocketException or IOException or TaskCanceledException && !cancellationToken.IsCancellationRequested)
+        catch (Exception ex) when (ex is HttpRequestException or SocketException or IOException or TaskCanceledException or TimeoutException && !cancellationToken.IsCancellationRequested)
         {
-            return RunnerResult.Failed($"{target} could not be read: {ex.Message}");
+            return RunnerResult.Failed($"{target} could not be read: {ex.Message}", ex);
         }
     }
 
@@ -122,7 +213,17 @@ public sealed partial class PrinterRunner(Func<IPEndPoint, TimeSpan, Cancellatio
         var extra = query.List("ports").Select(int.Parse).Where(p => Services.All(s => s.Port != p)).Distinct().ToList();
         var wanted = Services.Select(s => s.Port).Concat(extra).ToList();
         var timeout = Short(context, 3);
-        var open = await Task.WhenAll(wanted.Select(port => (connect ?? TcpConnect)(new IPEndPoint(address, port), timeout, cancellationToken))).ConfigureAwait(false);
+        // A few connections at a time, not thirty at once: a printer's small network stack (and a firewall counting
+        // new connections) takes that for a scan. The pace is awaited before each batch after the first.
+        var open = new bool[wanted.Count];
+        for (var start = 0; start < wanted.Count; start += PortsAtOnce)
+        {
+            if (start > 0)
+                await context.Pace.WaitAsync(cancellationToken).ConfigureAwait(false);
+            var batch = wanted.Skip(start).Take(PortsAtOnce).ToList();
+            var answers = await Task.WhenAll(batch.Select(port => (connect ?? TcpConnect)(new IPEndPoint(address, port), timeout, cancellationToken))).ConfigureAwait(false);
+            answers.CopyTo(open, start);
+        }
 
         var row = Base(target, address);
         foreach (var (port, name) in Services)
@@ -156,7 +257,7 @@ public sealed partial class PrinterRunner(Func<IPEndPoint, TimeSpan, Cancellatio
 
     // ---------------------------------------------------------------- IPP
 
-    private static async Task<RunnerResult> ReadIpp(QuerySpec query, RunnerContext context, string target, IPAddress address, CancellationToken cancellationToken)
+    private static async Task<RunnerResult> ReadIpp(PrinterSession session, QuerySpec query, RunnerContext context, string target, IPAddress address, CancellationToken cancellationToken)
     {
         var scheme = query.Text("scheme") ?? "ipp";
         var port = Number(query, "port", 631);
@@ -164,34 +265,35 @@ public sealed partial class PrinterRunner(Func<IPEndPoint, TimeSpan, Cancellatio
         var host = address.AddressFamily == AddressFamily.InterNetworkV6 ? $"[{address}]" : address.ToString();
         var url = $"{(scheme == "ipps" ? "https" : "http")}://{host}:{port}{path}";
 
-        // The request asks a printer about itself and carries no credential and no document, so a certificate the
-        // machine does not trust (the usual self-signed one) costs nothing to accept: it is recorded instead.
-        X509Certificate2? presented = null;
-        using var handler = new SocketsHttpHandler
-        {
-            AllowAutoRedirect = false,
-            UseProxy = false,
-            ConnectTimeout = Short(context, 5),
-            SslOptions = new SslClientAuthenticationOptions
-            {
-                RemoteCertificateValidationCallback = (_, certificate, _, _) =>
-                {
-                    presented = certificate is null ? null : new X509Certificate2(certificate);
-                    return true;
-                },
-            },
-        };
-        using var client = new HttpClient(handler, disposeHandler: false) { Timeout = Short(context, 10) };
+        var client = session.Http(Short(context, 5));
         using var request = new HttpRequestMessage(HttpMethod.Post, url) { Content = new ByteArrayContent(Ipp.GetPrinterAttributesRequest($"{scheme}://{target}:{port}{path}")) };
         request.Content.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue("application/ipp");
 
-        using var response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken).ConfigureAwait(false);
+        // The query's timeout belongs to this request, not to the client the whole scan shares.
+        using var timer = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        timer.CancelAfter(Short(context, 10));
+        HttpResponseMessage response;
+        try
+        {
+            response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, timer.Token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        {
+            throw new TimeoutException($"{target} did not answer the IPP request in time.");
+        }
+        using var disposable = response;
         if (!response.IsSuccessStatusCode)
-            return RunnerResult.Failed($"{target} answered HTTP {(int)response.StatusCode} to the IPP request");
+        {
+            // A printer that wants a sign-in is asking for one Keeper does not send (IPP carries no credential), so 401
+            // is Denied, never Refused: it says nothing about the integration's own credential.
+            var status = (int)response.StatusCode;
+            return RunnerResult.Failed($"{target} answered HTTP {status} to the IPP request",
+                status is 401 or 403 ? FailureKind.Denied : Failures.OfStatus(status));
+        }
         if (response.Content.Headers.ContentType?.MediaType != "application/ipp")
             return RunnerResult.Failed($"{target} did not answer in IPP ({response.Content.Headers.ContentType?.MediaType ?? "no content type"}): it may not be a printer, or IPP is off");
 
-        var body = await ReadCapped(response.Content, cancellationToken).ConfigureAwait(false);
+        var body = await ReadCapped(response.Content, timer.Token).ConfigureAwait(false);
         Ipp.Response parsed;
         try
         {
@@ -208,7 +310,7 @@ public sealed partial class PrinterRunner(Func<IPEndPoint, TimeSpan, Cancellatio
         foreach (var (name, value) in parsed.Attributes)
             row[name] = value?.DeepClone();
         row["tls"] = scheme == "ipps";
-        if (presented is not null)
+        if (scheme == "ipps" && session.Certificate() is { } presented)
         {
             row["tlsSubject"] = presented.Subject;
             row["tlsIssuer"] = presented.Issuer;
@@ -217,7 +319,6 @@ public sealed partial class PrinterRunner(Func<IPEndPoint, TimeSpan, Cancellatio
             row["tlsDaysLeft"] = (int)Math.Floor((presented.NotAfter.ToUniversalTime() - context.Now).TotalDays);
             row["tlsSelfSigned"] = presented.Subject == presented.Issuer;
         }
-        presented?.Dispose();
         return RunnerResult.Ok([row]);
     }
 
@@ -259,16 +360,20 @@ public sealed partial class PrinterRunner(Func<IPEndPoint, TimeSpan, Cancellatio
     private static readonly string[] ErrorBits0 = ["serviceRequested", "offline", "jammed", "doorOpen", "noToner", "lowToner", "noPaper", "lowPaper"];
     private static readonly string[] ErrorBits1 = ["overduePreventMaintenance", "inputTrayEmpty", "outputFull", "outputNearFull", "markerSupplyMissing", "outputTrayMissing", "inputTrayMissing"];
 
-    private static async Task<RunnerResult> ReadSnmp(QuerySpec query, RunnerContext context, string target, IPAddress address, CancellationToken cancellationToken)
+    private static async Task<RunnerResult> ReadSnmp(PrinterSession session, QuerySpec query, RunnerContext context, string target, IPAddress address, CancellationToken cancellationToken)
     {
         var what = query.Text("what")!;
         var endpoint = new IPEndPoint(address, Number(query, "port", 161));
         var timeout = Short(context, 3);
+        var channel = session.Snmp(endpoint);
+        // The scanner waited for the query's first datagram; every further one (the next value, a retry) waits for the pace.
+        var datagrams = 0;
+        Task Before(CancellationToken token) => datagrams++ == 0 ? Task.CompletedTask : context.Pace.WaitAsync(token);
 
         if (what == "public-community")
         {
             // The one community every audit tries, asked for one value. No walk, nothing else.
-            var answer = await SnmpV2c.GetAsync(endpoint, "public", $"{SysGroup}.1.0", timeout, cancellationToken).ConfigureAwait(false);
+            var answer = await channel.GetAsync("public", $"{SysGroup}.1.0", timeout, Before, cancellationToken).ConfigureAwait(false);
             var check = Base(target, address);
             check["answersPublicCommunity"] = answer is not null;
             if (answer is { } found)
@@ -278,11 +383,15 @@ public sealed partial class PrinterRunner(Func<IPEndPoint, TimeSpan, Cancellatio
 
         if (context.Connection.Secret("community") is not { Length: > 0 } community)
             return RunnerResult.Failed("the integration has no SNMP community: set it with 'keeper integration set-secret <id> community'");
+        // A printer that did not answer for this community earlier in the scan is not asked again: each unanswered
+        // request costs the printer's whole timeout twice.
+        if (channel.IsSilent(community))
+            return RunnerResult.Failed($"{target} did not answer SNMP earlier in this scan, so it was not asked again");
         var problems = new List<string>();
 
         async Task<IReadOnlyList<(string Oid, object? Value)>> Walk(string prefix)
         {
-            var walk = await SnmpV2c.WalkAsync(endpoint, community, prefix, 256, timeout, cancellationToken).ConfigureAwait(false);
+            var walk = await channel.WalkAsync(community, prefix, 256, timeout, Before, cancellationToken).ConfigureAwait(false);
             if (!walk.Complete && walk.Problem is { } problem)
                 problems.Add(problem);
             return walk.Rows;
@@ -291,7 +400,8 @@ public sealed partial class PrinterRunner(Func<IPEndPoint, TimeSpan, Cancellatio
         // The device must at least answer for its own description, or nothing below can be believed.
         var description = await Walk($"{SysGroup}.1").ConfigureAwait(false);
         if (description.Count == 0)
-            return RunnerResult.Failed($"{target} did not answer SNMP: {(problems.Count > 0 ? problems[0] : "no value for sysDescr")}");
+            return RunnerResult.Failed($"{target} did not answer SNMP: {(problems.Count > 0 ? problems[0] : "no value for sysDescr")}",
+                channel.IsSilent(community) ? FailureKind.Timeout : FailureKind.Error);
 
         List<JsonObject> rows = what switch
         {

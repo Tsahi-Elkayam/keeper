@@ -11,7 +11,7 @@ namespace Keeper.Runners.Host;
 /// size, owner-writable bits of a path) or command (one from a fixed allowlist). Files that hold credentials or
 /// keys are never opened; a setting whose name says it is a credential keeps no value in the rows.
 /// </summary>
-public sealed class HostRunner(Func<RunnerContext, IHostSession>? remote = null) : IRunner
+public sealed class HostRunner(Func<RunnerContext, IHostSession>? remote = null) : ISessionRunner
 {
     private static readonly string[] Reads = ["facts", "file", "stat", "command", "docker", "configs", "cups"];
     private static readonly string[] CupsKinds = ["printers", "settings", "pages"];
@@ -28,7 +28,10 @@ public sealed class HostRunner(Func<RunnerContext, IHostSession>? remote = null)
     /// <summary>The local machine is one read; an ssh integration reads each of its target hosts.</summary>
     public bool IsPerTarget(IConnection connection) => IsRemote(connection);
 
-    private static bool IsRemote(IConnection connection) => connection.Type == "ssh";
+    /// <summary>Only an ssh integration goes over the network; the local host integration reads this machine and is never paced.</summary>
+    public bool IsRemote(IConnection connection) => connection.Type == "ssh";
+
+    public string SessionFamily => "ssh";
 
     public IEnumerable<string> Validate(QuerySpec query)
     {
@@ -68,26 +71,79 @@ public sealed class HostRunner(Func<RunnerContext, IHostSession>? remote = null)
             yield return commandProblem;
     }
 
+    /// <summary>Runs one query on its own session (the local machine, or one ssh connection): open, run, close. A scan uses the session overload.</summary>
     public async Task<RunnerResult> RunAsync(QuerySpec query, RunnerContext context, CancellationToken cancellationToken)
+    {
+        IHostSession session;
+        try
+        {
+            session = await Task.Run(() => Open(context), cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (IsReadFailure(ex))
+        {
+            return RunnerResult.Failed($"host read failed: {ex.Message}", KindOf(ex));
+        }
+        using (session)
+            return await Execute(session, query, context, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>Opens the ssh connection to <c>context.Target</c> once; every query of that host in the scan runs over it.</summary>
+    public async Task<IRunnerSession> OpenAsync(RunnerContext context, CancellationToken cancellationToken)
     {
         try
         {
-            using var session = await Task.Run(() => Open(context), cancellationToken).ConfigureAwait(false);
+            return new HostRunnerSession(await Task.Run(() => Open(context), cancellationToken).ConfigureAwait(false));
+        }
+        catch (Exception ex) when (IsReadFailure(ex))
+        {
+            throw new RunnerFailureException(ex.Message, KindOf(ex), ex);
+        }
+    }
+
+    public Task<RunnerResult> RunAsync(IRunnerSession session, QuerySpec query, RunnerContext context, CancellationToken cancellationToken) =>
+        Execute(((HostRunnerSession)session).Inner, query, context, cancellationToken);
+
+    private sealed class HostRunnerSession(IHostSession inner) : IRunnerSession
+    {
+        public IHostSession Inner { get; } = inner;
+
+        public ValueTask DisposeAsync()
+        {
+            Inner.Dispose();
+            return ValueTask.CompletedTask;
+        }
+    }
+
+    /// <summary>
+    /// What a read can fail with, local or over ssh: files, parsing, the session's own errors, and everything SSH.NET and
+    /// the socket underneath throw - each is a failed read of this host with a kind, never an escaped exception.
+    /// </summary>
+    private static bool IsReadFailure(Exception ex) =>
+        ex is IOException or UnauthorizedAccessException or FormatException or JsonException or HostSessionException
+            or Renci.SshNet.Common.SshException or System.Net.Sockets.SocketException or TimeoutException;
+
+    private static FailureKind KindOf(Exception ex) => ex is HostSessionException { Kind: not FailureKind.Error } session ? session.Kind : SshFailures.Classify(ex);
+
+    private async Task<RunnerResult> Execute(IHostSession session, QuerySpec query, RunnerContext context, CancellationToken cancellationToken)
+    {
+        try
+        {
+            session.SetTimeout(context.Timeout);
             return await Task.Run(async () => query.Text("read") switch
             {
                 "facts" => RunnerResult.Ok([Facts(session)]),
                 "stat" => RunnerResult.Ok([Stat(session, query.Text("path")!)]),
-                "file" => ReadFile(session, query, context),
+                "file" => ReadFile(session, query, context, cancellationToken),
                 "command" => await Command(session, query, context, cancellationToken).ConfigureAwait(false),
-                "docker" => await Docker(session, query, cancellationToken).ConfigureAwait(false),
-                "configs" => Configs(session, query, context),
-                "cups" => await Cups(session, query, cancellationToken).ConfigureAwait(false),
+                "docker" => await Docker(session, query, context, cancellationToken).ConfigureAwait(false),
+                "configs" => Configs(session, query, context, cancellationToken),
+                "cups" => await Cups(session, query, context, cancellationToken).ConfigureAwait(false),
                 _ => RunnerResult.Failed("host: unknown read"),
             }, cancellationToken).ConfigureAwait(false);
         }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or FormatException or JsonException or HostSessionException)
+        catch (Exception ex) when (IsReadFailure(ex))
         {
-            return RunnerResult.Failed($"host read failed: {ex.Message}");
+            return RunnerResult.Failed($"host read failed: {ex.Message}", KindOf(ex));
         }
     }
 
@@ -138,7 +194,7 @@ public sealed class HostRunner(Func<RunnerContext, IHostSession>? remote = null)
         return row;
     }
 
-    private static RunnerResult ReadFile(IHostSession session, QuerySpec query, RunnerContext context)
+    private static RunnerResult ReadFile(IHostSession session, QuerySpec query, RunnerContext context, CancellationToken cancellationToken)
     {
         var path = session.Normalize(query.Text("path")!);
         var optional = Flag(query, "optional", false);
@@ -150,11 +206,12 @@ public sealed class HostRunner(Func<RunnerContext, IHostSession>? remote = null)
         var format = query.Text("format") ?? "lines";
         var reasons = new List<string>();
         var follow = Flag(query, "follow", true);
+        void Pause() => context.Pace.WaitAsync(cancellationToken).GetAwaiter().GetResult();
         var rows = format switch
         {
-            "directives" => WithIncludes(session, path, (text, file, context) => ConfigParsers.Directives(text, file, query.Text("style")!, context), follow, reasons),
+            "directives" => WithIncludes(session, path, (text, file, context) => ConfigParsers.Directives(text, file, query.Text("style")!, context), follow, reasons, Pause),
             "json" => Json(session.ReadAllText(path), query.Text("items")),
-            "kv" => WithOccurrences(WithIncludes(session, path, (text, file, _) => ConfigParsers.Kv(text, file), follow, reasons)),
+            "kv" => WithOccurrences(WithIncludes(session, path, (text, file, _) => ConfigParsers.Kv(text, file), follow, reasons, Pause)),
             "ini" => ConfigParsers.Ini(session.ReadAllText(path), path),
             _ => ConfigParsers.Lines(session.ReadAllText(path), path),
         };
@@ -182,7 +239,7 @@ public sealed class HostRunner(Func<RunnerContext, IHostSession>? remote = null)
     }
 
     /// <summary>The rows of a file and of what it includes (a wildcard too), each row naming its own file.</summary>
-    private static List<JsonObject> WithIncludes(IHostSession session, string path, Func<string, string, string, List<JsonObject>> parse, bool follow, List<string> reasons)
+    private static List<JsonObject> WithIncludes(IHostSession session, string path, Func<string, string, string, List<JsonObject>> parse, bool follow, List<string> reasons, Action pause)
     {
         var rows = new List<JsonObject>();
         var files = 0;
@@ -194,6 +251,9 @@ public sealed class HostRunner(Func<RunnerContext, IHostSession>? remote = null)
                     reasons.Add($"more than {HostGuards.MaxFiles} files are included; the rest were not read");
                 return;
             }
+            // Every included file after the first is another request to the host.
+            if (files > 1)
+                pause();
             if (session.ReadProblem(file) is { } problem)
                 throw new IOException($"{file} was not read: {problem}");
             foreach (var row in parse(session.ReadAllText(file), file, context))
@@ -204,6 +264,7 @@ public sealed class HostRunner(Func<RunnerContext, IHostSession>? remote = null)
                 var arguments = row["args"] is JsonArray args ? args.Select(a => a!.ToString()) : [row["value"]!.ToString()];
                 foreach (var pattern in arguments)
                 {
+                    pause();
                     foreach (var included in Expand(session, file, pattern))
                     {
                         if (chain.Contains(included, StringComparer.Ordinal))
@@ -247,13 +308,16 @@ public sealed class HostRunner(Func<RunnerContext, IHostSession>? remote = null)
     }
 
     /// <summary>The printers CUPS knows on this machine (USB and network queues) and its sharing settings.</summary>
-    private static async Task<RunnerResult> Cups(IHostSession session, QuerySpec query, CancellationToken cancellationToken)
+    private static async Task<RunnerResult> Cups(IHostSession session, QuerySpec query, RunnerContext context, CancellationToken cancellationToken)
     {
         var optional = Flag(query, "optional", false);
         var timeout = TimeSpan.FromSeconds(30);
+        var steps = 0;
 
         async Task<(IReadOnlyList<string>? Lines, RunnerResult? Stop)> Step(string name, bool tolerateFailure = false)
         {
+            if (steps++ > 0)
+                await context.Pace.WaitAsync(cancellationToken).ConfigureAwait(false);
             var output = await session.RunAsync(name, [], timeout, cancellationToken).ConfigureAwait(false);
             if (!output.Found)
                 return (null, optional ? RunnerResult.Ok([]) : RunnerResult.Failed("CUPS (lpstat) is not installed on this machine"));
@@ -322,7 +386,7 @@ public sealed class HostRunner(Func<RunnerContext, IHostSession>? remote = null)
     /// the device's name taken from the file name. Rows carry device, host (where they were read), file and modified
     /// (how old the backup is). A file that holds a secret is skipped and said so; the rest are still read.
     /// </summary>
-    private static RunnerResult Configs(IHostSession session, QuerySpec query, RunnerContext context)
+    private static RunnerResult Configs(IHostSession session, QuerySpec query, RunnerContext context, CancellationToken cancellationToken)
     {
         var folder = query.Text("folderSetting") is { } setting && context.Threshold(setting) is { Length: > 0 } configured ? configured : query.Text("folder")!;
         if (folder.StartsWith("imports:", StringComparison.Ordinal))
@@ -352,6 +416,8 @@ public sealed class HostRunner(Func<RunnerContext, IHostSession>? remote = null)
         var rows = new List<JsonObject>();
         foreach (var file in files)
         {
+            // One wait per file: each is a few SFTP operations on the host, and a folder can hold hundreds.
+            context.Pace.WaitAsync(cancellationToken).GetAwaiter().GetResult();
             var name = file[(file.LastIndexOfAny(['/', '\\']) + 1)..];
             if (session.ReadProblem(file) is { } skipped)
             {
@@ -381,14 +447,17 @@ public sealed class HostRunner(Func<RunnerContext, IHostSession>? remote = null)
     /// batches - one row per object, the inspect document as docker prints it) or the daemon's info. Credentials
     /// in environments and command lines are scrubbed with the other rows.
     /// </summary>
-    private static async Task<RunnerResult> Docker(IHostSession session, QuerySpec query, CancellationToken cancellationToken)
+    private static async Task<RunnerResult> Docker(IHostSession session, QuerySpec query, RunnerContext context, CancellationToken cancellationToken)
     {
         var optional = Flag(query, "optional", false);
         var what = query.Text("what")!;
         var timeout = TimeSpan.FromSeconds(60);
+        var steps = 0;
 
         async Task<(HostCommands.Output? Output, RunnerResult? Stop)> Step(string name, params string[] args)
         {
+            if (steps++ > 0)
+                await context.Pace.WaitAsync(cancellationToken).ConfigureAwait(false);
             var output = await session.RunAsync(name, args, timeout, cancellationToken).ConfigureAwait(false);
             if (!output.Found)
                 return (null, optional ? RunnerResult.Ok([]) : RunnerResult.Failed("docker is not installed on this machine"));
@@ -471,4 +540,8 @@ public sealed class HostRunner(Func<RunnerContext, IHostSession>? remote = null)
 }
 
 /// <summary>A machine could not be reached or read as asked (not a rule's fault, not a pass).</summary>
-public sealed class HostSessionException(string message) : Exception(message);
+public sealed class HostSessionException(string message, FailureKind kind = FailureKind.Error, Exception? inner = null) : Exception(message, inner)
+{
+    /// <summary>Why the machine could not be read, when the session knows (a refused sign-in, a host that is not there).</summary>
+    public FailureKind Kind { get; } = kind;
+}

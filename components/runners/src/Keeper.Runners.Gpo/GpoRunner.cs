@@ -10,8 +10,10 @@ namespace Keeper.Runners.Gpo;
 /// (audit.csv), preferences (Group Policy Preferences XML; any cpassword comes back as "set"), gpt (GPT.INI
 /// versions). scope: machine, user or both. Rows carry gpo (the GPO's GUID), scope and _file. A GPO folder
 /// that cannot be read makes the result partial; SYSVOL that cannot be read, failed.
+/// A scan keeps one <see cref="GpoSession"/> per integration: the SYSVOL listing and each GPO's GPT.INI are read once
+/// and shared by the five parts, which would otherwise list SYSVOL and open every GPT.INI again for each part.
 /// </summary>
-public sealed partial class GpoRunner(Func<IConnection, string>? policiesRoot = null) : IRunner
+public sealed partial class GpoRunner(Func<IConnection, string>? policiesRoot = null) : ISessionRunner
 {
     private const long MaxFileBytes = 16L * 1024 * 1024;
     private static readonly string[] Parts = ["registry", "security", "audit", "preferences", "gpt"];
@@ -27,6 +29,8 @@ public sealed partial class GpoRunner(Func<IConnection, string>? policiesRoot = 
 
     public bool PerTarget => false;
 
+    public string SessionFamily => "gpo";
+
     public IEnumerable<string> Validate(QuerySpec query)
     {
         var part = query.Text("part");
@@ -38,7 +42,25 @@ public sealed partial class GpoRunner(Func<IConnection, string>? policiesRoot = 
             yield return $"{part} settings are the computer's: scope machine";
     }
 
-    public Task<RunnerResult> RunAsync(QuerySpec query, RunnerContext context, CancellationToken cancellationToken)
+    /// <summary>What a scan keeps of SYSVOL between the parts: no connection (the OS holds the SMB session), only what was already read.</summary>
+    public sealed class GpoSession : IRunnerSession
+    {
+        internal List<string>? Folders { get; set; }
+
+        /// <summary>Each GPO folder's GPT.INI text, read once; null when the file is not there.</summary>
+        internal Dictionary<string, string?> Gpt { get; } = new(StringComparer.OrdinalIgnoreCase);
+
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+    }
+
+    /// <summary>Runs one query with nothing cached from before. A scan uses the session overload instead.</summary>
+    public Task<RunnerResult> RunAsync(QuerySpec query, RunnerContext context, CancellationToken cancellationToken) =>
+        RunAsync(new GpoSession(), query, context, cancellationToken);
+
+    public Task<IRunnerSession> OpenAsync(RunnerContext context, CancellationToken cancellationToken) =>
+        Task.FromResult<IRunnerSession>(new GpoSession());
+
+    public Task<RunnerResult> RunAsync(IRunnerSession session, QuerySpec query, RunnerContext context, CancellationToken cancellationToken)
     {
         string root;
         if (policiesRoot is not null)
@@ -57,7 +79,7 @@ public sealed partial class GpoRunner(Func<IConnection, string>? policiesRoot = 
                     "gpo needs the domain's name (example.org): the integration's endpoint is not one - set its option domain"));
             root = $@"\\{domain}\SYSVOL\{domain}\Policies";
         }
-        return Task.Run(() => Read(root, query, cancellationToken), cancellationToken);
+        return Task.Run(() => Read((GpoSession)session, root, query, context, cancellationToken), cancellationToken);
     }
 
     /// <summary>
@@ -73,29 +95,32 @@ public sealed partial class GpoRunner(Func<IConnection, string>? policiesRoot = 
         return DomainName().IsMatch(text) ? text : null;
     }
 
-    private static RunnerResult Read(string root, QuerySpec query, CancellationToken cancellationToken)
+    private static RunnerResult Read(GpoSession session, string root, QuerySpec query, RunnerContext context, CancellationToken cancellationToken)
     {
         var part = query.Text("part")!;
         var scope = query.Text("scope") ?? (part is "security" or "audit" ? "machine" : "both");
+        var reader = new Reader(session, context, cancellationToken);
         List<string> folders;
         try
         {
-            folders = [.. Directory.EnumerateDirectories(root).Where(f => GpoFolder().IsMatch(Path.GetFileName(f)))];
+            // The first request of the query is the listing, which the scanner's wait before the query covers; later queries reuse it.
+            folders = session.Folders ??= [.. Directory.EnumerateDirectories(root).Where(f => GpoFolder().IsMatch(Path.GetFileName(f)))];
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or System.Security.SecurityException)
         {
-            return RunnerResult.Failed($"SYSVOL could not be read ({root}): {ex.Message}");
+            return RunnerResult.Failed($"SYSVOL could not be read ({root}): {ex.Message}", ex);
         }
 
         var rows = new List<JsonObject>();
         var problems = new List<string>();
+        FailureKind? stopped = null;
         foreach (var folder in folders)
         {
             cancellationToken.ThrowIfCancellationRequested();
             var gpo = Path.GetFileName(folder).ToUpperInvariant();
             try
             {
-                foreach (var row in Rows(folder, part, scope))
+                foreach (var row in Rows(reader, folder, part, scope))
                 {
                     row["gpo"] = gpo;
                     rows.Add(row);
@@ -104,22 +129,61 @@ public sealed partial class GpoRunner(Func<IConnection, string>? policiesRoot = 
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or System.Xml.XmlException or InvalidDataException)
             {
                 problems.Add($"{gpo}: {ex.Message}");
+                // Access denied is this GPO's; a refused logon, a DC that went away or one pushing back would repeat on every GPO,
+                // and each repeat is another failed attempt against it.
+                var kind = Failures.Classify(ex);
+                if (kind is FailureKind.Refused or FailureKind.Unreachable or FailureKind.Throttled or FailureKind.Timeout)
+                {
+                    stopped = kind;
+                    problems.Add("the remaining Group Policy objects were not read");
+                    break;
+                }
             }
         }
         if (folders.Count == 0)
             return RunnerResult.Partial(rows, $"SYSVOL lists no Group Policy objects ({root}): a domain has at least two");
+        if (stopped is { } why && rows.Count == 0)
+            return RunnerResult.Failed($"no Group Policy object could be read: {string.Join("; ", problems.Take(3))}", why);
         if (problems.Count == folders.Count)
             return RunnerResult.Failed($"no Group Policy object could be read: {string.Join("; ", problems.Take(3))}");
         return problems.Count == 0 ? RunnerResult.Ok(rows)
-            : RunnerResult.Partial(rows, $"{problems.Count} of {folders.Count} Group Policy objects could not be read: {string.Join("; ", problems.Take(3))}");
+            : RunnerResult.Partial(rows, $"{problems.Count} of {folders.Count} Group Policy objects could not be read: {string.Join("; ", problems.Take(3))}")
+                with { Failure = stopped ?? FailureKind.None };
     }
 
-    private static IEnumerable<JsonObject> Rows(string folder, string part, string scope)
+    /// <summary>
+    /// Opens SYSVOL files for one query: a wait before each open (a part reads hundreds), and the GPT.INI cache. Never
+    /// reads outside the files the parts name.
+    /// </summary>
+    private sealed class Reader(GpoSession session, RunnerContext context, CancellationToken cancellationToken)
+    {
+        public void Pause() => context.Pace.WaitAsync(cancellationToken).GetAwaiter().GetResult();
+
+        public byte[]? Bytes(string file)
+        {
+            Pause();
+            return ReadBytes(file);
+        }
+
+        public string? Text(string file) => Bytes(file) is { } bytes ? Decode(bytes) : null;
+
+        /// <summary>GPT.INI of a GPO folder: read once per scan, whichever part asks first.</summary>
+        public string? Gpt(string folder)
+        {
+            if (session.Gpt.TryGetValue(folder, out var known))
+                return known;
+            var text = Text(Path.Combine(folder, "GPT.INI"));
+            session.Gpt[folder] = text;
+            return text;
+        }
+    }
+
+    private static IEnumerable<JsonObject> Rows(Reader reader, string folder, string part, string scope)
     {
         var halves = scope switch { "machine" => new[] { "Machine" }, "user" => ["User"], _ => ["Machine", "User"] };
         // Every GPO has a GPT.INI. One that cannot be opened is a GPO this account cannot read - never one
         // without settings. (Windows says "not there" for "not allowed" too, so it is opened, not looked for.)
-        var gpt = ReadText(Path.Combine(folder, "GPT.INI"))
+        var gpt = reader.Gpt(folder)
                   ?? throw new InvalidDataException("no GPT.INI: the folder cannot be read, or is an orphan or still replicating - not a whole GPO");
         switch (part)
         {
@@ -130,7 +194,7 @@ public sealed partial class GpoRunner(Func<IConnection, string>? policiesRoot = 
                 foreach (var half in halves)
                 {
                     var file = Path.Combine(folder, half, "Registry.pol");
-                    if (ReadBytes(file) is not { } bytes)
+                    if (reader.Bytes(file) is not { } bytes)
                         continue;
                     var entries = GpoFiles.RegistryPol(bytes) ?? throw new InvalidDataException($"{half}\\Registry.pol is not a Registry.pol file");
                     foreach (var entry in entries)
@@ -139,13 +203,13 @@ public sealed partial class GpoRunner(Func<IConnection, string>? policiesRoot = 
                 break;
             case "security":
                 var securityFile = Path.Combine(folder, "Machine", "Microsoft", "Windows NT", "SecEdit", "GptTmpl.inf");
-                if (ReadText(securityFile) is { } template)
+                if (reader.Text(securityFile) is { } template)
                     foreach (var row in GpoFiles.SecurityTemplate(template))
                         yield return Tagged(row, "Machine", @"Machine\Microsoft\Windows NT\SecEdit\GptTmpl.inf");
                 break;
             case "audit":
                 var auditFile = Path.Combine(folder, "Machine", "Microsoft", "Windows NT", "Audit", "audit.csv");
-                if (ReadText(auditFile) is { } audit)
+                if (reader.Text(auditFile) is { } audit)
                     foreach (var row in GpoFiles.AuditPolicy(audit))
                         yield return Tagged(row, "Machine", @"Machine\Microsoft\Windows NT\Audit\audit.csv");
                 break;
@@ -153,6 +217,7 @@ public sealed partial class GpoRunner(Func<IConnection, string>? policiesRoot = 
                 foreach (var half in halves)
                 {
                     List<string> files;
+                    reader.Pause();
                     try
                     {
                         files = [.. Directory.EnumerateFiles(Path.Combine(folder, half, "Preferences"), "*.xml", SearchOption.AllDirectories)
@@ -164,7 +229,7 @@ public sealed partial class GpoRunner(Func<IConnection, string>? policiesRoot = 
                     }
                     foreach (var file in files)
                     {
-                        if (ReadText(file) is not { } xml)
+                        if (reader.Text(file) is not { } xml)
                             continue;
                         var document = XmlRows.Load(new StringReader(xml), MaxFileBytes);
                         // Every preference item has its settings in a Properties child.
@@ -286,5 +351,5 @@ public sealed partial class GpoRunner(Func<IConnection, string>? policiesRoot = 
     }
 
     /// <summary>The file's text, by its BOM (GptTmpl.inf is UTF-16), or null when it is not there.</summary>
-    private static string? ReadText(string file) => ReadBytes(file) is { } bytes ? new StreamReader(new MemoryStream(bytes), detectEncodingFromByteOrderMarks: true).ReadToEnd() : null;
+    private static string Decode(byte[] bytes) => new StreamReader(new MemoryStream(bytes), detectEncodingFromByteOrderMarks: true).ReadToEnd();
 }

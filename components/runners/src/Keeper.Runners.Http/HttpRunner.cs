@@ -12,7 +12,7 @@ namespace Keeper.Runners.Http;
 /// cursorParam), body-offset (offsetField/limitField in a POST body), body-cursor (cursorField -> cursorBody),
 /// or none.
 /// </summary>
-public sealed class HttpRunner : IRunner
+public sealed class HttpRunner : ISessionRunner
 {
     private const int DefaultMaxPages = 200;
     private const int MaxRows = 500_000;
@@ -22,6 +22,9 @@ public sealed class HttpRunner : IRunner
     public string Protocol => "http";
 
     public bool PerTarget => false;
+
+    /// <summary>The http, graph and graphql runners share one session: one HTTP client per endpoint for the whole scan.</summary>
+    public string SessionFamily => "http";
 
     public IEnumerable<string> Validate(QuerySpec query)
     {
@@ -75,18 +78,26 @@ public sealed class HttpRunner : IRunner
             yield return perObject;
     }
 
+    public Task<IRunnerSession> OpenAsync(RunnerContext context, CancellationToken cancellationToken) =>
+        Task.FromResult<IRunnerSession>(new HttpSession());
+
     public async Task<RunnerResult> RunAsync(QuerySpec query, RunnerContext context, CancellationToken cancellationToken)
     {
+        await using var session = new HttpSession();
+        return await RunAsync(session, query, context, cancellationToken).ConfigureAwait(false);
+    }
+
+    public async Task<RunnerResult> RunAsync(IRunnerSession session, QuerySpec query, RunnerContext context, CancellationToken cancellationToken)
+    {
         if (query.Fields["for_each"] is JsonObject)
-            return await PerObject.RunAsync(this, query, context, cancellationToken).ConfigureAwait(false);
+            return await PerObject.RunAsync(this, query, context, cancellationToken, (q, ct) => RunAsync(session, q, context, ct)).ConfigureAwait(false);
         try
         {
-            using var engine = HttpEngine.Open(context);
-            return await Fetch(engine, query, context, cancellationToken).ConfigureAwait(false);
+            return await Fetch(HttpSession.Of(session).Engine(context), query, context, cancellationToken).ConfigureAwait(false);
         }
-        catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException or UnauthorizedAccessException or InvalidOperationException)
+        catch (Exception ex) when (HttpEngine.IsReadFailure(ex, cancellationToken))
         {
-            return RunnerResult.Failed(HttpEngine.Reason(ex));
+            return HttpEngine.Failure(ex);
         }
     }
 
@@ -156,7 +167,7 @@ public sealed class HttpRunner : IRunner
             IReadOnlyDictionary<string, string> responseHeaders;
             try
             {
-                (text, responseHeaders) = await engine.SendTextAsync(method, next, body, headers, cancellationToken).ConfigureAwait(false);
+                (text, responseHeaders) = await engine.SendTextAsync(context, page > 1, method, next, body, headers, cancellationToken).ConfigureAwait(false);
             }
             catch (HttpRequestException ex) when (ex.StatusCode == System.Net.HttpStatusCode.NotFound && query.Text("missing") == "empty")
             {

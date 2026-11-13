@@ -37,6 +37,11 @@ public interface IHostSession : IDisposable
     /// <summary>facts: os, kernel, architecture, uptimeSeconds, osId, osVersion, osName.</summary>
     JsonObject Facts();
 
+    /// <summary>Gives each operation of the query that follows this long. A session over the network was opened with one timeout only.</summary>
+    void SetTimeout(TimeSpan timeout)
+    {
+    }
+
     /// <summary>Runs a command that HostCommands.Problem accepted.</summary>
     Task<HostCommands.Output> RunAsync(string name, IReadOnlyList<string> args, TimeSpan timeout, CancellationToken cancellationToken);
 }

@@ -79,6 +79,20 @@ public static partial class RequestMacros
 }
 
 /// <summary>
+/// A connection whose session token can expire mid-scan (a vCenter session, a firewall manager's login). When a
+/// read is answered 401, the runner asks it to sign in once more and tries the request once more; a second 401
+/// is a refusal. Implemented by the integration's connection, used by the http runners.
+/// </summary>
+public interface ISessionTokenConnection
+{
+    /// <summary>
+    /// Drops the session token and signs in again. True when there is a token to try (a new one - or one another
+    /// read has just renewed); false when this connection's token cannot be renewed or its sign-in was refused.
+    /// </summary>
+    Task<bool> RenewSessionAsync(CancellationToken cancellationToken);
+}
+
+/// <summary>
 /// for_each: one request per object of another list - /servicePrincipals/{id}/synchronization/jobs for every
 /// service principal the for_each query returns. The list is fetched first through the same runner and
 /// integration - or given: values (a fixed list) or threshold (the tenant's comma-separated list). Each
@@ -145,8 +159,21 @@ public static partial class PerObject
             yield return "for_each.max must be 1 to 2000";
     }
 
-    public static async Task<RunnerResult> RunAsync(IRunner runner, QuerySpec query, RunnerContext context, CancellationToken cancellationToken)
+    /// <summary>How many children in a row may be turned away with the same Denied before the rest are not sent.</summary>
+    public const int DeniedStreakLimit = 3;
+
+    /// <summary>
+    /// Reads the list, then one request per object. <paramref name="run"/> runs one query (the list, or a child) -
+    /// a session runner passes a delegate over its open session, so every child uses the one connection; without
+    /// it each query goes through <paramref name="runner"/>'s own RunAsync.
+    /// Four children are in flight at most, each paced. A circuit breaker stops the rest: the first child the
+    /// credential is refused for (Refused) stops everything - more tries only count towards a lockout - and
+    /// three children in a row turned away as Denied mean the account may not read this at all.
+    /// </summary>
+    public static async Task<RunnerResult> RunAsync(IRunner runner, QuerySpec query, RunnerContext context, CancellationToken cancellationToken,
+        Func<QuerySpec, CancellationToken, Task<RunnerResult>>? run = null)
     {
+        run ??= (q, ct) => runner.RunAsync(q, context, ct);
         var each = (JsonObject)query.Fields["for_each"]!.DeepClone();
         var field = Values.Text(each["field"])!;
         var max = int.TryParse(Values.Text(each["max"]), NumberStyles.None, CultureInfo.InvariantCulture, out var m) ? m : DefaultMax;
@@ -160,37 +187,51 @@ public static partial class PerObject
             list = RunnerResult.Ok([.. (context.Threshold(setting) ?? "").Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
                 .Select(v => new JsonObject { [field] = v })]);
         else
-            list = await runner.RunAsync(new QuerySpec(query.Protocol, each, field, null), context, cancellationToken).ConfigureAwait(false);
+            list = await run(new QuerySpec(query.Protocol, each, field, null), cancellationToken).ConfigureAwait(false);
         if (list.State == "failed")
-            return RunnerResult.Failed($"the list for for_each failed: {list.Reason}");
+            return RunnerResult.Failed($"the list for for_each failed: {list.Reason}", list.Failure);
 
         var parents = list.Rows.Take(max).ToList();
         var template = query.Text("path")!;
         var childFields = (JsonObject)query.Fields.DeepClone();
         childFields.Remove("for_each");
 
+        var breaker = new Breaker();
         using var gate = new SemaphoreSlim(Parallel);
-        var results = await Task.WhenAll(parents.Select(async parent =>
+        async Task<(JsonObject Parent, RunnerResult Result, bool Skipped)> Child(JsonObject parent)
         {
             if (Path(template, parent) is not { } path || Params(childFields["params"], parent) is not { } parameters)
-                return (Parent: parent, Result: RunnerResult.Failed($"{Values.Text(FieldPath.First(parent, field)) ?? "?"}: not a plain id; skipped"));
+                return (Parent: parent, Result: RunnerResult.Failed($"{Values.Text(FieldPath.First(parent, field)) ?? "?"}: not a plain id; skipped"), Skipped: false);
             await gate.WaitAsync(cancellationToken).ConfigureAwait(false);
             try
             {
+                // Checked before the pace wait and again after it: a child that waited while another was refused is not sent.
+                if (breaker.Stopped)
+                    return (Parent: parent, Result: RunnerResult.Failed("not sent", breaker.Kind), Skipped: true);
+                await context.Pace.WaitAsync(cancellationToken).ConfigureAwait(false);
+                if (breaker.Stopped)
+                    return (Parent: parent, Result: RunnerResult.Failed("not sent", breaker.Kind), Skipped: true);
                 var fields = (JsonObject)childFields.DeepClone();
                 fields["path"] = path;
                 if (parameters.Count > 0)
                     fields["params"] = parameters;
-                return (Parent: parent, Result: await runner.RunAsync(new QuerySpec(query.Protocol, fields, query.Key, query.Name), context, cancellationToken).ConfigureAwait(false));
+                var result = await run(new QuerySpec(query.Protocol, fields, query.Key, query.Name), cancellationToken).ConfigureAwait(false);
+                breaker.Record(result);
+                return (Parent: parent, Result: result, Skipped: false);
             }
             finally
             {
                 gate.Release();
             }
-        })).ConfigureAwait(false);
+        }
+        // The first child alone: a wrong password meets the server once, then the breaker decides before four go at once.
+        var results = new List<(JsonObject Parent, RunnerResult Result, bool Skipped)>(parents.Count);
+        if (parents.Count > 0)
+            results.Add(await Child(parents[0]).ConfigureAwait(false));
+        results.AddRange(await Task.WhenAll(parents.Skip(1).Select(Child)).ConfigureAwait(false));
 
         var rows = new List<JsonObject>();
-        foreach (var (parent, result) in results)
+        foreach (var (parent, result, _) in results)
         {
             foreach (var row in result.Rows)
             {
@@ -199,7 +240,8 @@ public static partial class PerObject
             }
         }
 
-        var failed = results.Where(r => r.Result.State == "failed").ToList();
+        var notSent = results.Count(r => r.Skipped);
+        var failed = results.Where(r => !r.Skipped && r.Result.State == "failed").ToList();
         var partial = results.Where(r => r.Result.State == "partial").ToList();
         var absent = results.Count(r => r.Result.State == "ok" && r.Result.Reason == RunnerResult.NotFound);
         var notes = new List<string>();
@@ -212,16 +254,71 @@ public static partial class PerObject
             notes.Add($"only the first {max} of {list.Rows.Count} objects (raise for_each.max)");
         if (failed.Count > 0)
             notes.Add($"{failed.Count} of {parents.Count} objects failed: {string.Join("; ", failed.Take(3).Select(f => f.Result.Reason))}");
+        if (notSent > 0)
+            notes.Add($"{notSent} of {parents.Count} objects were not sent: {breaker.Why}");
         if (partial.Count > 0)
             notes.Add($"{partial.Count} of {parents.Count} objects were read only in part: {string.Join("; ", partial.Take(3).Select(p => p.Result.Reason))}");
         if (list.State == "partial")
             notes.Add($"the object list itself was partial: {list.Reason}");
 
-        if (parents.Count > 0 && failed.Count == parents.Count)
-            return RunnerResult.Failed(string.Join("; ", notes));
+        if (parents.Count > 0 && failed.Count + notSent == parents.Count)
+        {
+            // Every object failed: the read failed, as what turned the children away - or the one kind they all share.
+            var kinds = failed.Select(f => f.Result.Failure).Distinct().ToList();
+            var kind = breaker.Stopped ? breaker.Kind : kinds.Count == 1 ? kinds[0] : FailureKind.Error;
+            return RunnerResult.Failed(string.Join("; ", notes), kind);
+        }
         if (notes.Count > 0)
-            return RunnerResult.Partial(rows, string.Join("; ", info is null ? notes : [.. notes, info]));
+            // Some children read before the breaker tripped: partial, but the refusal (or denial) still reaches the scan.
+            return RunnerResult.Partial(rows, string.Join("; ", info is null ? notes : [.. notes, info])) with
+            {
+                Failure = breaker.Stopped ? breaker.Kind : FailureKind.None,
+            };
         return new RunnerResult(rows, "ok", info);
+    }
+
+    /// <summary>Watches the children's answers and decides when the rest are not sent. Thread-safe.</summary>
+    private sealed class Breaker
+    {
+        private readonly Lock _lock = new();
+        private FailureKind _streakKind;
+        private int _streak;
+
+        public bool Stopped { get; private set; }
+
+        public FailureKind Kind { get; private set; }
+
+        public string Why { get; private set; } = "";
+
+        public void Record(RunnerResult result)
+        {
+            lock (_lock)
+            {
+                if (Stopped)
+                    return;
+                if (result.State == "failed" && result.Failure is FailureKind.Refused or FailureKind.Denied)
+                {
+                    _streak = result.Failure == _streakKind ? _streak + 1 : 1;
+                    _streakKind = result.Failure;
+                    if (result.Failure == FailureKind.Refused)
+                        Trip(FailureKind.Refused, "the credential was refused (more tries would count towards a lockout)");
+                    else if (_streak >= DeniedStreakLimit)
+                        Trip(FailureKind.Denied, $"{_streak} objects in a row were denied, so the account may not read them");
+                }
+                else
+                {
+                    _streak = 0;
+                    _streakKind = FailureKind.None;
+                }
+            }
+        }
+
+        private void Trip(FailureKind kind, string why)
+        {
+            Stopped = true;
+            Kind = kind;
+            Why = why;
+        }
     }
 
     /// <summary>The path with each {field} replaced by the object's value - only plain ids, escaped; date macros are left for the runner.</summary>

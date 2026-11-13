@@ -68,7 +68,7 @@ public sealed partial class SmbRunner : IRunner
             return Task.FromResult(RunnerResult.Failed("the target is not a plain host name"));
         return Task.Run(() => !OperatingSystem.IsWindows() ? RunnerResult.Failed("smb reads need Windows") : query.Text("read") switch
         {
-            "shares" => Shares(host, query.Text("acl") == "true"),
+            "shares" => Shares(host, query.Text("acl") == "true", context, cancellationToken),
             "share-acl" => ShareAcl(host, query.Text("share")!),
             _ => Ntfs(host, query.Text("path")!),
         }, cancellationToken);
@@ -79,16 +79,21 @@ public sealed partial class SmbRunner : IRunner
     private const int MoreData = 234;
 
     [System.Runtime.Versioning.SupportedOSPlatform("windows")]
-    private static RunnerResult Shares(string host, bool withAcl)
+    private static RunnerResult Shares(string host, bool withAcl, RunnerContext context, CancellationToken cancellationToken)
     {
         var rows = new List<JsonObject>();
         var resume = 0;
         int status;
+        var firstPage = true;
         do
         {
+            // The OS keeps one SMB session to the host, so there is no logon of ours to save; each further call is a request, paced.
+            if (!firstPage)
+                context.Pace.WaitAsync(cancellationToken).GetAwaiter().GetResult();
+            firstPage = false;
             status = NetShareEnum(host, 1, out var buffer, MaxPreferredLength, out var read, out _, ref resume);
             if (status is not (0 or MoreData))
-                return RunnerResult.Failed($"{host}: the shares could not be listed ({Describe(status)})");
+                return RunnerResult.Failed($"{host}: the shares could not be listed ({Describe(status)})", Kind(status));
             try
             {
                 var size = Marshal.SizeOf<ShareInfo1>();
@@ -117,19 +122,28 @@ public sealed partial class SmbRunner : IRunner
         // Each disk share's permissions beside it. Reading them needs admin rights on the host: a share that
         // cannot be read is unknown, never "no permissions".
         var problems = new List<string>();
+        FailureKind? stopped = null;
         foreach (var share in rows.Where(r => r["type"]!.ToString() == "disk"))
         {
+            context.Pace.WaitAsync(cancellationToken).GetAwaiter().GetResult();
             var acl = ShareAcl(host, share["name"]!.ToString());
             if (acl.State == "failed")
             {
                 problems.Add(acl.Reason!);
+                // Access denied on one share is that share's; a refused logon or a host that went away would repeat on every one.
+                if (acl.Failure is FailureKind.Refused or FailureKind.Unreachable or FailureKind.Throttled or FailureKind.Timeout)
+                {
+                    stopped = acl.Failure;
+                    problems.Add("the remaining shares were not read");
+                    break;
+                }
                 continue;
             }
             share["path"] = acl.Rows.FirstOrDefault()?["path"]?.DeepClone();
             share["acl"] = new JsonArray([.. acl.Rows.Select(r => (JsonNode?)Entry(r))]);
         }
         return problems.Count == 0 ? RunnerResult.Ok(rows)
-            : RunnerResult.Partial(rows, $"{problems.Count} share(s) without their permissions: {string.Join("; ", problems.Take(3))}");
+            : RunnerResult.Partial(rows, $"{problems.Count} share(s) without their permissions: {string.Join("; ", problems.Take(3))}") with { Failure = stopped ?? FailureKind.None };
 
         static JsonObject Entry(JsonObject r) => new()
         {
@@ -143,7 +157,7 @@ public sealed partial class SmbRunner : IRunner
     {
         var status = NetShareGetInfo(host, share, 502, out var buffer);
         if (status != 0)
-            return RunnerResult.Failed($"{host}\\{share}: its permissions could not be read ({Describe(status)})");
+            return RunnerResult.Failed($"{host}\\{share}: its permissions could not be read ({Describe(status)})", Kind(status));
         try
         {
             var info = Marshal.PtrToStructure<ShareInfo502>(buffer);
@@ -239,7 +253,7 @@ public sealed partial class SmbRunner : IRunner
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or PrivilegeNotHeldException or System.ComponentModel.Win32Exception or ArgumentException)
         {
-            return RunnerResult.Failed($"{unc}: its permissions could not be read ({ex.Message})");
+            return RunnerResult.Failed($"{unc}: its permissions could not be read ({ex.Message})", ex);
         }
     }
 
@@ -276,12 +290,16 @@ public sealed partial class SmbRunner : IRunner
         _ => $"0x{mask:X}",
     };
 
+    /// <summary>The kind of a Win32 status from the share API: 5 is denied, logon failures are a refused account, 53 and 1722 no host.</summary>
+    public static FailureKind Kind(int status) => Failures.OfWin32(status) ?? FailureKind.Error;
+
     private static string Describe(int status) => status switch
     {
         5 => "access denied: this needs administrator rights on the host",
         53 => "the host could not be reached",
         67 => "no such share",
         1722 => "the host's RPC server is not answering",
+        1326 or 1331 or 1909 or 1330 or 1793 => "the account was refused (logon failure)",
         2310 => "no such share",
         _ => $"error {status}",
     };

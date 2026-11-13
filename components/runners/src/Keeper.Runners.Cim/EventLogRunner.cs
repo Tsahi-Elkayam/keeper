@@ -14,7 +14,7 @@ namespace Keeper.Runners.Cim;
 /// the same read Event Viewer does. Filtered on the host (ids, providers, a time window) and capped, so a
 /// flooded log cannot flood the scan. Read-only: logs are never cleared, exported or subscribed to.
 /// </summary>
-public sealed partial class EventLogRunner : IRunner
+public sealed partial class EventLogRunner : ISessionRunner
 {
     private const int DefaultDays = 7;
     private const int DefaultMax = 500;
@@ -58,25 +58,109 @@ public sealed partial class EventLogRunner : IRunner
         return $"*[System[{string.Join(" and ", parts)}]]";
     }
 
-    public Task<RunnerResult> RunAsync(QuerySpec query, RunnerContext context, CancellationToken cancellationToken)
+    public string SessionFamily => "eventlog";
+
+    /// <summary>The kind of an event log failure. Pure: the numbers and text come out of the exception, so this is tested without Windows.</summary>
+    public static FailureKind Classify(int hresult, string? message, bool unauthorized)
+    {
+        // Signed in, but this account may not read this log here: not the credential's fault.
+        if (unauthorized)
+            return FailureKind.Denied;
+        // 5 access denied, 1326 and friends logon failures (Refused), 1722 RPC server unavailable (Unreachable).
+        if (Failures.OfWin32(hresult) is { } kind)
+            return kind;
+        return Failures.SaysRefused(message) ? FailureKind.Refused : FailureKind.Error;
+    }
+
+    private static FailureKind KindOf(Exception ex)
+    {
+        for (var e = ex; e is not null; e = e.InnerException)
+        {
+            if (e is System.ComponentModel.Win32Exception win32 && Failures.OfWin32(win32.NativeErrorCode) is { } fromWin32)
+                return fromWin32;
+            var kind = Classify(e.HResult, e.Message, e is UnauthorizedAccessException);
+            if (kind != FailureKind.Error)
+                return kind;
+        }
+        return FailureKind.Error;
+    }
+
+    /// <summary>One remote Event Log session per host and scan: one sign-in, every eventlog query of the host reads over it.</summary>
+    internal sealed class EventLogRunnerSession(EventLogSession session) : IRunnerSession
+    {
+        public EventLogSession Session { get; } = session;
+
+        [System.Runtime.Versioning.SupportedOSPlatform("windows")]
+        public ValueTask DisposeAsync()
+        {
+            Session.Dispose();
+            return ValueTask.CompletedTask;
+        }
+    }
+
+    public Task<IRunnerSession> OpenAsync(RunnerContext context, CancellationToken cancellationToken)
+    {
+        if (!OperatingSystem.IsWindows())
+            throw new RunnerFailureException("eventlog needs Windows", FailureKind.Error);
+        if (string.IsNullOrWhiteSpace(context.Target))
+            throw new RunnerFailureException("eventlog needs a target host", FailureKind.Error);
+        return Task.Run(() =>
+        {
+            if (!OperatingSystem.IsWindows())
+                throw new PlatformNotSupportedException();
+            try
+            {
+                // The remote connection and the logon may only happen on the first read; if so, a refusal then
+                // shows on the first query and the scanner stops the credential from there.
+                return (IRunnerSession)new EventLogRunnerSession(Session(context.Target, context.Connection.WindowsCredential()));
+            }
+            catch (Exception ex) when (ex is EventLogException or UnauthorizedAccessException)
+            {
+                throw new RunnerFailureException($"{context.Target}: {ex.Message}", KindOf(ex), ex);
+            }
+        }, cancellationToken);
+    }
+
+    /// <summary>Outside a scan: one session for this one query.</summary>
+    public async Task<RunnerResult> RunAsync(QuerySpec query, RunnerContext context, CancellationToken cancellationToken)
+    {
+        if (!OperatingSystem.IsWindows())
+            return RunnerResult.Failed("eventlog needs Windows");
+        if (string.IsNullOrWhiteSpace(context.Target))
+            return RunnerResult.Failed("eventlog needs a target host");
+        IRunnerSession session;
+        try
+        {
+            session = await OpenAsync(context, cancellationToken).ConfigureAwait(false);
+        }
+        catch (RunnerFailureException ex)
+        {
+            return RunnerResult.Failed(ex.Message, ex.Kind);
+        }
+        await using (session.ConfigureAwait(false))
+            return await RunAsync(session, query, context, cancellationToken).ConfigureAwait(false);
+    }
+
+    public Task<RunnerResult> RunAsync(IRunnerSession session, QuerySpec query, RunnerContext context, CancellationToken cancellationToken)
     {
         if (!OperatingSystem.IsWindows())
             return Task.FromResult(RunnerResult.Failed("eventlog needs Windows"));
         if (string.IsNullOrWhiteSpace(context.Target))
             return Task.FromResult(RunnerResult.Failed("eventlog needs a target host"));
-        return Task.Run(() => OperatingSystem.IsWindows() ? Run(query, context, cancellationToken) : RunnerResult.Failed("eventlog needs Windows"),
+        if (session is not EventLogRunnerSession events)
+            return Task.FromResult(RunnerResult.Failed("eventlog was given a session of another family"));
+        return Task.Run(() => OperatingSystem.IsWindows() ? Run(events.Session, query, context, cancellationToken) : RunnerResult.Failed("eventlog needs Windows"),
             cancellationToken);
     }
 
     [System.Runtime.Versioning.SupportedOSPlatform("windows")]
-    private static RunnerResult Run(QuerySpec query, RunnerContext context, CancellationToken cancellationToken)
+    private static RunnerResult Run(EventLogSession session, QuerySpec query, RunnerContext context, CancellationToken cancellationToken)
     {
         var host = context.Target!;
         var log = query.Text("log")!;
         var max = query.Int("max") ?? DefaultMax;
         try
         {
-            using var session = Session(host, context.Connection.WindowsCredential());
             using var reader = new EventLogReader(new EventLogQuery(log, PathType.LogName, XPath(query))
             {
                 Session = session,
@@ -96,11 +180,14 @@ public sealed partial class EventLogRunner : IRunner
         catch (EventLogNotFoundException)
         {
             // A channel that does not exist on this host has no events: an empty answer, not a failure.
+            // Known risk: the same exception is raised when the remote log service is down or the log name is
+            // misspelled, so a host that could not be read at all can look like a quiet host. Kept as it was; a
+            // rule that must see events should say so with min_rows.
             return RunnerResult.Ok([]);
         }
         catch (Exception ex) when (ex is EventLogException or UnauthorizedAccessException)
         {
-            return RunnerResult.Failed($"{host}: {log}: {ex.Message}");
+            return RunnerResult.Failed($"{host}: {log}: {ex.Message}", KindOf(ex));
         }
     }
 

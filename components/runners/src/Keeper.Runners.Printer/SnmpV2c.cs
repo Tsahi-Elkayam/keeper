@@ -17,7 +17,7 @@ public static partial class SnmpV2c
 
     public sealed record Walk(IReadOnlyList<(string Oid, object? Value)> Rows, bool Complete, string? Problem);
 
-    private sealed record Reply(int RequestId, int ErrorStatus, string Oid, object? Value, bool EndOfMib);
+    internal sealed record Reply(int RequestId, int ErrorStatus, string Oid, object? Value, bool EndOfMib);
 
     private sealed class NoValue
     {
@@ -41,19 +41,118 @@ public static partial class SnmpV2c
         return Tlv(0x30, [.. Tlv(0x02, [1]), .. Tlv(0x04, Encoding.UTF8.GetBytes(community)), .. pdu]);
     }
 
+    /// <summary>
+    /// One UDP socket to one device for a whole scan, and what it has learned about the device: a community it
+    /// did not answer for is not asked again (an agent drops a wrong community without a word, and each unanswered
+    /// request costs the full timeout twice). Thread-safe; requests are sent one at a time.
+    /// </summary>
+    public sealed class Channel(IPEndPoint endpoint) : IDisposable
+    {
+        private readonly UdpClient _udp = Connected(endpoint);
+        private readonly SemaphoreSlim _one = new(1, 1);
+        private readonly HashSet<string> _silent = new(StringComparer.Ordinal);
+
+        public IPEndPoint Endpoint => endpoint;
+
+        /// <summary>How many requests went out, retries included: what the device was actually asked.</summary>
+        public int Sent { get; private set; }
+
+        /// <summary>Whether the device did not answer for this community earlier in the scan.</summary>
+        public bool IsSilent(string community)
+        {
+            lock (_silent)
+                return _silent.Contains(community);
+        }
+
+        private static UdpClient Connected(IPEndPoint endpoint)
+        {
+            var udp = new UdpClient(endpoint.AddressFamily);
+            udp.Connect(endpoint);
+            return udp;
+        }
+
+        internal async Task<Reply?> ExchangeAsync(string community, byte pduTag, string oid, TimeSpan timeout, Func<CancellationToken, Task>? before,
+            CancellationToken cancellationToken)
+        {
+            if (IsSilent(community))
+                return null;
+            await _one.WaitAsync(cancellationToken).ConfigureAwait(false);
+            try
+            {
+                for (var attempt = 0; attempt < 2; attempt++)
+                {
+                    var requestId = Random.Shared.Next(1, 0x3FFFFFFF);
+                    if (before is not null)
+                        await before(cancellationToken).ConfigureAwait(false);
+                    await _udp.SendAsync(BuildRequest(pduTag, community, requestId, oid), cancellationToken).ConfigureAwait(false);
+                    Sent++;
+                    using var limit = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                    limit.CancelAfter(timeout);
+                    try
+                    {
+                        while (true)
+                        {
+                            var received = await _udp.ReceiveAsync(limit.Token).ConfigureAwait(false);
+                            if (TryParse(received.Buffer, out var reply) && reply.RequestId == requestId)
+                                return reply;
+                        }
+                    }
+                    catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+                    {
+                        // No answer in time: ask once more.
+                    }
+                    catch (SocketException)
+                    {
+                        break;
+                    }
+                }
+                lock (_silent)
+                    _silent.Add(community);
+                return null;
+            }
+            finally
+            {
+                _one.Release();
+            }
+        }
+
+        public async Task<(string Oid, object? Value)?> GetAsync(string community, string oid, TimeSpan timeout, Func<CancellationToken, Task>? before,
+            CancellationToken cancellationToken)
+        {
+            var reply = await ExchangeAsync(community, Get, oid, timeout, before, cancellationToken).ConfigureAwait(false);
+            return reply is null || reply.ErrorStatus != 0 || reply.Value is NoValue ? null : (reply.Oid, reply.Value);
+        }
+
+        public Task<Walk> WalkAsync(string community, string prefix, int maxRows, TimeSpan timeout, Func<CancellationToken, Task>? before,
+            CancellationToken cancellationToken) =>
+            SnmpV2c.WalkAsync((tag, oid) => ExchangeAsync(community, tag, oid, timeout, before, cancellationToken), prefix, maxRows);
+
+        public void Dispose()
+        {
+            _udp.Dispose();
+            _one.Dispose();
+        }
+    }
+
     public static async Task<(string Oid, object? Value)?> GetAsync(IPEndPoint endpoint, string community, string oid, TimeSpan timeout, CancellationToken cancellationToken)
     {
-        var reply = await ExchangeAsync(endpoint, community, Get, oid, timeout, cancellationToken).ConfigureAwait(false);
-        return reply is null || reply.ErrorStatus != 0 || reply.Value is NoValue ? null : (reply.Oid, reply.Value);
+        using var channel = new Channel(endpoint);
+        return await channel.GetAsync(community, oid, timeout, null, cancellationToken).ConfigureAwait(false);
     }
 
     public static async Task<Walk> WalkAsync(IPEndPoint endpoint, string community, string prefix, int maxRows, TimeSpan timeout, CancellationToken cancellationToken)
+    {
+        using var channel = new Channel(endpoint);
+        return await channel.WalkAsync(community, prefix, maxRows, timeout, null, cancellationToken).ConfigureAwait(false);
+    }
+
+    private static async Task<Walk> WalkAsync(Func<byte, string, Task<Reply?>> exchange, string prefix, int maxRows)
     {
         var rows = new List<(string, object?)>();
         var current = prefix;
         while (true)
         {
-            var reply = await ExchangeAsync(endpoint, community, GetNext, current, timeout, cancellationToken).ConfigureAwait(false);
+            var reply = await exchange(GetNext, current).ConfigureAwait(false);
             if (reply is null)
                 return new Walk(rows, false, rows.Count == 0 ? "no answer from the device (SNMP off, a different community, or blocked)" : "the device stopped answering during the walk");
             if (reply.ErrorStatus != 0 || reply.EndOfMib || !reply.Oid.StartsWith(prefix + ".", StringComparison.Ordinal))
@@ -65,37 +164,6 @@ public static partial class SnmpV2c
             rows.Add((reply.Oid, reply.Value is NoValue ? null : reply.Value));
             current = reply.Oid;
         }
-    }
-
-    private static async Task<Reply?> ExchangeAsync(IPEndPoint endpoint, string community, byte pduTag, string oid, TimeSpan timeout, CancellationToken cancellationToken)
-    {
-        using var udp = new UdpClient(endpoint.AddressFamily);
-        udp.Connect(endpoint);
-        for (var attempt = 0; attempt < 2; attempt++)
-        {
-            var requestId = Random.Shared.Next(1, 0x3FFFFFFF);
-            await udp.SendAsync(BuildRequest(pduTag, community, requestId, oid), cancellationToken).ConfigureAwait(false);
-            using var limit = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-            limit.CancelAfter(timeout);
-            try
-            {
-                while (true)
-                {
-                    var received = await udp.ReceiveAsync(limit.Token).ConfigureAwait(false);
-                    if (TryParse(received.Buffer, out var reply) && reply.RequestId == requestId)
-                        return reply;
-                }
-            }
-            catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
-            {
-                // No answer in time: ask once more.
-            }
-            catch (SocketException)
-            {
-                return null;
-            }
-        }
-        return null;
     }
 
     private static bool TryParse(byte[] packet, out Reply reply)

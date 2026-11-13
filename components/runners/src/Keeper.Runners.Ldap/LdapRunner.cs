@@ -10,8 +10,10 @@ namespace Keeper.Runners.Ldap;
 /// ldap: a paged LDAP search - Active Directory or any directory. Kerberos/NTLM (Negotiate) with signing
 /// and sealing on ldap://, TLS on ldaps://; the current user, or the integration's stored credential.
 /// Secret attributes are never requested or returned. Search only - nothing is ever modified.
+/// A scan binds once per integration and runs every query over that connection (see <see cref="LdapSession"/>):
+/// a directory that counts failed or repeated binds is asked once.
 /// </summary>
-public sealed class LdapRunner : IRunner
+public sealed class LdapRunner : ISessionRunner
 {
     private const int DefaultPageSize = 500;
     private const int MaxRows = 500_000;
@@ -19,6 +21,8 @@ public sealed class LdapRunner : IRunner
     public string Protocol => "ldap";
 
     public bool PerTarget => false;
+
+    public string SessionFamily => "ldap";
 
     public IEnumerable<string> Validate(QuerySpec query)
     {
@@ -34,24 +38,89 @@ public sealed class LdapRunner : IRunner
             yield return "pageSize must be 1 to 5000";
     }
 
-    public Task<RunnerResult> RunAsync(QuerySpec query, RunnerContext context, CancellationToken cancellationToken) =>
-        Task.Run(() => Run(query, context, cancellationToken), cancellationToken);
+    /// <summary>Runs one query on its own connection: opens a session, runs, closes. A scan uses the session overload instead.</summary>
+    public async Task<RunnerResult> RunAsync(QuerySpec query, RunnerContext context, CancellationToken cancellationToken)
+    {
+        LdapSession session;
+        try
+        {
+            session = (LdapSession)await OpenAsync(context, cancellationToken).ConfigureAwait(false);
+        }
+        catch (RunnerFailureException ex)
+        {
+            return RunnerResult.Failed(ex.Message, ex.Kind);
+        }
+        catch (Exception ex) when (ex is FormatException or TimeoutException)
+        {
+            return RunnerResult.Failed(ex.Message, ex);
+        }
+        await using (session.ConfigureAwait(false))
+            return await RunAsync(session, query, context, cancellationToken).ConfigureAwait(false);
+    }
 
-    private static RunnerResult Run(QuerySpec query, RunnerContext context, CancellationToken cancellationToken)
+    /// <summary>Binds once. A refused bind throws with kind Refused; the scanner never tries this credential again.</summary>
+    public Task<IRunnerSession> OpenAsync(RunnerContext context, CancellationToken cancellationToken) =>
+        Task.Run<IRunnerSession>(() =>
+        {
+            try
+            {
+                return new LdapSession(Connect(context));
+            }
+            catch (Exception ex) when (ex is LdapException or DirectoryOperationException)
+            {
+                throw new RunnerFailureException(Reason(ex), ClassifyException(ex), ex);
+            }
+        }, cancellationToken);
+
+    public Task<RunnerResult> RunAsync(IRunnerSession session, QuerySpec query, RunnerContext context, CancellationToken cancellationToken) =>
+        Task.Run(() => RunSerial((LdapSession)session, query, context, cancellationToken), cancellationToken);
+
+    /// <summary>The connection is used by one query at a time: whether it is safe to share between threads is not documented.</summary>
+    private static RunnerResult RunSerial(LdapSession session, QuerySpec query, RunnerContext context, CancellationToken cancellationToken)
+    {
+        session.Gate.Wait(cancellationToken);
+        try
+        {
+            var result = Run(session, query, context, cancellationToken);
+            // A connection that worked and then dropped (an idle timeout, a DC failing over) is bound again once: the
+            // credential is known to work, so this is not a lockout risk - and every later query would fail otherwise.
+            if (result.State == "failed" && result.Failure == FailureKind.Unreachable && session.Worked && !session.Rebound)
+            {
+                session.Rebound = true;
+                try
+                {
+                    session.Replace(Connect(context));
+                }
+                catch (Exception ex) when (ex is LdapException or DirectoryOperationException)
+                {
+                    return result;
+                }
+                result = Run(session, query, context, cancellationToken);
+            }
+            if (result.State != "failed")
+                session.Worked = true;
+            return result;
+        }
+        finally
+        {
+            session.Gate.Release();
+        }
+    }
+
+    private static RunnerResult Run(LdapSession session, QuerySpec query, RunnerContext context, CancellationToken cancellationToken)
     {
         try
         {
-            using var connection = Connect(context);
-            var contexts = NamingContexts(connection);
-            var schemaCache = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+            var wire = new Wire(session, context, cancellationToken);
+            var contexts = NamingContexts(wire, session);
             bool SchemaHas(string attribute)
             {
-                if (!schemaCache.TryGetValue(attribute, out var has))
+                if (!session.SchemaCache.TryGetValue(attribute, out var has))
                 {
-                    var response = (SearchResponse)connection.SendRequest(new SearchRequest(contexts["schema"],
+                    var response = (SearchResponse)wire.Send(new SearchRequest(contexts["schema"],
                         $"(lDAPDisplayName={Escape(attribute)})", SearchScope.OneLevel, "lDAPDisplayName"));
                     has = response.Entries.Count > 0;
-                    schemaCache[attribute] = has;
+                    session.SchemaCache[attribute] = has;
                 }
                 return has;
             }
@@ -73,11 +142,10 @@ public sealed class LdapRunner : IRunner
             var rows = new List<JsonObject>();
             while (true)
             {
-                cancellationToken.ThrowIfCancellationRequested();
-                var response = (SearchResponse)connection.SendRequest(request, context.Timeout);
+                var response = (SearchResponse)wire.Send(request);
                 foreach (SearchResultEntry entry in response.Entries)
                 {
-                    rows.Add(Row(entry, connection, context.Timeout));
+                    rows.Add(Row(entry, wire));
                     if (rows.Count >= MaxRows)
                         return RunnerResult.Partial(rows, $"stopped at {MaxRows} entries");
                 }
@@ -92,13 +160,67 @@ public sealed class LdapRunner : IRunner
             if (attributes.Contains(LdapValues.SecurityDescriptor, StringComparer.OrdinalIgnoreCase)
                 && rows.Where(r => FieldPath.First(r, LdapValues.SecurityDescriptor) is not JsonObject).ToList() is { Count: > 0 } unread)
                 return RunnerResult.Partial(rows, $"{unread.Count} of {rows.Count} entries came back without a readable security descriptor " +
-                    $"(as {WhoAmI(connection, context.Timeout) ?? "this account"}), such as " +
+                    $"(as {WhoAmI(wire, session) ?? "this account"}), such as " +
                     string.Join("; ", unread.Take(3).Select(r => Keeper.Rules.Values.Text(r["distinguishedName"]))));
-            return new RunnerResult(rows, "ok", Notes(WhoAmI(connection, context.Timeout), query.List("attributes"), rows));
+            return new RunnerResult(rows, "ok", Notes(WhoAmI(wire, session), query.List("attributes"), rows));
         }
         catch (Exception ex) when (ex is LdapException or DirectoryOperationException or FormatException or TimeoutException)
         {
-            return RunnerResult.Failed(Reason(ex));
+            return RunnerResult.Failed(Reason(ex), ClassifyException(ex));
+        }
+    }
+
+    /// <summary>
+    /// The one place a request leaves for the directory: always with this query's timeout (the connection's own
+    /// timeout is only the one the bind used), and after a pace wait - except the first request of a query, which
+    /// the scanner's wait before the query already covers.
+    /// </summary>
+    private sealed class Wire(LdapSession session, RunnerContext context, CancellationToken cancellationToken)
+    {
+        private bool _sent;
+
+        public DirectoryResponse Send(DirectoryRequest request)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (_sent)
+                context.Pace.WaitAsync(cancellationToken).GetAwaiter().GetResult();
+            _sent = true;
+            return session.Connection.SendRequest(request, context.Timeout);
+        }
+    }
+
+    /// <summary>A connection bound once and the lookups that do not change during a scan; one query at a time uses it.</summary>
+    public sealed class LdapSession(LdapConnection connection) : IRunnerSession
+    {
+        internal LdapConnection Connection { get; private set; } = connection;
+
+        /// <summary>A query was read over this session: the bind works.</summary>
+        internal bool Worked { get; set; }
+
+        /// <summary>The connection was bound again once after it dropped; a second drop is the answer.</summary>
+        internal bool Rebound { get; set; }
+
+        internal void Replace(LdapConnection fresh)
+        {
+            Connection.Dispose();
+            Connection = fresh;
+        }
+
+        internal SemaphoreSlim Gate { get; } = new(1, 1);
+
+        internal Dictionary<string, string>? Contexts { get; set; }
+
+        internal Dictionary<string, bool> SchemaCache { get; } = new(StringComparer.OrdinalIgnoreCase);
+
+        internal bool WhoAmIKnown { get; set; }
+
+        internal string? WhoAmIValue { get; set; }
+
+        public ValueTask DisposeAsync()
+        {
+            Connection.Dispose();
+            Gate.Dispose();
+            return ValueTask.CompletedTask;
         }
     }
 
@@ -110,40 +232,52 @@ public sealed class LdapRunner : IRunner
             AuthType = AuthType.Negotiate,
             Timeout = context.Timeout,
         };
-        connection.SessionOptions.ProtocolVersion = 3;
-        connection.SessionOptions.ReferralChasing = ReferralChasingOptions.None;
-        if (ssl)
-        {
-            connection.SessionOptions.SecureSocketLayer = true;
-        }
-        else
-        {
-            // Kerberos/NTLM integrity and confidentiality on a plain LDAP port.
-            connection.SessionOptions.Signing = true;
-            connection.SessionOptions.Sealing = true;
-        }
-
-        var credential = context.Connection.WindowsCredential();
-        if (credential is null)
-            connection.Bind();
-        else
-            connection.Bind(credential);
-        return connection;
-    }
-
-    /// <summary>Who the directory says this connection is bound as (the LDAP "Who am I?" operation), or null.</summary>
-    private static string? WhoAmI(LdapConnection connection, TimeSpan timeout)
-    {
         try
         {
-            var response = (ExtendedResponse)connection.SendRequest(new ExtendedRequest("1.3.6.1.4.1.4203.1.11.3"), timeout);
+            connection.SessionOptions.ProtocolVersion = 3;
+            connection.SessionOptions.ReferralChasing = ReferralChasingOptions.None;
+            if (ssl)
+            {
+                connection.SessionOptions.SecureSocketLayer = true;
+            }
+            else
+            {
+                // Kerberos/NTLM integrity and confidentiality on a plain LDAP port.
+                connection.SessionOptions.Signing = true;
+                connection.SessionOptions.Sealing = true;
+            }
+
+            var credential = context.Connection.WindowsCredential();
+            if (credential is null)
+                connection.Bind();
+            else
+                connection.Bind(credential);
+            return connection;
+        }
+        catch
+        {
+            connection.Dispose();
+            throw;
+        }
+    }
+
+    /// <summary>Who the directory says this connection is bound as (the LDAP "Who am I?" operation), or null. Asked once per session.</summary>
+    private static string? WhoAmI(Wire wire, LdapSession session)
+    {
+        if (session.WhoAmIKnown)
+            return session.WhoAmIValue;
+        try
+        {
+            var response = (ExtendedResponse)wire.Send(new ExtendedRequest("1.3.6.1.4.1.4203.1.11.3"));
             // An empty answer is the anonymous identity: the directory showed only what anyone may see.
-            return response.ResponseValue is { Length: > 0 } value ? AuthzId(System.Text.Encoding.UTF8.GetString(value)) : "anonymous";
+            session.WhoAmIValue = response.ResponseValue is { Length: > 0 } value ? AuthzId(System.Text.Encoding.UTF8.GetString(value)) : "anonymous";
         }
         catch (Exception ex) when (ex is LdapException or DirectoryOperationException)
         {
-            return null;   // a directory without the operation still answered the search
+            session.WhoAmIValue = null;   // a directory without the operation still answered the search
         }
+        session.WhoAmIKnown = true;
+        return session.WhoAmIValue;
     }
 
     /// <summary>"u:EXAMPLE\reader" -> EXAMPLE\reader; "dn:CN=..." -> CN=...</summary>
@@ -183,13 +317,16 @@ public sealed class LdapRunner : IRunner
         return (endpoint.Trim(), 389, false);
     }
 
-    private static Dictionary<string, string> NamingContexts(LdapConnection connection)
+    /// <summary>The rootDSE naming contexts, read on the session's first query and kept for the scan.</summary>
+    private static Dictionary<string, string> NamingContexts(Wire wire, LdapSession session)
     {
-        var response = (SearchResponse)connection.SendRequest(new SearchRequest("", "(objectClass=*)", SearchScope.Base,
+        if (session.Contexts is { } known)
+            return known;
+        var response = (SearchResponse)wire.Send(new SearchRequest("", "(objectClass=*)", SearchScope.Base,
             "defaultNamingContext", "configurationNamingContext", "schemaNamingContext", "rootDomainNamingContext"));
         var root = response.Entries[0];
         string Read(string name) => root.Attributes.Contains(name) ? (string)root.Attributes[name][0] : "";
-        return new Dictionary<string, string>
+        return session.Contexts = new Dictionary<string, string>
         {
             ["domain"] = Read("defaultNamingContext"),
             ["config"] = Read("configurationNamingContext"),
@@ -204,7 +341,7 @@ public sealed class LdapRunner : IRunner
         _ => LdapMacros.Expand(text, now, contexts, _ => false),
     };
 
-    private static JsonObject Row(SearchResultEntry entry, LdapConnection connection, TimeSpan timeout)
+    private static JsonObject Row(SearchResultEntry entry, Wire wire)
     {
         var row = new JsonObject { ["distinguishedName"] = entry.DistinguishedName };
         foreach (DirectoryAttribute attribute in entry.Attributes.Values)
@@ -216,7 +353,7 @@ public sealed class LdapRunner : IRunner
             if (RangeOf(name) is { } range)
             {
                 name = range.Attribute;
-                values.AddRange(RestOfRange(connection, entry.DistinguishedName, range, timeout));
+                values.AddRange(RestOfRange(wire, entry.DistinguishedName, range));
             }
             if (SecretAttributes.IsSecret(name))
                 continue;
@@ -249,13 +386,13 @@ public sealed class LdapRunner : IRunner
         return new Range(name[..at], bounds[1] == "*" ? null : long.Parse(bounds[1], NumberStyles.None, CultureInfo.InvariantCulture));
     }
 
-    private static IEnumerable<object> RestOfRange(LdapConnection connection, string dn, Range first, TimeSpan timeout)
+    private static IEnumerable<object> RestOfRange(Wire wire, string dn, Range first)
     {
         var range = first;
         for (var page = 0; range.High is { } high && page < 10_000; page++)
         {
-            var response = (SearchResponse)connection.SendRequest(
-                new SearchRequest(dn, "(objectClass=*)", SearchScope.Base, $"{range.Attribute};range={high + 1}-*"), timeout);
+            var response = (SearchResponse)wire.Send(
+                new SearchRequest(dn, "(objectClass=*)", SearchScope.Base, $"{range.Attribute};range={high + 1}-*"));
             var next = response.Entries.Count == 0 ? null : response.Entries[0].Attributes.Values.Cast<DirectoryAttribute>()
                 .FirstOrDefault(a => RangeOf(a.Name)?.Attribute.Equals(range.Attribute, StringComparison.OrdinalIgnoreCase) == true);
             if (next is null)
@@ -291,10 +428,68 @@ public sealed class LdapRunner : IRunner
 
     private static string Reason(Exception ex) => ex switch
     {
-        LdapException { ErrorCode: 49 } => "the directory refused the credentials (invalid credentials)",
-        LdapException { ErrorCode: 81 } => "the directory server is unreachable",
-        LdapException l => $"LDAP error {l.ErrorCode.ToString(CultureInfo.InvariantCulture)}: {l.Message}",
+        LdapException l => Describe(l.ErrorCode, l.ServerErrorMessage, l.Message),
         DirectoryOperationException d => $"the search was refused: {d.Message}",
         _ => ex.Message,
+    };
+
+    /// <summary>The kind of a failed LDAP call, from its exception.</summary>
+    public static FailureKind ClassifyException(Exception ex) => ex switch
+    {
+        LdapException l => Classify(l.ErrorCode, l.ServerErrorMessage),
+        DirectoryOperationException { Response: { } response } => Classify((int)response.ResultCode, response.ErrorMessage),
+        _ => Failures.Classify(ex),
+    };
+
+    /// <summary>
+    /// The kind of an LDAP result code. 49 (invalid credentials) is always the credential itself - whatever AD says
+    /// in its sub-code (bad password, locked, expired, disabled, logon hours, workstation), presenting it again can
+    /// only count towards a lockout. 50 is a signed-in account that may not read this; 51 and 52 are a busy or
+    /// unavailable server; 81 and 91 are no server to talk to; 85 is no answer in time.
+    /// </summary>
+    public static FailureKind Classify(int errorCode, string? serverMessage) => errorCode switch
+    {
+        49 => FailureKind.Refused,
+        50 => FailureKind.Denied,
+        51 or 52 => FailureKind.Throttled,
+        81 or 91 => FailureKind.Unreachable,
+        85 => FailureKind.Timeout,
+        _ => Failures.SaysRefused(serverMessage) ? FailureKind.Refused : FailureKind.Error,
+    };
+
+    /// <summary>What an Active Directory bind failure means: the sub-code after "data " in the server's message.</summary>
+    public static string? AdMeaning(string? serverMessage)
+    {
+        if (serverMessage is null)
+            return null;
+        var at = serverMessage.IndexOf("data ", StringComparison.OrdinalIgnoreCase);
+        if (at < 0)
+            return null;
+        var code = new string(serverMessage[(at + 5)..].TakeWhile(Uri.IsHexDigit).ToArray()).ToLowerInvariant();
+        return code switch
+        {
+            "52e" => "the user name or password is wrong (52e)",
+            "525" => "the user does not exist (525)",
+            "530" => "the account may not sign in at this time of day (530)",
+            "531" => "the account may not sign in from this workstation (531)",
+            "532" or "773" => "the password has expired or must be changed (" + code + ")",
+            "533" => "the account is disabled (533)",
+            "701" => "the account has expired (701)",
+            "775" => "the account is locked out (775)",
+            _ => null,
+        };
+    }
+
+    /// <summary>The words for a failed LDAP call, with the Active Directory meaning when the server gave one.</summary>
+    public static string Describe(int errorCode, string? serverMessage, string message) => errorCode switch
+    {
+        49 => "the directory refused the credentials (invalid credentials" + (AdMeaning(serverMessage) is { } meaning ? $": {meaning}" : "") + ")",
+        50 => "the directory denied access (insufficient access rights)",
+        51 => "the directory is busy",
+        52 => "the directory is unavailable",
+        81 => "the directory server is unreachable",
+        91 => "the directory server could not be connected to",
+        85 => "the directory did not answer in time",
+        _ => $"LDAP error {errorCode.ToString(CultureInfo.InvariantCulture)}: {message}",
     };
 }

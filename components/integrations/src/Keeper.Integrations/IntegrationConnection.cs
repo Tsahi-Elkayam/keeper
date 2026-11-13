@@ -11,10 +11,21 @@ using Microsoft.Identity.Client.Broker;
 namespace Keeper.Integrations;
 
 /// <summary>
+/// A sign-in that failed, with what kind of failure it was, so the scan can tell a refused credential (never
+/// presented again) from a busy service (slow down) from one that did not answer. It is an
+/// <see cref="HttpRequestException"/> - what the runners and the push already catch for a failed request - and
+/// carries its kind in an inner <see cref="RunnerFailureException"/>, which <see cref="Failures.Classify"/> reads.
+/// </summary>
+public sealed class SignInException(string message, FailureKind kind) : HttpRequestException(message, new RunnerFailureException(message, kind))
+{
+    public FailureKind Kind { get; } = kind;
+}
+
+/// <summary>
 /// The connection a runner gets: one integration's endpoint and credentials. Secrets are opened from the
 /// vault only when used, and only this integration's. Tokens are cached for the life of the process.
 /// </summary>
-public sealed partial class IntegrationConnection : IConnection, IAwsConnection, IDisposable
+public sealed partial class IntegrationConnection : IConnection, IAwsConnection, ISessionTokenConnection, IDisposable
 {
     private readonly IntegrationRecord _record;
     private readonly Keeper.Vault.Vault? _vault;
@@ -25,7 +36,8 @@ public sealed partial class IntegrationConnection : IConnection, IAwsConnection,
     private string? _token;
     private DateTimeOffset _tokenExpires;
     private string? _signedInAs;
-    private IntegrationException? _tokenError;
+    private DateTimeOffset _tokenIssued;
+    private Exception? _tokenError;
 
     public IntegrationConnection(IntegrationRecord record, Keeper.Vault.Vault? vault)
     {
@@ -56,6 +68,21 @@ public sealed partial class IntegrationConnection : IConnection, IAwsConnection,
         && (!type.AllowsEndpointPath(uri.AbsolutePath) || uri.Query.Length > 0)
             ? $"the {type.Id} endpoint has a path its type does not allow ({uri.AbsolutePath}{uri.Query}); set it again: keeper integration set {_record.Id} --endpoint <url>"
             : null;
+
+    /// <summary>
+    /// The handler token and session sign-ins (OAuth, vCenter, session-login) send through; null: a plain one. A
+    /// seam for tests, which answer sign-ins without a network.
+    /// </summary>
+    public HttpMessageHandler? SignInHandler { get; init; }
+
+    /// <summary>The pause before a sign-in is tried again after a busy answer; doubles with each try. A seam for tests.</summary>
+    public TimeSpan SignInBackoff { get; init; } = TimeSpan.FromSeconds(2);
+
+    /// <summary>
+    /// A token issued less than this long ago is not signed in for again when a read says it was refused: reads that fail
+    /// together (the for_each children in flight) share the one new sign-in. A seam for tests.
+    /// </summary>
+    public TimeSpan SessionRenewGrace { get; init; } = TimeSpan.FromSeconds(30);
 
     /// <summary>Sign in to Entra again even when a cached token is valid: right after a PIM activation, so the new role is in it.</summary>
     public bool FreshSignIn { get; init; }
@@ -156,16 +183,24 @@ public sealed partial class IntegrationConnection : IConnection, IAwsConnection,
         }
     }
 
-    private async Task<string> TokenAsync(CancellationToken cancellationToken)
+    private Task<string> TokenAsync(CancellationToken cancellationToken) => EnsureTokenAsync(renew: false, cancellationToken);
+
+    /// <summary>
+    /// The session token, signing in when there is none or it is about to expire (or, with <paramref name="renew"/>,
+    /// because the system said it has expired). What is remembered for the whole scan: a sign-in that cannot work
+    /// as set up (a wrong or missing credential, an answer that is no token) - asking again for every query would
+    /// open a sign-in window per query, or repeat a wrong password until the account locks. What is not: a busy or
+    /// silent service (429, 5xx, a timeout, a reset). That is tried again by the next read, after the pace.
+    /// </summary>
+    private async Task<string> EnsureTokenAsync(bool renew, CancellationToken cancellationToken)
     {
         await _tokenLock.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            // A refused sign-in is refused for the whole scan: asking again for every query would open a
-            // sign-in window per query, or repeat a wrong password until the account locks.
             if (_tokenError is not null)
                 throw _tokenError;
-            if (_token is not null && DateTimeOffset.UtcNow < _tokenExpires.AddMinutes(-2))
+            if (_token is not null && DateTimeOffset.UtcNow < _tokenExpires.AddMinutes(-2)
+                && (!renew || DateTimeOffset.UtcNow - _tokenIssued < SessionRenewGrace))
                 return _token;
             try
             {
@@ -179,8 +214,14 @@ public sealed partial class IntegrationConnection : IConnection, IAwsConnection,
                     "gcp-service-account" => await GoogleServiceAccountAsync(cancellationToken).ConfigureAwait(false),
                     _ => await EntraCertificateAsync(cancellationToken).ConfigureAwait(false),
                 };
+                _tokenIssued = DateTimeOffset.UtcNow;
             }
-            catch (IntegrationException ex)
+            catch (IntegrationException ex) when (!ex.Transient)
+            {
+                _tokenError = ex;
+                throw;
+            }
+            catch (SignInException ex) when (ex.Kind == FailureKind.Refused)
             {
                 _tokenError = ex;
                 throw;
@@ -190,6 +231,26 @@ public sealed partial class IntegrationConnection : IConnection, IAwsConnection,
         finally
         {
             _tokenLock.Release();
+        }
+    }
+
+    /// <summary>
+    /// A vCenter or session-login token that the system no longer accepts (the session expired mid-scan): sign in once
+    /// more. Reads that fail at the same moment share the one new sign-in. False when there is nothing to renew or
+    /// the sign-in itself fails - the reads then fail as the sign-in did.
+    /// </summary>
+    public async Task<bool> RenewSessionAsync(CancellationToken cancellationToken)
+    {
+        if (_record.AuthKind is not ("vcenter-session" or "session-login"))
+            return false;
+        try
+        {
+            await EnsureTokenAsync(renew: true, cancellationToken).ConfigureAwait(false);
+            return true;
+        }
+        catch (Exception ex) when (ex is IntegrationException or SignInException)
+        {
+            return false;
         }
     }
 
@@ -227,19 +288,81 @@ public sealed partial class IntegrationConnection : IConnection, IAwsConnection,
         ["password"] = RequiredSecret("password"),
     };
 
+    /// <summary>
+    /// One sign-in request and its answer's text. A refusal (401, 403, 400 invalid_grant/invalid_client) throws a
+    /// <see cref="SignInException"/> of kind Refused, which the connection remembers. A busy or silent service (408,
+    /// 429, 5xx, a timeout, a reset) is tried again, at most twice more with a growing pause, and then fails as
+    /// Throttled, Timeout or Unreachable - never remembered as a refusal, so one slow minute does not end the scan's access.
+    /// </summary>
+    private async Task<string> SignInSendAsync(string host, Func<HttpRequestMessage> create, CancellationToken cancellationToken)
+    {
+        using var client = new HttpClient(SignInHandler ?? new SocketsHttpHandler { AllowAutoRedirect = false }, disposeHandler: SignInHandler is null)
+        {
+            Timeout = TimeSpan.FromSeconds(30),
+        };
+        for (var attempt = 1; ; attempt++)
+        {
+            SignInException failure;
+            try
+            {
+                using var request = create();
+                using var response = await client.SendAsync(request, cancellationToken).ConfigureAwait(false);
+                var text = await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false);
+                if (response.IsSuccessStatusCode)
+                    return text;
+                var status = (int)response.StatusCode;
+                if (status is 401 or 403 || (status == 400 && SaysRefusedGrant(text)))
+                    throw new SignInException($"{host} refused the sign-in ({status}).", FailureKind.Refused);
+                if (status is < 500 and not (408 or 429))
+                    throw new IntegrationException($"{host} did not accept the sign-in request ({status}); check the integration's endpoint and sign-in options.");
+                failure = new SignInException($"{host} was not available for the sign-in ({status}).",
+                    status == 429 ? FailureKind.Throttled : status is 408 or 504 ? FailureKind.Timeout : FailureKind.Throttled);
+            }
+            catch (HttpRequestException ex) when (ex is not SignInException)
+            {
+                failure = new SignInException($"{host} could not be reached for the sign-in: {ex.Message}", Failures.Classify(ex));
+            }
+            catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+            {
+                failure = new SignInException($"{host} did not answer the sign-in in time.", FailureKind.Timeout);
+            }
+            if (attempt >= 3)
+                throw failure;
+            await Task.Delay(SignInBackoff * attempt, cancellationToken).ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>A 400 from a token endpoint that says the credential is wrong (RFC 6749: invalid_grant, invalid_client), or a vendor's "invalid credentials".</summary>
+    private static bool SaysRefusedGrant(string body) =>
+        body.Contains("invalid_grant", StringComparison.OrdinalIgnoreCase) || body.Contains("invalid_client", StringComparison.OrdinalIgnoreCase)
+        || body.Contains("unauthorized_client", StringComparison.OrdinalIgnoreCase) || Failures.SaysRefused(body);
+
+    private static JsonNode? ParseSignIn(string host, string text)
+    {
+        try
+        {
+            return JsonNode.Parse(text);
+        }
+        catch (System.Text.Json.JsonException)
+        {
+            // Not JSON is not a busy service: the sign-in URL is not a token endpoint. Said once, for the scan.
+            throw new IntegrationException($"{host} answered the sign-in with something that is not JSON; check the integration's endpoint and sign-in options.");
+        }
+    }
+
     private async Task<(string, DateTimeOffset)> OAuthAsync(Dictionary<string, string> form, Uri tokenUrl, CancellationToken cancellationToken)
     {
-        using var client = new HttpClient(new SocketsHttpHandler { AllowAutoRedirect = false }) { Timeout = TimeSpan.FromSeconds(30) };
-        using var request = new HttpRequestMessage(HttpMethod.Post, tokenUrl) { Content = new FormUrlEncodedContent(form) };
-        if (_record.Options["headers"] is JsonObject staticHeaders)
+        var text = await SignInSendAsync(tokenUrl.Host, () =>
         {
-            foreach (var (name, value) in staticHeaders)
-                request.Headers.TryAddWithoutValidation(name, value?.ToString());
-        }
-        using var response = await client.SendAsync(request, cancellationToken).ConfigureAwait(false);
-        if (!response.IsSuccessStatusCode)
-            throw new IntegrationException($"{tokenUrl.Host} refused the sign-in ({(int)response.StatusCode}).");
-        var body = JsonNode.Parse(await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false));
+            var request = new HttpRequestMessage(HttpMethod.Post, tokenUrl) { Content = new FormUrlEncodedContent(form) };
+            if (_record.Options["headers"] is JsonObject staticHeaders)
+            {
+                foreach (var (name, value) in staticHeaders)
+                    request.Headers.TryAddWithoutValidation(name, value?.ToString());
+            }
+            return request;
+        }, cancellationToken).ConfigureAwait(false);
+        var body = ParseSignIn(tokenUrl.Host, text);
         var token = body?["access_token"]?.ToString() ?? throw new IntegrationException($"{tokenUrl.Host} returned no access token.");
         var seconds = int.TryParse(body?["expires_in"]?.ToString(), out var s) ? s : 3600;
         return (token, DateTimeOffset.UtcNow.AddSeconds(seconds));
@@ -248,14 +371,14 @@ public sealed partial class IntegrationConnection : IConnection, IAwsConnection,
     private async Task<(string, DateTimeOffset)> VCenterSessionAsync(CancellationToken cancellationToken)
     {
         var endpoint = new Uri(_record.Endpoint);
-        using var client = new HttpClient(new SocketsHttpHandler { AllowAutoRedirect = false }) { Timeout = TimeSpan.FromSeconds(30) };
-        using var request = new HttpRequestMessage(HttpMethod.Post, new Uri(endpoint, "/api/session"));
-        request.Headers.Authorization = new AuthenticationHeaderValue("Basic",
-            Convert.ToBase64String(Encoding.UTF8.GetBytes($"{_record.Identity}:{RequiredSecret("password")}")));
-        using var response = await client.SendAsync(request, cancellationToken).ConfigureAwait(false);
-        if (!response.IsSuccessStatusCode)
-            throw new IntegrationException($"vCenter refused the sign-in ({(int)response.StatusCode}).");
-        var token = (await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false)).Trim().Trim('"');
+        var password = RequiredSecret("password");
+        var text = await SignInSendAsync(endpoint.Host, () =>
+        {
+            var request = new HttpRequestMessage(HttpMethod.Post, new Uri(endpoint, "/api/session"));
+            request.Headers.Authorization = new AuthenticationHeaderValue("Basic", Convert.ToBase64String(Encoding.UTF8.GetBytes($"{_record.Identity}:{password}")));
+            return request;
+        }, cancellationToken).ConfigureAwait(false);
+        var token = text.Trim().Trim('"');
         return (token, DateTimeOffset.UtcNow.AddMinutes(25));
     }
 
@@ -293,8 +416,7 @@ public sealed partial class IntegrationConnection : IConnection, IAwsConnection,
             extras.Add(name["loginFields.".Length..]);
         }
 
-        using var client = new HttpClient(new SocketsHttpHandler { AllowAutoRedirect = false }) { Timeout = TimeSpan.FromSeconds(30) };
-        using var request = new HttpRequestMessage(HttpMethod.Post, uri)
+        var text = await SignInSendAsync(uri.Host, () => new HttpRequestMessage(HttpMethod.Post, uri)
         {
             Content = _record.Options["body"]?.ToString() == "form"
                 ? new FormUrlEncodedContent(fields)
@@ -303,11 +425,8 @@ public sealed partial class IntegrationConnection : IConnection, IAwsConnection,
                 : new StringContent(new JsonObject(fields.Select(f => KeyValuePair.Create(f.Key, extras.Contains(f.Key) && f.Value is "true" or "false"
                     ? (JsonNode?)JsonValue.Create(f.Value == "true")
                     : JsonValue.Create(f.Value)))).ToJsonString(), Encoding.UTF8, "application/json"),
-        };
-        using var response = await client.SendAsync(request, cancellationToken).ConfigureAwait(false);
-        if (!response.IsSuccessStatusCode)
-            throw new IntegrationException($"{uri.Host} refused the sign-in ({(int)response.StatusCode}).");
-        var body = JsonNode.Parse(await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false));
+        }, cancellationToken).ConfigureAwait(false);
+        var body = ParseSignIn(uri.Host, text);
         var tokenField = _record.Options["tokenField"]?.ToString() ?? "token";
         var token = Keeper.Rules.FieldPath.First(body, tokenField)?.ToString();
         if (string.IsNullOrEmpty(token))
@@ -398,8 +517,30 @@ public sealed partial class IntegrationConnection : IConnection, IAwsConnection,
         }
         catch (MsalException ex)
         {
-            throw new IntegrationException($"Entra sign-in failed: {ex.ErrorCode}: {ex.Message}");
+            throw EntraFailure(ex);
         }
+    }
+
+    /// <summary>
+    /// What an Entra failure is: a service that is busy or silent (429, 5xx, a timeout) is passed on as such and is not
+    /// remembered; an answer that turns the credential away (invalid_client, invalid_grant, a wrong secret) is a
+    /// refusal; anything else (no browser, a cancelled prompt) is a problem with the set-up.
+    /// </summary>
+    public static Exception EntraFailure(MsalException ex)
+    {
+        var text = $"Entra sign-in failed: {ex.ErrorCode}: {ex.Message}";
+        if (ex is MsalServiceException service)
+        {
+            if (service.StatusCode == 429)
+                return new SignInException(text, FailureKind.Throttled);
+            if (service.StatusCode == 408 || service.ErrorCode is "request_timeout")
+                return new SignInException(text, FailureKind.Timeout);
+            if (service.StatusCode >= 500 || service.ErrorCode is "service_not_available" or "temporarily_unavailable")
+                return new SignInException(text, FailureKind.Throttled);
+            if (service.StatusCode is 400 or 401 or 403)
+                return new SignInException(text, FailureKind.Refused);
+        }
+        return new IntegrationException(text);
     }
 
     /// <summary>
@@ -439,7 +580,7 @@ public sealed partial class IntegrationConnection : IConnection, IAwsConnection,
         }
         catch (MsalException ex)
         {
-            throw new IntegrationException($"Entra sign-in failed: {ex.ErrorCode}: {ex.Message}");
+            throw EntraFailure(ex);
         }
     }
 

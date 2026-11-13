@@ -68,12 +68,33 @@ public sealed class TlsRunner : IRunner
         }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
         {
-            return RunnerResult.Failed($"{host}:{port} did not answer within {context.Timeout.TotalSeconds:0} s");
+            return RunnerResult.Failed($"{host}:{port} did not answer within {context.Timeout.TotalSeconds:0} s", FailureKind.Timeout);
         }
         catch (Exception ex) when (ex is SocketException or IOException or AuthenticationException)
         {
-            return RunnerResult.Failed($"{host}:{port}: {ex.Message}");
+            return RunnerResult.Failed($"{host}:{port}: {ex.Message}", Classify(ex));
         }
+    }
+
+    /// <summary>
+    /// What a failed connection or handshake says about the host: nothing listening or no route is Unreachable, a
+    /// reset or a stream the other side closed during the handshake (a firewall or a busy device dropping new
+    /// connections) is Throttled, a timeout is Timeout. Not the generic classifier: .NET words a handshake that was cut
+    /// off as "Authentication failed", and that is never a refused credential here - a TLS read has none.
+    /// </summary>
+    public static FailureKind Classify(Exception ex)
+    {
+        for (var inner = ex; inner is not null; inner = inner.InnerException)
+        {
+            if (inner is SocketException socket)
+                return Failures.Classify(socket);
+            if (inner is TimeoutException or OperationCanceledException)
+                return FailureKind.Timeout;
+        }
+        return ex.Message.Contains("closed the transport stream", StringComparison.OrdinalIgnoreCase)
+               || ex.Message.Contains("reset", StringComparison.OrdinalIgnoreCase) || ex.Message.Contains("unexpected EOF", StringComparison.OrdinalIgnoreCase)
+            ? FailureKind.Throttled
+            : FailureKind.Error;
     }
 
     /// <summary>

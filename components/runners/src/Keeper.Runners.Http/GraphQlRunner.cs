@@ -9,13 +9,15 @@ namespace Keeper.Runners.Http;
 /// anything is sent. Cursor paging: paging.cursor and paging.hasNext name fields in the response,
 /// paging.variable the query variable that takes the cursor.
 /// </summary>
-public sealed partial class GraphQlRunner : IRunner
+public sealed partial class GraphQlRunner : ISessionRunner
 {
     private const int DefaultMaxPages = 100;
 
     public string Protocol => "graphql";
 
     public bool PerTarget => false;
+
+    public string SessionFamily => "http";
 
     public IEnumerable<string> Validate(QuerySpec query)
     {
@@ -42,14 +44,23 @@ public sealed partial class GraphQlRunner : IRunner
         return null;
     }
 
+    public Task<IRunnerSession> OpenAsync(RunnerContext context, CancellationToken cancellationToken) =>
+        Task.FromResult<IRunnerSession>(new HttpSession());
+
     public async Task<RunnerResult> RunAsync(QuerySpec query, RunnerContext context, CancellationToken cancellationToken)
+    {
+        await using var session = new HttpSession();
+        return await RunAsync(session, query, context, cancellationToken).ConfigureAwait(false);
+    }
+
+    public async Task<RunnerResult> RunAsync(IRunnerSession session, QuerySpec query, RunnerContext context, CancellationToken cancellationToken)
     {
         if (Problem(query.Text("document")) is { } problem)
             return RunnerResult.Failed(problem);
 
         try
         {
-            using var engine = HttpEngine.Open(context);
+            var engine = HttpSession.Of(session).Engine(context);
             var uri = engine.Build(query.Text("path") ?? "/graphql");
             // Dates in the document and the variables ({DAYS_AGO:30}); a macro only ever becomes a date, never syntax.
             var document = RequestMacros.Expand(query.Text("document")!, context);
@@ -60,7 +71,7 @@ public sealed partial class GraphQlRunner : IRunner
 
             for (var page = 1; ; page++)
             {
-                var (body, _) = await engine.PostJsonAsync(uri, new JsonObject
+                var (body, _) = await engine.PostJsonAsync(context, page > 1, uri, new JsonObject
                 {
                     ["query"] = document,
                     ["variables"] = (JsonObject)JsonNode.Parse(variables.ToJsonString())!,
@@ -68,7 +79,7 @@ public sealed partial class GraphQlRunner : IRunner
 
                 if (body?["errors"] is JsonArray { Count: > 0 } errors)
                     return rows.Count == 0
-                        ? RunnerResult.Failed($"GraphQL errors: {HttpEngine.Truncate(errors.ToJsonString(), 300)}")
+                        ? RunnerResult.Failed($"GraphQL errors: {HttpEngine.Truncate(errors.ToJsonString(), 300)}", ClassifyErrors(errors))
                         : RunnerResult.Partial(rows, $"GraphQL errors on page {page}");
 
                 rows.AddRange(RowValues.ItemsOf(body, query.Text("items")));
@@ -84,10 +95,30 @@ public sealed partial class GraphQlRunner : IRunner
             }
             return RunnerResult.Ok(rows);
         }
-        catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException or UnauthorizedAccessException or InvalidOperationException)
+        catch (Exception ex) when (HttpEngine.IsReadFailure(ex, cancellationToken))
         {
-            return RunnerResult.Failed(HttpEngine.Reason(ex));
+            return HttpEngine.Failure(ex);
         }
+    }
+
+    private static readonly string[] RefusedErrors =
+    [
+        "unauthenticated", "unauthorized", "not authenticated", "authentication required", "authentication failed", "invalid token",
+        "token expired", "expired token", "invalid credentials", "invalid api key", "invalid_token",
+    ];
+
+    private static readonly string[] DeniedErrors = ["forbidden", "access denied", "permission denied", "not authorized", "insufficient permission", "not allowed"];
+
+    /// <summary>
+    /// GraphQL answers 200 with the refusal in its errors: an unauthenticated error means the credential was turned
+    /// away (Refused), a forbidden one that it may not read this (Denied). Anything else is a plain error.
+    /// </summary>
+    public static FailureKind ClassifyErrors(JsonArray errors)
+    {
+        var text = errors.ToJsonString();
+        if (RefusedErrors.Any(p => text.Contains(p, StringComparison.OrdinalIgnoreCase)))
+            return FailureKind.Refused;
+        return DeniedErrors.Any(p => text.Contains(p, StringComparison.OrdinalIgnoreCase)) ? FailureKind.Denied : FailureKind.Error;
     }
 
     [GeneratedRegex("\"(?:[^\"\\\\]|\\\\.)*\"", RegexOptions.CultureInvariant)]

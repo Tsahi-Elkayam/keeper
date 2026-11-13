@@ -19,6 +19,9 @@ public sealed class StoreRunner : IRunner
 
     public bool PerTarget => false;
 
+    /// <summary>Reads local files, not the network: the scan's pace does not apply.</summary>
+    public bool IsRemote(IConnection connection) => false;
+
     public IEnumerable<string> Validate(QuerySpec query)
     {
         if (SqlGuard.Problem(query.Text("text"), ForbiddenTables) is { } problem)

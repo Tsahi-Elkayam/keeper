@@ -16,7 +16,7 @@ namespace Keeper.Runners.Aws;
 /// and where the request passes it), regions (all | home | a list), accounts (all | own), maxPages, billed,
 /// for_each (one request per object of a list, in that object's own account and region).
 /// </summary>
-public sealed class AwsRunner : IRunner
+public sealed class AwsRunner : ISessionRunner
 {
     private const int DefaultMaxPages = 100;
     private const int MaxRows = 200_000;
@@ -180,12 +180,44 @@ public sealed class AwsRunner : IRunner
         name.Equals("Action", StringComparison.OrdinalIgnoreCase) || name.Equals("Version", StringComparison.OrdinalIgnoreCase)
         || name.StartsWith("X-Amz-", StringComparison.OrdinalIgnoreCase);
 
+    /// <summary>One HTTP client for every AWS read of the scan: connections to an AWS endpoint are made once, not per query.</summary>
+    public string SessionFamily => "aws";
+
+    /// <summary>The key under which a failure's <see cref="Exception.Data"/> names its <see cref="FailureKind"/> (set by the integration's credential code).</summary>
+    public const string FailureKindData = "keeper.failureKind";
+
+    private sealed class AwsSession(HttpClient client) : IRunnerSession
+    {
+        public HttpClient Client => client;
+
+        public ValueTask DisposeAsync()
+        {
+            client.Dispose();
+            return ValueTask.CompletedTask;
+        }
+    }
+
+    public Task<IRunnerSession> OpenAsync(RunnerContext context, CancellationToken cancellationToken)
+    {
+        if (context.Connection is not IAwsConnection)
+            throw new RunnerFailureException($"the {context.Connection.Type} integration cannot sign AWS requests", FailureKind.Error);
+        // Its own timeout is off: each request carries the timeout of the query that sends it.
+        return Task.FromResult<IRunnerSession>(new AwsSession(new HttpClient(context.Connection.CreateHttpHandler()) { Timeout = Timeout.InfiniteTimeSpan }));
+    }
+
     public async Task<RunnerResult> RunAsync(QuerySpec query, RunnerContext context, CancellationToken cancellationToken)
+    {
+        if (context.Connection is not IAwsConnection)
+            return RunnerResult.Failed($"the {context.Connection.Type} integration cannot sign AWS requests");
+        await using var session = await OpenAsync(context, cancellationToken).ConfigureAwait(false);
+        return await RunAsync(session, query, context, cancellationToken).ConfigureAwait(false);
+    }
+
+    public async Task<RunnerResult> RunAsync(IRunnerSession session, QuerySpec query, RunnerContext context, CancellationToken cancellationToken)
     {
         if (context.Connection is not IAwsConnection aws)
             return RunnerResult.Failed($"the {context.Connection.Type} integration cannot sign AWS requests");
-        using var client = new HttpClient(context.Connection.CreateHttpHandler()) { Timeout = context.Timeout };
-        var call = new Caller(aws, client);
+        var call = new Caller(aws, ((AwsSession)session).Client, context);
         return query.Fields["for_each"] is JsonObject
             ? await PerParent(call, query, cancellationToken).ConfigureAwait(false)
             : await Across(call, query, cancellationToken).ConfigureAwait(false);
@@ -231,12 +263,16 @@ public sealed class AwsRunner : IRunner
         each.Remove("max");
         var list = await Across(call, new QuerySpec("aws", each, field, null), cancellationToken).ConfigureAwait(false);
         if (list.State == "failed")
-            return RunnerResult.Failed($"the list for for_each failed: {list.Reason}");
+            return RunnerResult.Failed($"the list for for_each failed: {list.Reason}", list.Failure);
 
         var service = Service(query)!;
         var childFields = (JsonObject)query.Fields.DeepClone();
         childFields.Remove("for_each");
         var parents = list.Rows.Take(max).ToList();
+        // Circuit breaker, as for the http runners' for_each: a refused credential stops the rest at once (the
+        // Caller remembers it), and three objects in a row turned away as denied mean the role may not read them.
+        var deniedStreak = 0;
+        var deniedStop = false;
         using var gate = new SemaphoreSlim(Parallel);
         var results = await Task.WhenAll(parents.Select(async parent =>
         {
@@ -256,7 +292,15 @@ public sealed class AwsRunner : IRunner
             await gate.WaitAsync(cancellationToken).ConfigureAwait(false);
             try
             {
+                if (Volatile.Read(ref deniedStop))
+                    return (Parent: parent, Label: label, Result: RunnerResult.Failed("not sent: three objects in a row were denied", FailureKind.Denied));
                 var child = await call.ReadAsync(service, new QuerySpec("aws", fields, query.Key, query.Name), account, region, cancellationToken).ConfigureAwait(false);
+                lock (gate)
+                {
+                    deniedStreak = child.State == "failed" && child.Failure == FailureKind.Denied ? deniedStreak + 1 : 0;
+                    if (deniedStreak >= PerObject.DeniedStreakLimit)
+                        Volatile.Write(ref deniedStop, true);
+                }
                 return (Parent: parent, Label: label, Result: child);
             }
             finally
@@ -284,6 +328,13 @@ public sealed class AwsRunner : IRunner
             : RunnerResult.Partial(combined.Rows, string.Join("; ", notes.Prepend(combined.Reason).OfType<string>()));
     }
 
+    /// <summary>The kind that all of these failures share; Refused when any was (the credential is dead whatever else happened); else Error.</summary>
+    private static FailureKind KindOf(IEnumerable<FailureKind> kinds)
+    {
+        var distinct = kinds.Distinct().ToList();
+        return distinct.Contains(FailureKind.Refused) ? FailureKind.Refused : distinct.Count == 1 ? distinct[0] : FailureKind.Error;
+    }
+
     /// <summary>Every place read cleanly: ok. Some failed or were cut short: partial, saying which. All failed: failed.</summary>
     private static RunnerResult Combine(List<(string Label, RunnerResult Result)> results, string what)
     {
@@ -291,7 +342,7 @@ public sealed class AwsRunner : IRunner
         var failed = results.Where(r => r.Result.State == "failed").ToList();
         var partial = results.Where(r => r.Result.State == "partial").ToList();
         if (results.Count > 0 && failed.Count == results.Count)
-            return RunnerResult.Failed(string.Join("; ", failed.Take(3).Select(f => $"{f.Label}: {f.Result.Reason}")));
+            return RunnerResult.Failed(string.Join("; ", failed.Take(3).Select(f => $"{f.Label}: {f.Result.Reason}")), KindOf(failed.Select(f => f.Result.Failure)));
         var notes = new List<string>();
         if (failed.Count > 0)
             notes.Add($"{failed.Count} of {results.Count} {what} failed: {string.Join("; ", failed.Take(3).Select(f => $"{f.Label}: {f.Result.Reason}"))}");
@@ -352,17 +403,44 @@ public sealed class AwsRunner : IRunner
     }
 
     /// <summary>An error answer; Missing when it says the thing asked for does not exist (404, NoSuch..., ...NotFound).</summary>
-    private sealed class AwsError(string message, bool missing) : HttpRequestException(message)
+    private sealed class AwsError(string message, bool missing, FailureKind kind) : HttpRequestException(message)
     {
         public bool Missing { get; } = missing;
+
+        public FailureKind Kind { get; } = kind;
     }
 
     /// <summary>One account and region: the action, page by page, signed for that place.</summary>
-    private sealed class Caller(IAwsConnection aws, HttpClient client)
+    private sealed class Caller(IAwsConnection aws, HttpClient client, RunnerContext context)
     {
+        private int _sent;
+        private string? _refused;
+
         public IAwsConnection Aws => aws;
 
+        /// <summary>
+        /// Before a request: the first of the query goes at once (the scanner has waited for it), every other - another
+        /// page, another account or region, a for_each object, a retry - waits for the host's pace.
+        /// </summary>
+        private Task WaitAsync(bool retry, CancellationToken cancellationToken) =>
+            Interlocked.Increment(ref _sent) > 1 || retry ? context.Pace.WaitAsync(cancellationToken) : Task.CompletedTask;
+
+        /// <summary>The kind of a credential failure: the integration sets it on the exception; a busy STS passes on as Throttled.</summary>
+        private static FailureKind CredentialKind(Exception ex) =>
+            ex.Data[FailureKindData] is string name && Enum.TryParse<FailureKind>(name, out var kind) ? kind : Failures.Classify(ex);
+
         public async Task<RunnerResult> ReadAsync(AwsService service, QuerySpec query, string? account, string region, CancellationToken cancellationToken)
+        {
+            // A refused key is not presented to another account, region or object: every try counts towards a lockout.
+            if (Volatile.Read(ref _refused) is { } stop)
+                return RunnerResult.Failed($"not sent: {stop}", FailureKind.Refused);
+            var result = await ReadPlaceAsync(service, query, account, region, cancellationToken).ConfigureAwait(false);
+            if (result.State == "failed" && result.Failure == FailureKind.Refused)
+                Interlocked.CompareExchange(ref _refused, result.Reason ?? "the credential was refused", null);
+            return result;
+        }
+
+        private async Task<RunnerResult> ReadPlaceAsync(AwsService service, QuerySpec query, string? account, string region, CancellationToken cancellationToken)
         {
             AwsCredentials credentials;
             try
@@ -371,7 +449,7 @@ public sealed class AwsRunner : IRunner
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
-                return RunnerResult.Failed($"no credentials{(account is null ? "" : $" for {account}")}: {Keeper.Common.Redactor.Clean(ex.Message)}");
+                return RunnerResult.Failed($"no credentials{(account is null ? "" : $" for {account}")}: {Keeper.Common.Redactor.Clean(ex.Message)}", CredentialKind(ex));
             }
 
             var action = query.Text("action")!;
@@ -395,9 +473,9 @@ public sealed class AwsRunner : IRunner
                     // first page only. A later page that vanishes is a cut-short read.
                     return page == 1 ? new RunnerResult([], "ok", RunnerResult.NotFound) : RunnerResult.Partial(rows, $"page {page}: {ex.Message}");
                 }
-                catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException && !cancellationToken.IsCancellationRequested)
+                catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException or TimeoutException && !cancellationToken.IsCancellationRequested)
                 {
-                    return page == 1 ? RunnerResult.Failed(ex.Message) : RunnerResult.Partial(rows, $"page {page}: {ex.Message}");
+                    return page == 1 ? RunnerResult.Failed(ex.Message, ex is AwsError awsError ? awsError.Kind : Failures.Classify(ex)) : RunnerResult.Partial(rows, $"page {page}: {ex.Message}");
                 }
 
                 List<JsonObject> pageRows;
@@ -475,12 +553,27 @@ public sealed class AwsRunner : IRunner
 
             for (var attempt = 1; ; attempt++)
             {
+                await WaitAsync(retry: attempt > 1, cancellationToken).ConfigureAwait(false);
                 using var request = Build(service, query, action, host, parameters, out var body);
                 // Signed at the moment it is sent: AWS refuses a signature more than five minutes off.
                 SigV4.Sign(request, body, credentials, AwsServices.SigningRegion(service, region), service.Signing, DateTimeOffset.UtcNow,
                     hashHeader: service.Id == "s3");
-                using var response = await client.SendAsync(request, cancellationToken).ConfigureAwait(false);
-                var text = await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false);
+                // The query's timeout belongs to this request, not to the shared client. Only our own timer firing is a
+                // timeout; the caller cancelling is not.
+                using var timer = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                timer.CancelAfter(context.Timeout);
+                string text;
+                HttpResponseMessage response;
+                try
+                {
+                    response = await client.SendAsync(request, timer.Token).ConfigureAwait(false);
+                    text = await response.Content.ReadAsStringAsync(timer.Token).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+                {
+                    throw new TimeoutException($"{host} did not answer within {context.Timeout.TotalSeconds:0} s.");
+                }
+                using var disposable = response;
                 if (response.IsSuccessStatusCode)
                     return text;
                 var (code, message) = ErrorOf(text);
@@ -490,6 +583,7 @@ public sealed class AwsRunner : IRunner
                 var throttled = (int)response.StatusCode is 429 or 503 || code is "Throttling" or "ThrottlingException" or "RequestLimitExceeded" or "TooManyRequestsException";
                 if (throttled && attempt < 5)
                 {
+                    context.Pace.Signal(FailureKind.Throttled);
                     await Task.Delay(TimeSpan.FromSeconds(Math.Min(30, 2 * attempt * attempt)), cancellationToken).ConfigureAwait(false);
                     continue;
                 }
@@ -502,8 +596,26 @@ public sealed class AwsRunner : IRunner
                 // as likely a wrong path, and a wrong path must never read as "this object has none".
                 throw new AwsError($"{host} answered {(int)response.StatusCode} {code}: {Keeper.Common.Redactor.Clean(Truncate(message, 300))}",
                     code.StartsWith("NoSuch", StringComparison.Ordinal) || code.EndsWith("NotFound", StringComparison.Ordinal)
-                    || code.EndsWith("NotFoundError", StringComparison.Ordinal) || code.EndsWith("NotFoundException", StringComparison.Ordinal));
+                    || code.EndsWith("NotFoundError", StringComparison.Ordinal) || code.EndsWith("NotFoundException", StringComparison.Ordinal),
+                    throttled ? FailureKind.Throttled : KindOf(code, (int)response.StatusCode, region == aws.AwsRegions.FirstOrDefault()));
             }
+        }
+
+        /// <summary>
+        /// What an AWS error code says. A key AWS does not know or a signature that does not match is the credential
+        /// being turned away (Refused) - but only in the home region: an opt-in region that is not enabled answers the
+        /// same codes for a perfectly good key, and one such region must not stop the credential everywhere. There they
+        /// are Denied. AccessDenied and its kin mean signed in but not allowed (Denied).
+        /// </summary>
+        public static FailureKind KindOf(string code, int status, bool home)
+        {
+            if (code is "InvalidClientTokenId" or "SignatureDoesNotMatch" or "ExpiredToken" or "ExpiredTokenException"
+                or "UnrecognizedClientException" or "InvalidSignatureException" or "IncompleteSignature" or "MissingAuthenticationToken")
+                return home ? FailureKind.Refused : FailureKind.Denied;
+            if (code is "AccessDenied" or "AccessDeniedException" or "UnauthorizedOperation" or "AuthFailure" or "UnauthorizedAccess" or "Forbidden"
+                || code.StartsWith("AccessDenied", StringComparison.Ordinal))
+                return FailureKind.Denied;
+            return Failures.OfStatus(status) is var kind and not FailureKind.Refused ? kind : FailureKind.Denied;
         }
 
         private static HttpRequestMessage Build(AwsService service, QuerySpec query, string action, string host,

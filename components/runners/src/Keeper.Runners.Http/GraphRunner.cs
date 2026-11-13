@@ -9,13 +9,15 @@ namespace Keeper.Runners.Http;
 /// the rule; consistency: eventual adds the ConsistencyLevel header and $count. The bearer token comes
 /// from the integration (Entra sign-in or a certificate), never from the rule.
 /// </summary>
-public sealed class GraphRunner : IRunner
+public sealed class GraphRunner : ISessionRunner
 {
     public const string DefaultEndpoint = "https://graph.microsoft.com";
 
     public string Protocol => "graph";
 
     public bool PerTarget => false;
+
+    public string SessionFamily => "http";
 
     public IEnumerable<string> Validate(QuerySpec query)
     {
@@ -37,13 +39,22 @@ public sealed class GraphRunner : IRunner
             yield return perObject;
     }
 
+    public Task<IRunnerSession> OpenAsync(RunnerContext context, CancellationToken cancellationToken) =>
+        Task.FromResult<IRunnerSession>(new HttpSession());
+
     public async Task<RunnerResult> RunAsync(QuerySpec query, RunnerContext context, CancellationToken cancellationToken)
     {
+        await using var session = new HttpSession();
+        return await RunAsync(session, query, context, cancellationToken).ConfigureAwait(false);
+    }
+
+    public async Task<RunnerResult> RunAsync(IRunnerSession session, QuerySpec query, RunnerContext context, CancellationToken cancellationToken)
+    {
         if (query.Fields["for_each"] is JsonObject)
-            return await PerObject.RunAsync(this, query, context, cancellationToken).ConfigureAwait(false);
+            return await PerObject.RunAsync(this, query, context, cancellationToken, (q, ct) => RunAsync(session, q, context, ct)).ConfigureAwait(false);
         try
         {
-            using var engine = HttpEngine.Open(context, DefaultEndpoint);
+            var engine = HttpSession.Of(session).Engine(context, DefaultEndpoint);
             var parameters = new List<KeyValuePair<string, string>>();
             void Add(string name, string? value)
             {
@@ -82,9 +93,9 @@ public sealed class GraphRunner : IRunner
                 query.Key, query.Name);
             return await HttpRunner.Fetch(engine, versioned, context, cancellationToken, headers, parameters).ConfigureAwait(false);
         }
-        catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException or UnauthorizedAccessException or InvalidOperationException)
+        catch (Exception ex) when (HttpEngine.IsReadFailure(ex, cancellationToken))
         {
-            return RunnerResult.Failed(HttpEngine.Reason(ex));
+            return HttpEngine.Failure(ex);
         }
     }
 }

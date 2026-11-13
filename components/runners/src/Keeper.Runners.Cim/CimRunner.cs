@@ -12,7 +12,7 @@ namespace Keeper.Runners.Cim;
 /// In-process: no PowerShell, no child processes. Kerberos with the current user, or the integration's
 /// stored credential. Only SELECT is accepted; CIM methods are never invoked.
 /// </summary>
-public sealed partial class CimRunner : IRunner
+public sealed partial class CimRunner : ISessionRunner
 {
     public string Protocol => "cim";
 
@@ -38,20 +38,42 @@ public sealed partial class CimRunner : IRunner
         return null;
     }
 
+    public string SessionFamily => "cim";
+
+    public Task<IRunnerSession> OpenAsync(RunnerContext context, CancellationToken cancellationToken) =>
+        CimSessions.OpenAsync(Protocol, context, cancellationToken);
+
+    /// <summary>Outside a scan: one session for this one query.</summary>
     public Task<RunnerResult> RunAsync(QuerySpec query, RunnerContext context, CancellationToken cancellationToken)
     {
-        if (!OperatingSystem.IsWindows())
-            return Task.FromResult(RunnerResult.Failed("cim needs Windows"));
-        if (Problem(query.Text("wql")) is { } problem)
-            return Task.FromResult(RunnerResult.Failed(problem));
-        if (string.IsNullOrWhiteSpace(context.Target))
-            return Task.FromResult(RunnerResult.Failed("cim needs a target host"));
-        return Task.Run(() => OperatingSystem.IsWindows() ? Run(query, context, cancellationToken) : RunnerResult.Failed("cim needs Windows"),
+        if (Precheck(query, context) is { } failed)
+            return Task.FromResult(failed);
+        return CimSessions.OneShot(Protocol, context, cancellationToken, session => RunAsync(session, query, context, cancellationToken));
+    }
+
+    public Task<RunnerResult> RunAsync(IRunnerSession session, QuerySpec query, RunnerContext context, CancellationToken cancellationToken)
+    {
+        if (Precheck(query, context) is { } failed)
+            return Task.FromResult(failed);
+        if (session is not CimRunnerSession cim)
+            return Task.FromResult(RunnerResult.Failed("cim was given a session of another family"));
+        return Task.Run(() => OperatingSystem.IsWindows() ? Run(cim, query, context, cancellationToken) : RunnerResult.Failed("cim needs Windows"),
             cancellationToken);
     }
 
+    private static RunnerResult? Precheck(QuerySpec query, RunnerContext context)
+    {
+        if (!OperatingSystem.IsWindows())
+            return RunnerResult.Failed("cim needs Windows");
+        if (Problem(query.Text("wql")) is { } problem)
+            return RunnerResult.Failed(problem);
+        if (string.IsNullOrWhiteSpace(context.Target))
+            return RunnerResult.Failed("cim needs a target host");
+        return null;
+    }
+
     [System.Runtime.Versioning.SupportedOSPlatform("windows")]
-    private static RunnerResult Run(QuerySpec query, RunnerContext context, CancellationToken cancellationToken)
+    private static RunnerResult Run(CimRunnerSession shared, QuerySpec query, RunnerContext context, CancellationToken cancellationToken)
     {
         var host = context.Target!;
         try
@@ -59,9 +81,11 @@ public sealed partial class CimRunner : IRunner
             if (Expand(query.Text("wql")!, host) is not { } wql)
                 return RunnerResult.Failed($"{host}: not a host name {{HOST}} can stand for");
 
-            using var session = CimSessions.Open(host, context, query.List("fallback_chain"));
+            using var lease = CimSessions.Lease(shared, host, context, query.List("fallback_chain"));
+            // The session's timeout is fixed when it is created; this query's own limit goes on the operation.
+            using var options = new CimOperationOptions { Timeout = context.Timeout };
             var rows = new List<JsonObject>();
-            foreach (var instance in session.QueryInstances(query.Text("namespace") ?? "root/cimv2", "WQL", wql))
+            foreach (var instance in lease.Session.QueryInstances(query.Text("namespace") ?? "root/cimv2", "WQL", wql, options))
             {
                 cancellationToken.ThrowIfCancellationRequested();
                 using (instance)
@@ -76,7 +100,12 @@ public sealed partial class CimRunner : IRunner
         }
         catch (CimException ex)
         {
-            return RunnerResult.Failed($"{host}: {ex.Message}");
+            return RunnerResult.Failed($"{host}: {ex.Message}", CimErrors.Of(ex));
+        }
+        catch (RunnerFailureException ex)
+        {
+            // The rule's own fallback_chain needed a session of its own and that sign-in failed.
+            return RunnerResult.Failed(ex.Message, ex.Kind);
         }
     }
 
