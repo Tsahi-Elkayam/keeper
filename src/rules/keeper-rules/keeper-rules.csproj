@@ -1,0 +1,10 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <AssemblyName>Keeper.Cli.Rules</AssemblyName>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\..\scan\Keeper.Scan\Keeper.Scan.csproj" />
+    <ProjectReference Include="..\..\engine\Keeper.Home\Keeper.Home.csproj" />
+    <ProjectReference Include="..\..\engine\Keeper.Review\Keeper.Review.csproj" />
+  </ItemGroup>
+</Project>

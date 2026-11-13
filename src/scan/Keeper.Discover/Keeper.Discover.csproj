@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <ItemGroup>
+    <PackageReference Include="YamlDotNet" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\..\engine\Keeper.Common\Keeper.Common.csproj" />
+    <ProjectReference Include="..\..\engine\Keeper.Contracts\Keeper.Contracts.csproj" />
+    <ProjectReference Include="..\..\rules\Keeper.Rules\Keeper.Rules.csproj" />
+    <ProjectReference Include="..\Keeper.Runners\Keeper.Runners.csproj" />
+    <ProjectReference Include="..\Keeper.Runners.Tls\Keeper.Runners.Tls.csproj" />
+    <ProjectReference Include="..\Keeper.Scan\Keeper.Scan.csproj" />
+    <ProjectReference Include="..\..\engine\Keeper.Store\Keeper.Store.csproj" />
+    <ProjectReference Include="..\..\sign-in\Keeper.Integrations\Keeper.Integrations.csproj" />
+  </ItemGroup>
+</Project>

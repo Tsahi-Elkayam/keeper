@@ -1,0 +1,9 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <AssemblyName>Keeper.Cli.Rank</AssemblyName>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\Keeper.Rank\Keeper.Rank.csproj" />
+    <ProjectReference Include="..\Keeper.Home\Keeper.Home.csproj" />
+  </ItemGroup>
+</Project>

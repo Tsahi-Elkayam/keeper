@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <ItemGroup>
+    <!-- The engine's YAML library (used by Keeper.Rules too); config files are parsed with it, no new dependency. -->
+    <PackageReference Include="YamlDotNet" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\Keeper.Common\Keeper.Common.csproj" />
+    <ProjectReference Include="..\Keeper.Contracts\Keeper.Contracts.csproj" />
+    <ProjectReference Include="..\Keeper.Store\Keeper.Store.csproj" />
+    <ProjectReference Include="..\Keeper.Queue\Keeper.Queue.csproj" />
+    <ProjectReference Include="..\Keeper.Query\Keeper.Query.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <EmbeddedResource Include="Migrations\*.sql" LogicalName="review/%(Filename)%(Extension)" />
+    <EmbeddedResource Include="Questions\*.sql" LogicalName="review-questions/%(Filename)%(Extension)" />
+  </ItemGroup>
+</Project>

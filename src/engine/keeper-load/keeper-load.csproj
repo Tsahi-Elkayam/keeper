@@ -1,0 +1,9 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <AssemblyName>Keeper.Cli.Load</AssemblyName>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\Keeper.Review\Keeper.Review.csproj" />
+    <ProjectReference Include="..\Keeper.Home\Keeper.Home.csproj" />
+  </ItemGroup>
+</Project>

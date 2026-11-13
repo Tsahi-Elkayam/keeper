@@ -1,0 +1,9 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <ItemGroup>
+    <PackageReference Include="YamlDotNet" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\..\engine\Keeper.Common\Keeper.Common.csproj" />
+    <ProjectReference Include="..\..\engine\Keeper.Contracts\Keeper.Contracts.csproj" />
+  </ItemGroup>
+</Project>

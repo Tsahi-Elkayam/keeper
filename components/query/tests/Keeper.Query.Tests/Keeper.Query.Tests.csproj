@@ -1,9 +1,0 @@
-<Project Sdk="Microsoft.NET.Sdk">
-  <ItemGroup>
-    <ProjectReference Include="..\..\src\Keeper.Query\Keeper.Query.csproj" />
-  </ItemGroup>
-  <ItemGroup>
-    <EmbeddedResource Include="TestPack\*.sql" LogicalName="questions/%(Filename)%(Extension)" />
-    <EmbeddedResource Include="TestSchema\*.sql" LogicalName="items/%(Filename)%(Extension)" />
-  </ItemGroup>
-</Project>

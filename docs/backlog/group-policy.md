@@ -1,7 +1,7 @@
 # Backlog - Group Policy (SYSVOL content)
 
 Checks `rules/group-policy.yaml` cannot express with the `gpo` runner as coded
-(`components/runners/src/Keeper.Runners.Gpo`), one line each with what it needs. The pack judges what
+(`src/scan/Keeper.Runners.Gpo`), one line each with what it needs. The pack judges what
 a GPO *sets*; the directory side (flags, links, ACLs, extension lists) is in `rules/active-directory.yaml`.
 
 ## Runner notes (what the rules rely on)

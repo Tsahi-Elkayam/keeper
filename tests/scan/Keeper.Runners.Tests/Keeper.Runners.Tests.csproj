@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <ItemGroup>
+    <ProjectReference Include="..\..\..\src\scan\Keeper.Runners.Files\Keeper.Runners.Files.csproj" />
+    <ProjectReference Include="..\..\..\src\scan\Keeper.Runners.Http\Keeper.Runners.Http.csproj" />
+    <ProjectReference Include="..\..\..\src\scan\Keeper.Runners.Ldap\Keeper.Runners.Ldap.csproj" />
+    <ProjectReference Include="..\..\..\src\scan\Keeper.Runners.Sql\Keeper.Runners.Sql.csproj" />
+    <ProjectReference Include="..\..\..\src\scan\Keeper.Runners.Tls\Keeper.Runners.Tls.csproj" />
+    <ProjectReference Include="..\..\..\src\scan\Keeper.Runners.Cim\Keeper.Runners.Cim.csproj" />
+    <ProjectReference Include="..\..\..\src\scan\Keeper.Runners.Aws\Keeper.Runners.Aws.csproj" />
+    <ProjectReference Include="..\..\..\src\scan\Keeper.Runners.Gpo\Keeper.Runners.Gpo.csproj" />
+    <ProjectReference Include="..\..\..\src\scan\Keeper.Runners.Host\Keeper.Runners.Host.csproj" />
+    <ProjectReference Include="..\..\..\src\scan\Keeper.Runners.Printer\Keeper.Runners.Printer.csproj" />
+    <ProjectReference Include="..\..\..\src\scan\Keeper.Runners.Smb\Keeper.Runners.Smb.csproj" />
+    <ProjectReference Include="..\..\testkit\Keeper.TestKit\Keeper.TestKit.csproj" />
+  </ItemGroup>
+</Project>

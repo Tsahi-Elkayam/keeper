@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Identity.Client" />
+    <PackageReference Include="Microsoft.Identity.Client.Broker" />
+    <PackageReference Include="YamlDotNet" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\..\scan\Keeper.Runners\Keeper.Runners.csproj" />
+    <ProjectReference Include="..\Keeper.Vault\Keeper.Vault.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <EmbeddedResource Include="Migrations\*.sql" LogicalName="integrations/%(Filename)%(Extension)" />
+    <EmbeddedResource Include="integration-types.yaml" LogicalName="integrations/integration-types.yaml" />
+    <EmbeddedResource Include="graph-permissions.yaml" LogicalName="integrations/graph-permissions.yaml" />
+  </ItemGroup>
+</Project>

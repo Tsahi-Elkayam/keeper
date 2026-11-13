@@ -1488,8 +1488,8 @@ SELECT host, sources, source_list FROM per_host
     compensates; a second computer query without `{ENABLED}` (or `userAccountControl` kept on a
     disabled-computers query) would be exact.
 11. **Verification.** None of the SQL above has been run; it is written against the schema in
-    `components\review\src\Keeper.Review\Migrations\*.sql` and
-    `components\integrations\src\Keeper.Integrations\Migrations\001-integrations.sql`, and the
+    `src\engine\Keeper.Review\Migrations\*.sql` and
+    `src\sign-in\Keeper.Integrations\Migrations\001-integrations.sql`, and the
     `ShippedRulesTests` empty-store test will catch syntax errors but not wrong attribute paths.
 
 ## Attributes other packs must add

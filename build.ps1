@@ -21,7 +21,7 @@
        expression after 're:' (e.g. re:\b10\.\d+\.\d+\.\d+\b).
     3. Validates every rule file in rules\.
     4. With -Test, runs the unit tests.
-    5. Publishes keeper (components\keeper\src\keeper; every verb is a library it runs in-process)
+    5. Publishes keeper (src\engine\keeper; every verb is a library it runs in-process)
        into .\build\<runtime> as one self-contained file (the machine that runs it needs no .NET; with
        -FrameworkDependent it needs the .NET 10 runtime instead), removes the keeper-* binaries an older
        build left there, and replaces .\build\<runtime>\rules with the repo's rules\. On macOS the
@@ -135,7 +135,7 @@ else {
 }
 
 # 3. Every rule file loads, and ids are unique across them
-$keeperProject = [IO.Path]::Combine($repo, 'components', 'keeper', 'src', 'keeper', 'keeper.csproj')
+$keeperProject = [IO.Path]::Combine($repo, 'src', 'engine', 'keeper', 'keeper.csproj')
 # No --nologo here: dotnet run hands options it does not know to the program, which would read it as its own.
 & dotnet run --project $keeperProject -c $Configuration -- rules validate (Join-Path $repo 'rules')
 if ($LASTEXITCODE -ne 0) { throw "Rule validation failed (exit $LASTEXITCODE): fix the file:line:col above." }
@@ -146,7 +146,7 @@ if ($Test) {
     if ($LASTEXITCODE -ne 0) { throw "Tests failed (exit $LASTEXITCODE)." }
 }
 
-# 5. Publish - one binary; the verbs (components\<c>\src\keeper-<verb>) are libraries inside it
+# 5. Publish - one binary; the verbs (src\<part>\keeper-<verb>) are libraries inside it
 # An older build published every verb as its own keeper-<verb> binary: gone now, so they go from here too.
 if (Test-Path $out) {
     Get-ChildItem $out -File -Filter 'keeper-*' | Remove-Item

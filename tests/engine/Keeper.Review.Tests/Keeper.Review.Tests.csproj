@@ -1,0 +1,10 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <ItemGroup>
+    <ProjectReference Include="..\..\..\src\engine\Keeper.Review\Keeper.Review.csproj" />
+    <!-- The integrations config family's secret-safety proof seeds a real integration store + vault and drives
+         the real integration handlers, so the test references them and the demo-value vault (DLP-safe secrets). -->
+    <ProjectReference Include="..\..\..\src\sign-in\Keeper.Integrations\Keeper.Integrations.csproj" />
+    <ProjectReference Include="..\..\..\src\sign-in\Keeper.Vault\Keeper.Vault.csproj" />
+    <ProjectReference Include="..\..\testkit\Keeper.TestKit\Keeper.TestKit.csproj" />
+  </ItemGroup>
+</Project>

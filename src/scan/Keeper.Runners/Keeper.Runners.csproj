@@ -1,0 +1,6 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <ItemGroup>
+    <ProjectReference Include="..\..\engine\Keeper.Common\Keeper.Common.csproj" />
+    <ProjectReference Include="..\..\rules\Keeper.Rules\Keeper.Rules.csproj" />
+  </ItemGroup>
+</Project>

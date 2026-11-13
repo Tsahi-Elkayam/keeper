@@ -1,0 +1,10 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <AssemblyName>Keeper.Cli.Connect</AssemblyName>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\Keeper.Integrations\Keeper.Integrations.csproj" />
+    <ProjectReference Include="..\..\engine\Keeper.Home\Keeper.Home.csproj" />
+    <ProjectReference Include="..\..\scan\Keeper.Scan\Keeper.Scan.csproj" />
+  </ItemGroup>
+</Project>

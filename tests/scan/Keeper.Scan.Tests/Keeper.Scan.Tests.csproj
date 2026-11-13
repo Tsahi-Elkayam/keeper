@@ -1,0 +1,8 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <ItemGroup>
+    <ProjectReference Include="..\..\..\src\scan\Keeper.Scan\Keeper.Scan.csproj" />
+    <!-- The shipped store rules read every component's tables, so their tests build the whole store. -->
+    <ProjectReference Include="..\..\..\src\engine\Keeper.Composition\Keeper.Composition.csproj" />
+    <ProjectReference Include="..\..\..\src\sign-in\keeper-connect\keeper-connect.csproj" />
+  </ItemGroup>
+</Project>

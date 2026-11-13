@@ -25,7 +25,7 @@ New component `components/discover`:
 - `src/Keeper.Discover` library: addresses, targets file, inventory, lifecycle, probe gate, probes,
   sources, classifier, orchestrator (`Discoverer`).
 - `src/keeper-discover` verb `DiscoverVerb.Run(args)`, registered in
-  `components/keeper/src/keeper/Program.cs` and referenced by `keeper.csproj` [verified: that is
+  `src/engine/keeper/Program.cs` and referenced by `keeper.csproj` [verified: that is
   how `certs` is wired].
 - `tests/Keeper.Discover.Tests`.
 
@@ -268,7 +268,7 @@ stash`, no `docker prune`. Adding a NuGet package needs the owner's yes (task 8)
 `[SupportedOSPlatform("windows")]` or Windows-only API in `Keeper.Discover`; nothing written to the
 store; no tenant data; refusals throw `ArgumentException` with a clear message, as other verbs do.
 
-**T1. Component and addresses.** Create `components/discover/src/Keeper.Discover/Keeper.Discover.csproj`,
+**T1. Component and addresses.** Create `src/scan/Keeper.Discover/Keeper.Discover.csproj`,
 `tests/Keeper.Discover.Tests/`; add both to `Keeper.slnx`. `Addresses.cs`: parse IPv4/IPv6 addresses
 and CIDRs, contains, expand with a cap, the always-excluded classes.
 *Accept:* `/24` expands to 254 hosts; `/31` and `/32` keep every address; `2001:db8::/64` refuses to
@@ -344,7 +344,7 @@ for 3 scans over 14 days becomes likely-gone with `everAnswered: false`; an outa
 and changes nothing; excluded hosts get no dial; cancellation writes a partial inventory.
 *Review:* no state change on degraded or cut-short scans; notes explain every refusal.
 
-**T12. Verb.** `components/discover/src/keeper-discover/DiscoverVerb.cs` + csproj; register in
+**T12. Verb.** `src/scan/keeper-discover/DiscoverVerb.cs` + csproj; register in
 `Program.cs` and `keeper.csproj`. Flags: `--targets`, `--fresh`, `--dry-run` (sources, address count,
 time estimate at the configured rate, sends nothing), `--ignore-window`, `--help`.
 *Accept:* `--dry-run` dials nothing; a temp-home manual run against loopback writes the inventory;

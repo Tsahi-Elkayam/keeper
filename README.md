@@ -130,12 +130,12 @@ dry run unless `--apply`). `keeper run` calls them; `keeper help --all` lists th
 
 | Path | What |
 |---|---|
-| `components\<component>\src` | One folder per library; `keeper-<verb>\` holds that verb; `tests\` beside it |
-| `components\common`, `contracts`, `store`, `queue`, `query`, `home` | The shared base: arguments, records, SQLite, the queue, questions, the Keeper home |
-| `components\rules`, `runners`, `scan`, `discover` | The rule language, the read-only runners (ldap, graph, http, graphql, sql, cim, tls, file, store, host), the scanner, and the network discovery engine |
-| `components\review`, `rank`, `report`, `push` | Findings and registers, today's ranking, reports, tickets |
-| `components\vault`, `integrations` | Encrypted secrets; how Keeper reaches each system |
-| `components\keeper` | The `keeper` binary (dispatch, setup) and the verbs composed over every component: `run`, `db`, `qm`, `query` |
+| `src\engine\` | The engine: the `keeper` binary and its daily run, the store, the queue (the only writer), questions, findings and registers, today's ranking, the Keeper home |
+| `src\scan\` | Scanning: the scanner, the read-only runners (ldap, graph, http, graphql, sql, cim, tls, file, store, host, printer) and network discovery |
+| `src\sign-in\` | Sign-in: integrations, `keeper connect`, the encrypted vault, configuration as files |
+| `src\rules\` | The rule language: model, loader, validation, `keeper rules` |
+| `src\reports\` | Reports and trends: today's list, every report, the one-page view, tickets |
+| `tests\<part>\` | Each project's tests, by the same parts; `tests\testkit\` holds what they share |
 | `rules\` | The generic rule packs, one file per system type |
 | `docs\` | `ARCHITECTURE.md`, `RULES.md` (the rule format), `DISCOVERY.md`, `KUBERNETES.md`, `NETWORK.md`, `PRINTERS.md`, `SECURITY.md`, `backlog\` (checks not yet rules, and why) |
 | `build\<runtime>\` | The binaries and the rules (`build.ps1` output; git ignores it) |

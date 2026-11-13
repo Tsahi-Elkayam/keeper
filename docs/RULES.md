@@ -329,7 +329,7 @@ Secrets in URLs are masked like secret fields: a signed URL's `sig=`, `X-Amz-Sig
 | `keeper` | store | Keeper's own registers |
 | `http` | http | Any other JSON API |
 
-The types are data: `components/integrations/src/Keeper.Integrations/integration-types.yaml`, built into keeper
+The types are data: `src/sign-in/Keeper.Integrations/integration-types.yaml`, built into keeper
 (an embedded resource, so its guards cannot be changed on disk). A tenant adds its own in
 `settings/integration-types/*.yaml`, in the same form, so a product with a REST or GraphQL API needs a type file and
 a rule file, no code:

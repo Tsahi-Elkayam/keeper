@@ -1,7 +1,8 @@
 # Architecture
 
-Keeper tells you what to do today. It is a wrapper around components that each stand on their own:
-own folder, project, tests and tables; no component reaches into another's internals.
+Keeper tells you what to do today. It is one binary over an engine and four parts - scan, sign-in, rules and
+reports - each in its own folder under `src\`. A project stands on its own: its own folder, tests and tables;
+none reaches into another's internals.
 
 ## Pipeline
 
@@ -23,7 +24,7 @@ integrations ─┘                              │
                                     keeper push ──> trackers (plan is a dry run; apply asks)
 ```
 
-There is one binary, `keeper`. Each verb is a library in its component's `keeper-<verb>\` folder
+There is one binary, `keeper`. Each verb is a library in its part's `keeper-<verb>\` folder
 (`<Verb>Verb.Run(args)`); `keeper` registers them in `Commands` and runs them in its own process -
 nothing is started as a child process. `keeper run` calls the stages in order. A verb that throws
 past its own handlers fails alone with an exit code, as a separate process did. People change the
@@ -36,27 +37,25 @@ the account's SID through `row_seen`.
 The ranker treats the findings of one check as one task: ranked by its worst instance plus its reach,
 its time counted once, shown as one line with its number of targets.
 
-## Components
+## Parts
 
-| Folder | Project(s) | Job |
-|---|---|---|
-| `components/common` | Keeper.Common | Arguments, exit codes, time format, redaction, JSON Lines |
-| `components/contracts` | Keeper.Contracts | Records that cross a process boundary: fact, coverage, finding, result, run |
-| `components/store` | Keeper.Store | SQLite: read-only and read-write connections, per-component migrations, backup |
-| `components/queue` | Keeper.Queue | The single writer: spool, lock, a transaction and an audit row per request |
-| `components/query` | Keeper.Query | Named read-only questions in `.sql` files, bound parameters |
-| `components/vault` | Keeper.Vault | AES-256-GCM, data key protected by the OS: DPAPI on Windows, an owner-only `vault.key` file elsewhere |
-| `components/integrations` | Keeper.Integrations | Endpoints, identities, encrypted secrets, allowed hosts |
-| `components/rules` | Keeper.Rules | Rule files: model, loader, validation, condition evaluator |
-| `components/runners` | Keeper.Runners + one project per protocol | Read-only runners: ldap, graph, http, graphql, sql, cim, tls, file, store, host (files, device configuration folders, Docker, CUPS printers and allowlisted commands of this machine, or of each host of an ssh integration), printer (network printers: ports, IPP, Printer-MIB) |
-| `components/scan` | Keeper.Scan + verbs scan, rules, certs | Runs a system's rules through its runner; writes a run folder; validates rule files |
-| `components/discover` | Keeper.Discover + verb discover | Network discovery (`free` and `manual` modes): probes allowed networks via `ProbeGate` and writes `data/imports/discovery/inventory.json` |
-| `components/review` | Keeper.Review + verbs | The domain: schema, handlers, questions, load, track; decide, system, register, config |
-| `components/rank` | Keeper.Rank + verb | What to do today |
-| `components/report` | Keeper.Report + verbs | The daily list and audience reports |
-| `components/push` | Keeper.Push + verb | Tickets in ServiceNow / monday |
-| `components/home` | Keeper.Home | The Keeper home: where a tenant's settings and data live |
-| `components/keeper` | Keeper.Composition, keeper + verbs run, db, qm, query | The one binary: dispatch, setup, the daily run, and the verbs composed over every component |
+| Part | Folder | Projects | Job |
+|---|---|---|---|
+| Engine | `src/engine` | Keeper.Common, Keeper.Contracts, Keeper.Store, Keeper.Queue, Keeper.Query, Keeper.Home | Arguments and exit codes; records that cross a stage (fact, coverage, finding, result, run); SQLite with per-component migrations; the single writer (spool, lock, one transaction and one audit row per request); named read-only questions; the Keeper home |
+| | | Keeper.Review + verbs load, track, decide, system, register | The domain: schema, handlers, questions (trends among them), findings lifecycle, decisions, registers |
+| | | Keeper.Rank + verb rank | What to do today |
+| | | Keeper.Composition, keeper + verbs run, db, qm, query | The one binary: dispatch, setup, help, the daily run |
+| Scan | `src/scan` | Keeper.Scan + verbs scan, certs | Runs a system's rules through its runner and writes a run folder |
+| | | Keeper.Runners + one project per protocol | Read-only runners: ldap, graph, http, graphql, sql, cim, tls, file, store, host (files, device configuration folders, Docker, CUPS printers and allowlisted commands of this machine, or of each host of an ssh integration), printer (network printers: ports, IPP, Printer-MIB) |
+| | | Keeper.Discover + verb discover | Network discovery (`free` and `manual` modes): probes allowed networks via `ProbeGate` and writes `data/imports/discovery/inventory.json` |
+| Sign-in | `src/sign-in` | Keeper.Integrations + verbs integration, connect | Endpoints, identities, allowed hosts, Entra and AWS sign-in; the Graph permission map |
+| | | Keeper.Vault | AES-256-GCM, data key protected by the OS: DPAPI on Windows, an owner-only `vault.key` file elsewhere |
+| | | verb config | The configuration as files, both ways |
+| Rules | `src/rules` | Keeper.Rules + verb rules | Rule files: model, loader, validation, condition evaluator |
+| Reports | `src/reports` | Keeper.Report + verbs report, today | The daily list, audience reports, trends, the one-page view |
+| | | Keeper.Push + verb push | Tickets in ServiceNow / monday |
+
+Tests sit under `tests/<part>/`, one project per library; `tests/testkit` holds the shared fakes and the demo vault.
 
 Each component owns its tables and ships its own migrations (`schema_version` keeps one version per
 component). Request kinds are namespaced: `review.override`, `integrations.set-secret`.

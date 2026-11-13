@@ -35,7 +35,7 @@ if (-not $SkipTests) {
 
 Step 'build the keeper binary'
 $bin = Join-Path $Repo 'build\win-smoke'
-dotnet build (Join-Path $Repo 'components\keeper\src\keeper') -o $bin --nologo -v q
+dotnet build (Join-Path $Repo 'src\engine\keeper') -o $bin --nologo -v q
 Copy-Item (Join-Path $Repo 'rules') (Join-Path $bin 'rules') -Recurse -Force
 
 $env:KEEPER_HOME = Join-Path $env:TEMP 'keeper-smoke-home'

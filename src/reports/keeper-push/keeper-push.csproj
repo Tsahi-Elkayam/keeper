@@ -1,0 +1,10 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <AssemblyName>Keeper.Cli.Push</AssemblyName>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\Keeper.Push\Keeper.Push.csproj" />
+    <ProjectReference Include="..\..\sign-in\Keeper.Integrations\Keeper.Integrations.csproj" />
+    <ProjectReference Include="..\..\engine\Keeper.Home\Keeper.Home.csproj" />
+  </ItemGroup>
+</Project>

@@ -1,8 +1,0 @@
-<Project Sdk="Microsoft.NET.Sdk">
-  <ItemGroup>
-    <ProjectReference Include="..\..\src\Keeper.Queue\Keeper.Queue.csproj" />
-  </ItemGroup>
-  <ItemGroup>
-    <EmbeddedResource Include="TestSchema\*.sql" LogicalName="notes/%(Filename)%(Extension)" />
-  </ItemGroup>
-</Project>

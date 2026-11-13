@@ -13,7 +13,7 @@ Graph; every other data plane needs a different token or a different integration
 
 ## How the 22.10 extension reads what used to be parked
 
-Two runner behaviours, both in `components/runners/src/Keeper.Runners/PerObject.cs` and
+Two runner behaviours, both in `src/scan/Keeper.Runners/PerObject.cs` and
 `Keeper.Runners/Rows.cs`, unlocked most of the old "engine gap" items:
 
 - **Several placeholders per path.** `for_each` fills every `{field}` of the path from the parent row,

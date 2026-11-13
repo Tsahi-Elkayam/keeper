@@ -1,0 +1,44 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <AssemblyName>keeper</AssemblyName>
+    <RootNamespace>Keeper.Cli</RootNamespace>
+  </PropertyGroup>
+  <!-- The one binary: every verb is a library beside its component, run in this process. -->
+  <ItemGroup>
+    <ProjectReference Include="..\Keeper.Common\Keeper.Common.csproj" />
+    <ProjectReference Include="..\Keeper.Home\Keeper.Home.csproj" />
+    <ProjectReference Include="..\keeper-run\keeper-run.csproj" />
+    <ProjectReference Include="..\keeper-qm\keeper-qm.csproj" />
+    <ProjectReference Include="..\keeper-query\keeper-query.csproj" />
+    <ProjectReference Include="..\keeper-db\keeper-db.csproj" />
+    <ProjectReference Include="..\..\scan\keeper-scan\keeper-scan.csproj" />
+    <ProjectReference Include="..\..\scan\keeper-certs\keeper-certs.csproj" />
+    <ProjectReference Include="..\..\rules\keeper-rules\keeper-rules.csproj" />
+    <ProjectReference Include="..\..\scan\keeper-discover\keeper-discover.csproj" />
+    <ProjectReference Include="..\keeper-load\keeper-load.csproj" />
+    <ProjectReference Include="..\keeper-track\keeper-track.csproj" />
+    <ProjectReference Include="..\keeper-decide\keeper-decide.csproj" />
+    <ProjectReference Include="..\keeper-system\keeper-system.csproj" />
+    <ProjectReference Include="..\keeper-register\keeper-register.csproj" />
+    <ProjectReference Include="..\..\sign-in\keeper-config\keeper-config.csproj" />
+    <ProjectReference Include="..\keeper-rank\keeper-rank.csproj" />
+    <ProjectReference Include="..\..\reports\keeper-today\keeper-today.csproj" />
+    <ProjectReference Include="..\..\reports\keeper-report\keeper-report.csproj" />
+    <ProjectReference Include="..\..\reports\keeper-push\keeper-push.csproj" />
+    <ProjectReference Include="..\..\sign-in\keeper-integration\keeper-integration.csproj" />
+    <ProjectReference Include="..\..\sign-in\keeper-connect\keeper-connect.csproj" />
+  </ItemGroup>
+  <!-- The repo's rules beside every build (dotnet build / dotnet run), replaced each time so a removed or renamed
+       rule file does not linger; build.ps1 does the same for what it publishes. -->
+  <Target Name="CopyRepoRules" AfterTargets="Build">
+    <PropertyGroup>
+      <KeeperRulesSource>$(MSBuildThisFileDirectory)..\..\..\rules</KeeperRulesSource>
+    </PropertyGroup>
+    <ItemGroup>
+      <KeeperRuleFile Include="$(KeeperRulesSource)\*.yaml" />
+    </ItemGroup>
+    <RemoveDir Directories="$(OutDir)rules" />
+    <Copy SourceFiles="@(KeeperRuleFile)" DestinationFolder="$(OutDir)rules" />
+  </Target>
+</Project>
