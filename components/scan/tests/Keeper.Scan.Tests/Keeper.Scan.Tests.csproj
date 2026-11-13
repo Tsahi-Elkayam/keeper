@@ -3,5 +3,6 @@
     <ProjectReference Include="..\..\src\Keeper.Scan\Keeper.Scan.csproj" />
     <!-- The shipped store rules read every component's tables, so their tests build the whole store. -->
     <ProjectReference Include="..\..\..\keeper\src\Keeper.Composition\Keeper.Composition.csproj" />
+    <ProjectReference Include="..\..\..\integrations\src\keeper-connect\keeper-connect.csproj" />
   </ItemGroup>
 </Project>

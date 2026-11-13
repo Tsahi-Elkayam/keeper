@@ -252,3 +252,48 @@ public sealed class ShippedRulesTests : IDisposable
         Assert.Matches(@"13 stale: last sign-in in the window to a year ago\s+1", text);
     }
 }
+
+public sealed class ShippedGraphPermissionTests
+{
+    private static RuleSet Shipped()
+    {
+        for (var dir = new DirectoryInfo(AppContext.BaseDirectory); dir is not null; dir = dir.Parent)
+        {
+            if (File.Exists(Path.Combine(dir.FullName, "Keeper.slnx")))
+                return RuleLoader.LoadAll([(Path.Combine(dir.FullName, "rules"), "builtin")], Runners.Registry().Validators);
+        }
+        throw new DirectoryNotFoundException("The repo's rules folder was not found above the test binaries.");
+    }
+
+    [Fact]
+    public void Every_graph_path_a_shipped_rule_reads_is_in_the_permission_map()
+    {
+        var report = ConnectVerb.Assess(Shipped(), new HashSet<string>(StringComparer.OrdinalIgnoreCase));
+
+        Assert.Equal(0, report.Unmapped);
+        Assert.Contains(report.Systems, s => s.System == "entra" && s.Rules > 200);
+    }
+
+    [Fact]
+    public void Granting_the_recommended_permissions_lets_every_shipped_graph_rule_run()
+    {
+        var granted = new HashSet<string>(Keeper.Integrations.GraphPermissions.Recommended(), StringComparer.OrdinalIgnoreCase);
+
+        var report = ConnectVerb.Assess(Shipped(), granted);
+
+        Assert.Empty(report.Missing);
+        Assert.All(report.Systems, s => Assert.Equal(s.Rules, s.Ready));
+    }
+
+    [Fact]
+    public void A_missing_permission_is_named_with_the_rules_it_holds_back()
+    {
+        var granted = new HashSet<string>(Keeper.Integrations.GraphPermissions.Recommended().Where(p => p != "AuditLog.Read.All"), StringComparer.OrdinalIgnoreCase);
+
+        var report = ConnectVerb.Assess(Shipped(), granted);
+
+        var audit = Assert.Single(report.Missing);
+        Assert.Equal("AuditLog.Read.All", audit.Need);
+        Assert.Contains(audit.Blocked, b => b.System == "entra");
+    }
+}

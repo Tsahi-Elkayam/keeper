@@ -72,6 +72,7 @@
   <Folder Name="/integrations/">
     <Project Path="components/integrations/src/Keeper.Integrations/Keeper.Integrations.csproj" />
     <Project Path="components/integrations/src/keeper-integration/keeper-integration.csproj" />
+    <Project Path="components/integrations/src/keeper-connect/keeper-connect.csproj" />
     <Project Path="components/integrations/tests/Keeper.Integrations.Tests/Keeper.Integrations.Tests.csproj" />
   </Folder>
   <Folder Name="/home/">

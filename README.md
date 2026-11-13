@@ -54,6 +54,8 @@ $k = '.\build\win-x64\keeper.exe'                    # build/osx-arm64/keeper on
 & $k integration add ad --type ldap --auth negotiate --endpoint <your domain> --reason "AD review"
 & $k qm run
 & $k scan active-directory --test                   # one rule, connection test only
+& $k connect microsoft --tenant <id> --client-id <app id> --certificate <thumbprint>
+                                                    # Entra, Intune, Microsoft 365, Defender: docs/CONNECT-MICROSOFT.md
 & $k run                                            # the whole loop
 & $k today
 ```

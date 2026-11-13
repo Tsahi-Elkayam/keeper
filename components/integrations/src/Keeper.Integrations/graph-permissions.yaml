@@ -1,0 +1,128 @@
+# Microsoft Graph application permissions the shipped rules need, by request path. All are read permissions.
+# A rule's path takes the entries of the longest matching path (the whole path, or the path followed by '/' or '(').
+# 'any' lists permissions of which one is enough; an entry with 'select' applies only when the rule selects that
+# field. Sources: docs/backlog/microsoft-cloud.md ("Graph permissions") and the Graph API reference for each call.
+# Entries marked 'confirm' are documented loosely by Microsoft; the first run on a tenant settles them.
+#
+# Never listed here, on purpose: permissions that read secrets or content (BitlockerKey.Read.All,
+# DeviceLocalCredential.Read.All, Mail.Read, Files.Read.All, Sites.Read.All). The rules read metadata only.
+
+# ---- Directory: users, groups, devices, organisation
+- { path: /users, any: [User.Read.All, Directory.Read.All] }
+- { path: /users, select: signInActivity, any: [AuditLog.Read.All] }
+- { path: /users/*/authentication/requirements, any: [Policy.Read.All, UserAuthenticationMethod.Read.All], confirm: true }
+- { path: /users/*/mailFolders/inbox/messageRules, any: [MailboxSettings.Read] }
+- { path: /groups, any: [GroupMember.Read.All, Group.Read.All, Directory.Read.All] }
+- { path: /groupSettings, any: [Directory.Read.All] }
+- { path: /groupLifecyclePolicies, any: [Directory.Read.All, Group.Read.All] }
+- { path: /devices, any: [Device.Read.All, Directory.Read.All] }
+- { path: /organization, any: [Organization.Read.All, Directory.Read.All] }
+- { path: /domains, any: [Domain.Read.All, Directory.Read.All] }
+- { path: /subscribedSkus, any: [Organization.Read.All, LicenseAssignment.Read.All, Directory.Read.All] }
+- { path: /directory/subscriptions, any: [Organization.Read.All, Directory.Read.All] }
+- { path: /directory/administrativeUnits, any: [AdministrativeUnit.Read.All, Directory.Read.All] }
+- { path: /directory/deletedItems, any: [Directory.Read.All] }
+- { path: /directory/onPremisesSynchronization, any: [OnPremDirectorySynchronization.Read.All] }
+- { path: /directory/recommendations, any: [DirectoryRecommendations.Read.All] }
+- { path: /directory/deviceLocalCredentials, any: [DeviceLocalCredential.ReadBasic.All] }
+- { path: /informationProtection/bitlocker/recoveryKeys, any: [BitlockerKey.ReadBasic.All] }
+
+# ---- Applications and consent
+- { path: /applications, any: [Application.Read.All, Directory.Read.All] }
+- { path: /servicePrincipals, any: [Application.Read.All, Directory.Read.All] }
+- { path: /servicePrincipals/*/synchronization/jobs, any: [Synchronization.Read.All] }
+- { path: /oauth2PermissionGrants, any: [DelegatedPermissionGrant.Read.All, Directory.Read.All] }
+
+# ---- Roles and PIM
+- { path: /roleManagement/directory/roleAssignments, any: [RoleManagement.Read.Directory, RoleManagement.Read.All, Directory.Read.All] }
+- { path: /roleManagement/directory/roleDefinitions, any: [RoleManagement.Read.Directory, RoleManagement.Read.All] }
+- { path: /roleManagement/directory/roleAssignmentScheduleInstances, any: [RoleAssignmentSchedule.Read.Directory, RoleManagement.Read.Directory] }
+- { path: /roleManagement/directory/roleEligibilityScheduleInstances, any: [RoleEligibilitySchedule.Read.Directory, RoleManagement.Read.Directory] }
+- { path: /roleManagement/directory/roleEligibilitySchedules, any: [RoleEligibilitySchedule.Read.Directory, RoleManagement.Read.Directory] }
+- { path: /policies/roleManagementPolicies, any: [RoleManagementPolicy.Read.Directory] }
+- { path: /policies/roleManagementPolicyAssignments, any: [RoleManagementPolicy.Read.Directory] }
+- { path: /identityGovernance/roleManagementAlerts/alerts, any: [RoleManagementAlert.Read.Directory] }
+
+# ---- Policies and Conditional Access
+- { path: /identity/conditionalAccess/policies, any: [Policy.Read.All] }
+- { path: /identity/conditionalAccess/namedLocations, any: [Policy.Read.All] }
+- { path: /identity/customAuthenticationExtensions, any: [CustomAuthenticationExtension.Read.All] }
+- { path: /policies/authorizationPolicy, any: [Policy.Read.All] }
+- { path: /policies/authenticationMethodsPolicy, any: [Policy.Read.All] }
+- { path: /policies/authenticationStrengthPolicies, any: [Policy.Read.All] }
+- { path: /policies/authenticationFlowsPolicy, any: [Policy.Read.All] }
+- { path: /policies/identitySecurityDefaultsEnforcementPolicy, any: [Policy.Read.All] }
+- { path: /policies/adminConsentRequestPolicy, any: [Policy.Read.All] }
+- { path: /policies/defaultAppManagementPolicy, any: [Policy.Read.All] }
+- { path: /policies/tokenLifetimePolicies, any: [Policy.Read.All] }
+- { path: /policies/activityBasedTimeoutPolicies, any: [Policy.Read.All] }
+- { path: /policies/crossTenantAccessPolicy, any: [Policy.Read.All] }
+- { path: /policies/permissionGrantPolicies, any: [Policy.Read.PermissionGrant, Policy.Read.All] }
+- { path: /policies/deviceRegistrationPolicy, any: [Policy.Read.DeviceConfiguration, Policy.Read.All] }
+
+# ---- Logs, reports, risk
+- { path: /auditLogs/signIns, any: [AuditLog.Read.All] }
+- { path: /auditLogs/directoryAudits, any: [AuditLog.Read.All] }
+- { path: /auditLogs/provisioning, any: [AuditLog.Read.All] }
+- { path: /reports/authenticationMethods, any: [AuditLog.Read.All] }
+- { path: /reports, any: [Reports.Read.All] }
+- { path: /copilot/reports, any: [Reports.Read.All] }
+- { path: /admin/reportSettings, any: [ReportSettings.Read.All] }
+- { path: /identityProtection/riskyUsers, any: [IdentityRiskyUser.Read.All] }
+- { path: /identityProtection/riskyServicePrincipals, any: [IdentityRiskyServicePrincipal.Read.All] }
+- { path: /identityProtection/riskDetections, any: [IdentityRiskEvent.Read.All] }
+
+# ---- Governance
+- { path: /identityGovernance/accessReviews, any: [AccessReview.Read.All] }
+- { path: /identityGovernance/lifecycleWorkflows, any: [LifecycleWorkflows.Read.All] }
+
+# ---- Microsoft 365 admin settings and service health
+- { path: /admin/serviceAnnouncement/issues, any: [ServiceHealth.Read.All] }
+- { path: /admin/serviceAnnouncement/messages, any: [ServiceMessage.Read.All] }
+- { path: /admin/sharepoint/settings, any: [SharePointTenantSettings.Read.All] }
+- { path: /admin/appsAndServices, any: [OrgSettings-AppsAndServices.Read.All] }
+- { path: /admin/forms, any: [OrgSettings-Forms.Read.All] }
+- { path: /admin/microsoft365Apps, any: [OrgSettings-Microsoft365Install.Read.All] }
+- { path: /teamwork/teamsAppSettings, any: [TeamworkAppSettings.Read.All] }
+
+# ---- Security (Defender XDR, Defender for Identity, eDiscovery)
+- { path: /security/incidents, any: [SecurityIncident.Read.All] }
+- { path: /security/alerts_v2, any: [SecurityAlert.Read.All] }
+- { path: /security/identities/sensors, any: [SecurityIdentitiesSensors.Read.All] }
+- { path: /security/identities/healthIssues, any: [SecurityIdentitiesHealth.Read.All] }
+- { path: /security/attackSimulation, any: [AttackSimulation.Read.All] }
+- { path: /security/threatSubmission, any: [ThreatSubmission.Read.All] }
+- { path: /security/cases/ediscoveryCases, any: [eDiscovery.Read.All] }
+
+# ---- Intune
+- { path: /deviceManagement, any: [DeviceManagementServiceConfig.Read.All, DeviceManagementConfiguration.Read.All] }
+- { path: /deviceManagement/managedDevices, any: [DeviceManagementManagedDevices.Read.All] }
+- { path: /deviceManagement/troubleshootingEvents, any: [DeviceManagementManagedDevices.Read.All] }
+- { path: /deviceManagement/userExperienceAnalyticsDevicePerformance, any: [DeviceManagementManagedDevices.Read.All] }
+- { path: /deviceManagement/deviceCompliancePolicies, any: [DeviceManagementConfiguration.Read.All] }
+- { path: /deviceManagement/deviceCompliancePolicyDeviceStateSummary, any: [DeviceManagementConfiguration.Read.All] }
+- { path: /deviceManagement/deviceConfigurations, any: [DeviceManagementConfiguration.Read.All] }
+- { path: /deviceManagement/deviceConfigurationDeviceStateSummaries, any: [DeviceManagementConfiguration.Read.All] }
+- { path: /deviceManagement/configurationPolicies, any: [DeviceManagementConfiguration.Read.All] }
+- { path: /deviceManagement/managedDeviceEncryptionStates, any: [DeviceManagementConfiguration.Read.All] }
+- { path: /deviceManagement/windowsFeatureUpdateProfiles, any: [DeviceManagementConfiguration.Read.All] }
+- { path: /deviceManagement/windowsDriverUpdateProfiles, any: [DeviceManagementConfiguration.Read.All] }
+- { path: /deviceManagement/ndesConnectors, any: [DeviceManagementConfiguration.Read.All, DeviceManagementServiceConfig.Read.All], confirm: true }
+- { path: /deviceManagement/deviceHealthScripts, any: [DeviceManagementScripts.Read.All, DeviceManagementConfiguration.Read.All], confirm: true }
+- { path: /deviceManagement/deviceManagementScripts, any: [DeviceManagementScripts.Read.All, DeviceManagementConfiguration.Read.All], confirm: true }
+- { path: /deviceManagement/deviceEnrollmentConfigurations, any: [DeviceManagementServiceConfig.Read.All] }
+- { path: /deviceManagement/applePushNotificationCertificate, any: [DeviceManagementServiceConfig.Read.All] }
+- { path: /deviceManagement/depOnboardingSettings, any: [DeviceManagementServiceConfig.Read.All] }
+- { path: /deviceManagement/windowsAutopilotDeviceIdentities, any: [DeviceManagementServiceConfig.Read.All] }
+- { path: /deviceManagement/windowsAutopilotDeploymentProfiles, any: [DeviceManagementServiceConfig.Read.All] }
+- { path: /deviceManagement/importedDeviceIdentities, any: [DeviceManagementServiceConfig.Read.All] }
+- { path: /deviceManagement/androidManagedStoreAccountEnterpriseSettings, any: [DeviceManagementServiceConfig.Read.All] }
+- { path: /deviceManagement/androidDeviceOwnerEnrollmentProfiles, any: [DeviceManagementServiceConfig.Read.All] }
+- { path: /deviceManagement/mobileThreatDefenseConnectors, any: [DeviceManagementServiceConfig.Read.All] }
+- { path: /deviceManagement/exchangeConnectors, any: [DeviceManagementServiceConfig.Read.All] }
+- { path: /deviceManagement/roleAssignments, any: [DeviceManagementRBAC.Read.All] }
+- { path: /deviceManagement/roleDefinitions, any: [DeviceManagementRBAC.Read.All] }
+- { path: /deviceManagement/operationApprovalPolicies, any: [DeviceManagementRBAC.Read.All] }
+- { path: /deviceManagement/auditEvents, any: [DeviceManagementApps.Read.All, DeviceManagementConfiguration.Read.All, DeviceManagementManagedDevices.Read.All, DeviceManagementRBAC.Read.All, DeviceManagementServiceConfig.Read.All] }
+- { path: /deviceAppManagement, any: [DeviceManagementApps.Read.All] }
+- { path: /deviceAppManagement/vppTokens, any: [DeviceManagementServiceConfig.Read.All, DeviceManagementApps.Read.All], confirm: true }

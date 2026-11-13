@@ -14,5 +14,6 @@
   <ItemGroup>
     <EmbeddedResource Include="Migrations\*.sql" LogicalName="integrations/%(Filename)%(Extension)" />
     <EmbeddedResource Include="integration-types.yaml" LogicalName="integrations/integration-types.yaml" />
+    <EmbeddedResource Include="graph-permissions.yaml" LogicalName="integrations/graph-permissions.yaml" />
   </ItemGroup>
 </Project>

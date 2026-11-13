@@ -27,6 +27,7 @@
     <ProjectReference Include="..\..\..\report\src\keeper-report\keeper-report.csproj" />
     <ProjectReference Include="..\..\..\push\src\keeper-push\keeper-push.csproj" />
     <ProjectReference Include="..\..\..\integrations\src\keeper-integration\keeper-integration.csproj" />
+    <ProjectReference Include="..\..\..\integrations\src\keeper-connect\keeper-connect.csproj" />
   </ItemGroup>
   <!-- The repo's rules beside every build (dotnet build / dotnet run), replaced each time so a removed or renamed
        rule file does not linger; build.ps1 does the same for what it publishes. -->

@@ -24,6 +24,7 @@ var verbs = new (string Name, string What, Func<string[], int> Run)[]
     ("system", "the systems Keeper knows and what maps to them", SystemVerb.Run),
     ("register", "vendors, contracts, licences, key dates, initiatives", RegisterVerb.Run),
     ("integration", "how Keeper reaches each system, and its encrypted secrets", IntegrationVerb.Run),
+    ("connect", "connect a Microsoft 365 tenant in one step and check its permissions", ConnectVerb.Run),
     ("config", "export and import the client configuration as files (systems, settings, overrides, registers, integrations)", ConfigVerb.Run),
     ("rules", "validate, list and explain rule files", RulesVerb.Run),
     ("push", "open tickets for delegated findings (plan, apply, sync)", PushVerb.Run),
