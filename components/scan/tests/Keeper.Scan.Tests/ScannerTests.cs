@@ -156,6 +156,8 @@ public sealed class ScannerTests : IDisposable
         public Task<RunnerResult> RunAsync(QuerySpec query, RunnerContext context, CancellationToken cancellationToken)
         {
             var host = context.Target ?? "-";
+            if (rowsPerHost.GetValueOrDefault(host) < 0)
+                return Task.FromResult(RunnerResult.Failed($"{host}: not reachable", FailureKind.Unreachable));
             var rows = Enumerable.Range(1, rowsPerHost.GetValueOrDefault(host))
                 .Select(i => new JsonObject { ["name"] = $"{host}|admin{i}", ["id"] = $"admin{i}", ["host"] = host }).ToList();
             return Task.FromResult(RunnerResult.Ok(rows));
@@ -197,6 +199,17 @@ public sealed class ScannerTests : IDisposable
         {
             Files = [file], Connection = new FilesConnection(), RunsDir = Runs, ImportsDir = Imports, PreviousRows = previousRows,
         }, CancellationToken.None);
+    }
+
+    [Fact]
+    public async Task A_per_host_count_with_a_host_that_failed_is_not_whole()
+    {
+        var report = await ScanFake(new() { ["pc01.example.org"] = 1, ["pc02.example.org"] = -1 }, _ => null, perTarget: true);
+
+        var coverage = Read<CoverageRecord>(report, RunFolder.Coverage);
+        Assert.Equal("partial", coverage.Single(c => c.Scope == "rule" && c.Item == "EX-ADMINS-TOO-MANY").State);
+        Assert.Contains(Read<ResultRecord>(report, RunFolder.Results),
+            r => r.RuleId == "EX-ADMINS-TOO-MANY" && r.EntityKey == "pc02.example.org" && r.State == "unknown");
     }
 
     [Theory]

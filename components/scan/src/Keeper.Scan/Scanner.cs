@@ -851,6 +851,7 @@ public sealed class Scanner(RunnerRegistry registry, TimeProvider? clock = null)
                         continue;
                     if (target.State == "failed")
                     {
+                        settled = false;   // a host not counted: the rule's answer is not whole, whatever the others say
                         run.Result(new ResultRecord
                         {
                             Instance = instance, System = system, RuleId = rule.Id, EntityType = rule.EntityType, EntityKey = target.Target!,
