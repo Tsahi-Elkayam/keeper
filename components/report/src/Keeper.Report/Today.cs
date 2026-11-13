@@ -122,8 +122,13 @@ public static class TodayBuilder
             .ToList();
         due = GroupFindingsByDay(due);
 
+        // System types no scan has reached. Store packs (Keeper's own data) and opt-in packs are not about the estate.
         var neverScanned = Sql.Rows(connection,
-                "SELECT system, COUNT(*) AS rules FROM rule WHERE system NOT IN (SELECT DISTINCT system FROM run) GROUP BY system ORDER BY system;")
+                """
+                SELECT system, COUNT(*) AS rules FROM rule
+                WHERE system NOT IN (SELECT DISTINCT system FROM run) AND COALESCE(integration, '') <> 'keeper'
+                GROUP BY system ORDER BY system;
+                """)
             .Select(r => $"{r["system"]} ({r["rules"]} rules)")
             .ToList();
 

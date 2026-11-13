@@ -208,12 +208,28 @@ public static class TodayDocument
                 new Section($"New since yesterday ({report.NewSinceYesterday})", report.NewTitles.ToList(), "Nothing new."),
                 new Section("Blind spots",
                     [.. report.StaleScans.Select(s => "Not scanned recently: " + s),
-                     .. report.BlindSpots.Select(b => $"{b.System} via {b.Instance}: {b.Item} {b.State}{(b.Why is null ? "" : " - " + Short(b.Why, 200))}"),
+                     .. BlindSpotLines(report.BlindSpots),
                      .. report.NeverScanned.Count == 0 ? Array.Empty<string>()
-                         : [$"Never scanned - none of these checks has run (add an integration, or accept KEEPER-SYSTEM-NEVER-SCANNED): {string.Join(", ", report.NeverScanned)}"]],
+                         : [$"Not covered - no scan has reached these system types, so none of their checks ran (live systems: 'keeper integration types'; tools' reports: data/imports/<tool>): {string.Join(", ", report.NeverScanned)}"]],
                     "Every source answered in its newest scan."),
             ]);
     }
 
     private static string Short(string text, int max) => text.Length <= max ? text : text[..max] + "...";
+
+    /// <summary>
+    /// One line per system and integration: the reads that failed for one reason are said once, with how many,
+    /// not once per query (an import pack with no report has a dozen queries and one cause).
+    /// </summary>
+    internal static IEnumerable<string> BlindSpotLines(IReadOnlyList<BlindSpot> spots) =>
+        spots.GroupBy(b => (b.System, b.Instance))
+            .Select(g =>
+            {
+                var reasons = g.GroupBy(b => b.Why ?? "", StringComparer.Ordinal).OrderByDescending(r => r.Count()).ToList();
+                var what = g.Count() == 1 ? $"{g.First().Item} {g.First().State}"
+                    : $"{g.Count()} reads {string.Join(" or ", g.Select(b => b.State).Distinct(StringComparer.Ordinal))}";
+                var why = reasons[0].Key.Length == 0 ? "" : " - " + Short(reasons[0].Key, 200)
+                    + (reasons.Count > 1 ? $" (and {reasons.Count - 1} other reason{(reasons.Count > 2 ? "s" : "")})" : "");
+                return $"{g.Key.System} via {g.Key.Instance}: {what}{why}";
+            });
 }

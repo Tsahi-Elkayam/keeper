@@ -2,6 +2,10 @@ schema: keeper.rules/1
 system: obligations
 name: Recurring obligations people must prove
 integration: keeper
+# Off until the organisation takes the practice up: keeper decide setting obligations.enabled true.
+# Without it a new Keeper home would open with dozens of "never attested" findings about duties nobody
+# has said apply to them (an emergency-call test where there is no telephony).
+opt_in: obligations.enabled
 # Duties no scan can see (a restore test, a DR drill, a password rotation) are proved by an
 # attestation: obligation id, target ('-' for the whole estate, or a domain, system or script),
 # state yes/no/na, done_on, evidence, expires_on.

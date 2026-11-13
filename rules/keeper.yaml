@@ -176,23 +176,30 @@ rules:
     evidence: "{system} via {instance}: {failed} hosts could not be read, e.g. {sample}"
 
   - id: KEEPER-SYSTEM-NEVER-SCANNED
-    title: Keeper has rules for a system type that has never been scanned
+    title: A system type has an integration but has never been scanned
     kind: missing
     category: MON
     severity: info
     entity: system-type
-    why: If the organisation runs this system, none of its checks are being made.
-    fix: Add an integration for it (keeper integration add), or accept this finding if the system is not in use.
+    why: >-
+      Someone set up a way to reach this kind of system, so the organisation runs it, yet none of its checks
+      has been made. System types with no integration at all are not findings: 'keeper today' lists them once
+      under blind spots, and 'keeper report coverage' shows them. Nor is a type whose hosts come from another
+      scan that has not listed any yet (domain controllers before the first directory scan): keeper run says it waits.
+    fix: Run keeper run (or keeper scan <system>); if it is left out on purpose, accept this finding.
     query:
       protocol: store
       text: >
-        SELECT system, COUNT(*) AS rules
-        FROM rule
-        WHERE system <> 'keeper' AND system NOT IN (SELECT DISTINCT system FROM run)
-        GROUP BY system
+        SELECT r.system, r.integration, COUNT(*) AS rules
+        FROM rule r
+        WHERE r.system <> 'keeper' AND r.system NOT IN (SELECT DISTINCT system FROM run)
+          AND r.integration NOT IN ('files', 'keeper', 'host')
+          AND EXISTS (SELECT 1 FROM integration i WHERE i.enabled = 1 AND i.type = r.integration)
+          AND (r.targets_entity IS NULL OR EXISTS (SELECT 1 FROM row_seen s WHERE s.entity_type = r.targets_entity))
+        GROUP BY r.system, r.integration
       key: system
     each: any
-    evidence: "{system}: {rules} rules, never scanned"
+    evidence: "{system}: {rules} rules through a {integration} integration, never scanned"
 
   - id: KEEPER-UNMAPPED-ENTITIES
     title: Scanned entities that belong to no system

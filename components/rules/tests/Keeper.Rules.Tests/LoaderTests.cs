@@ -55,6 +55,26 @@ public sealed class LoaderTests : IDisposable
         """;
 
     [Fact]
+    public void A_file_names_the_setting_that_turns_it_on()
+    {
+        var plain = RuleLoader.LoadFile(Write("plain.yaml", Valid), "builtin", Protocols);
+        var optIn = RuleLoader.LoadFile(Write("optin.yaml", Valid.Replace("integration: ldap", "integration: ldap\nopt_in: obligations.enabled", StringComparison.Ordinal)), "builtin", Protocols);
+
+        Assert.Null(plain.OptIn);
+        Assert.Equal("obligations.enabled", optIn.OptIn);
+    }
+
+    [Fact]
+    public void An_opt_in_that_is_not_a_setting_name_is_refused()
+    {
+        var path = Write("bad.yaml", Valid.Replace("integration: ldap", "integration: ldap\nopt_in: Not A Setting", StringComparison.Ordinal));
+
+        var ex = Assert.Throws<RuleException>(() => RuleLoader.LoadFile(path, "builtin", Protocols));
+
+        Assert.Contains("opt_in", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void A_valid_file_loads_with_defaults_applied()
     {
         var file = RuleLoader.LoadFile(Write("ad.yaml", Valid), "builtin", Protocols);

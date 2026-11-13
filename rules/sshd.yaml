@@ -62,6 +62,7 @@ rules:
           - { field: occurrence, op: eq, value: 1 }
           - { field: match, op: absent }
           - { field: value, op: eq, value: "no" }
+    evidence: 'sshd_config does not set "PasswordAuthentication no" outside a Match block, so passwords are accepted'
 
   - id: SSHD-MAX-AUTH-TRIES
     title: SSH allows many sign-in attempts per connection

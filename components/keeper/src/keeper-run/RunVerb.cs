@@ -39,12 +39,16 @@ public static class RunVerb
                 .. cli.Get("pace") is { } pace ? ["--pace", pace] : Array.Empty<string>()];
             var build = Iso.Stamp(DateTimeOffset.UtcNow);
 
-            var scans = cli.Has("no-scan") ? [] : Plan(paths, cli);
+            var (scans, waiting) = cli.Has("no-scan") ? ([], []) : Plan(paths, cli);
             var external = scans.Where(p => !p.Type.Equals("keeper", StringComparison.OrdinalIgnoreCase)).ToList();
-            var fromStore = scans.Except(external).ToList();
+            // Keeper's own health checks read how every other scan went, the store's other systems included: last.
+            var fromStore = scans.Except(external)
+                .OrderBy(p => p.System.Equals("keeper", StringComparison.OrdinalIgnoreCase) ? 1 : 0).ToList();
             Console.WriteLine(scans.Count == 0
                 ? "No scans this run."
                 : $"Scans: {string.Join(", ", scans.Select(p => p.Integration is null ? p.System : $"{p.System} via {p.Integration}"))}");
+            foreach (var line in waiting)
+                Console.WriteLine(line);
             if (cli.Has("dry-run"))
             {
                 // What each scan would cost the estate, read from the rules and the store only: nothing is sent.
@@ -159,7 +163,7 @@ public static class RunVerb
             }
         }
 
-        static List<(string System, string? Integration, string Type)> Plan(KeeperPaths paths, CliArgs cli)
+        static (List<(string System, string? Integration, string Type)> Plan, List<string> Waiting) Plan(KeeperPaths paths, CliArgs cli)
         {
             var rules = RuleSources.Load(paths.TenantRules);
             var asked = cli.Get("scan")?.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
@@ -169,26 +173,49 @@ public static class RunVerb
                     throw new ArgumentException($"No rules for '{name}'. 'keeper scan --list' shows the systems.");
             }
 
-            IReadOnlyList<IntegrationRecord> integrations;
-            using (var connection = new Database(paths.Database).OpenReadOnly())
-                integrations = IntegrationStore.All(connection);
+            if (rules.Files.Count == 0)
+                throw new ArgumentException($"No rule files found (built-in: {RuleSources.BuiltIn}; tenant: {paths.TenantRules}). " +
+                                            "A build from build.ps1 puts the rules beside the binary.");
 
             var plan = new List<(string, string?, string)>();
+            var waiting = new List<(PackReadiness.Waiting Kind, string Detail)>();
+            using var connection = new Database(paths.Database).OpenReadOnly();
+            var integrations = IntegrationStore.All(connection);
+            var inputs = new StoreInputs(connection);
+            var settings = Sql.Rows(connection, "SELECT key, value FROM setting;")
+                .ToDictionary(r => (string)r["key"]!, r => (string)r["value"]!, StringComparer.Ordinal);
+            var now = DateTimeOffset.UtcNow;
             foreach (var system in asked ?? rules.Systems.ToArray())
             {
-                var type = rules.ForSystem(system)[0].Integration;
+                var files = rules.ForSystem(system);
+                var type = files[0].Integration;
                 var matching = integrations.Where(i => i.Enabled && IntegrationTypes.Satisfies(type, i.Type)).ToList();
-                if (matching.Count > 0)
-                    plan.AddRange(matching.Select(i => (system, (string?)i.Id, type)));
+                var candidates = matching.Select(i => (Id: (string?)i.Id, i.Options)).ToList();
                 // A type that needs no configuration has its implicit instance; for host rules that is the local
                 // machine, which is read beside any ssh fleet.
                 if (IntegrationTypes.IsImplicit(type) && (matching.Count == 0 || type == "host"))
-                    plan.Add((system, null, type));
+                    candidates.Add((null, new System.Text.Json.Nodes.JsonObject()));
                 else if (matching.Count == 0 && asked is not null)
                     throw new ArgumentException($"{system} needs a {type} integration and none is enabled. 'keeper integration add' sets one up.");
                 // Unasked systems without an integration are skipped: nobody has said how to reach them.
+
+                foreach (var (id, options) in candidates)
+                {
+                    // A system named with --scan runs whatever it lacks, and says so; the daily run leaves a pack
+                    // nobody set up out, in one line, instead of reporting it as a failed scan.
+                    var notReady = asked is null
+                        ? PackReadiness.Check(files, id is null, options, paths.Imports, settings.GetValueOrDefault,
+                            inputs.Threshold, spec => inputs.Targets(spec, now))
+                        : null;
+                    if (notReady is { } why)
+                        waiting.Add(why);
+                    else
+                        plan.Add((system, id, type));
+                }
             }
-            return plan;
+            var lines = waiting.GroupBy(w => w.Kind).OrderBy(g => g.Key)
+                .Select(g => PackReadiness.Line(g.Key, g.Select(w => w.Detail).Distinct(StringComparer.Ordinal))).ToList();
+            return (plan, lines);
         }
 
         static bool Stage(string verb, string[] stageArgs, List<string> problems, bool tolerateNoData = false)

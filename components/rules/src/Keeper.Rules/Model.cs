@@ -223,7 +223,15 @@ public sealed record Rule
 }
 
 public sealed record RuleFile(string System, string Name, string Integration, TargetSpec? Targets, IReadOnlyList<Rule> Rules,
-    string Path, string Origin, string Sha256);
+    string Path, string Origin, string Sha256)
+{
+    /// <summary>
+    /// A setting that must be on (true, on, yes or 1) before 'keeper run' reads this file: a pack that is about a
+    /// practice the organisation takes up (recurring obligations), not about a system Keeper reaches. Null: always on.
+    /// 'keeper scan' of the system still runs it when asked.
+    /// </summary>
+    public string? OptIn { get; init; }
+}
 
 public sealed class RuleSet(IReadOnlyList<RuleFile> files)
 {

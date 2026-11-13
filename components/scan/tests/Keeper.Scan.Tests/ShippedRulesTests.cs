@@ -137,6 +137,44 @@ public sealed class ShippedRulesTests : IDisposable
         Assert.Equal("ok", report.Manifest.Status);
     }
 
+    [Fact]
+    public async Task A_system_type_with_no_integration_is_not_a_never_scanned_finding_but_one_with_an_integration_is()
+    {
+        using (var connection = Store.OpenReadWrite())
+        {
+            Sql.Execute(connection,
+                """
+                INSERT INTO rule (rule_id, system, title, kind, lens, category, severity, entity_type, protocol, refresh_min, source_file, loaded_at, integration) VALUES
+                  ('VM-1', 'vmware', 't', 'missing', 'both', 'CFG', 'low', 'vm', 'http', 1440, 'f', '2026-01-01T00:00:00Z', 'vcenter'),
+                  ('AWS-1', 'aws', 't', 'missing', 'both', 'CFG', 'low', 'account', 'aws', 1440, 'f', '2026-01-01T00:00:00Z', 'aws'),
+                  ('PC-1', 'pingcastle', 't', 'missing', 'both', 'CFG', 'low', 'rule', 'file', 1440, 'f', '2026-01-01T00:00:00Z', 'files');
+                INSERT INTO rule (rule_id, system, title, kind, lens, category, severity, entity_type, protocol, refresh_min, source_file, loaded_at, integration, targets_entity) VALUES
+                  ('DCC-1', 'dc-certificates', 't', 'missing', 'both', 'PKI', 'low', 'dc', 'tls', 1440, 'f', '2026-01-01T00:00:00Z', 'tls', 'computer');
+                INSERT INTO integration (integration_id, type, endpoint, auth_kind, identity, options, enabled, changed_by, changed_at, why)
+                VALUES ('vc', 'vcenter', 'https://vc.example.org', 'vcenter-session', NULL, '{}', 1, 'test', '2026-01-01T00:00:00Z', 'test'),
+                       ('tls', 'tls', '', 'none', NULL, '{}', 1, 'test', '2026-01-01T00:00:00Z', 'test');
+                """);
+        }
+        var keeper = Shipped().Files.Single(f => f.System == "keeper");
+        var neverScanned = keeper with { Rules = [.. keeper.Rules.Where(r => r.Id == "KEEPER-SYSTEM-NEVER-SCANNED")] };
+
+        var report = await Scan([neverScanned]);
+
+        var findings = JsonLines.Read<FindingRecord>(Path.Combine(_dir, "runs", report.Manifest.RunId, RunFolder.Findings))
+            .Select(f => f.Target).ToList();
+        // aws: nobody set up a way to reach it; pingcastle: an import; dc-certificates: waits for a scan to list computers.
+        Assert.Equal(["vmware"], findings);
+
+        Seen("run-ad", "active-directory", 0, ("dc1", new JsonObject()));
+        using (var connection = Store.OpenReadWrite())
+            Sql.Execute(connection, "UPDATE row_seen SET entity_type = 'computer' WHERE run_id = 'run-ad';");
+        var again = await Scan([neverScanned]);
+
+        // Once computers are listed, a TLS integration that still never read the domain controllers is a gap.
+        Assert.Equal(["dc-certificates", "vmware"], JsonLines.Read<FindingRecord>(Path.Combine(_dir, "runs", again.Manifest.RunId, RunFolder.Findings))
+            .Select(f => f.Target).Order(StringComparer.Ordinal).ToList());
+    }
+
     private static JsonObject Ad(string sid, string uac, string? logon, string created, string? mailbox = null, string? expires = null,
         string ou = "Staff")
     {

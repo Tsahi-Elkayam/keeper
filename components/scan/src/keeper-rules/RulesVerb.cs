@@ -117,8 +117,8 @@ public static class RulesVerb
             var buildId = Iso.Stamp(DateTimeOffset.UtcNow);
             var file = Path.Combine(paths.Builds, buildId, "rules.json");
             Directory.CreateDirectory(Path.GetDirectoryName(file)!);
-            var rows = set.Rules.Select(r => new RulesLoadHandler.RuleRow(r.Id, r.System, r.Title, r.Kind, r.Lens, r.Category, r.Severity,
-                r.EntityType, r.Query.Protocol, (int)r.Refresh.TotalMinutes, r.Why, r.Fix, r.Refs, r.Source) { QueryId = r.Query.Id }).ToList();
+            var rows = set.Files.SelectMany(f => f.Rules.Select(r => new RulesLoadHandler.RuleRow(r.Id, r.System, r.Title, r.Kind, r.Lens, r.Category, r.Severity,
+                r.EntityType, r.Query.Protocol, (int)r.Refresh.TotalMinutes, r.Why, r.Fix, r.Refs, r.Source) { QueryId = r.Query.Id, Integration = f.Integration, TargetsEntity = f.Targets is { List.Count: 0 } spec ? spec.Entity : null })).ToList();
             File.WriteAllText(file, JsonSerializer.Serialize(rows, JsonLines.Options));
 
             new RequestWriter(paths.Spool).Submit("review.rules-load", $"Rule catalogue: {rows.Count} rules", new

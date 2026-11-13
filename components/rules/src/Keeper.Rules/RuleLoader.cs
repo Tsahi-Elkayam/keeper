@@ -20,7 +20,7 @@ public static partial class RuleLoader
     public const string Schema = "keeper.rules/1";
     public const long MaxFileBytes = 1024 * 1024;
 
-    private static readonly string[] FileFields = ["schema", "system", "name", "integration", "defaults", "targets", "rules"];
+    private static readonly string[] FileFields = ["schema", "system", "name", "integration", "opt_in", "defaults", "targets", "rules"];
     private static readonly string[] DefaultFields = ["kind", "lens", "category", "severity", "refresh", "entity"];
     private static readonly string[] TargetFields = ["entity", "where", "field", "list"];
     private static readonly string[] RuleFields =
@@ -119,6 +119,10 @@ public static partial class RuleLoader
         if (!SystemId().IsMatch(integration))
             reader.Error($"integration '{integration}' must be lower-case letters, digits and dashes.");
 
+        var optIn = reader.Text(top, "opt_in", "file");
+        if (optIn is not null && !OptInKey().IsMatch(optIn))
+            reader.Error(top["opt_in"], $"opt_in '{optIn}' must be a setting name: lower-case letters, digits, dots and dashes.");
+
         var defaults = top.TryGetValue("defaults", out var defaultsNode) ? reader.Fields(defaultsNode, "defaults", DefaultFields) : null;
         TargetSpec? targets = null;
         if (top.TryGetValue("targets", out var targetsNode) && reader.Fields(targetsNode, "targets", TargetFields) is { } t)
@@ -152,7 +156,7 @@ public static partial class RuleLoader
             foreach (var withApplies in rules.Where(r => r.Applies is not null))
                 reader.Error($"rule {withApplies.Id}: 'applies' needs the file's targets to be entity and field (a host's attributes), not a list or nothing.");
 
-        return errors.Count > before ? null : new RuleFile(system, name, integration, targets, rules, path, origin, Hashing.Sha256File(path));
+        return errors.Count > before ? null : new RuleFile(system, name, integration, targets, rules, path, origin, Hashing.Sha256File(path)) { OptIn = optIn };
     }
 
     private static Rule? ReadRule(YamlReader reader, YamlNode node, string system, Dictionary<string, YamlNode>? defaults,
@@ -590,6 +594,9 @@ public static partial class RuleLoader
 
     [GeneratedRegex("^[a-z][a-z0-9-]*$", RegexOptions.CultureInvariant)]
     private static partial Regex SystemId();
+
+    [GeneratedRegex("^[a-z][a-z0-9-]*(\\.[a-z0-9][a-z0-9-]*)*$", RegexOptions.CultureInvariant)]
+    private static partial Regex OptInKey();
 
     [GeneratedRegex("^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$", RegexOptions.CultureInvariant)]
     private static partial Regex RuleId();

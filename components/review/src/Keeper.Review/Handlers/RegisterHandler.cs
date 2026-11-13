@@ -97,6 +97,12 @@ public sealed class RulesLoadHandler : IRequestHandler
     {
         /// <summary>The id of the query the rule reads (QuerySpec.Id), as coverage and row_seen name it.</summary>
         public string? QueryId { get; init; }
+
+        /// <summary>The integration type the rule's file reads through.</summary>
+        public string? Integration { get; init; }
+
+        /// <summary>When the rule's file finds its hosts in the store: the entity type they are.</summary>
+        public string? TargetsEntity { get; init; }
     }
 
     public void Apply(RequestContext context)
@@ -118,10 +124,10 @@ public sealed class RulesLoadHandler : IRequestHandler
         {
             context.Execute(
                 """
-                INSERT INTO rule (rule_id, system, title, kind, lens, category, severity, entity_type, protocol, query_id, refresh_min, why, fix, refs, source_file, loaded_at)
-                VALUES (:id, :system, :title, :kind, :lens, :category, :severity, :type, :protocol, :query, :refresh, :why, :fix, :refs, :source, :at);
+                INSERT INTO rule (rule_id, system, title, kind, lens, category, severity, entity_type, protocol, query_id, refresh_min, why, fix, refs, source_file, loaded_at, integration, targets_entity)
+                VALUES (:id, :system, :title, :kind, :lens, :category, :severity, :type, :protocol, :query, :refresh, :why, :fix, :refs, :source, :at, :integration, :targets);
                 """,
-                (":id", r.RuleId), (":system", r.System), (":title", r.Title), (":kind", r.Kind), (":lens", r.Lens),
+                (":integration", r.Integration), (":targets", r.TargetsEntity), (":id", r.RuleId), (":system", r.System), (":title", r.Title), (":kind", r.Kind), (":lens", r.Lens),
                 (":category", r.Category), (":severity", r.Severity), (":type", r.EntityType), (":protocol", r.Protocol), (":query", r.QueryId),
                 (":refresh", r.RefreshMinutes), (":why", r.Why), (":fix", r.Fix),
                 (":refs", JsonSerializer.Serialize(r.Refs, JsonLines.Options)), (":source", r.SourceFile), (":at", context.NowText));

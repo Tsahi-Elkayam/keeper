@@ -33,6 +33,25 @@ public sealed class RenderTests
     }
 
     [Fact]
+    public void Blind_spots_are_one_line_per_system_and_integration_not_one_per_query()
+    {
+        const string NoReport = "no folder imports/pingcastle: put the tool's report there";
+        var report = Report("x") with
+        {
+            BlindSpots =
+            [
+                .. Enumerable.Range(1, 8).Select(i => new BlindSpot("files", "pingcastle", $"q-{i}", "failed", NoReport, "2026-10-20T06:00:00Z")),
+                new BlindSpot("ad", "active-directory", "q-gpo", "partial", "access denied on 2 objects", "2026-10-20T06:00:00Z"),
+            ],
+        };
+
+        var lines = Render.As(TodayDocument.From(report), "text").Split('\n');
+
+        Assert.Single(lines, l => l.Contains("pingcastle via files: 8 reads failed - " + NoReport, StringComparison.Ordinal));
+        Assert.Single(lines, l => l.Contains("active-directory via ad: q-gpo partial - access denied on 2 objects", StringComparison.Ordinal));
+    }
+
+    [Fact]
     public void A_check_on_many_targets_is_one_line_with_its_reach()
     {
         var report = Report("x") with

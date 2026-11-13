@@ -46,6 +46,18 @@ rules:
     evidence: "{sAMAccountName} - password never expires"
 ```
 
+`opt_in: <setting>` (optional, file level) keeps the file out of `keeper run` until that setting is `true` (`keeper decide
+setting <setting> true`). It is for packs about a practice the organisation takes up rather than a system Keeper
+reaches - the recurring obligations pack uses `opt_in: obligations.enabled` - so a new Keeper home does not open with
+findings about duties nobody said apply. `keeper scan <system>` still runs it when asked.
+
+Which hosts a per-host file reads: its own `targets.list` when it has one; else the integration's
+`targets.<system>` option (`--option targets.dc-certificates=lab-dc.example.org`); else, for a file with
+`targets: { entity, field }`, the hosts the store lists; else the integration's plain `targets` option, then its endpoint.
+The plain `targets` option never replaces the store's list: a file that reads domain controllers from the directory
+must not judge the integration's other hosts (web sites, say) as domain controllers. Until the store lists any such
+host, `keeper run` leaves the file out and says it waits; `keeper scan <system>` reads nothing and says why.
+
 `applies` says which of the file's target hosts a rule is about: a condition over the host's attributes (the
 same ones `targets.where` reads), true means the rule is judged on that host. A rule without it is judged on
 every target. A host that does not match is not judged at all (no result, no finding); a host whose attributes
