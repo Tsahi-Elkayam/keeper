@@ -317,6 +317,29 @@ Secrets in URLs are masked like secret fields: a signed URL's `sig=`, `X-Amz-Sig
 | `keeper` | store | Keeper's own registers |
 | `http` | http | Any other JSON API |
 
+The types are data: `components/integrations/src/Keeper.Integrations/integration-types.yaml`, built into keeper
+(an embedded resource, so its guards cannot be changed on disk). A tenant adds its own in
+`settings/integration-types/*.yaml`, in the same form, so a product with a REST or GraphQL API needs a type file and
+a rule file, no code:
+
+```yaml
+schema: keeper.integration-types/1
+types:
+  - id: palo-alto
+    description: Palo Alto PAN-OS XML API, show and get only
+    protocols: [http]
+    auth: [api-key-header]
+    hosts: []                    # when given, the only hosts its endpoint may name (*.suffix for any one under it)
+    readPaths: ['/api/']         # when given, the only paths a rule may read
+    readPosts: []                # paths where a POST is a read; none: GET only
+```
+
+Also `endpoint` (the default, https), `endpointPath`, `resource` (Entra) and `readCommand` (`field`, `allowed`,
+`parametersField`, `deniedParameters`), as the built-in types use them. A tenant type cannot replace a built-in one,
+may name only protocols Keeper has runners for (not `store`, `file` or `host`) and only auth kinds Keeper can sign in
+with; a field it does not know (a misspelt `readpaths`) is an error, never a guard left out. A file that is not valid
+stops every command until it is fixed. `keeper integration types` lists them with the file that added each.
+
 ## Google Cloud
 
 Every GCP rule reads Cloud Asset Inventory: one asset type per query, its full configuration as Google's

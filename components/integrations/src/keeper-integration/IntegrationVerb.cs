@@ -20,7 +20,17 @@ public static class IntegrationVerb
                 return Usage(asked: true);
             var command = cli.At(0) ?? "list";
             if (command == "types")
+            {
+                // The built-in types need no home; with one, the tenant's own types are listed too.
+                try
+                {
+                    KeeperContext.Load(cli);
+                }
+                catch (SettingsException)
+                {
+                }
                 return Types();
+            }
 
             var (_, paths) = KeeperContext.Load(cli);
             var db = new Database(paths.Database);
@@ -53,7 +63,7 @@ public static class IntegrationVerb
         {
             foreach (var type in IntegrationTypes.All)
             {
-                Console.WriteLine($"{type.Id,-12} {type.Description}");
+                Console.WriteLine($"{type.Id,-12} {type.Description}" + (type.Source is { } file ? $" (added by {file})" : ""));
                 Console.WriteLine($"{"",-12} protocols: {string.Join(", ", type.Protocols)}; auth: {string.Join(", ", type.AuthKinds)}" +
                                   (type.AllowedHosts.Count > 0 ? $"; hosts: {string.Join(", ", type.AllowedHosts)}" : ""));
             }

@@ -34,9 +34,12 @@ that estate's weaknesses. This page says how each is protected, and what is not 
   off and refuses to run without one. Values never appear in output, logs, questions or reports;
   error messages pass through a redactor.
 - **Sent only where they belong.** SaaS integration types have an allow-list of hosts. Requests go to
-  paths relative to the integration's own endpoint, and a handler pins every request to that host.
-- **Held only by the process that needs it.** Each system is scanned in its own process, which opens
-  only its integration's secret.
+  paths relative to the integration's own endpoint, and a handler pins every request to that host. The types and
+  their guards are built into keeper; a type a tenant adds (settings/integration-types) cannot replace a built-in
+  one or loosen its guards.
+- **Held only by the scan that needs it.** A scan opens only its integration's secret. Inside `keeper run` the scans
+  run one after another in one process, and an integration's signed-in connection is kept for that integration's
+  later systems until the run's last scan, then ended.
 - **Expiry is tracked.** A secret records when it expires; `KEEPER-SECRET-EXPIRY` warns before it does,
   and `KEEPER-SECRET-NO-EXPIRY` flags one with no date.
 

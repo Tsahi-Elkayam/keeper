@@ -5,6 +5,7 @@
   <ItemGroup>
     <PackageReference Include="Microsoft.Identity.Client" />
     <PackageReference Include="Microsoft.Identity.Client.Broker" />
+    <PackageReference Include="YamlDotNet" />
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\..\..\runners\src\Keeper.Runners\Keeper.Runners.csproj" />
@@ -12,5 +13,6 @@
   </ItemGroup>
   <ItemGroup>
     <EmbeddedResource Include="Migrations\*.sql" LogicalName="integrations/%(Filename)%(Extension)" />
+    <EmbeddedResource Include="integration-types.yaml" LogicalName="integrations/integration-types.yaml" />
   </ItemGroup>
 </Project>

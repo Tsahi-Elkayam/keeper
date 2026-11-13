@@ -1,0 +1,306 @@
+schema: keeper.integration-types/1
+
+# The kinds of system Keeper reads. Each type says the protocols its rules may use, the ways it may sign in (auth
+# kinds: each one is code in Keeper.Integrations), and the guards that keep a stored credential where it belongs:
+#   hosts         the hosts its endpoint may point at ('*.suffix' for any one host under it); none: any host
+#   endpoint      the endpoint used when an integration gives none
+#   endpointPath  the path an endpoint must have ('*' for one segment), for a type that limits what it reads
+#   resource      the Entra resource its tokens are for, when that is not the endpoint's own host
+#   readPosts     paths (relative to the endpoint, '*' within a segment) where a POST is a read
+#   readPaths     when given, the only paths a rule may read at all
+#   readCommand   for an API whose POSTs run named commands: where the body names it, the names allowed, and
+#                 parameters that are never sent
+# This file is built into keeper. A tenant adds its own types in settings/integration-types/*.yaml, in the same form;
+# a tenant type cannot replace one of these.
+
+types:
+  - id: ldap
+    description: 'Active Directory or another LDAP directory, and its Group Policy objects in SYSVOL'
+    protocols: ['ldap', 'gpo']
+    auth: ['negotiate', 'windows-credential']
+  - id: graph
+    description: 'Microsoft Graph: Entra ID, Intune, Microsoft 365'
+    protocols: ['graph']
+    auth: ['entra-interactive', 'entra-certificate']
+    hosts: ['graph.microsoft.com', 'graph.microsoft.us', 'dod-graph.microsoft.us', 'microsoftgraph.chinacloudapi.cn']
+    endpoint: 'https://graph.microsoft.com'
+  # Resource Graph takes its KQL as a POST; the query is the rule's own text, and Resource Graph only reads.
+  - id: azure
+    description: 'Azure Resource Manager'
+    protocols: ['http']
+    auth: ['entra-interactive', 'entra-certificate']
+    hosts: ['management.azure.com', 'management.usgovcloudapi.net', 'management.chinacloudapi.cn']
+    endpoint: 'https://management.azure.com'
+    readPosts: ['/providers/Microsoft.ResourceGraph/resources']
+  # Microsoft APIs whose tokens are for another resource than Graph: one integration each, all through the
+  # same Entra app (its own permissions per API), each held to its own hosts.
+  - id: power-platform
+    description: 'Power Platform admin: environments, DLP policies (api.bap.microsoft.com)'
+    protocols: ['http']
+    auth: ['entra-interactive', 'entra-certificate']
+    hosts: ['api.bap.microsoft.com']
+    endpoint: 'https://api.bap.microsoft.com'
+    resource: 'https://service.powerapps.com/'
+  - id: power-apps
+    description: 'Power Apps admin: apps and connections (api.powerapps.com)'
+    protocols: ['http']
+    auth: ['entra-interactive', 'entra-certificate']
+    hosts: ['api.powerapps.com']
+    endpoint: 'https://api.powerapps.com'
+    resource: 'https://service.powerapps.com/'
+  - id: power-automate
+    description: 'Power Automate admin: flows (api.flow.microsoft.com)'
+    protocols: ['http']
+    auth: ['entra-interactive', 'entra-certificate']
+    hosts: ['api.flow.microsoft.com']
+    endpoint: 'https://api.flow.microsoft.com'
+    resource: 'https://service.flow.microsoft.com/'
+  - id: power-platform-api
+    description: 'Power Platform API (api.powerplatform.com)'
+    protocols: ['http']
+    auth: ['entra-interactive', 'entra-certificate']
+    hosts: ['api.powerplatform.com']
+    endpoint: 'https://api.powerplatform.com'
+    resource: 'https://api.powerplatform.com'
+  # The token is for the environment's own URL, so a token for one environment never opens another. The hosts are
+  # Dataverse's regional ones (crm, crm2 ... crm22), not every *.dynamics.com; the US government clouds sign in
+  # elsewhere than Entra's public cloud, which is all Keeper signs in to so far.
+  - id: dataverse
+    description: 'One Dataverse environment''s Web API (https://<org>.crm<n>.dynamics.com)'
+    protocols: ['http']
+    auth: ['entra-interactive', 'entra-certificate']
+    hosts: ['*.crm.dynamics.com', '*.crm2.dynamics.com', '*.crm3.dynamics.com', '*.crm4.dynamics.com', '*.crm5.dynamics.com', '*.crm6.dynamics.com', '*.crm7.dynamics.com', '*.crm8.dynamics.com', '*.crm9.dynamics.com', '*.crm10.dynamics.com', '*.crm11.dynamics.com', '*.crm12.dynamics.com', '*.crm13.dynamics.com', '*.crm14.dynamics.com', '*.crm15.dynamics.com', '*.crm16.dynamics.com', '*.crm17.dynamics.com', '*.crm18.dynamics.com', '*.crm19.dynamics.com', '*.crm20.dynamics.com', '*.crm21.dynamics.com', '*.crm22.dynamics.com']
+  - id: power-bi
+    description: 'Power BI admin REST API'
+    protocols: ['http']
+    auth: ['entra-interactive', 'entra-certificate']
+    hosts: ['api.powerbi.com']
+    endpoint: 'https://api.powerbi.com'
+    resource: 'https://analysis.windows.net/powerbi/api'
+  # Its regional hosts (api-eu, api-us, ...) share the one resource. api.security.microsoft.com is Defender XDR's
+  # own API, with another resource: not this type. Advanced hunting takes its KQL as a POST; KQL only reads.
+  - id: defender-endpoint
+    description: 'Microsoft Defender for Endpoint API (machines, vulnerabilities, advanced hunting)'
+    protocols: ['http']
+    auth: ['entra-interactive', 'entra-certificate']
+    hosts: ['api.securitycenter.microsoft.com', '*.securitycenter.microsoft.com']
+    endpoint: 'https://api.securitycenter.microsoft.com'
+    resource: 'https://api.securitycenter.microsoft.com'
+    readPosts: ['/api/advancedqueries/run']
+  # Its lists take their filters as a POST; closing or dismissing an alert is another path.
+  - id: cloud-apps
+    description: 'Microsoft Defender for Cloud Apps API (https://<tenant>.<region>.portal.cloudappsecurity.com)'
+    protocols: ['http']
+    auth: ['entra-interactive', 'entra-certificate']
+    hosts: ['*.portal.cloudappsecurity.com']
+    resource: '05a65629-4c1b-48c1-a78b-804c4abdd4af'
+    readPosts: ['/api/v1/alerts/', '/api/v1/activities/', '/api/v1/entities/', '/api/v1/files/', '/api/v1/discovery/discovered_apps/']
+  # GET /secrets/<name> answers with the value: it is not here. Lists, versions, keys' public parts, certificates
+  # and their policies are.
+  - id: key-vault
+    description: 'One Azure Key Vault''s metadata (https://<vault>.vault.azure.net; not Managed HSM): names, dates, policies - never a secret''s value'
+    protocols: ['http']
+    auth: ['entra-interactive', 'entra-certificate']
+    hosts: ['*.vault.azure.net']
+    resource: 'https://vault.azure.net'
+    readPaths:
+      - '/secrets'
+      - '/secrets/*/versions'
+      - '/keys'
+      - '/keys/*'
+      - '/keys/*/versions'
+      - '/certificates'
+      - '/certificates/*'
+      - '/certificates/*/versions'
+      - '/certificates/*/policy'
+      - '/deletedsecrets'
+      - '/deletedkeys'
+      - '/deletedcertificates'
+  # The REST endpoint the Exchange Online module itself calls: one POST per cmdlet, Get- cmdlets only - except with
+  # a parameter that mails a log (Get-MobileDeviceStatistics -GetMailboxLog) or shows an export's credential
+  # (Get-ComplianceSearchAction -IncludeCredential).
+  - id: exchange-online
+    description: 'Exchange Online through its module''s REST endpoint (https://outlook.office365.com/adminapi/beta/<tenant id>), Get- cmdlets only'
+    protocols: ['http']
+    auth: ['entra-interactive', 'entra-certificate']
+    hosts: ['outlook.office365.com']
+    endpointPath: '/adminapi/beta/*'
+    readPosts: ['/InvokeCommand']
+    readCommand:
+      field: 'CmdletInput.CmdletName'
+      allowed: ['Get-*']
+      parametersField: 'CmdletInput.Parameters'
+      deniedParameters: ['GetMailboxLog', 'NotificationEmailAddresses', 'IncludeCredential']
+  - id: purview
+    description: 'Security & Compliance (Purview) through the same REST endpoint (https://<region>.ps.compliance.protection.outlook.com/adminapi/beta/<tenant id>), Get- cmdlets only'
+    protocols: ['http']
+    auth: ['entra-interactive', 'entra-certificate']
+    hosts: ['ps.compliance.protection.outlook.com', '*.ps.compliance.protection.outlook.com']
+    endpointPath: '/adminapi/beta/*'
+    resource: 'https://ps.compliance.protection.outlook.com'
+    readPosts: ['/InvokeCommand']
+    readCommand:
+      field: 'CmdletInput.CmdletName'
+      allowed: ['Get-*']
+      parametersField: 'CmdletInput.Parameters'
+      deniedParameters: ['GetMailboxLog', 'NotificationEmailAddresses', 'IncludeCredential']
+  # The endpoint is the home region. Hosts are never configured: the runner builds them under amazonaws.com.
+  - id: aws
+    description: 'Amazon Web Services: read-only actions, signed in-process; every account through its read-only role'
+    protocols: ['aws']
+    auth: ['aws-access-key', 'aws-assume-role']
+  # Google Cloud through Cloud Asset Inventory: every resource's configuration, IAM policies and organisation
+  # policies, from one host and one read (ListAssets). The endpoint names the scope - an organisation, a folder or a
+  # project - and its token has the read-only scope, so it cannot change anything whatever its roles.
+  - id: gcp
+    description: 'Google Cloud: Cloud Asset Inventory over an organisation, folder or project (https://cloudasset.googleapis.com/v1/organizations/<n>), read-only token'
+    protocols: ['http']
+    auth: ['gcp-service-account']
+    hosts: ['cloudasset.googleapis.com']
+    endpointPath: '/v1/*/*'
+    readPaths:
+      - '/v1/*/*/assets'
+  # The cluster's own API server, read with a service account that holds only the "view" kind of access. What a
+  # rule may read is a short, explicit list: workloads, nodes, RBAC and network policy. Never secrets, config maps
+  # (which hold secrets in practice), logs, exec, proxy, port-forward or a service account's token.
+  - id: kubernetes
+    description: 'A Kubernetes cluster''s API server (https://<host>:6443), read-only: workloads, nodes, RBAC and network policy - never secrets, config maps, logs or exec; option caCertificate trusts the cluster''s own CA'
+    protocols: ['http']
+    auth: ['bearer']
+    readPaths:
+      - '/version'
+      - '/api/v1/namespaces'
+      - '/api/v1/nodes'
+      - '/api/v1/pods'
+      - '/api/v1/services'
+      - '/api/v1/serviceaccounts'
+      - '/api/v1/resourcequotas'
+      - '/api/v1/limitranges'
+      - '/api/v1/persistentvolumes'
+      - '/api/v1/persistentvolumeclaims'
+      - '/apis/apps/v1/deployments'
+      - '/apis/apps/v1/daemonsets'
+      - '/apis/apps/v1/statefulsets'
+      - '/apis/apps/v1/replicasets'
+      - '/apis/batch/v1/cronjobs'
+      - '/apis/batch/v1/jobs'
+      - '/apis/autoscaling/v2/horizontalpodautoscalers'
+      - '/apis/rbac.authorization.k8s.io/v1/clusterroles'
+      - '/apis/rbac.authorization.k8s.io/v1/clusterrolebindings'
+      - '/apis/rbac.authorization.k8s.io/v1/roles'
+      - '/apis/rbac.authorization.k8s.io/v1/rolebindings'
+      - '/apis/networking.k8s.io/v1/networkpolicies'
+      - '/apis/networking.k8s.io/v1/ingresses'
+      - '/apis/policy/v1/poddisruptionbudgets'
+      - '/apis/storage.k8s.io/v1/storageclasses'
+      - '/apis/admissionregistration.k8s.io/v1/validatingwebhookconfigurations'
+      - '/apis/admissionregistration.k8s.io/v1/mutatingwebhookconfigurations'
+      - '/apis/certificates.k8s.io/v1/certificatesigningrequests'
+  # FortiOS REST. Reading is GET only; what a rule may read is the configuration tables its checks judge and the
+  # system status - never a configuration backup (which holds keys), API users, certificates or licence data.
+  - id: fortigate
+    description: 'A FortiGate firewall''s REST API (https://<host>), read-only: the configuration tables its rules judge and system status - never a configuration backup, certificate or key; option caCertificate trusts a device certificate'
+    protocols: ['http']
+    auth: ['bearer']
+    readPaths:
+      - '/api/v2/monitor/system/status'
+      - '/api/v2/monitor/vpn/ipsec'
+      - '/api/v2/cmdb/system/global'
+      - '/api/v2/cmdb/system/interface'
+      - '/api/v2/cmdb/system/admin'
+      - '/api/v2/cmdb/system/accprofile'
+      - '/api/v2/cmdb/system/snmp/community'
+      - '/api/v2/cmdb/system/ntp'
+      - '/api/v2/cmdb/system/dns'
+      - '/api/v2/cmdb/firewall/policy'
+      - '/api/v2/cmdb/firewall/address'
+      - '/api/v2/cmdb/vpn.ipsec/phase1-interface'
+      - '/api/v2/cmdb/vpn.ipsec/phase2-interface'
+      - '/api/v2/cmdb/log.syslogd/setting'
+  - id: checkpoint
+    description: 'Check Point management API (show- commands only, on a read-only session)'
+    protocols: ['http']
+    auth: ['session-login']
+    readPosts: ['/web_api/show-*', '/web_api/v*/show-*']
+  - id: sccm
+    description: 'SCCM AdminService (or the site database)'
+    protocols: ['http', 'sql']
+    auth: ['negotiate', 'windows-credential', 'basic']
+  - id: cim
+    description: 'Windows hosts: WMI over WinRM, the registry (read-only), event logs, file shares and NTFS permissions'
+    protocols: ['cim', 'registry', 'eventlog', 'smb']
+    auth: ['negotiate', 'windows-credential']
+  - id: sql
+    description: 'SQL Server instances'
+    protocols: ['sql']
+    auth: ['negotiate', 'basic']
+  - id: tls
+    description: 'TLS endpoints'
+    protocols: ['tls']
+    auth: ['none']
+  - id: snmp
+    description: 'SNMP devices (UDP 161): read-only GET/GETNEXT; the endpoint is the CIDR range the credential may be used in'
+    protocols: ['snmp']
+    auth: ['snmp-v3', 'snmp-v2c']
+  - id: vcenter
+    description: 'VMware vCenter REST API'
+    protocols: ['http']
+    auth: ['vcenter-session']
+  - id: veeam
+    description: 'Veeam Backup & Replication REST API'
+    protocols: ['http']
+    auth: ['oauth-password']
+  - id: prtg
+    description: 'PRTG API'
+    protocols: ['http']
+    auth: ['api-key-query', 'basic']
+  - id: dynatrace
+    description: 'Dynatrace API'
+    protocols: ['http']
+    auth: ['api-key-header']
+    hosts: ['*.live.dynatrace.com', '*.apps.dynatrace.com', '*.dynatrace-managed.com']
+  - id: servicenow
+    description: 'ServiceNow Table API'
+    protocols: ['http']
+    auth: ['basic', 'bearer', 'oauth-client-credentials']
+    hosts: ['*.service-now.com', '*.servicenowservices.com']
+  - id: monday
+    description: 'monday.com GraphQL API'
+    protocols: ['graphql']
+    auth: ['api-key-header']
+    hosts: ['api.monday.com']
+    endpoint: 'https://api.monday.com/v2'
+  - id: wiz
+    description: 'Wiz GraphQL API'
+    protocols: ['graphql']
+    auth: ['oauth-client-credentials']
+    hosts: ['*.app.wiz.io', '*.app.wiz.us']
+  - id: rubrik
+    description: 'Rubrik Security Cloud GraphQL API'
+    protocols: ['graphql', 'http']
+    auth: ['oauth-client-credentials']
+    hosts: ['*.my.rubrik.com']
+  - id: files
+    description: 'Reports other tools wrote into imports\'
+    protocols: ['file']
+    auth: ['none']
+  - id: keeper
+    description: 'Keeper''s own registers'
+    protocols: ['store']
+    auth: ['none']
+  - id: ssh
+    description: 'Unix hosts over SSH, read-only: the same configuration-file and command reads as the local host type; the endpoint lists where the credential may be used (CIDR ranges, host names, *.suffix), the targets option lists the hosts, and the hostKeys option pins their host keys'
+    protocols: ['host']
+    auth: ['ssh-key', 'ssh-password']
+  - id: printer
+    description: 'Network printers and multifunction devices, read-only: which services answer (connect only), IPP attributes, and the Printer-MIB over SNMP (page count, supplies, alerts); the endpoint lists where it may talk (CIDR ranges, host names, *.suffix) and the targets option lists the printers'
+    protocols: ['printer']
+    auth: ['none', 'snmp-v2c']
+  - id: host
+    description: 'The machine Keeper runs on: configuration files and a fixed set of read-only commands'
+    protocols: ['host']
+    auth: ['none']
+  - id: http
+    description: 'Any other JSON API'
+    protocols: ['http']
+    auth: ['none', 'negotiate', 'basic', 'bearer', 'api-key-header', 'api-key-query', 'oauth-client-credentials', 'session-login']

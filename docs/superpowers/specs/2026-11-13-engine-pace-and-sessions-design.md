@@ -293,9 +293,20 @@ override satisfies every required setting. (All done: sections 10 and 11.)
   risks as many denials as lock the account. A refusal (a clear wrong password) was already one try.
 - `ScanRequest.Notes` carries the policy line into the run notes; `--plan` prints it.
 
+### 16. Integration types as data (2026-11-13)
+
+- `integration-types.yaml` (embedded in Keeper.Integrations) replaces the C# list; it was generated from the list and
+  checked field by field against it (all 38 types) before the list was removed. The guards' reasons moved with it as
+  comments. Auth kinds (`SecretsFor`) stay code: each is a sign-in Keeper implements.
+- `IntegrationTypeCatalog.Parse`: unknown fields are errors; a tenant type cannot reuse a built-in id, name a
+  protocol no built-in type uses (or store, file, host) or an unknown auth kind; endpoint https and on its own hosts.
+- `IntegrationTypes.UseTenantFolder(settings/integration-types)` runs from `KeeperContext.Loaded`, which the keeper
+  binary wires; `All` = built-in then tenant; `IntegrationType.Source` names a tenant type's file.
+
 ## Not in this change
 
-Moving integration types from code to data. Recorded as a follow-up.
+Nothing from the list in the pilot review is left. Not done: a live run on Windows and against a real AD (Samba AD
+lab in the Tests section), and `keeper config export` does not carry settings/integration-types.
 
 ## Tests
 

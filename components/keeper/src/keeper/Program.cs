@@ -31,6 +31,8 @@ var verbs = new (string Name, string What, Func<string[], int> Run)[]
 };
 foreach (var (name, _, run) in verbs)
     Commands.Add(name, run);
+// Integration types a tenant adds (settings/integration-types/*.yaml) are known to every verb once it loads the home.
+KeeperContext.Loaded += paths => Keeper.Integrations.IntegrationTypes.UseTenantFolder(Path.Combine(paths.SettingsDir, "integration-types"));
 
 try
 {
@@ -56,7 +58,7 @@ try
         ? Commands.Run(verb, rest)
         : Commands.Run("query", args);   // a question: keeper broken == keeper query broken
 }
-catch (Exception ex) when (ex is SettingsException or ArgumentException)
+catch (Exception ex) when (ex is SettingsException or ArgumentException or Keeper.Integrations.IntegrationException)
 {
     Console.Error.WriteLine(ex.Message);
     return ExitCodes.Usage;

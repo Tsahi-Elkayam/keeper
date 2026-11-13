@@ -8,6 +8,12 @@ public static class KeeperContext
     /// Loads settings for a keeper binary from --settings &lt;file&gt;, or the Keeper home. Refuses a
     /// settings file or data folder inside a source tree, beside the binaries, or readable by others.
     /// </summary>
+    /// <summary>
+    /// Called with the home's paths each time a verb loads it, before the verb goes on: the keeper binary reads the
+    /// tenant's own definitions there (integration types) for components this one does not know.
+    /// </summary>
+    public static event Action<KeeperPaths>? Loaded;
+
     public static (KeeperSettings Settings, KeeperPaths Paths) Load(CliArgs cli)
     {
         var given = cli.Get("settings");
@@ -25,6 +31,8 @@ public static class KeeperContext
         HomeSecurity.EnsurePrivate(Path.GetDirectoryName(file)!, "The settings folder");
         if (Directory.Exists(data))
             HomeSecurity.EnsurePrivate(data, "The data folder");
-        return (settings, new KeeperPaths(file, data));
+        var paths = new KeeperPaths(file, data);
+        Loaded?.Invoke(paths);
+        return (settings, paths);
     }
 }
