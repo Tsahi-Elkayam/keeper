@@ -108,7 +108,7 @@ public sealed class Scanner(RunnerRegistry registry, TimeProvider? clock = null)
 
         using var run = new RunWriter(request.RunsDir, instance, system, started);
         var rules = request.Files.SelectMany(f => f.Rules.Select(r => (Rule: r, File: f))).ToList();
-        var queries = rules.GroupBy(r => r.Rule.Query.Id).ToList();
+        var (queries, readOf) = Group(rules);
         var outcomes = new Dictionary<string, QueryOutcome>(StringComparer.Ordinal);
 
         var dropRatio = double.TryParse(request.Threshold("scan.row-drop-ratio"), System.Globalization.NumberStyles.Float,
@@ -120,7 +120,10 @@ public sealed class Scanner(RunnerRegistry registry, TimeProvider? clock = null)
         var (fetched, cost, paceNotes) = await FetchAll(queries, request, cancellationToken).ConfigureAwait(false);
         foreach (var group in queries)
         {
-            var (rule, _) = group.First();
+            // The rows' entity type and name come from a rule judged row by row when there is one: a count rule's
+            // entity (the instance, a host) is what the count is about, not what the rows are.
+            var rule = group.Select(g => g.Rule).FirstOrDefault(r => r.Count is null) ?? group.First().Rule;
+            var nameField = group.Select(g => g.Rule.Query.Name).FirstOrDefault(n => n is not null);
             var outcome = fetched[group.Key];
             // Keeper's own store and other tools' files cannot lose sight of rows, so only their min_rows applies.
             var dropCheck = rule.Query.Protocol is not ("store" or "file");
@@ -138,7 +141,7 @@ public sealed class Scanner(RunnerRegistry registry, TimeProvider? clock = null)
                     Query = group.Key,
                     EntityType = rule.EntityType,
                     EntityKey = KeyOf(rule.Query, row, target),
-                    EntityName = rule.Query.Name is { } nameField ? Values.Text(FieldPath.First(row, nameField)) : null,
+                    EntityName = nameField is not null ? Values.Text(FieldPath.First(row, nameField)) : null,
                     Target = target,
                     Attrs = outcome.Masked(row),
                     ObservedAt = observedAt,
@@ -177,7 +180,7 @@ public sealed class Scanner(RunnerRegistry registry, TimeProvider? clock = null)
                     : attributes.TryGetValue(target, out var host) ? evaluator.Each(applies, host).Fails
                     : null;
             }
-            findings += Evaluate(rule, outcomes[rule.Query.Id], request, run, instance, system, observedAt, appliesTo);
+            findings += Evaluate(rule, outcomes[readOf[(rule, file)]], request, run, instance, system, observedAt, appliesTo);
         }
 
         var states = outcomes.Values.Select(o => o.State).ToList();
@@ -408,7 +411,7 @@ public sealed class Scanner(RunnerRegistry registry, TimeProvider? clock = null)
     /// </summary>
     public ScanPlan Plan(ScanRequest request)
     {
-        var queries = request.Files.SelectMany(f => f.Rules.Select(r => (Rule: r, File: f))).GroupBy(r => r.Rule.Query.Id).ToList();
+        var (queries, _) = Group([.. request.Files.SelectMany(f => f.Rules.Select(r => (Rule: r, File: f)))]);
         var (outcomes, _, reads) = BuildPlan(queries, request);
         var profile = Profile(request);
         var endpointHost = EndpointHost(request.Connection.Endpoint);
@@ -426,6 +429,43 @@ public sealed class Scanner(RunnerRegistry registry, TimeProvider? clock = null)
         var problems = outcomes.Where(o => o.Value.Targets.Any(t => t.State == "failed")).Select(o => $"{o.Key}: {o.Value.Targets.First(t => t.State == "failed").Reason}").ToList();
         return new ScanPlan(profile, hosts, queries.Count, reads.Count, merged.Count, totalSessions, TimeSpan.FromSeconds(Math.Max(readTime, sessionTime)), problems);
     }
+
+    /// <summary>
+    /// Rules with the same query share one read - unless their files name different targets: each read then gets the
+    /// hosts its own file names. The first target list keeps the query's id (its history); another gets the id with
+    /// "~" and a hash of its targets, so neither reads the other's hosts. Returns the groups and each rule's group.
+    /// </summary>
+    private static (List<IGrouping<string, (Rule Rule, RuleFile File)>> Groups, Dictionary<(Rule, RuleFile), string> ReadOf) Group(
+        List<(Rule Rule, RuleFile File)> rules)
+    {
+        var firstTargets = new Dictionary<string, string>(StringComparer.Ordinal);
+        var readOf = new Dictionary<(Rule, RuleFile), string>();
+        foreach (var (rule, file) in rules)
+        {
+            var targets = TargetsText(file.Targets);
+            var id = rule.Query.Id;
+            if (!firstTargets.TryAdd(id, targets) && firstTargets[id] != targets)
+                id = $"{id}~{Convert.ToHexStringLower(System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(targets)))[..6]}";
+            readOf[(rule, file)] = id;
+        }
+        return (rules.GroupBy(r => readOf[r], StringComparer.Ordinal).ToList(), readOf);
+    }
+
+    /// <summary>A target list as text, equal for equal lists whichever file they are in.</summary>
+    private static string TargetsText(TargetSpec? spec) => spec is null ? "" :
+        $"{spec.Entity}|{spec.Field}|{string.Join(",", spec.List)}|{ConditionText(spec.Where)}";
+
+    private static string ConditionText(Condition? condition) => condition switch
+    {
+        null => "",
+        LeafCondition l => $"({l.Field} {l.Op} {l.Value?.ToJsonString()} {l.Threshold} {l.Format} {l.Required})",
+        AllCondition a => $"all[{string.Join(",", a.Items.Select(ConditionText))}]",
+        AnyCondition a => $"any[{string.Join(",", a.Items.Select(ConditionText))}]",
+        NotCondition n => $"not[{ConditionText(n.Item)}]",
+        ElementCondition e => $"element[{e.Of} {e.All} {ConditionText(e.Where)}]",
+        AlwaysCondition => "always",
+        _ => condition.GetType().Name,
+    };
 
     /// <summary>Reads of one host that a runner can serve with one read (registry values under one key) become that one read.</summary>
     private static List<Read> Merge(List<Read> reads)

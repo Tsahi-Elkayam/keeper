@@ -636,6 +636,79 @@ public sealed class ScannerTests : IDisposable
         Assert.All(keys, k => Assert.Matches("^pc0[12]\\.example\\.org\\|", k));
     }
 
+    private RuleFile FakeFile(string name, string body)
+    {
+        var path = Path.Combine(_dir, name);
+        File.WriteAllText(path, body);
+        return RuleLoader.LoadFile(path, "test", new RunnerRegistry([new FakeRunner(true, [])]).Validators);
+    }
+
+    [Fact]
+    public async Task Rows_take_their_entity_from_a_rule_judged_row_by_row_not_from_a_count_rule_listed_first()
+    {
+        // A count on the instance and a rule per member share one read: the rows are members, whatever the order.
+        var registry = new RunnerRegistry([new FakeRunner(false, new() { ["-"] = 2 })]);
+        var file = FakeFile("order.yaml", """
+            schema: keeper.rules/1
+            system: example
+            integration: files
+            defaults: { lens: both, refresh: 1d, category: IAM, kind: misconfigured, severity: low }
+            rules:
+              - id: EX-COUNT
+                title: Count
+                entity: instance
+                query: { protocol: fake, key: id }
+                count: { op: gt, value: 5 }
+              - id: EX-MEMBER
+                title: Member
+                entity: member
+                query: { protocol: fake, key: id, name: name }
+                each: any
+            """);
+
+        var report = await new Scanner(registry, new Clock(Now)).RunAsync(new ScanRequest
+        {
+            Files = [file], Connection = new FilesConnection(), RunsDir = Runs, ImportsDir = Imports,
+        }, CancellationToken.None);
+
+        var rows = Read<RowRecord>(report, RunFolder.Rows);
+        Assert.Equal(2, rows.Count);
+        Assert.All(rows, r => Assert.Equal("member", r.EntityType));
+        Assert.All(rows, r => Assert.StartsWith("-|admin", r.EntityName, StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task One_query_in_files_with_different_targets_reads_each_file_s_own_hosts()
+    {
+        var registry = new RunnerRegistry([new FakeRunner(true, new() { ["pc01"] = 1, ["pc02"] = 1 })]);
+        string Body(string id, string host) => $$"""
+            schema: keeper.rules/1
+            system: example
+            integration: files
+            targets: { list: [{{host}}] }
+            defaults: { lens: both, refresh: 1d, category: IAM, kind: misconfigured, severity: low, entity: member }
+            rules:
+              - id: {{id}}
+                title: Member
+                query: { protocol: fake, key: id }
+                each: any
+            """;
+        var first = FakeFile("a.yaml", Body("EX-A", "pc01"));
+        var second = FakeFile("b.yaml", Body("EX-B", "pc02"));
+
+        var report = await new Scanner(registry, new Clock(Now)).RunAsync(new ScanRequest
+        {
+            Files = [first, second], Connection = new FilesConnection(), RunsDir = Runs, ImportsDir = Imports,
+        }, CancellationToken.None);
+
+        var findings = Read<FindingRecord>(report, RunFolder.Findings);
+        Assert.Equal(["EX-A pc01|admin1", "EX-B pc02|admin1"], findings.Select(f => $"{f.RuleId} {f.Target}").Order(StringComparer.Ordinal));
+        var queries = Read<RowRecord>(report, RunFolder.Rows).Select(r => r.Query).Distinct().Order(StringComparer.Ordinal).ToList();
+        Assert.Equal(2, queries.Count);
+        Assert.Equal(first.Rules[0].Query.Id, queries[0]);                  // the first target list keeps the id and its history
+        Assert.StartsWith(first.Rules[0].Query.Id + "~", queries[1], StringComparison.Ordinal);
+    }
+
     [Fact]
     public async Task A_short_host_name_inside_a_key_is_not_mistaken_for_the_host()
     {
