@@ -74,6 +74,9 @@ public sealed record ScanRequest
     /// </summary>
     public RunSessions? Sessions { get; init; }
 
+    /// <summary>What the caller learned before the scan (the account's lockout policy), for the run notes.</summary>
+    public IReadOnlyList<string> Notes { get; init; } = [];
+
     /// <summary>When the integration may be read; the scan stops reading when it closes. Null: any time.</summary>
     public ScanWindow? Window { get; init; }
 }
@@ -384,7 +387,7 @@ public sealed class Scanner(RunnerRegistry registry, TimeProvider? clock = null)
             }
         }
 
-        var notes = new List<string>();
+        var notes = new List<string>(request.Notes);
         var remote = reads.Any(r => r.Runner.IsRemote(connection));
         if (remote)
             notes.Add($"pace: {profile}; {sessions} session(s) opened on {lanes.Count} host(s) for {merged.Count} read(s)" +

@@ -103,6 +103,7 @@ public static class ScanVerb
                 using var own = shared is null ? new IntegrationConnection(record, vault) { FreshSignIn = fresh } : null;
                 var link = shared ?? own!;
                 var scanner = new Scanner(Keeper.Scan.Runners.Registry());
+                var lockout = Lockout(link, inputs, LogonGuard.Process);
                 var started = DateTimeOffset.UtcNow;
                 var request = new ScanRequest
                 {
@@ -128,10 +129,13 @@ public static class ScanVerb
                     Log = message => Console.Error.WriteLine($"  {Redactor.Clean(message)}"),
                     Sessions = run,
                     Window = window,
+                    Notes = lockout is null ? [] : [lockout],
                 };
                 if (cli.Has("plan"))
                 {
                     PrintPlan(systemName, record.Id, scanner.Plan(request));
+                    if (lockout is not null)
+                        Console.WriteLine($"  {lockout}");
                     if (ScanWindow.From(record.Options) is { } planWindow)
                         Console.WriteLine(planWindow.ClosesAt(DateTimeOffset.UtcNow) is { } closes
                             ? $"  window: {planWindow} - open now, closes {closes.ToLocalTime():yyyy-MM-dd HH:mm}"
@@ -225,6 +229,28 @@ public static class ScanVerb
             Console.Error.WriteLine(Redactor.Clean(ex.Message));
             return ExitCodes.Failed;
         }
+    }
+
+    /// <summary>
+    /// What the stored Active Directory reads say about how many bad passwords lock this Windows account. Where that is
+    /// two or fewer, the guard risks fewer "access denied" sign-ins than its usual two. Returns the run note, or null
+    /// for an account that is not a Windows account Keeper holds the password of. Nothing is sent: an extra sign-in to
+    /// read the policy would be one more chance to lock the account.
+    /// </summary>
+    private static string? Lockout(IConnection link, StoreInputs inputs, LogonGuard guard)
+    {
+        if (!LogonGuard.PresentsSecret(link) || !LogonGuard.KeyOf(link).StartsWith("windows|", StringComparison.Ordinal))
+            return null;
+        if (StoreInputs.LockoutFor(link.Identity, inputs.LockoutPolicies()) is not { } known)
+            return $"lockout: the lockout policy of {link.Identity}'s domain is not known yet (an active-directory scan stores it); " +
+                   $"Keeper risks at most {LogonGuard.DeniedSignInsBeforeRefusal} sign-ins answered access denied";
+        guard.LimitDeniedSignIns(link, known.DeniedSignInsAllowed);
+        var source = $"{(known.FineGrained ? "a fine-grained policy of " : "")}{known.Domain}, active-directory scan of {known.At[..Math.Min(10, known.At.Length)]}";
+        return known.Threshold == 0
+            ? $"lockout: {known.Domain} does not lock accounts ({source})"
+            : $"lockout: {known.Threshold} bad password(s) lock {link.Identity} ({source}); Keeper presents a refused password " +
+              $"once and risks at most {guard.DeniedSignInsFor(link)} sign-in(s) answered access denied" +
+              (known.Threshold == 1 ? " - one wrong password locks this account: check it with 'keeper scan <system> --test' first" : "");
     }
 
     /// <summary>

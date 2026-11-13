@@ -282,10 +282,20 @@ override satisfies every required setting. (All done: sections 10 and 11.)
   window's reason, so the lane fails the rest and `HostPace` ends a read in flight. It is not a push-back and not in
   `PushedBack`. A run note says the window closed.
 
+### 15. The lockout policy before scanning (2026-11-13)
+
+- Read from the store, not the domain: `StoreInputs.LockoutPolicies` takes rows with `lockoutThreshold` (domain) or
+  `msDS-LockoutThreshold` (fine-grained) from the newest run of each query that read them.
+- `StoreInputs.LockoutFor(identity)`: the account's domain by UPN suffix (DC= labels) or NetBIOS name (the domain
+  object's `name`, or the DN's first label); one known domain when the identity names none. The strictest non-zero
+  threshold among the domain's own and its fine-grained policies (Keeper cannot resolve which PSO applies).
+- `LogonGuard.LimitDeniedSignIns(account, threshold - 1)`, clamped to 1..2: the DCOM "denied at sign-in" rule never
+  risks as many denials as lock the account. A refusal (a clear wrong password) was already one try.
+- `ScanRequest.Notes` carries the policy line into the run notes; `--plan` prints it.
+
 ## Not in this change
 
-Reading the account's lockout policy before scanning; moving integration types from code to data. Recorded as
-follow-ups.
+Moving integration types from code to data. Recorded as a follow-up.
 
 ## Tests
 

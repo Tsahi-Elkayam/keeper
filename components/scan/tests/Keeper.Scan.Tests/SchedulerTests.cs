@@ -366,6 +366,34 @@ public sealed class SchedulerTests : IDisposable
     }
 
     [Fact]
+    public async Task A_domain_that_locks_at_two_risks_one_denied_sign_in()
+    {
+        var runner = new SessionRunner(_ => FailureKind.Denied);
+        string[] hosts = [.. Enumerable.Range(1, 6).Select(i => $"pc{i:00}.example.org")];
+        var guard = new LogonGuard();
+        guard.LimitDeniedSignIns(new Connection(), allowed: 1);   // lockoutThreshold 2: a second wrong password would lock
+
+        var report = await Scan(runner, queries: 3, hosts, pace: PaceProfile.Unlimited with { Hosts = 1 }, guard: guard);
+
+        Assert.Equal(1, runner.Opens);
+        Assert.Contains(report.Manifest.Notes, n => n.Contains("denied at sign-in by pc01.example.org with no host", StringComparison.Ordinal));
+    }
+
+    [Theory]
+    [InlineData(0, 2)]
+    [InlineData(1, 1)]
+    [InlineData(5, 2)]   // never more than the usual two
+    public void The_denials_risked_follow_the_limit(int allowed, int risked)
+    {
+        var guard = new LogonGuard();
+        guard.LimitDeniedSignIns(new Connection(), allowed == 0 ? 1 : allowed);
+        if (allowed == 0)
+            guard = new LogonGuard();
+
+        Assert.Equal(risked, guard.DeniedSignInsFor(new Connection("reader@example.org")));   // one account however it is spelled
+    }
+
+    [Fact]
     public async Task Access_denied_on_hosts_after_an_accepted_sign_in_is_about_those_hosts()
     {
         var runner = new SessionRunner(host => host.StartsWith("pc01", StringComparison.Ordinal) ? FailureKind.None : FailureKind.Denied);

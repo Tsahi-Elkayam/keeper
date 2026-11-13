@@ -15,6 +15,24 @@ public sealed record PartialRead(int Count, DateTimeOffset At, bool Low);
 public sealed record CleanRead(string At, IReadOnlyDictionary<string, JsonObject> Rows);
 
 /// <summary>
+/// A lockout policy an Active Directory scan read: the domain's own (<c>lockoutThreshold</c> on the domain object) or a
+/// fine-grained one (<c>msDS-LockoutThreshold</c> on a password settings object). Threshold 0 never locks.
+/// </summary>
+public sealed record LockoutPolicy(string Key, string? Name, bool FineGrained, int Threshold, string At)
+{
+    /// <summary>The domain the policy belongs to, as the DC= part of its DN (dc=example,dc=org).</summary>
+    public string Domain => string.Join(',', Key.Split(',', StringSplitOptions.TrimEntries)
+        .Where(p => p.StartsWith("DC=", StringComparison.OrdinalIgnoreCase))).ToLowerInvariant();
+}
+
+/// <summary>What Keeper knows about how many bad passwords lock an account, and from where.</summary>
+public sealed record LockoutKnown(int Threshold, string Domain, string At, bool FineGrained)
+{
+    /// <summary>How many sign-ins answered "access denied" may be risked: never as many as lock the account.</summary>
+    public int DeniedSignInsAllowed => Threshold == 0 ? int.MaxValue : Math.Max(1, Threshold - 1);
+}
+
+/// <summary>
 /// What a scan reads from the store before it starts: tenant thresholds, threshold overrides, and the
 /// hosts earlier scans saw (targets for per-host rules). Read-only.
 /// </summary>
@@ -43,6 +61,85 @@ public sealed class StoreInputs
     }
 
     public string? Threshold(string name) => _thresholds.GetValueOrDefault(name);
+
+    /// <summary>
+    /// The lockout policies the newest Active Directory reads found: for each query that read one, the rows of its
+    /// newest run (a policy deleted since is gone from it). Nothing is sent anywhere: it is what earlier scans stored.
+    /// </summary>
+    public IReadOnlyList<LockoutPolicy> LockoutPolicies()
+    {
+        var policies = new List<LockoutPolicy>();
+        foreach (var r in Sql.Rows(_connection,
+                     """
+                     WITH policy AS (
+                         SELECT rs.run_id, rs.query, rs.entity_key, rs.entity_name, rs.attrs, r.instance, r.started_at
+                         FROM row_seen rs JOIN run r ON r.run_id = rs.run_id
+                         WHERE json_valid(rs.attrs)
+                           AND (json_extract(rs.attrs, '$.lockoutThreshold') IS NOT NULL
+                                OR json_extract(rs.attrs, '$."msDS-LockoutThreshold"') IS NOT NULL)),
+                     newest AS (
+                         SELECT instance, query, MAX(started_at) AS started_at FROM policy GROUP BY instance, query)
+                     SELECT DISTINCT p.entity_key, p.entity_name, p.attrs, p.started_at
+                     FROM policy p JOIN newest n ON n.instance = p.instance AND n.query = p.query AND n.started_at = p.started_at
+                     ORDER BY p.started_at DESC, p.entity_key;
+                     """))
+        {
+            if (JsonNode.Parse((string)r["attrs"]!) is not JsonObject attrs)
+                continue;
+            var fineGrained = attrs["lockoutThreshold"] is null;
+            if (Integer(attrs[fineGrained ? "msDS-LockoutThreshold" : "lockoutThreshold"]) is not { } threshold)
+                continue;
+            var key = (string)r["entity_key"]!;
+            // A key read from another field (cn of a policy) has no DN: the row's own DN says the domain.
+            if (!key.Contains("DC=", StringComparison.OrdinalIgnoreCase) && Values.Text(attrs["distinguishedName"]) is { } dn)
+                key = dn;
+            var name = r["entity_name"] as string ?? Values.Text(attrs[fineGrained ? "cn" : "name"]);
+            policies.Add(new LockoutPolicy(key, name, fineGrained, threshold, (string)r["started_at"]!));
+        }
+        return policies;
+
+        static int? Integer(JsonNode? node)
+        {
+            if (node is JsonArray { Count: > 0 } list)
+                node = list[0];
+            return int.TryParse(Values.Text(node), System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out var n) && n >= 0
+                ? n
+                : null;
+        }
+    }
+
+    /// <summary>
+    /// How many bad passwords lock <paramref name="identity"/> (EXAMPLE\reader or reader@example.org), from the
+    /// stored policies of its domain: the strictest of the domain's own and every fine-grained policy of that domain
+    /// (which one applies to the account needs its groups; the strictest is the safe guess). Null when no Active
+    /// Directory scan stored the domain's policy, or the account's domain cannot be told.
+    /// </summary>
+    public static LockoutKnown? LockoutFor(string? identity, IReadOnlyList<LockoutPolicy> policies)
+    {
+        var domains = policies.Where(p => !p.FineGrained).ToList();
+        if (identity is null || domains.Count == 0)
+            return null;
+        LockoutPolicy? domain = null;
+        if (identity.Contains('@', StringComparison.Ordinal))
+        {
+            var dn = string.Join(',', identity[(identity.IndexOf('@') + 1)..].Split('.').Select(label => "dc=" + label.ToLowerInvariant()));
+            domain = domains.FirstOrDefault(d => d.Domain == dn);
+        }
+        else if (identity.Contains('\\', StringComparison.Ordinal))
+        {
+            var netbios = identity[..identity.IndexOf('\\')];
+            domain = domains.FirstOrDefault(d => string.Equals(d.Name, netbios, StringComparison.OrdinalIgnoreCase)
+                                                 || d.Domain.Split(',')[0].Equals("dc=" + netbios, StringComparison.OrdinalIgnoreCase));
+        }
+        // One domain known and an identity that names none (or names it differently): that domain.
+        domain ??= domains.Select(d => d.Domain).Distinct(StringComparer.Ordinal).Count() == 1 ? domains[0] : null;
+        if (domain is null)
+            return null;
+        var applying = policies.Where(p => p.Domain == domain.Domain && (p == domain || p.FineGrained)).ToList();
+        var locking = applying.Where(p => p.Threshold > 0).ToList();
+        var strictest = locking.Count > 0 ? locking.MinBy(p => p.Threshold)! : domain;
+        return new LockoutKnown(strictest.Threshold, domain.Name ?? domain.Domain, domain.At, strictest.FineGrained);
+    }
 
     /// <summary>
     /// The threshold overrides of this rule, most specific first: those for this entity, then those for the whole

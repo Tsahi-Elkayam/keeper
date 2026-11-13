@@ -45,6 +45,12 @@ a WinRM quota or an AD lockout policy that is a password spray. The design is in
   denied" (an HTTP 403, LDAP 50, SQL 229) means the sign-in was accepted and one object is closed: that read
   fails, the rest of the host is read. The cost: while unproven, hosts that do not answer each take their
   timeout in turn, so start with `keeper scan <system> --test`.
+- **The domain's lockout policy, from the store.** For a Windows account Keeper holds the password of, the last
+  active-directory scan's `lockoutThreshold` (and the strictest fine-grained `msDS-LockoutThreshold` of that domain:
+  which one applies needs the account's groups) says how many bad passwords lock it. Where that is two, one "access
+  denied" sign-in stops the credential instead of two. The run notes and `--plan` say the policy and where it came
+  from, or that it is not known yet. Nothing is sent to read it: a sign-in to read the policy would be one more chance
+  to lock the account. A threshold of one is said loudly: one wrong password locks that account.
 - **One Windows account, one credential.** EXAMPLE\reader refused through the ldap integration is not presented
   again through the cim or sql integration either. A proof is per integration: two integrations may hold
   different passwords for one account, so each proves its own before going wide.

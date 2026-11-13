@@ -429,6 +429,7 @@ public sealed class LogonGuard
     private readonly Dictionary<string, string> _refused = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, List<string>> _strikes = new(StringComparer.OrdinalIgnoreCase);
     private readonly HashSet<string> _accepted = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, int> _deniedAllowed = new(StringComparer.OrdinalIgnoreCase);
     private readonly Lock _lock = new();
 
     /// <summary>
@@ -469,6 +470,24 @@ public sealed class LogonGuard
     /// </summary>
     private static string ProofOf(IConnection connection) => $"{connection.Instance}|{KeyOf(connection)}";
 
+    /// <summary>
+    /// The account's domain locks after so few bad passwords that <see cref="DeniedSignInsBeforeRefusal"/> denials could
+    /// lock it: at most <paramref name="allowed"/> are risked (never fewer than one - Keeper cannot tell a denial from a
+    /// wrong password without trying once). From the lockout policy an Active Directory scan stored.
+    /// </summary>
+    public void LimitDeniedSignIns(IConnection connection, int allowed)
+    {
+        lock (_lock)
+            _deniedAllowed[KeyOf(connection)] = Math.Clamp(allowed, 1, DeniedSignInsBeforeRefusal);
+    }
+
+    /// <summary>How many sign-ins answered "access denied" make this account's credential refused.</summary>
+    public int DeniedSignInsFor(IConnection connection)
+    {
+        lock (_lock)
+            return _deniedAllowed.GetValueOrDefault(KeyOf(connection), DeniedSignInsBeforeRefusal);
+    }
+
     /// <summary>Called once per credential, when it is first refused: the binary keeps it in the Keeper home right away.</summary>
     public Action<IConnection, string>? OnRefused { get; set; }
 
@@ -505,7 +524,7 @@ public sealed class LogonGuard
                 _strikes[key] = hosts = [];
             if (!hosts.Contains(host, StringComparer.OrdinalIgnoreCase))
                 hosts.Add(host);
-            if (hosts.Count < DeniedSignInsBeforeRefusal)
+            if (hosts.Count < _deniedAllowed.GetValueOrDefault(KeyOf(connection), DeniedSignInsBeforeRefusal))
                 return false;
             text = $"not tried: {connection.Identity ?? "the current user"} was denied at sign-in by {string.Join(" and ", hosts)} with no host accepting it ({reason}) - " +
                    "a wrong password can look like that, so Keeper stops using it so the account is not locked out; check the credential and its rights, then scan again";

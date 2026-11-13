@@ -45,6 +45,78 @@ public sealed class StoreInputsTests : IDisposable
             null, (":run", runId), (":q", query), (":t", type), (":k", key), (":target", target), (":attrs", attrs));
     }
 
+    private const string DomainQuery = "q-domain";
+
+    private void Policies(string runId, string at, int domainThreshold, params (string Cn, int Threshold)[] fineGrained)
+    {
+        Run(runId, "ad-main", "active-directory", at, ("query", DomainQuery, "ok", 1));
+        Row(runId, DomainQuery, "domain", "DC=example,DC=org",
+            $$"""{ "distinguishedName": "DC=example,DC=org", "name": "example", "lockoutThreshold": "{{domainThreshold}}" }""");
+        foreach (var (cn, threshold) in fineGrained)
+            Row(runId, "q-pso", "policy", cn,
+                $$"""{ "distinguishedName": "CN={{cn}},CN=Password Settings Container,CN=System,DC=example,DC=org", "cn": "{{cn}}", "msDS-LockoutThreshold": ["{{threshold}}"] }""");
+    }
+
+    [Theory]
+    [InlineData("EXAMPLE\\reader")]
+    [InlineData("reader@example.org")]
+    [InlineData("reader")]                 // one domain known: that one
+    public void The_lockout_threshold_comes_from_the_newest_ad_read(string identity)
+    {
+        Policies("ad1", "2026-10-20T06:00:00Z", domainThreshold: 3);
+        Policies("ad2", "2026-10-21T06:00:00Z", domainThreshold: 5);
+
+        using var connection = Store.OpenReadOnly();
+        var known = StoreInputs.LockoutFor(identity, new StoreInputs(connection).LockoutPolicies());
+
+        Assert.NotNull(known);
+        Assert.Equal(5, known.Threshold);
+        Assert.Equal(4, known.DeniedSignInsAllowed);
+        Assert.Equal("example", known.Domain);
+    }
+
+    [Fact]
+    public void The_strictest_fine_grained_policy_counts_and_a_deleted_one_is_gone()
+    {
+        Policies("ad1", "2026-10-20T06:00:00Z", domainThreshold: 10, ("Old-Strict", 1), ("Admins", 0));
+        Policies("ad2", "2026-10-21T06:00:00Z", domainThreshold: 10, ("Service-Accounts", 2), ("Admins", 0));
+
+        using var connection = Store.OpenReadOnly();
+        var known = StoreInputs.LockoutFor("EXAMPLE\\svc-keeper", new StoreInputs(connection).LockoutPolicies())!;
+
+        Assert.Equal(2, known.Threshold);         // Old-Strict was deleted since; 0 never locks
+        Assert.True(known.FineGrained);
+        Assert.Equal(1, known.DeniedSignInsAllowed);
+    }
+
+    [Fact]
+    public void A_domain_that_never_locks_and_one_that_is_not_known()
+    {
+        Policies("ad1", "2026-10-20T06:00:00Z", domainThreshold: 0);
+
+        using var connection = Store.OpenReadOnly();
+        var policies = new StoreInputs(connection).LockoutPolicies();
+
+        Assert.Equal(0, StoreInputs.LockoutFor("EXAMPLE\\reader", policies)!.Threshold);
+        Assert.Equal(int.MaxValue, StoreInputs.LockoutFor("EXAMPLE\\reader", policies)!.DeniedSignInsAllowed);
+        Assert.Null(StoreInputs.LockoutFor("EXAMPLE\\reader", []));
+    }
+
+    [Fact]
+    public void Two_domains_and_an_identity_that_names_neither_is_not_guessed()
+    {
+        Policies("ad1", "2026-10-20T06:00:00Z", domainThreshold: 3);
+        Run("ad9", "ad-other", "active-directory", "2026-10-20T06:00:00Z", ("query", DomainQuery, "ok", 1));
+        Row("ad9", DomainQuery, "domain", "DC=other,DC=net", """{ "name": "other", "lockoutThreshold": 1 }""");
+
+        using var connection = Store.OpenReadOnly();
+        var policies = new StoreInputs(connection).LockoutPolicies();
+
+        Assert.Null(StoreInputs.LockoutFor("reader", policies));
+        Assert.Equal(1, StoreInputs.LockoutFor("OTHER\\reader", policies)!.Threshold);
+        Assert.Equal(3, StoreInputs.LockoutFor("reader@example.org", policies)!.Threshold);
+    }
+
     [Theory]
     [InlineData("ok", false)]
     [InlineData("partial", true)]   // the computers read was cut short: a missing PC may just be missing from the list
