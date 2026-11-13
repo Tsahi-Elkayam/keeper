@@ -431,15 +431,19 @@ public sealed class Scanner(RunnerRegistry registry, TimeProvider? clock = null)
     private static List<Read> Merge(List<Read> reads)
     {
         var result = new List<Read>(reads.Count);
-        var groups = new Dictionary<(string Lane, string Protocol, string Key), List<Read>>();
+        var at = new Dictionary<Read, int>(ReferenceEqualityComparer.Instance);
+        // The target as written, not the lane: a member must keep its own spelling of the host (its rows' host field,
+        // and so its entity keys), so two files that spell one host differently read it twice over the one session.
+        var groups = new Dictionary<(string Lane, string Target, string Protocol, string Key), List<Read>>();
         foreach (var read in reads)
         {
             if (read.Runner is IQueryMerger merger && merger.MergeKey(read.Query) is { } key)
             {
-                var slot = (read.Lane.ToLowerInvariant(), read.Query.Protocol, key);
+                var slot = (read.Lane.ToLowerInvariant(), read.Target ?? "", read.Query.Protocol, key);
                 if (!groups.TryGetValue(slot, out var list))
                 {
                     groups[slot] = list = [];
+                    at[read] = result.Count;
                     result.Add(read);   // a placeholder in the first member's place, replaced below
                 }
                 list.Add(read);
@@ -447,9 +451,11 @@ public sealed class Scanner(RunnerRegistry registry, TimeProvider? clock = null)
             }
             result.Add(read);
         }
-        foreach (var list in groups.Values)
+        // Members that cannot be merged go back after their group's first, in order; inserting shifts the places
+        // after it, so groups are handled from the last place to the first.
+        foreach (var list in groups.Values.OrderByDescending(l => at[l[0]]))
         {
-            var at = result.IndexOf(list[0]);
+            var place = at[list[0]];
             if (list.Count == 1)
                 continue;
             QuerySpec merged;
@@ -461,10 +467,10 @@ public sealed class Scanner(RunnerRegistry registry, TimeProvider? clock = null)
             catch (Exception)
 #pragma warning restore CA1031
             {
-                result.InsertRange(at + 1, list.Skip(1));
+                result.InsertRange(place + 1, list.Skip(1));
                 continue;
             }
-            result[at] = new Read([.. list.SelectMany(r => r.Members)], merged, list[0].Runner, list[0].Target, list[0].Lane);
+            result[place] = new Read([.. list.SelectMany(r => r.Members)], merged, list[0].Runner, list[0].Target, list[0].Lane);
         }
         return result;
     }
@@ -498,8 +504,9 @@ public sealed class Scanner(RunnerRegistry registry, TimeProvider? clock = null)
                     // Until the credential has been accepted once - a read that came back with data - credentialed work goes
                     // one host at a time across the scan: a wrong password meets one host, not every host the pace lets in.
                     // Opening a session is not proof: some runners sign in only on their first read.
-                    // An integration with no credential (auth none: TLS handshakes, open printers) has no account to lock.
-                    var proving = connection.AuthKind != "none" && !request.Guard.Proven(connection);
+                    // An integration that presents no secret (auth none, or negotiate as the Windows user Keeper runs as) has
+                    // no password Keeper could have wrong, so nothing to lock.
+                    var proving = LogonGuard.PresentsSecret(connection) && !request.Guard.Proven(connection);
                     if (proving)
                         await _proving.WaitAsync(cancellationToken).ConfigureAwait(false);
                     try
@@ -539,7 +546,7 @@ public sealed class Scanner(RunnerRegistry registry, TimeProvider? clock = null)
                             result = await Safe(read.Runner.Protocol, () => read.Runner.RunAsync(read.Query, context, cancellationToken), cancellationToken).ConfigureAwait(false);
                         }
                         if (fresh)
-                            deniedHere = Learn(request, pacer, host, read.Target, result) ?? deniedHere;
+                            deniedHere = Learn(request, pacer, host, read, result) ?? deniedHere;
                     }
                     finally
                     {
@@ -610,20 +617,23 @@ public sealed class Scanner(RunnerRegistry registry, TimeProvider? clock = null)
 
     /// <summary>
     /// What a read (or a sign-in) said about the credential and the host. A refusal stops the credential. Data coming
-    /// back proves it. While it is unproven, "access denied" is ambiguous - over DCOM a wrong password says just that -
-    /// so it counts towards a refusal and the rest of this host is not tried: returns why, for the lane.
+    /// back, or a host that answered as the account, proves it. While it is unproven, "access denied" from a runner
+    /// where that can be a wrong password (DCOM) is ambiguous, so it counts towards a refusal and the rest of this host
+    /// is not tried: returns why, for the lane. Elsewhere a denial is about one object and the host is read on.
     /// A push-back slows the host and, in a row, stops it.
     /// </summary>
-    private static string? Learn(ScanRequest request, Pacer pacer, string host, string? target, RunnerResult result)
+    private static string? Learn(ScanRequest request, Pacer pacer, string host, Read read, RunnerResult result)
     {
         var connection = request.Connection;
+        var target = read.Target;
         string? deniedHere = null;
         switch (result.Failure)
         {
             case FailureKind.Refused:
                 request.Guard.Refuse(connection, target ?? host, Redactor.Clean(result.Reason) ?? "refused");
                 break;
-            case FailureKind.Denied when connection.AuthKind != "none" && !request.Guard.Proven(connection):
+            case FailureKind.Denied when read.Runner.DeniedMayBeSignIn && !result.SignedIn
+                                         && LogonGuard.PresentsSecret(connection) && !request.Guard.Proven(connection):
                 var reason = Redactor.Clean(result.Reason) ?? "access denied";
                 request.Guard.DeniedAtSignIn(connection, target ?? host, reason);
                 deniedHere = $"not tried: {target ?? host} denied {connection.Identity ?? "the current user"} before any host accepted it ({reason}) - " +
@@ -633,12 +643,12 @@ public sealed class Scanner(RunnerRegistry registry, TimeProvider? clock = null)
                 pacer.Signal(host, result.Failure);
                 break;
         }
-        if (result.State is "ok" or "partial" && result.Failure is not (FailureKind.Refused or FailureKind.Denied))
-        {
+        var answered = result.State is "ok" or "partial" && result.Failure is not (FailureKind.Refused or FailureKind.Denied);
+        // An empty answer is not proof: some runners turn "could not read" into no rows (an event log service that is down).
+        if (result.SignedIn || (answered && result.Rows.Count > 0))
             request.Guard.Accepted(connection);
-            if (result.Failure is not (FailureKind.Throttled or FailureKind.Timeout))
-                pacer.Signal(host, FailureKind.None);
-        }
+        if (answered && result.Failure is not (FailureKind.Throttled or FailureKind.Timeout))
+            pacer.Signal(host, FailureKind.None);
         return deniedHere;
     }
 

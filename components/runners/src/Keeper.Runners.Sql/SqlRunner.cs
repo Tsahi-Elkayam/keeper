@@ -47,6 +47,9 @@ public sealed class SqlRunner : ISessionRunner
         /// <summary>Connections to databases that cannot be switched to on one connection (Azure SQL Database), by name.</summary>
         internal Dictionary<string, SqlConnection> Separate { get; } = new(StringComparer.OrdinalIgnoreCase);
 
+        /// <summary>Whether the connection already broke once and was signed in again: a second break is not.</summary>
+        internal bool Reopened { get; set; }
+
         public async ValueTask DisposeAsync()
         {
             foreach (var other in Separate.Values)
@@ -88,7 +91,7 @@ public sealed class SqlRunner : ISessionRunner
             await connection.OpenAsync(cancellationToken).ConfigureAwait(false);
             return new SqlSession(server, connection);
         }
-        catch (Exception ex) when (ex is SqlException or InvalidOperationException or TimeoutException)
+        catch (Exception ex) when (ex is SqlException or InvalidOperationException or TimeoutException or RunnerFailureException)
         {
             if (connection is not null)
                 await connection.DisposeAsync().ConfigureAwait(false);
@@ -145,7 +148,7 @@ public sealed class SqlRunner : ISessionRunner
             while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
                 databases.Add((reader.GetString(0), reader.GetString(1), reader.GetInt32(2) == 1));
         }
-        catch (Exception ex) when (ex is SqlException or InvalidOperationException or TimeoutException)
+        catch (Exception ex) when (ex is SqlException or InvalidOperationException or TimeoutException or RunnerFailureException)
         {
             return RunnerResult.Failed($"{server}: the databases could not be listed: {Keeper.Common.Redactor.Clean(ex.Message)}", ClassifyException(ex));
         }
@@ -191,11 +194,12 @@ public sealed class SqlRunner : ISessionRunner
             return RunnerResult.Failed($"{server}: no database could be read: {string.Join("; ", problems.Take(3))}", pushedBack ?? FailureKind.Error);
         return problems.Count == 0 ? RunnerResult.Ok(rows)
             : RunnerResult.Partial(rows, $"{read} of {databases.Count} databases read, not all of them whole: {string.Join("; ", problems.Take(3))}")
-                with { Failure = pushedBack is FailureKind.Refused ? FailureKind.Refused : FailureKind.None };
+                with { Failure = pushedBack ?? FailureKind.None };   // a push-back still slows the host, a refusal still stops the credential
     }
 
     /// <summary>
-    /// The session's connection, moved to <paramref name="database"/>. A connection that broke is signed in again once.
+    /// The session's connection, moved to <paramref name="database"/>. A connection that broke is signed in again once
+    /// per scan of the instance; after a second break the instance is not signed in to again.
     /// Azure SQL Database cannot switch databases on one connection (error 40508 and kin): a database that refuses the
     /// switch that way gets its own connection, kept for the rest of the scan.
     /// </summary>
@@ -206,7 +210,11 @@ public sealed class SqlRunner : ISessionRunner
         var connection = session.Connection;
         if (connection.State != ConnectionState.Open)
         {
+            if (session.Reopened)
+                throw new RunnerFailureException($"{session.Server}: the connection broke again; Keeper does not sign in to it a third time this scan", FailureKind.Unreachable);
+            session.Reopened = true;
             connection.Close();
+            await steps.NextAsync().ConfigureAwait(false);
             await connection.OpenAsync(cancellationToken).ConfigureAwait(false);
         }
         if (string.Equals(connection.Database, database, StringComparison.OrdinalIgnoreCase))
@@ -222,6 +230,7 @@ public sealed class SqlRunner : ISessionRunner
             var other = new SqlConnection(ConnectionString(session.Server, database, context));
             try
             {
+                await steps.NextAsync().ConfigureAwait(false);   // a sign-in of its own: paced like any other request
                 await other.OpenAsync(cancellationToken).ConfigureAwait(false);
             }
             catch
@@ -277,7 +286,7 @@ public sealed class SqlRunner : ISessionRunner
                 await transaction.RollbackAsync(CancellationToken.None).ConfigureAwait(false);
             }
         }
-        catch (Exception ex) when (ex is SqlException or InvalidOperationException or TimeoutException)
+        catch (Exception ex) when (ex is SqlException or InvalidOperationException or TimeoutException or RunnerFailureException)
         {
             // The switch to this database failed (it cannot be opened, or was dropped): reported for this database, the connection stays usable.
             return RunnerResult.Failed($"{server}: {Keeper.Common.Redactor.Clean(ex.Message)}", ClassifyException(ex));

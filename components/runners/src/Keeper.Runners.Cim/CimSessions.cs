@@ -106,8 +106,39 @@ internal sealed class CimRunnerSession(CimSession session, IReadOnlyList<string>
 
     public string Transport { get; } = transport;
 
+    /// <summary>Sessions over a rule's own fallback_chain, by chain: opened once per host like the shared one, failures included.</summary>
+    private readonly Dictionary<string, (CimSession? Session, RunnerFailureException? Failure)> _byChain = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>The host's session over <paramref name="chain"/>: opened the first time a rule asks for it, then reused; a refusal is not tried again.</summary>
+    internal CimSession ForChain(IReadOnlyList<string> chain, Func<CimSession> open)
+    {
+        var key = string.Join(',', chain);
+        lock (_byChain)
+        {
+            if (_byChain.TryGetValue(key, out var held))
+                return held.Session ?? throw new RunnerFailureException(held.Failure!.Message, held.Failure.Kind, held.Failure);
+            try
+            {
+                var session = open();
+                _byChain[key] = (session, null);
+                return session;
+            }
+            catch (RunnerFailureException ex)
+            {
+                _byChain[key] = (null, ex);
+                throw;
+            }
+        }
+    }
+
     public ValueTask DisposeAsync()
     {
+        lock (_byChain)
+        {
+            foreach (var (session, _) in _byChain.Values)
+                session?.Dispose();
+            _byChain.Clear();
+        }
         Session.Dispose();
         return ValueTask.CompletedTask;
     }
@@ -180,15 +211,16 @@ internal static class CimSessions
 
     /// <summary>
     /// The session a query reads over. Normally the host's shared one. A rule whose fallback_chain differs from the
-    /// chain the session was opened with gets a session of its own for that one query - rare, and one more sign-in,
-    /// but ignoring the rule's chain would read it over a transport the rule excluded.
+    /// chain the session was opened with reads over a session of that chain - one more sign-in per host and chain,
+    /// kept with the host's session for the rest of the scan; ignoring the rule's chain would read it over a transport
+    /// the rule excluded.
     /// </summary>
     [System.Runtime.Versioning.SupportedOSPlatform("windows")]
     public static CimLease Lease(CimRunnerSession shared, string host, RunnerContext context, IReadOnlyList<string> ruleChain)
     {
         if (ruleChain.Count == 0 || ruleChain.SequenceEqual(shared.Chain, StringComparer.OrdinalIgnoreCase))
             return new CimLease(shared.Session, owned: false);
-        return new CimLease(Open(host, context, ruleChain).Session, owned: true);
+        return new CimLease(shared.ForChain(ruleChain, () => Open(host, context, ruleChain).Session), owned: false);
     }
 
     /// <summary>

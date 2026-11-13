@@ -173,7 +173,7 @@ vCenter/session-login sessions are never logged out and not renewed on a 401 mid
   host, so an open proved nothing: the credential counts as accepted only when a remote read returns data, and
   until then each lane's open *and* first read go through the one-at-a-time gate.
 - **Denied while unproven skips the host.** Any "access denied" (open or read) before the credential was accepted
-  counts towards a refusal and the rest of that host - every family - is not tried.
+  counts towards a refusal and the rest of that host - every family - is not tried. (Narrowed in section 9.)
 - **Refusals are kept the moment they happen** (LogonGuard.OnRefused), not at the end of the scan.
 - **A Windows account is one credential** across integrations (EXAMPLE\reader = reader@example.org).
 - SEC_E_LOGON_DENIED (0x8009030C) is Refused; an SSH host-key mismatch is not a sign-in denial (nothing was sent).
@@ -186,6 +186,31 @@ vCenter/session-login sessions are never logged out and not renewed on a 401 mid
   throws falls back or fails that query only; registry merge keys keep the path's case.
 - Known cost: while a credential is unproven, sign-ins are serial, so unreachable hosts at the head of the list
   each cost their timeout before the first host accepts. `keeper scan --test` proves the credential on one host.
+
+### 9. Second review fixes (2026-11-13)
+
+- **Refusals kept per account.** The file is keyed by the guard's key and the integration, so a Windows account
+  refused through ad-main is not presented by a separate `keeper scan` of win-servers. It holds while the refused
+  integration's credential is unchanged, and not for an integration whose own secret was set after the refusal.
+  `--retry-sign-in` forgets the account's refusals; a proven scan forgets only its own. Writes go through a lock
+  file; a home that cannot be written warns instead of aborting the scan.
+- **Typed kinds win over message words.** `Failures.Classify` looks for a typed kind through the whole chain
+  before reading messages, and an `AuthenticationException` (TLS handshake) is Error, never Refused.
+- **Denied is ambiguous only where it can be a wrong password.** `IRunner.DeniedMayBeSignIn` (cim, registry,
+  eventlog) and `RunnerResult.SignedIn` (the host answered as the account: StdRegProv return codes). A 403, LDAP
+  50 or SQL 229 fails one read; the host is read on. This replaces section 8's "any access denied while unproven".
+- **No guard without a held secret.** `LogonGuard.PresentsSecret`: auth none and negotiate are not refused, kept
+  or serialized.
+- **Proof needs rows or SignedIn.** An empty ok answer (an event log service that is down) is not proof.
+- **Proof per integration, refusal per account.** Two integrations with one account name and different passwords
+  each prove their own.
+- LDAP: a rebind that is refused reports the refusal. CIM: a rule chain's session is opened once per host and
+  kept, failure included. SQL: a broken connection is signed in again once per scan; an Azure SQL separate
+  connection is paced; a push-back in `databases: all` keeps its kind on the partial result. for_each: a list or
+  child that is partial with a refusal stops the children. `Scanner.Merge` is linear; merging keeps each spelling
+  of a host as its own read.
+- Left as is: an HTTP session sign-in answered 429/5xx is retried within the read and not remembered (the host
+  stops after *stopAfter* such reads); a runner-signalled throttle can hold a host at the 30 s interval for long.
 
 ## Not in this change
 

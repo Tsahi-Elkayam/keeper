@@ -30,6 +30,7 @@ public sealed class PerObjectTests
                 "/sites/s1/lists/l1/items" => RunnerResult.Ok([new() { ["title"] = "a" }]),
                 "/sites/s2/lists/l2/items" => RunnerResult.Ok([new() { ["title"] = "b" }]),
                 "/sites/s2/lists/l3/items" => RunnerResult.Ok([]),
+                "/locked" => RunnerResult.Partial([new() { ["id"] = "o1" }, new() { ["id"] = "o2" }], "page 2: logon failure") with { Failure = FailureKind.Refused },
                 _ => RunnerResult.Failed($"{path}: 404"),
             });
         }
@@ -53,6 +54,20 @@ public sealed class PerObjectTests
         Assert.Equal("partial", result.State);                    // sp-2 failed, and two ids were not plain ids
         Assert.Contains("3 of 4 objects failed", result.Reason, StringComparison.Ordinal);
         Assert.DoesNotContain(runner.Paths, p => p.Contains("..", StringComparison.Ordinal) || p == "/servicePrincipals/jobs");
+    }
+
+    [Fact]
+    public async Task A_list_that_met_a_refused_credential_sends_no_child()
+    {
+        // A nested for_each whose list was read part-way before the password was refused: the children would present it again.
+        var runner = new PathRunner();
+        var query = Query("/locked/{id}", new JsonObject { ["path"] = "/locked", ["field"] = "id" });
+
+        var result = await runner.RunAsync(query, Context.For(new FakeConnection("")), CancellationToken.None);
+
+        Assert.Equal("failed", result.State);
+        Assert.Equal(FailureKind.Refused, result.Failure);
+        Assert.Equal(["/locked"], runner.Paths);
     }
 
     [Fact]

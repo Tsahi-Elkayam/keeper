@@ -108,8 +108,30 @@ public static class Failures
     public static bool SaysRefused(string? message) =>
         message is not null && RefusedPhrases.Any(p => message.Contains(p, StringComparison.OrdinalIgnoreCase));
 
-    /// <summary>The kind of an exception, walking its inner exceptions.</summary>
+    /// <summary>
+    /// The kind of an exception, walking its inner exceptions. A typed answer anywhere in the chain (a status, a code,
+    /// a kind a runner set) wins over words in a message: an outer message often repeats an inner one's text. A TLS
+    /// handshake that failed ("authentication failed because the remote party sent a TLS alert") never presented a
+    /// credential, so it is not a refusal.
+    /// </summary>
     public static FailureKind Classify(Exception? exception)
+    {
+        if (Typed(exception) is { } typed)
+            return typed;
+        for (var ex = exception; ex is not null; ex = ex.InnerException)
+        {
+            if (ex is System.Security.Authentication.AuthenticationException)
+                return FailureKind.Error;
+        }
+        for (var ex = exception; ex is not null; ex = ex.InnerException)
+        {
+            if (SaysRefused(ex.Message))
+                return FailureKind.Refused;
+        }
+        return FailureKind.Error;
+    }
+
+    private static FailureKind? Typed(Exception? exception)
     {
         for (var ex = exception; ex is not null; ex = ex.InnerException)
         {
@@ -135,10 +157,8 @@ public static class Failures
                 case IOException io when OfWin32(io.HResult) is { } kind:
                     return kind;
             }
-            if (SaysRefused(ex.Message))
-                return FailureKind.Refused;
         }
-        return FailureKind.Error;
+        return null;
     }
 }
 
@@ -388,6 +408,20 @@ public sealed class LogonGuard
         return $"{connection.Instance}|{connection.Identity ?? "(current user)"}";
     }
 
+    /// <summary>
+    /// Whether the integration presents a secret Keeper holds - a password, a key, a token - so a wrong one counts
+    /// towards a lockout. Not for auth none (nothing is presented) or negotiate (the Windows user Keeper runs as,
+    /// whose ticket is not a password Keeper could have wrong): the guard leaves those alone.
+    /// </summary>
+    public static bool PresentsSecret(IConnection connection) => connection.AuthKind is not ("none" or "negotiate" or "");
+
+    /// <summary>
+    /// What a proof is kept under: the integration and its credential key. A refusal is per account (the account is
+    /// what locks), but a proof is per integration: two integrations may hold different passwords for one account,
+    /// and one that works says nothing about the other.
+    /// </summary>
+    private static string ProofOf(IConnection connection) => $"{connection.Instance}|{KeyOf(connection)}";
+
     /// <summary>Called once per credential, when it is first refused: the binary keeps it in the Keeper home right away.</summary>
     public Action<IConnection, string>? OnRefused { get; set; }
 
@@ -395,7 +429,7 @@ public sealed class LogonGuard
     public bool Proven(IConnection connection)
     {
         lock (_lock)
-            return _accepted.Contains(KeyOf(connection));
+            return _accepted.Contains(ProofOf(connection));
     }
 
     /// <summary>A sign-in was accepted: the credential works, and "access denied" at sign-in is from now on about the host.</summary>
@@ -403,18 +437,20 @@ public sealed class LogonGuard
     {
         lock (_lock)
         {
-            _accepted.Add(KeyOf(connection));
-            _strikes.Remove(KeyOf(connection));
+            _accepted.Add(ProofOf(connection));
+            _strikes.Remove(ProofOf(connection));
         }
     }
 
     /// <summary>A sign-in was answered "access denied". Returns true when that made the credential refused.</summary>
     public bool DeniedAtSignIn(IConnection connection, string host, string reason)
     {
+        if (!PresentsSecret(connection))
+            return false;
         string text;
         lock (_lock)
         {
-            var key = KeyOf(connection);
+            var key = ProofOf(connection);
             // Once a sign-in was accepted the password is right: a host that denies it is one where the account lacks the right.
             if (_accepted.Contains(key))
                 return false;
@@ -439,9 +475,12 @@ public sealed class LogonGuard
     }
 
     /// <summary>Records a refusal; the first one is the one reported.</summary>
-    public void Refuse(IConnection connection, string? host, string reason) =>
-        Record(connection, $"not tried: {connection.Identity ?? "the current user"} was refused{(host is null ? "" : $" by {host}")} ({reason}) - " +
-                           "Keeper stops using it so the account is not locked out; fix the credential, then scan again");
+    public void Refuse(IConnection connection, string? host, string reason)
+    {
+        if (PresentsSecret(connection))
+            Record(connection, $"not tried: {connection.Identity ?? "the current user"} was refused{(host is null ? "" : $" by {host}")} ({reason}) - " +
+                   "Keeper stops using it so the account is not locked out; fix the credential, then scan again");
+    }
 
     private void Record(IConnection connection, string text)
     {

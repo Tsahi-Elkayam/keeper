@@ -10,6 +10,12 @@ public sealed record RunnerResult(IReadOnlyList<JsonObject> Rows, string State, 
     /// <summary>For a failed read: what kind of failure, so the scan can slow down, skip a host or stop using a credential.</summary>
     public FailureKind Failure { get; init; }
 
+    /// <summary>
+    /// The host answered as the account - a registry provider's return code, a bind that succeeded before a search
+    /// was refused - so the sign-in itself was accepted, whatever this read's outcome. It proves the credential.
+    /// </summary>
+    public bool SignedIn { get; init; }
+
     public static RunnerResult Ok(IReadOnlyList<JsonObject> rows) => new(rows, "ok", null);
 
     public static RunnerResult Partial(IReadOnlyList<JsonObject> rows, string reason) => new(rows, "partial", reason);
@@ -134,6 +140,12 @@ public interface IRunner
 
     /// <summary>Whether a query through this integration goes over the network, so the scan's pace applies. False for local files and the store.</summary>
     bool IsRemote(IConnection connection) => true;
+
+    /// <summary>
+    /// Whether "access denied" from this runner can be a wrong password. Over DCOM it can: a bad logon comes back as
+    /// plain access denied. Elsewhere (HTTP 403, LDAP 50, SQL 229) the sign-in was accepted and one object is closed.
+    /// </summary>
+    bool DeniedMayBeSignIn => false;
 
     /// <summary>Checks a query's protocol-specific fields when the rule file is loaded.</summary>
     IEnumerable<string> Validate(QuerySpec query);

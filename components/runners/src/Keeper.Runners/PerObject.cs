@@ -190,6 +190,9 @@ public static partial class PerObject
             list = await run(new QuerySpec(query.Protocol, each, field, null), cancellationToken).ConfigureAwait(false);
         if (list.State == "failed")
             return RunnerResult.Failed($"the list for for_each failed: {list.Reason}", list.Failure);
+        // A list read part-way before the credential was refused (a nested for_each): no child is sent with it.
+        if (list.Failure == FailureKind.Refused)
+            return RunnerResult.Failed($"the list for for_each met a refused credential: {list.Reason}", FailureKind.Refused);
 
         var parents = list.Rows.Take(max).ToList();
         var template = query.Text("path")!;
@@ -296,7 +299,8 @@ public static partial class PerObject
             {
                 if (Stopped)
                     return;
-                if (result.State == "failed" && result.Failure is FailureKind.Refused or FailureKind.Denied)
+                // A partial child that met a refusal (its own for_each) counts as one too.
+                if ((result.State == "failed" && result.Failure is FailureKind.Refused or FailureKind.Denied) || result.Failure == FailureKind.Refused)
                 {
                     _streak = result.Failure == _streakKind ? _streak + 1 : 1;
                     _streakKind = result.Failure;

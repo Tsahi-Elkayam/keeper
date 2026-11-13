@@ -16,6 +16,9 @@ public sealed partial class CimRunner : ISessionRunner
 {
     public string Protocol => "cim";
 
+    /// <summary>Over DCOM and RPC a wrong password comes back as plain access denied.</summary>
+    public bool DeniedMayBeSignIn => true;
+
     public bool PerTarget => true;
 
     public IEnumerable<string> Validate(QuerySpec query)

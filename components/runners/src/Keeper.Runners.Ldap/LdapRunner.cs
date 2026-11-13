@@ -93,7 +93,11 @@ public sealed class LdapRunner : ISessionRunner
                 }
                 catch (Exception ex) when (ex is LdapException or DirectoryOperationException)
                 {
-                    return result;
+                    // A bind refused now (the password changed, the account locked meanwhile) is a refusal, not the drop.
+                    var kind = ClassifyException(ex);
+                    return kind == FailureKind.Refused
+                        ? RunnerResult.Failed($"ldap: binding again after the connection dropped was refused: {ex.Message}", kind)
+                        : result;
                 }
                 result = Run(session, query, context, cancellationToken);
             }

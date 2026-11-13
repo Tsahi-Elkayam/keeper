@@ -115,27 +115,37 @@ public static class ScanVerb
                 }
                 Directory.CreateDirectory(runsDir);
 
-                // A refusal outlives the process: separate scans must not each present a refused password once more.
+                // A refusal outlives the process: separate scans must not each present a refused password once more -
+                // nor separate integrations that sign in as one Windows account.
                 var refusals = new SignInRefusals(Path.Combine(paths.DataDir, "state", "sign-in-refusals.json"));
-                var credential = SignInRefusals.Fingerprint(record.Id, record.Identity, record.Endpoint, record.AuthKind,
-                    record.Secrets.Values.Select(v => $"{v.Name}={v.SetAt}"));
-                if (cli.Has("retry-sign-in"))
-                    refusals.Clear(link);
-                else if (refusals.Find(link, credential) is { } recorded)
+                static string CredentialOf(IntegrationRecord r) =>
+                    SignInRefusals.Fingerprint(r.Id, r.Identity, r.Endpoint, r.AuthKind, r.Secrets.Values.Select(v => $"{v.Name}={v.SetAt}"));
+                var credentials = IntegrationStore.All(connection).ToDictionary(r => r.Id, CredentialOf, StringComparer.OrdinalIgnoreCase);
+                var credential = CredentialOf(record);
+                DateTimeOffset? secretSetAt = record.Secrets.Values
+                    .Select(v => DateTimeOffset.TryParse(v.SetAt, CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal, out var at) ? at : (DateTimeOffset?)null)
+                    .Max();
+                if (!LogonGuard.PresentsSecret(link))
+                {
+                    // Nothing Keeper presents can lock this account: no refusal is kept or restored.
+                }
+                else if (cli.Has("retry-sign-in"))
+                    TryKeep(() => refusals.ClearAccount(link));
+                else if (refusals.Find(link, id => id.Equals(record.Id, StringComparison.OrdinalIgnoreCase) ? credential : credentials.GetValueOrDefault(id), secretSetAt) is { } recorded)
                     request.Guard.Restore(link, recorded);
                 // Kept the moment it happens: a scan stopped half-way (Ctrl-C, a crash) must not forget it.
                 request.Guard.OnRefused = (refusedConnection, text) =>
                 {
-                    if (refusedConnection.Instance == link.Instance && refusals.Find(link, credential) is null)
-                        refusals.Record(link, credential, text, DateTimeOffset.UtcNow);
+                    if (refusedConnection.Instance == link.Instance)
+                        TryKeep(() => refusals.Record(link, credential, text, DateTimeOffset.UtcNow));
                 };
 
                 Console.WriteLine($"Scanning {systemName} through {record.Id} ({record.Type}){(test ? " - connection test" : "")}...");
                 var report = await scanner.RunAsync(request, CancellationToken.None);
                 request.Guard.OnRefused = null;
                 // A credential that read data in this scan and was not refused works: an old record of it is gone.
-                if (request.Guard.Refusal(link) is null && request.Guard.Proven(link))
-                    refusals.Clear(link);
+                if (LogonGuard.PresentsSecret(link) && request.Guard.Refusal(link) is null && request.Guard.Proven(link))
+                    TryKeep(() => refusals.Clear(link));
 
                 Console.WriteLine($"{report.Manifest.Status}: {report.Rules} rules, {report.Queries} queries, {report.Rows} rows, " +
                                   $"{report.Findings} findings, {report.FailedQueries} failed queries." +
@@ -178,6 +188,22 @@ public static class ScanVerb
         {
             Console.Error.WriteLine(Redactor.Clean(ex.Message));
             return ExitCodes.Failed;
+        }
+    }
+
+    /// <summary>
+    /// Keeping a refusal is a safeguard, not the scan: a home that cannot be written (read-only, a lock held too long)
+    /// is said on stderr and the scan goes on - the in-process guard still stops the credential.
+    /// </summary>
+    private static void TryKeep(Action keep)
+    {
+        try
+        {
+            keep();
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            Console.Error.WriteLine($"  warning: could not keep the sign-in refusal in the Keeper home: {ex.Message}");
         }
     }
 

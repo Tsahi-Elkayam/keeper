@@ -34,6 +34,9 @@ public sealed partial class RegistryRunner : ISessionRunner, IQueryMerger
 
     public string Protocol => "registry";
 
+    /// <summary>Over DCOM and RPC a wrong password comes back as plain access denied.</summary>
+    public bool DeniedMayBeSignIn => true;
+
     public bool PerTarget => true;
 
     public IEnumerable<string> Validate(QuerySpec query)
@@ -188,8 +191,12 @@ public sealed partial class RegistryRunner : ISessionRunner, IQueryMerger
         }
     }
 
-    /// <summary>The failure kind of a StdRegProv return code: 5 is access denied on this key (signed in, not allowed), the rest is an error.</summary>
-    private static FailureKind KindOf(uint code) => code == 5 ? FailureKind.Denied : FailureKind.Error;
+    /// <summary>
+    /// A StdRegProv call that returned an error code: the provider answered, so the sign-in was accepted. 5 is access
+    /// denied on this key (signed in, not allowed), the rest is an error.
+    /// </summary>
+    private static RunnerResult Answered(string reason, uint code) =>
+        RunnerResult.Failed(reason, code == 5 ? FailureKind.Denied : FailureKind.Error) with { SignedIn = true };
 
     [System.Runtime.Versioning.SupportedOSPlatform("windows")]
     private static async Task<RunnerResult> Run(CimRunnerSession shared, QuerySpec query, RunnerContext context, CancellationToken cancellationToken)
@@ -209,9 +216,9 @@ public sealed partial class RegistryRunner : ISessionRunner, IQueryMerger
             {
                 var (code, subkeys) = await calls.CallAsync("EnumKey", hive, key).ConfigureAwait(false);
                 if (code == 2)
-                    return RunnerResult.Ok([]);       // no such key: no subkeys
+                    return RunnerResult.Ok([]) with { SignedIn = true };       // no such key: no subkeys
                 if (code != 0)
-                    return RunnerResult.Failed($"{host}: EnumKey {key} returned {code}", KindOf(code));
+                    return Answered($"{host}: EnumKey {key} returned {code}", code);
                 return RunnerResult.Ok(Strings(subkeys, "sNames")
                     .Select(n => new JsonObject { ["host"] = host, ["key"] = key, ["subkey"] = n }).ToList());
             }
@@ -221,7 +228,7 @@ public sealed partial class RegistryRunner : ISessionRunner, IQueryMerger
             if (enumCode == 2)
                 return RunnerResult.Ok([row]);       // the key does not exist: a fact a rule can judge
             if (enumCode != 0)
-                return RunnerResult.Failed($"{host}: EnumValues {key} returned {enumCode}", KindOf(enumCode));
+                return Answered($"{host}: EnumValues {key} returned {enumCode}", enumCode);
 
             var names = Strings(listing, "sNames");
             var types = listing?.OutParameters["Types"]?.Value is int[] t ? t : [];
@@ -276,7 +283,7 @@ public sealed partial class RegistryRunner : ISessionRunner, IQueryMerger
         if (code == 2)
             return RunnerResult.Ok([]);
         if (code != 0)
-            return RunnerResult.Failed($"{host}: EnumKey {certificates} returned {code}", KindOf(code));
+            return Answered($"{host}: EnumKey {certificates} returned {code}", code);
         var rows = new List<JsonObject>();
         var unread = new List<string>();
         foreach (var thumbprint in Strings(listing, "sNames"))

@@ -39,9 +39,13 @@ public sealed class SchedulerTests : IDisposable
     /// A per-host runner with sessions that records every open, read and close. <paramref name="open"/> decides how a
     /// host's sign-in goes; <paramref name="read"/> how a read goes. Optionally merges queries with the same "path".
     /// </summary>
-    private sealed class SessionRunner(Func<string, FailureKind> open, Func<string, QuerySpec, RunnerResult>? read = null, bool merge = false)
+    private sealed class SessionRunner(Func<string, FailureKind> open, Func<string, QuerySpec, RunnerResult>? read = null, bool merge = false,
+        bool deniedMayBeSignIn = true)
         : ISessionRunner, IQueryMerger
     {
+        /// <summary>Like CIM over DCOM by default: access denied can be a wrong password.</summary>
+        public bool DeniedMayBeSignIn => deniedMayBeSignIn;
+
         public ConcurrentQueue<string> Log { get; } = new();
         public int Opens => Log.Count(l => l.StartsWith("open ", StringComparison.Ordinal));
         public int Reads => Log.Count(l => l.StartsWith("read ", StringComparison.Ordinal));
@@ -84,7 +88,7 @@ public sealed class SchedulerTests : IDisposable
         {
             var host = ((Session)session).Host;
             Assert.False(((Session)session).Closed);
-            Assert.Equal(context.Target, host);
+            Assert.Equal(context.Target, host, ignoreCase: true);   // one session per host, whichever spelling opened it
             var now = Interlocked.Increment(ref _inFlight);
             var onHost = _perHost.AddOrUpdate(host, 1, (_, n) => n + 1);
             lock (Log)
@@ -93,11 +97,11 @@ public sealed class SchedulerTests : IDisposable
                 MaxPerHost = Math.Max(MaxPerHost, onHost);
             }
             await Task.Delay(2, cancellationToken);
-            Log.Enqueue($"read {host} {query.Text("path")} {string.Join(",", query.List("values"))}");
+            Log.Enqueue($"read {context.Target} {query.Text("path")} {string.Join(",", query.List("values"))}");
             _perHost.AddOrUpdate(host, 0, (_, n) => n - 1);
             Interlocked.Decrement(ref _inFlight);
             return read?.Invoke(host, query) ?? RunnerResult.Ok(
-                [new JsonObject { ["host"] = host, ["key"] = query.Text("path"), ["value"] = 1 }]);
+                [new JsonObject { ["host"] = context.Target, ["key"] = query.Text("path"), ["value"] = 1 }]);
         }
 
         public string? MergeKey(QuerySpec query) => merge ? query.Text("path") : null;
@@ -265,6 +269,71 @@ public sealed class SchedulerTests : IDisposable
     }
 
     [Fact]
+    public async Task Access_denied_where_it_cannot_be_a_wrong_password_skips_only_that_read()
+    {
+        // A Graph 403 or an LDAP 50 on one object: the sign-in was accepted. The rest of the host is read, nothing is refused.
+        var runner = new SessionRunner(_ => FailureKind.None,
+            (host, query) => query.Text("path") == "P1"
+                ? RunnerResult.Failed($"{host}: forbidden", FailureKind.Denied)
+                : RunnerResult.Ok([new JsonObject { ["host"] = host, ["value"] = 1 }]),
+            deniedMayBeSignIn: false);
+        var guard = new LogonGuard();
+
+        await Scan(runner, queries: 4, ["pc01.example.org", "pc02.example.org"], pace: PaceProfile.Unlimited with { Hosts = 1 }, guard: guard);
+
+        Assert.Equal(8, runner.Reads);
+        Assert.Null(guard.Refusal(new Connection()));
+    }
+
+    [Fact]
+    public async Task Access_denied_from_a_host_that_answered_as_the_account_proves_the_credential()
+    {
+        // StdRegProv returning 5 on one key: the provider ran as the account, so the password is right.
+        var runner = new SessionRunner(_ => FailureKind.None,
+            (host, query) => query.Text("path") == "P1"
+                ? RunnerResult.Failed($"{host}: EnumValues returned 5", FailureKind.Denied) with { SignedIn = true }
+                : RunnerResult.Ok([new JsonObject { ["host"] = host, ["value"] = 1 }]));
+        var guard = new LogonGuard();
+
+        await Scan(runner, queries: 3, ["pc01.example.org", "pc02.example.org"], pace: PaceProfile.Unlimited with { Hosts = 1 }, guard: guard);
+
+        Assert.Equal(6, runner.Reads);
+        Assert.True(guard.Proven(new Connection()));
+        Assert.Null(guard.Refusal(new Connection()));
+    }
+
+    [Fact]
+    public async Task An_empty_answer_is_not_proof_the_password_works()
+    {
+        // An event log whose service is down answers no rows: the scan must stay one sign-in at a time.
+        var runner = new SessionRunner(_ => FailureKind.None, (_, _) => RunnerResult.Ok([]));
+        var guard = new LogonGuard();
+
+        await Scan(runner, queries: 2, ThreeHosts, pace: PaceProfile.Unlimited with { Hosts = 3 }, guard: guard);
+
+        Assert.False(guard.Proven(new Connection()));
+        Assert.Equal(1, runner.MaxInFlight);
+    }
+
+    [Fact]
+    public void A_tls_handshake_that_failed_is_not_a_refused_password()
+    {
+        var tls = new HttpRequestException("The SSL connection could not be established, see inner exception.",
+            new System.Security.Authentication.AuthenticationException("Authentication failed because the remote party sent a TLS alert: 'HandshakeFailure'."));
+
+        Assert.Equal(FailureKind.Error, Failures.Classify(tls));
+    }
+
+    [Fact]
+    public void A_kind_inside_the_chain_wins_over_the_words_of_an_outer_message()
+    {
+        var signIn = new HttpRequestException("sign-in: authentication failed (503)", new RunnerFailureException("busy", FailureKind.Throttled));
+
+        Assert.Equal(FailureKind.Throttled, Failures.Classify(signIn));
+        Assert.Equal(FailureKind.Refused, Failures.Classify(new InvalidOperationException("Login failed for user 'reader'.")));
+    }
+
+    [Fact]
     public async Task A_partial_read_that_met_a_refusal_still_stops_the_credential()
     {
         // A for_each that read some children before one was refused answers partial: the refusal must still count.
@@ -294,7 +363,11 @@ public sealed class SchedulerTests : IDisposable
         }, CancellationToken.None);
 
         Assert.Equal("ok", report.Manifest.Status);
-        Assert.Equal(1, runner.Reads);                       // one host, one key: one read for all three queries
+        // One session for the host, but each spelling is read on its own, so each keeps its own host field.
+        Assert.Equal(1, runner.Opens);
+        Assert.Equal(2, runner.Reads);
+        Assert.Contains(runner.Log, l => l.StartsWith("read SRV1.example.org ", StringComparison.Ordinal));
+        Assert.Contains(runner.Log, l => l.StartsWith("read srv1.example.org ", StringComparison.Ordinal));
     }
 
     [Fact]
@@ -538,13 +611,13 @@ public sealed class SignInRefusalsTests : IDisposable
 
     public void Dispose() => Directory.Delete(_dir, recursive: true);
 
-    private sealed class Connection : IConnection
+    private sealed class Connection(string instance = "lab-ssh", string? identity = "reader", string authKind = "ssh-password") : IConnection
     {
-        public string Instance => "lab-ssh";
+        public string Instance => instance;
         public string Type => "ssh";
         public string Endpoint => "192.0.2.0/24";
-        public string AuthKind => "ssh-password";
-        public string? Identity => "reader";
+        public string AuthKind => authKind;
+        public string? Identity => identity;
         public JsonObject Options { get; } = [];
         public string? Secret(string name) => null;
         public NetworkCredential? WindowsCredential() => null;
@@ -552,22 +625,57 @@ public sealed class SignInRefusalsTests : IDisposable
         public Task AuthorizeAsync(HttpRequestMessage request, CancellationToken cancellationToken) => Task.CompletedTask;
     }
 
+    private string File_ => Path.Combine(_dir, "state", "sign-in-refusals.json");
+
     [Fact]
     public void A_refusal_outlives_the_process_until_the_secret_is_set_again()
     {
-        var file = Path.Combine(_dir, "state", "sign-in-refusals.json");
         var connection = new Connection();
         var before = SignInRefusals.Fingerprint("lab-ssh", "reader", "192.0.2.0/24", "ssh-password", ["password=2026-11-13T10:00:00Z"]);
-        new SignInRefusals(file).Record(connection, before, "not tried: reader was refused", DateTimeOffset.UnixEpoch);
+        new SignInRefusals(File_).Record(connection, before, "not tried: reader was refused", DateTimeOffset.UnixEpoch);
 
-        var again = new SignInRefusals(file);             // a later process
+        var again = new SignInRefusals(File_);             // a later process
         var after = SignInRefusals.Fingerprint("lab-ssh", "reader", "192.0.2.0/24", "ssh-password", ["password=2026-11-13T11:00:00Z"]);
 
-        Assert.StartsWith("not tried: reader was refused", again.Find(connection, before), StringComparison.Ordinal);
-        Assert.Null(again.Find(connection, after));        // the password was set again: try it
+        Assert.StartsWith("not tried: reader was refused", again.Find(connection, _ => before, null), StringComparison.Ordinal);
+        Assert.Null(again.Find(connection, _ => after, null));        // the password was set again: try it
         again.Clear(connection);
-        Assert.Null(again.Find(connection, before));
-        Assert.DoesNotContain("Right-Pass", File.ReadAllText(file), StringComparison.Ordinal);
+        Assert.Null(again.Find(connection, _ => before, null));
+        Assert.DoesNotContain("Right-Pass", File.ReadAllText(File_), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void A_windows_account_refused_through_one_integration_is_not_tried_by_another_process_through_another()
+    {
+        // The scheduler scans each system in its own process: ldap, then cim, both signing in as EXAMPLE\reader.
+        var ldap = new Connection("ad-main", "EXAMPLE\\reader", "windows-credential");
+        var cim = new Connection("win-servers", "reader@example.org", "windows-credential");
+        var credentials = new Dictionary<string, string> { ["ad-main"] = "ldap-1", ["win-servers"] = "cim-1" };
+        new SignInRefusals(File_).Record(ldap, "ldap-1", "not tried: EXAMPLE\\reader was refused", new DateTimeOffset(2026, 11, 13, 12, 0, 0, TimeSpan.Zero));
+
+        var later = new SignInRefusals(File_);
+        var setBefore = new DateTimeOffset(2026, 11, 1, 0, 0, 0, TimeSpan.Zero);
+        var setAfter = new DateTimeOffset(2026, 11, 13, 13, 0, 0, TimeSpan.Zero);
+
+        Assert.Contains("refused through ad-main", later.Find(cim, id => credentials.GetValueOrDefault(id), setBefore), StringComparison.Ordinal);
+        Assert.Null(later.Find(cim, id => credentials.GetValueOrDefault(id), setAfter));          // its password was entered since
+        Assert.Null(later.Find(cim, id => id == "ad-main" ? "ldap-2" : "cim-1", setBefore));      // ad-main's password was set again
+        Assert.Null(later.Find(new Connection("other", "EXAMPLE\\writer", "windows-credential"), id => credentials.GetValueOrDefault(id), setBefore));
+
+        later.Clear(cim);                                  // cim read data: its own record only
+        Assert.NotNull(later.Find(cim, id => credentials.GetValueOrDefault(id), setBefore));
+        later.ClearAccount(cim);                           // --retry-sign-in: the account's records
+        Assert.Null(later.Find(ldap, id => credentials.GetValueOrDefault(id), null));
+    }
+
+    [Fact]
+    public void Two_processes_recording_at_once_keep_both_refusals()
+    {
+        Parallel.For(0, 20, i => new SignInRefusals(File_).Record(new Connection($"lab-{i}"), $"c{i}", "refused", DateTimeOffset.UnixEpoch));
+
+        var all = new SignInRefusals(File_);
+        for (var i = 0; i < 20; i++)
+            Assert.NotNull(all.Find(new Connection($"lab-{i}"), id => id == $"lab-{i}" ? $"c{i}" : null, null));
     }
 
     [Fact]
@@ -579,5 +687,36 @@ public sealed class SignInRefusalsTests : IDisposable
 
         Assert.Equal("not tried: recorded earlier", guard.Refusal(connection));
         Assert.False(guard.Proven(connection));
+    }
+
+    [Fact]
+    public void Nothing_is_refused_for_a_credential_keeper_does_not_hold()
+    {
+        var guard = new LogonGuard();
+        var none = new Connection("open-api", null, "none");
+        var negotiate = new Connection("shares", null, "negotiate");
+
+        guard.Refuse(none, "api.example.org", "401");
+        guard.Refuse(negotiate, "srv1", "1326");
+        Assert.False(guard.DeniedAtSignIn(negotiate, "srv1", "denied"));
+        Assert.False(guard.DeniedAtSignIn(negotiate, "srv2", "denied"));
+
+        Assert.Null(guard.Refusal(none));
+        Assert.Null(guard.Refusal(negotiate));
+    }
+
+    [Fact]
+    public void A_proof_is_per_integration_but_a_refusal_is_per_account()
+    {
+        var guard = new LogonGuard();
+        var right = new Connection("ad-main", "EXAMPLE\\reader", "windows-credential");
+        var wrong = new Connection("win-servers", "EXAMPLE\\reader", "windows-credential");
+
+        guard.Accepted(right);
+        Assert.True(guard.Proven(right));
+        Assert.False(guard.Proven(wrong));                 // its own password has not worked yet: one host at a time
+
+        guard.Refuse(wrong, "srv1", "1326");
+        Assert.NotNull(guard.Refusal(right));              // the account is what locks
     }
 }
