@@ -154,8 +154,7 @@ B1 an explicit null counts as `absent` (registry writes null for an unreadable v
 B2 query dedup ignores targets, entity and name; B3 a mask can leak through `name` across rules of one query;
 B5 per-host count rules report rule coverage ok despite a failed host; B6 `targets.where` drops hosts it cannot
 judge without saying so; B7/B10/B11 store reads without ORDER BY; B8 empty keys collapse; B9 one rule-wide
-override satisfies every required setting. (GPO re-listing, LDAP range bounds and vCenter/session-login sessions:
-done, section 10.)
+override satisfies every required setting. (All done: sections 10 and 11.)
 
 ### 7. Found while building (2026-11-13)
 
@@ -222,6 +221,20 @@ done, section 10.)
 - LDAP ranged attributes: reaching the page cap is a failed read, never a silently short list.
 - Checked, already right: GPO lists SYSVOL once per scan (GpoSession); a vCenter or session-login token is
   renewed once on a 401 mid-scan (RenewSessionAsync).
+
+### 11. Engine review bugs B1-B11 (2026-11-13)
+
+- B1: a value the registry could not read is named in the row's `_unread`; any condition on it is unknown.
+- B2: rules with one query in files with different targets read their own hosts (id~hash for the second list);
+  stored rows take entity type and name from a rule judged row by row, not a count rule listed first.
+- B3: entity names on rows and findings are read after every mask of the query.
+- B5: a per-host count with a failed host is not covered "ok".
+- B6: hosts the targets' where cannot judge are a manifest note (not an incomplete list, which would keep every
+  finding open in any domain with never-used computer objects).
+- B7/B10/B11: host attributes keep the newest read (ORDER BY); overrides most specific first; fixed order of
+  the incomplete-list reasons.
+- B8: several keyless rows of one read and host get host|(no key: content hash); one keeps its old key.
+- B9: a rule override sets only the rule's own threshold (name=value when it has several), never the time zone.
 
 ## Not in this change
 
