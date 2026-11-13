@@ -9,4 +9,7 @@ public static class ExitCodes
 
     /// <summary>Ran, but could not see everything it should have: partial data, or none.</summary>
     public const int NoData = 3;
+
+    /// <summary>Did not run because this is not the time: outside the integration's scan window.</summary>
+    public const int NotNow = 4;
 }

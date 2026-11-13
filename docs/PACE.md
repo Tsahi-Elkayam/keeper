@@ -79,6 +79,21 @@ Set per integration with `keeper integration set <id> --option pace=normal`, or 
 One number of a profile: `--option pace.hosts=2`, `pace.sessionsPerSecond`, `pace.requestsPerSecond`,
 `pace.stopAfter`. `--parallel <n>` is the number of hosts at once for one scan.
 
+## Scan windows
+
+When the estate's owners let Keeper read an integration:
+
+```
+keeper integration set win-servers --option window=20:00-06:00 --option window.days=Sun-Thu
+keeper integration set win-servers --option window.timeZone=Asia/Jerusalem   # default: the Keeper machine's own
+```
+
+A window that ends at or before its start runs past midnight; `00:00-24:00` is the whole day. The days are the days
+the window opens (Thursday 20:00 runs into Friday 06:00). Outside the window `keeper scan` sends nothing and exits 4
+(`keeper run` lists the system as not scanned). When the window closes during a scan, Keeper stops reading: the reads
+not made are failed, never empty, so nothing is retired, and the run notes say when it closed. `--ignore-window` scans
+now anyway; `--test` and `--plan` are not held to the window, and `--plan` shows it.
+
 ## Before a scan
 
 ```

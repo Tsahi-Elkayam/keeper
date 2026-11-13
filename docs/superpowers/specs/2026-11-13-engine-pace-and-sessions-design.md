@@ -273,10 +273,19 @@ override satisfies every required setting. (All done: sections 10 and 11.)
   without a new attempt and without being learned from again.
 - Not shared: a connection test and a plan; a scan run on its own closes its sessions and signs out as before.
 
+### 14. Scan windows (2026-11-13)
+
+- `ScanWindow` (Keeper.Runners) from options `window`, `window.days`, `window.timeZone`; parse errors are usage errors.
+- `keeper scan` outside its window: nothing sent, exit `ExitCodes.NotNow` (4); `keeper run` reports it as not scanned.
+  `--ignore-window` on both; `--test` and `--plan` ignore the window.
+- `Pacer.Until` = when the open window closes (or now, when it is not open); from then `Stopped` gives every host the
+  window's reason, so the lane fails the rest and `HostPace` ends a read in flight. It is not a push-back and not in
+  `PushedBack`. A run note says the window closed.
+
 ## Not in this change
 
-Scan windows (only at night); reading the account's lockout policy
-before scanning; moving integration types from code to data. Recorded as follow-ups.
+Reading the account's lockout policy before scanning; moving integration types from code to data. Recorded as
+follow-ups.
 
 ## Tests
 

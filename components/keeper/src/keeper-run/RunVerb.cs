@@ -16,7 +16,7 @@ public static class RunVerb
     {
         try
         {
-            var cli = new CliArgs(args, flags: ["scan-all", "no-scan", "dry-run", "fresh-sign-in", "discover", "retry-sign-in"]);
+            var cli = new CliArgs(args, flags: ["scan-all", "no-scan", "dry-run", "fresh-sign-in", "discover", "retry-sign-in", "ignore-window"]);
             if (cli.Help)
                 return CliUsage.Print("""
                     keeper run - the daily pipeline: load rules, scan, load, track, rank, then today's list
@@ -29,11 +29,13 @@ public static class RunVerb
                       keeper run --fresh-sign-in      new Entra tokens for every scan: right after activating a PIM role
                       keeper run --pace gentle        how hard every scan reads (gentle, normal, fast; see 'keeper scan --help')
                       keeper run --retry-sign-in      sign in again with credentials refused before (after an account was unlocked)
+                      keeper run --ignore-window      scan integrations whose scan window (option window) is closed now
                     """, asked: true);
             var (_, paths) = KeeperContext.Load(cli);
             var passSettings = cli.Get("settings") is { } s ? new[] { "--settings", Path.GetFullPath(s) } : [];
             string[] scanFlags = [.. cli.Has("fresh-sign-in") ? ["--fresh-sign-in"] : Array.Empty<string>(),
                 .. cli.Has("retry-sign-in") ? ["--retry-sign-in"] : Array.Empty<string>(),
+                .. cli.Has("ignore-window") ? ["--ignore-window"] : Array.Empty<string>(),
                 .. cli.Get("pace") is { } pace ? ["--pace", pace] : Array.Empty<string>()];
             var build = Iso.Stamp(DateTimeOffset.UtcNow);
 
@@ -148,7 +150,9 @@ public static class RunVerb
                 Console.WriteLine();
                 string[] scanArgs = integration is null ? [system, .. passOn] : [system, "--integration", integration, .. passOn];
                 var code = Commands.Run("scan", scanArgs);
-                if (code == ExitCodes.NoData)
+                if (code == ExitCodes.NotNow)
+                    problems.Add($"{system}: not scanned, outside its integration's scan window");
+                else if (code == ExitCodes.NoData)
                     problems.Add($"{system}: partial scan (see its blind spots)");
                 else if (code != ExitCodes.Ok)
                     problems.Add($"{system}: scan failed (exit {code})");

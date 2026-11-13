@@ -21,7 +21,7 @@ public static class ScanVerb
     {
         try
         {
-            var cli = new CliArgs(args, flags: ["test", "list", "fresh-sign-in", "plan", "retry-sign-in"]);
+            var cli = new CliArgs(args, flags: ["test", "list", "fresh-sign-in", "plan", "retry-sign-in", "ignore-window"]);
             if (cli.Help)
                 return CliUsage.Print("""
                     keeper scan - run one system's rules through its integration and write a run folder (read-only towards the system)
@@ -42,6 +42,8 @@ public static class ScanVerb
                         --parallel <n>       hosts at once (overrides the pace's)
                         --retry-sign-in      sign in again although this credential was refused before (after the
                                              account was unlocked); setting the secret again does the same
+                        --ignore-window      scan now although the integration's scan window is closed (option window,
+                                             for example window=20:00-06:00 window.days=Sun-Thu); --test and --plan never wait for it
                     Keeper opens one session per host and reuses it, slows down for a host that pushes back (timeouts, 429/503,
                     busy) and stops reading it after a few times, and never presents a credential again after it was refused -
                     for the rest of the scan and of 'keeper run' - so an account is not locked out.
@@ -82,6 +84,15 @@ public static class ScanVerb
                 var previous = inputs.PreviousRows(record.Id, systemName);
 
                 var test = cli.Has("test");
+                // When the estate's owners let it be read. A connection test (one read) and a plan (none) are not held to it.
+                var window = test || cli.Has("plan") || cli.Has("ignore-window") ? null : ScanWindow.From(record.Options);
+                if (window is not null && window.ClosesAt(DateTimeOffset.UtcNow) is null)
+                {
+                    Console.WriteLine($"Not scanning {systemName} through {record.Id}: outside its scan window ({window}); " +
+                                      $"it opens {window.NextOpen(DateTimeOffset.UtcNow).ToLocalTime():yyyy-MM-dd HH:mm}. Nothing was sent. " +
+                                      "--ignore-window scans now.");
+                    return ExitCodes.NotNow;
+                }
                 var runsDir = test ? Path.Combine(paths.DataDir, "tmp", "test-" + Iso.Stamp(DateTimeOffset.UtcNow)) : paths.Runs;
                 // Inside 'keeper run' the integration's connection (its token, its signed-in vCenter session) and the
                 // hosts' sessions are the run's: the next system through this integration reuses them, and the run ends
@@ -116,10 +127,15 @@ public static class ScanVerb
                     TargetLimit = test ? 1 : null,
                     Log = message => Console.Error.WriteLine($"  {Redactor.Clean(message)}"),
                     Sessions = run,
+                    Window = window,
                 };
                 if (cli.Has("plan"))
                 {
                     PrintPlan(systemName, record.Id, scanner.Plan(request));
+                    if (ScanWindow.From(record.Options) is { } planWindow)
+                        Console.WriteLine(planWindow.ClosesAt(DateTimeOffset.UtcNow) is { } closes
+                            ? $"  window: {planWindow} - open now, closes {closes.ToLocalTime():yyyy-MM-dd HH:mm}"
+                            : $"  window: {planWindow} - closed now, opens {planWindow.NextOpen(DateTimeOffset.UtcNow).ToLocalTime():yyyy-MM-dd HH:mm}");
                     return ExitCodes.Ok;
                 }
                 Directory.CreateDirectory(runsDir);

@@ -73,6 +73,9 @@ public sealed record ScanRequest
     /// handed back instead of closed. Null for a scan of its own: its sessions close when its hosts are done.
     /// </summary>
     public RunSessions? Sessions { get; init; }
+
+    /// <summary>When the integration may be read; the scan stops reading when it closes. Null: any time.</summary>
+    public ScanWindow? Window { get; init; }
 }
 
 /// <summary>What a scan would cost one host.</summary>
@@ -343,7 +346,9 @@ public sealed class Scanner(RunnerRegistry registry, TimeProvider? clock = null)
     {
         var connection = request.Connection;
         var profile = Profile(request);
-        var pacer = new Pacer(profile, _clock);
+        // A scan started outside its window (the caller should not have) reads nothing: the window closed already.
+        var now = _clock.GetUtcNow();
+        var pacer = new Pacer(profile, _clock) { Until = request.Window is { } window ? window.ClosesAt(now) ?? now : null };
         var endpointHost = EndpointHost(connection.Endpoint);
         var (outcomes, plans, reads) = BuildPlan(queries, request);
 
@@ -389,6 +394,9 @@ public sealed class Scanner(RunnerRegistry registry, TimeProvider? clock = null)
             notes.Add(stopped ? pacer.Stopped(host)! : $"{host} pushed back {signals} time(s); Keeper slowed down for it");
         if (request.Guard.Refusal(connection) is { } refusal)
             notes.Add(refusal);
+        if (pacer.WindowClosed)
+            notes.Add($"the scan window ({request.Window}) closed at {pacer.Until:yyyy-MM-dd HH:mm zzz} before every host was read: " +
+                      "the rest are failed reads, nothing was retired by them");
         return (outcomes, new ScanCost(sessions, lanes.Count, merged.Count, reads.Count - merged.Count, reused), notes);
     }
 

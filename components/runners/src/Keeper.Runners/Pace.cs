@@ -256,6 +256,15 @@ public sealed class Pacer(PaceProfile profile, TimeProvider? clock = null)
 
     public PaceProfile Profile { get; } = profile;
 
+    /// <summary>
+    /// When the integration's scan window closes: from then on every host counts as stopped, so the reads not made by
+    /// then are failed (never empty) and a read in flight ends at its next request. Null: no window.
+    /// </summary>
+    public DateTimeOffset? Until { get; init; }
+
+    /// <summary>Whether the scan window closed while hosts were still to be read.</summary>
+    public bool WindowClosed { get; private set; }
+
     private sealed class HostState
     {
         public DateTimeOffset Next = DateTimeOffset.MinValue;
@@ -365,7 +374,16 @@ public sealed class Pacer(PaceProfile profile, TimeProvider? clock = null)
     public string? Stopped(string host)
     {
         lock (_lock)
-            return _hosts.TryGetValue(host, out var state) ? state.Stopped : null;
+        {
+            if (_hosts.TryGetValue(host, out var state) && state.Stopped is not null)
+                return state.Stopped;
+            if (Until is { } until && _clock.GetUtcNow() >= until)
+            {
+                WindowClosed = true;
+                return $"the integration's scan window closed at {until:yyyy-MM-dd HH:mm zzz}";
+            }
+            return null;
+        }
     }
 
     /// <summary>Hosts that pushed back at least once, with the number of times, and whether they were stopped.</summary>

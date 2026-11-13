@@ -252,6 +252,57 @@ public sealed class SchedulerTests : IDisposable
         Assert.All(pc02, c => Assert.Equal("failed", c.State));   // still a failed read, never empty
     }
 
+    [Fact]
+    public async Task A_scan_stops_reading_when_its_window_closes()
+    {
+        var clock = new Settable { Now = new DateTimeOffset(2026, 11, 13, 5, 50, 0, TimeSpan.Zero) };
+        var reads = 0;
+        // The window closes during the second read of the first host.
+        var runner = new SessionRunner(_ => FailureKind.None, read: (_, _) =>
+        {
+            if (Interlocked.Increment(ref reads) == 2)
+                clock.Now = clock.Now.AddMinutes(15);
+            return null!;
+        });
+        var registry = new RunnerRegistry([runner]);
+        var window = ScanWindow.From(new JsonObject { ["window"] = "20:00-06:00" }, TimeZoneInfo.Utc);
+
+        var report = await new Scanner(registry, clock).RunAsync(new ScanRequest
+        {
+            Files = [Rules(5, ThreeHosts, registry)],
+            Connection = new Connection(),
+            RunsDir = Runs,
+            ImportsDir = _dir,
+            Pace = PaceProfile.Unlimited with { Hosts = 1 },
+            Window = window,
+        }, CancellationToken.None);
+
+        Assert.Equal(2, runner.Reads);                        // nothing is read after 06:00
+        var targets = Coverage(report).Where(c => c.Scope == "target").ToList();
+        Assert.Equal(15, targets.Count);
+        Assert.Equal(13, targets.Count(c => c.State == "failed"));   // not empty: nothing is retired by a read not made
+        Assert.Contains(report.Manifest.Notes, n => n.Contains("scan window (20:00-06:00) closed", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task A_scan_started_outside_its_window_reads_nothing()
+    {
+        var runner = new SessionRunner(_ => FailureKind.None);
+        var registry = new RunnerRegistry([runner]);
+        var clock = new Settable { Now = new DateTimeOffset(2026, 11, 13, 12, 0, 0, TimeSpan.Zero) };
+
+        await new Scanner(registry, clock).RunAsync(new ScanRequest
+        {
+            Files = [Rules(2, ThreeHosts, registry)],
+            Connection = new Connection(),
+            RunsDir = Runs,
+            ImportsDir = _dir,
+            Window = ScanWindow.From(new JsonObject { ["window"] = "20:00-06:00" }, TimeZoneInfo.Utc),
+        }, CancellationToken.None);
+
+        Assert.Empty(runner.Log);
+    }
+
     private sealed class Settable : TimeProvider
     {
         public DateTimeOffset Now { get; set; } = DateTimeOffset.UnixEpoch;
