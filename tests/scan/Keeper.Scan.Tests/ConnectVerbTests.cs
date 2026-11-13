@@ -22,13 +22,22 @@ public sealed class ConnectVerbTests
         Assert.Null(ConnectVerb.Hint("AADSTS50000: something else"));
 
     [Fact]
-    public void A_second_tenant_in_the_same_home_is_found_and_the_same_tenant_again_is_not()
+    public void An_integration_that_scanned_one_tenant_is_not_pointed_at_another_and_a_second_tenant_is_said()
     {
-        IntegrationRecord[] home = [Graph("microsoft", "11111111-1111-1111-1111-111111111111")];
+        const string a = "11111111-1111-1111-1111-111111111111", b = "22222222-2222-2222-2222-222222222222";
+        IntegrationRecord[] home = [Graph("microsoft", a)];
+        static bool Scanned(string _) => true;
+        static bool Never(string _) => false;
 
-        Assert.Equal("microsoft", ConnectVerb.OtherTenant(home, "city-b", "22222222-2222-2222-2222-222222222222")?.Id);
-        Assert.Null(ConnectVerb.OtherTenant(home, "microsoft", "22222222-2222-2222-2222-222222222222"));
-        Assert.Null(ConnectVerb.OtherTenant(home, "second-app", "11111111-1111-1111-1111-111111111111"));
-        Assert.Null(ConnectVerb.OtherTenant([Graph("old", "33333333-3333-3333-3333-333333333333", enabled: false)], "microsoft", "x.onmicrosoft.com"));
+        // Re-pointing 'microsoft' after it scanned tenant A would reuse A's finding keys: refused.
+        Assert.Equal(ConnectVerb.TenantClash.Repointed, ConnectVerb.Clash(home, "microsoft", b, Scanned).Kind);
+        // Before any scan it is a mistyped tenant being fixed: fine.
+        Assert.Equal(ConnectVerb.TenantClash.None, ConnectVerb.Clash(home, "microsoft", b, Never).Kind);
+        Assert.Equal(ConnectVerb.TenantClash.None, ConnectVerb.Clash(home, "microsoft", " " + a.ToUpperInvariant(), Scanned).Kind);
+        // Another tenant under another name keeps its own finding keys; the home then reads two tenants, and says so.
+        var second = ConnectVerb.Clash(home, "city-b", b, Scanned);
+        Assert.Equal((ConnectVerb.TenantClash.SecondTenant, "microsoft"), (second.Kind, second.Other?.Id));
+        Assert.Equal(ConnectVerb.TenantClash.SecondTenant, ConnectVerb.Clash([Graph("old", b, enabled: false)], "microsoft", a, Scanned).Kind);
+        Assert.Equal(ConnectVerb.TenantClash.None, ConnectVerb.Clash([], "microsoft", a, Scanned).Kind);
     }
 }

@@ -57,4 +57,46 @@ public sealed class GraphPermissionsTests
         Assert.Contains("Directory.Read.All", user);
         Assert.Equal("Keeper reader", GraphPermissions.Describe(Token("""{"app_displayname":"Keeper reader","exp":1900000000}""")).AppName);
     }
+
+    [Theory]
+    [InlineData("opaque-token")]
+    [InlineData("a.b")]
+    [InlineData("a.!!!.c")]
+    public void A_token_that_is_not_a_jwt_is_refused_plainly(string token)
+    {
+        var ex = Record.Exception(() => GraphPermissions.Granted(token));
+        Assert.True(ex is ArgumentException or FormatException, ex?.GetType().Name ?? "no exception");
+    }
+
+    [Fact]
+    public void An_audience_that_is_not_a_string_does_not_break_the_description()
+    {
+        var (aud, _, app) = GraphPermissions.Describe(Token("""{"aud":["a","b"],"app_displayname":42}"""));
+
+        Assert.Null(aud);
+        Assert.Null(app);
+    }
+
+    [Fact]
+    public void Permissions_that_can_change_the_tenant_are_named()
+    {
+        var writes = GraphPermissions.Writes(new HashSet<string>(
+            ["Policy.Read.All", "Directory.ReadWrite.All", "User.ReadWrite.All", "Mail.Send", "DeviceManagementManagedDevices.PrivilegedOperations.All", "Sites.FullControl.All"],
+            StringComparer.OrdinalIgnoreCase));
+
+        Assert.Equal(["Directory.ReadWrite.All", "Mail.Send", "Sites.FullControl.All", "User.ReadWrite.All"], writes);
+        Assert.Empty(GraphPermissions.Writes(new HashSet<string>(GraphPermissions.Recommended(), StringComparer.OrdinalIgnoreCase)));
+    }
+
+    [Fact]
+    public void A_path_whose_longest_entry_needs_an_unselected_field_falls_back_to_the_shorter_path()
+    {
+        var map = GraphPermissions.Parse("""
+            - { path: /users, any: [User.Read.All] }
+            - { path: /users/*/extras, select: secretField, any: [Extra.Read.All] }
+            """);
+
+        Assert.Equal("User.Read.All", GraphPermissions.Needs("/users/{id}/extras", [], map)!.Single().Any[0]);
+        Assert.Equal("Extra.Read.All", GraphPermissions.Needs("/users/{id}/extras", ["secretField"], map)!.Single().Any[0]);
+    }
 }

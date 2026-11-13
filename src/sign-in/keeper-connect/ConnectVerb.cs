@@ -73,11 +73,18 @@ public static class ConnectVerb
         var (_, paths) = KeeperContext.Load(cli);
         var all = Integrations(paths);
         var exists = all.Any(i => i.Id == name);
-        // A finding is known by its rule, entity and target, and every Graph tenant has the same target: two tenants
-        // in one home would resolve each other's findings. One Keeper home per tenant keeps them apart.
-        if (OtherTenant(all, name, tenant) is { } other)
-            throw new ArgumentException($"This Keeper home already reads tenant {other.Options["tenantId"]} through integration {other.Id}. " +
-                                        "Use one Keeper home per tenant: set KEEPER_HOME to a new folder, run 'keeper setup' there, then connect.");
+        // A finding is known by its integration, check and target. An integration that has scanned one tenant and is
+        // pointed at another would close the first tenant's findings and open the second's under the same keys.
+        switch (Clash(all, name, tenant, HasScans(paths)))
+        {
+            case (TenantClash.Repointed, var scanned):
+                throw new ArgumentException($"Integration {name} has scanned tenant {scanned!.Options["tenantId"]}; pointing it at {tenant} would mix the " +
+                                            $"two tenants' findings. Connect {tenant} under another name (--name <name>), or in its own Keeper home (KEEPER_HOME).");
+            case (TenantClash.SecondTenant, var other):
+                Console.WriteLine($"Note: this home also reads tenant {other!.Options["tenantId"]} (integration {other.Id}). Each tenant's findings stay " +
+                                  "apart, but today's list and the reports cover both; a Keeper home per tenant gives each its own.");
+                break;
+        }
         var reason = cli.Get("reason") ?? $"Connect Microsoft 365 tenant {tenant}";
         string[] change =
         [
@@ -120,8 +127,19 @@ public static class ConnectVerb
             token = request.Headers.Authorization?.Parameter ?? throw new IntegrationException("The sign-in returned no token.");
         }
 
-        var (_, expires, app) = GraphPermissions.Describe(token);
-        var granted = GraphPermissions.Granted(token);
+        DateTimeOffset? expires;
+        string? app;
+        IReadOnlySet<string> granted;
+        try
+        {
+            (_, expires, app) = GraphPermissions.Describe(token);
+            granted = GraphPermissions.Granted(token);
+        }
+        catch (Exception ex) when (ex is ArgumentException or FormatException or System.Text.Json.JsonException or InvalidOperationException)
+        {
+            Console.WriteLine("Signed in, but the token is not one Keeper can read its permissions from (not a JSON web token).");
+            return ExitCodes.Failed;
+        }
         Console.WriteLine($"Signed in to {record.Options["tenantId"]} as {app ?? "app " + record.Options["clientId"]}" +
                           $"{(expires is { } e ? $" (token until {e.ToLocalTime():HH:mm})" : "")}. Nothing was read from the tenant.");
 
@@ -189,6 +207,12 @@ public static class ConnectVerb
         foreach (var s in report.Systems)
             Console.WriteLine($"  {s.System,-12} {s.Ready,4} of {Rules(s.Rules),-10}{(s.Ready == s.Rules ? "" : "   (the rest record 'could not check' until the permissions below are granted)")}");
         Console.WriteLine();
+        if (GraphPermissions.Writes(granted) is { Count: > 0 } writes)
+        {
+            Console.WriteLine($"Warning: the app may also CHANGE the tenant: {string.Join(", ", writes)}.");
+            Console.WriteLine("  Keeper never uses them; remove them from the app so a stolen certificate cannot either.");
+            Console.WriteLine();
+        }
         if (report.Missing.Count == 0)
         {
             Console.WriteLine($"Permissions: everything the rules need is granted ({granted.Count} in the token).");
@@ -225,10 +249,41 @@ public static class ConnectVerb
         : message.Contains("is not in CurrentUser", StringComparison.Ordinal) ? "Import the certificate with its private key into this user's store on this machine."
         : null;
 
-    /// <summary>An enabled Graph integration other than <paramref name="name"/> that reads a different tenant, or null.</summary>
-    public static IntegrationRecord? OtherTenant(IEnumerable<IntegrationRecord> integrations, string name, string tenant) =>
-        integrations.FirstOrDefault(i => i.Type == "graph" && i.Enabled && i.Id != name
-            && i.Options["tenantId"]?.ToString() is { } other && !string.Equals(other, tenant, StringComparison.OrdinalIgnoreCase));
+    public enum TenantClash
+    {
+        None,
+
+        /// <summary>The integration being connected has scanned another tenant: refused.</summary>
+        Repointed,
+
+        /// <summary>Another Graph integration (enabled or not) reads another tenant: allowed, and said.</summary>
+        SecondTenant,
+    }
+
+    /// <summary>How connecting <paramref name="tenant"/> as integration <paramref name="name"/> meets the tenants this home already reads.</summary>
+    /// <param name="hasScans">Whether the store holds scans of an integration; pointing one that has none elsewhere (a mistyped tenant) is fine.</param>
+    public static (TenantClash Kind, IntegrationRecord? Other) Clash(IEnumerable<IntegrationRecord> integrations, string name, string tenant, Func<string, bool> hasScans)
+    {
+        bool Differs(IntegrationRecord i) => i.Type == "graph" && i.Options["tenantId"]?.ToString()?.Trim() is { Length: > 0 } t
+                                              && !string.Equals(t, tenant.Trim(), StringComparison.OrdinalIgnoreCase);
+        var list = integrations.ToList();
+        if (list.FirstOrDefault(i => i.Id == name) is { } self && Differs(self) && hasScans(name))
+            return (TenantClash.Repointed, self);
+        return list.FirstOrDefault(i => i.Id != name && Differs(i)) is { } other ? (TenantClash.SecondTenant, other) : (TenantClash.None, null);
+    }
+
+    private static Func<string, bool> HasScans(KeeperPaths paths) => id =>
+    {
+        try
+        {
+            using var connection = new Database(paths.Database).OpenReadOnly();
+            return Sql.Scalar(connection, "SELECT 1 FROM run WHERE instance = :id LIMIT 1;", null, (":id", id)) is not null;
+        }
+        catch (Microsoft.Data.Sqlite.SqliteException)
+        {
+            return true;   // the store cannot say: treat it as scanned, and refuse rather than risk mixing tenants
+        }
+    };
 
     private static X509Certificate2? FindCertificate(string thumbprint)
     {

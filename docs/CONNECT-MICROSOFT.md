@@ -10,15 +10,17 @@ that will run Keeper.
 
 ## 0. One Keeper home per tenant
 
-A finding is known by its rule, the thing it is about, and its target, and every tenant's Graph target is the same
-(`graph.microsoft.com`). Two tenants in one home would close each other's findings. Give each tenant its own home:
+Give each tenant its own Keeper home: its own today list, reports, trends and settings.
 
 ```powershell
 $env:KEEPER_HOME = 'D:\Keeper\<tenant name>'
-keeper setup
+keeper setup --tenant <tenant name> --apply
 ```
 
-`keeper connect` refuses a second tenant in a home that already reads one.
+A home can read several tenants, each under its own integration name (`--name`), and keeps their findings apart,
+but its today list and reports then cover them together; `keeper connect` says so when it adds a second tenant.
+It refuses to point an integration that has already scanned one tenant at another, because the two tenants'
+findings would mix under the same keys. A tenant id typed wrong can be corrected before the first scan.
 
 ## 1. A certificate on the machine that runs Keeper
 

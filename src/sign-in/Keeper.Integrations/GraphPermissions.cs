@@ -73,10 +73,17 @@ public static class GraphPermissions
         var matching = map.Where(e => Matches(Segments(e.Path), request)).ToList();
         if (matching.Count == 0)
             return null;
-        var longest = matching.Max(e => Segments(e.Path).Count);
-        return matching.Where(e => Segments(e.Path).Count == longest && (e.Select is null || selected.Contains(e.Select)))
-            .Select(e => new Need(e.Any, e.Confirm))
-            .ToList();
+        // The longest path that has an entry for this request decides; one whose only entries need a field the
+        // request does not select leaves the decision to the next shorter path.
+        foreach (var length in matching.Select(e => Segments(e.Path).Count).Distinct().OrderDescending())
+        {
+            var needs = matching.Where(e => Segments(e.Path).Count == length && (e.Select is null || selected.Contains(e.Select)))
+                .Select(e => new Need(e.Any, e.Confirm))
+                .ToList();
+            if (needs.Count > 0)
+                return needs;
+        }
+        return null;
     }
 
     /// <summary>The path's segments without its query and without the key or function arguments after a '('.</summary>
@@ -99,12 +106,7 @@ public static class GraphPermissions
     /// </summary>
     public static IReadOnlySet<string> Granted(string accessToken)
     {
-        var parts = accessToken.Split('.');
-        if (parts.Length < 2)
-            throw new ArgumentException("not a JSON web token");
-        var payload = parts[1].Replace('-', '+').Replace('_', '/');
-        payload = payload.PadRight(payload.Length + (4 - payload.Length % 4) % 4, '=');
-        using var json = JsonDocument.Parse(Encoding.UTF8.GetString(Convert.FromBase64String(payload)));
+        using var json = Payload(accessToken);
         var granted = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         if (json.RootElement.TryGetProperty("roles", out var roles) && roles.ValueKind == JsonValueKind.Array)
             granted.UnionWith(roles.EnumerateArray().Select(r => r.GetString()).OfType<string>());
@@ -116,15 +118,40 @@ public static class GraphPermissions
     /// <summary>The token's audience and expiry, for the line that says who Keeper signed in as and until when.</summary>
     public static (string? Audience, DateTimeOffset? Expires, string? AppName) Describe(string accessToken)
     {
+        using var json = Payload(accessToken);
+        var root = json.RootElement;
+        return (Text(root, "aud"),
+                root.TryGetProperty("exp", out var exp) && exp.ValueKind == JsonValueKind.Number && exp.TryGetInt64(out var seconds)
+                    ? DateTimeOffset.FromUnixTimeSeconds(seconds) : null,
+                Text(root, "app_displayname"));
+
+        static string? Text(JsonElement root, string name) =>
+            root.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.String ? value.GetString() : null;
+    }
+
+    /// <summary>The token's payload: the second dot-separated part, base64url. Throws ArgumentException when it is no JWT.</summary>
+    private static JsonDocument Payload(string accessToken)
+    {
         var parts = accessToken.Split('.');
+        if (parts.Length < 3)
+            throw new ArgumentException("not a JSON web token");
         var payload = parts[1].Replace('-', '+').Replace('_', '/');
         payload = payload.PadRight(payload.Length + (4 - payload.Length % 4) % 4, '=');
-        using var json = JsonDocument.Parse(Encoding.UTF8.GetString(Convert.FromBase64String(payload)));
-        var root = json.RootElement;
-        return (root.TryGetProperty("aud", out var aud) ? aud.GetString() : null,
-                root.TryGetProperty("exp", out var exp) && exp.TryGetInt64(out var seconds) ? DateTimeOffset.FromUnixTimeSeconds(seconds) : null,
-                root.TryGetProperty("app_displayname", out var name) ? name.GetString() : null);
+        var json = JsonDocument.Parse(Encoding.UTF8.GetString(Convert.FromBase64String(payload)));
+        if (json.RootElement.ValueKind != JsonValueKind.Object)
+        {
+            json.Dispose();
+            throw new ArgumentException("not a JSON web token");
+        }
+        return json;
     }
+
+    /// <summary>Granted permissions that can change the tenant: Keeper asks for none and should be told of any.</summary>
+    public static IReadOnlyList<string> Writes(IReadOnlySet<string> granted) =>
+        [.. granted.Where(p => p.Contains(".ReadWrite", StringComparison.OrdinalIgnoreCase) || p.Contains(".Manage", StringComparison.OrdinalIgnoreCase)
+                               || p.Contains(".Write", StringComparison.OrdinalIgnoreCase) || p.EndsWith(".Send", StringComparison.OrdinalIgnoreCase)
+                               || p.Contains("FullControl", StringComparison.OrdinalIgnoreCase))
+            .Order(StringComparer.OrdinalIgnoreCase)];
 
     /// <summary>Every permission the map can ask for, the first of each 'any' (the one the setup guide grants).</summary>
     public static IReadOnlyList<string> Recommended(IReadOnlyList<Entry>? map = null) =>
