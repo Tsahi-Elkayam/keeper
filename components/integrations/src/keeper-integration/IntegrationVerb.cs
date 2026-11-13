@@ -126,7 +126,7 @@ public static class IntegrationVerb
                     keys[name["hostKeys.".Length..]] = value;
                     options["hostKeys"] = keys;
                 }
-                else if (name is "targets" or "scopes")
+                else if (name is "targets" or "scopes" || name.StartsWith("targets.", StringComparison.Ordinal) && name.Length > "targets.".Length)
                 {
                     options[name] = new JsonArray(value.Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries)
                         .Select(v => (JsonNode)JsonValue.Create(v)).ToArray());
@@ -255,7 +255,9 @@ public static class IntegrationVerb
                   keeper integration set-secret <id> <password|token|clientSecret> [--expires yyyy-MM-dd] --reason "<why>"
                   keeper integration remove <id> --reason "<why>"
 
-                  Options: targets=a,b,c  scopes=x,y  clientId=..  tenantId=..  tokenUrl=https://..  header=..  prefix=..
+                  Options: targets=a,b,c (the hosts of rule files without a target list of their own)
+                           targets.<system>=a,b (that system's files only, also those that find their hosts in the store,
+                           e.g. targets.windows-baseline=lab-pc)  scopes=x,y  clientId=..  tenantId=..  tokenUrl=https://..  header=..  prefix=..
                            param=..  headers.<name>=..  tls=trust (sql)  allowHttp=true (only if you accept cleartext)
                            cimProtocol=auto|wsman|dcom (cim: WinRM, then DCOM for hosts WinRM cannot reach)
                            port=22  hostKeys.<host>=SHA256:<fingerprint>[,SHA256:...]  acceptAnyHostKey=true (ssh; the host key is then not verified)

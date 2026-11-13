@@ -146,9 +146,9 @@ public sealed class Scanner(RunnerRegistry registry, TimeProvider? clock = null)
             }
         }
         // Hosts left out because the targets' where could not judge them are said, once per target list.
-        if (request.Connection.Options["targets"] is not JsonArray)
         {
-            foreach (var spec in request.Files.Select(f => f.Targets).OfType<TargetSpec>().Where(t => t.List.Count == 0)
+            foreach (var spec in request.Files.Where(f => OptionTargets(request.Connection.Options, f) is null)
+                         .Select(f => f.Targets).OfType<TargetSpec>().Where(t => t.List.Count == 0)
                          .DistinctBy(TargetsText, StringComparer.Ordinal))
             {
                 if (request.TargetsUnjudged(spec) is { } unjudged)
@@ -439,7 +439,7 @@ public sealed class Scanner(RunnerRegistry registry, TimeProvider? clock = null)
                 outcome.Targets.Add(new TargetOutcome(null, "partial", targetsProblem, 0));
             // A query-wide record beside the hosts' own: it tells the tracker that a host missing from this read may
             // simply be missing from the list, not retired.
-            if (file.Targets is { List.Count: 0 } spec && connection.Options["targets"] is not JsonArray && request.TargetsIncomplete(spec) is { } incomplete)
+            if (file.Targets is { List.Count: 0 } spec && OptionTargets(connection.Options, file) is null && request.TargetsIncomplete(spec) is { } incomplete)
                 outcome.Targets.Add(new TargetOutcome(null, "partial", incomplete, 0));
 
             // A host listed twice is read once (its rows would count twice).
@@ -494,9 +494,9 @@ public sealed class Scanner(RunnerRegistry registry, TimeProvider? clock = null)
         foreach (var (rule, file) in rules)
         {
             // The hosts the file will really read (as ResolveTargets picks them): its own fixed list, else the
-            // integration's targets option, which then stands for every file, else its target spec.
+            // integration's targets option that applies to it (see OptionTargets), else its target spec.
             var targets = file.Targets is { List.Count: > 0 } fixedList ? TargetsText(fixedList)
-                : connection.Options["targets"] is JsonArray ? "(integration targets)"
+                : OptionTargets(connection.Options, file) is { } fromOptions ? "(integration targets) " + fromOptions.ToJsonString()
                 : TargetsText(file.Targets);
             var id = rule.Query.Id;
             if (!firstTargets.TryAdd(id, targets) && firstTargets[id] != targets)
@@ -851,13 +851,21 @@ public sealed class Scanner(RunnerRegistry registry, TimeProvider? clock = null)
     {
         var options = request.Connection.Options;
         // A list the rule author wrote into the file is their choice. A file that finds its hosts in the store (every
-        // directory-driven pack) can be pointed at named hosts by the integration: one lab machine, one host to try.
+        // directory-driven pack) can be pointed at named hosts by the integration's targets.<system> option: one lab
+        // machine, one host to try. The plain targets option is for files with no target list of their own.
         if (file.Targets is { List.Count: > 0 } fixedList)
             return (fixedList.List, null);
-        if (options["targets"] is JsonArray fromOptions)
+        if (OptionTargets(options, file) is { } fromOptions)
             return (fromOptions.Select(t => Values.Text(t)).OfType<string>().Where(t => t.Length > 0).ToList(), null);
         if (file.Targets is { } spec)
-            return (request.ResolveTargets(spec), null);
+        {
+            var known = request.ResolveTargets(spec);
+            return known.Count == 0 && options["targets"] is JsonArray
+                ? (known, $"no {spec.Entity ?? "host"} the store knows matches this file's targets (scan the system that lists them first); " +
+                          $"the integration's targets option is for files without a target list of their own - " +
+                          $"set {TargetsOption}{file.System}=<host> to point this one at named hosts")
+                : (known, null);
+        }
         if (options["targetsFrom"]?.ToString() == "discovery" && options["targetsKind"]?.ToString() is { Length: > 0 } kinds)
             return DiscoveryTargets.Read(request.ImportsDir, kinds, request.Connection.Endpoint, request.Connection.Type, _clock.GetUtcNow());
         // For these types the endpoint is the scope they may talk to, not a host to read.
@@ -865,6 +873,18 @@ public sealed class Scanner(RunnerRegistry registry, TimeProvider? clock = null)
             return ([], null);
         return (string.IsNullOrWhiteSpace(request.Connection.Endpoint) ? [] : [request.Connection.Endpoint], null);
     }
+
+    private const string TargetsOption = "targets.";
+
+    /// <summary>
+    /// The hosts an integration option names for one rule file, or null when none applies. <c>targets.&lt;system&gt;</c>
+    /// names hosts for that system's files. The plain <c>targets</c> option applies only to files without a target
+    /// list of their own: a file that finds its hosts in the store (domain controllers, Windows servers) knows what
+    /// they are, and pointing it at the integration's general list judges the wrong hosts as if they were those.
+    /// </summary>
+    internal static JsonArray? OptionTargets(JsonObject options, RuleFile file) =>
+        options[TargetsOption + file.System] as JsonArray
+        ?? (file.Targets is null ? options["targets"] as JsonArray : null);
 
     private RunnerContext Context(ScanRequest request, string? target) =>
         new(request.Connection, target, request.ImportsDir, request.StoreFile, _clock.GetUtcNow(), request.Timeout,

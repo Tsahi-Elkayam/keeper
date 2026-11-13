@@ -30,4 +30,7 @@ tracks the results, lists what it found and builds the interactive page. Everyth
 
 Run Keeper from a domain-joined Windows machine, add an `ldap` integration (`--auth negotiate`, endpoint your
 domain) and a `cim` one, and run `keeper run`. The Windows packs find their hosts in Active Directory. To try a
-single host first, give the `cim` integration `--option targets=<host>`: an explicit list overrides the directory.
+single host first, name it per pack on the `cim` integration, e.g. `--option targets.windows-baseline=<host>`
+(and `targets.windows-server=<host>`, `targets.workstations=<host>`): a pack's own list overrides the directory. The
+plain `targets` option does not: it is for packs with no host list of their own, and a pack that reads servers or
+domain controllers from the directory is never pointed at another list by accident.

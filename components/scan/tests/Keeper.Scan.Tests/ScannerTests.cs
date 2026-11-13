@@ -690,6 +690,77 @@ public sealed class ScannerTests : IDisposable
         Assert.All(rows, r => Assert.StartsWith("-|admin", r.EntityName, StringComparison.Ordinal));
     }
 
+    private const string GenericPack = """
+        schema: keeper.rules/1
+        system: endpoints
+        integration: files
+        defaults: { lens: both, refresh: 1d, category: PKI, kind: misconfigured, severity: low, entity: member }
+        rules:
+          - id: EX-ENDPOINT
+            title: Endpoint
+            query: { protocol: fake, key: name, name: name }
+            each: any
+        """;
+
+    private const string StorePack = """
+        schema: keeper.rules/1
+        system: dcs
+        integration: files
+        targets: { entity: computer, field: dNSHostName }
+        defaults: { lens: both, refresh: 1d, category: PKI, kind: misconfigured, severity: low, entity: member }
+        rules:
+          - id: EX-DC
+            title: Domain controller
+            query: { protocol: fake, key: name, name: name, variant: dc }
+            each: any
+        """;
+
+    [Fact]
+    public async Task The_integration_targets_option_does_not_stand_in_for_hosts_a_pack_finds_in_the_store()
+    {
+        // One TLS-like integration lists two web sites. The generic pack reads them; the pack that reads domain
+        // controllers from the store must not judge the web sites as if they were domain controllers.
+        var registry = new RunnerRegistry([new FakeRunner(true, new() { ["web.example.org"] = 1 })]);
+        var connection = new FilesConnection();
+        connection.Options["targets"] = new JsonArray("web.example.org");
+
+        var report = await new Scanner(registry, new Clock(Now)).RunAsync(new ScanRequest
+        {
+            Files = [FakeFile("generic.yaml", GenericPack), FakeFile("store.yaml", StorePack)],
+            Connection = connection, RunsDir = Runs, ImportsDir = Imports,
+            ResolveTargets = _ => [],                       // no directory scan has listed a domain controller yet
+        }, CancellationToken.None);
+
+        var results = Read<ResultRecord>(report, RunFolder.Results);
+        Assert.Contains(results, r => r.RuleId == "EX-ENDPOINT" && r.State == "fail");
+        Assert.DoesNotContain(results, r => r.RuleId == "EX-DC" && r.State is "fail" or "pass");
+        var failed = Assert.Single(Read<CoverageRecord>(report, RunFolder.Coverage), c => c.Scope == "rule" && c.Item == "EX-DC");
+        Assert.Equal("failed", failed.State);
+        Assert.Contains("targets.dcs=", failed.Reason, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task The_targets_option_for_one_system_points_its_store_pack_at_named_hosts()
+    {
+        var registry = new RunnerRegistry([new FakeRunner(true, new() { ["web.example.org"] = 1, ["lab-dc.example.org"] = 1 })]);
+        var connection = new FilesConnection();
+        connection.Options["targets"] = new JsonArray("web.example.org");
+        connection.Options["targets.dcs"] = new JsonArray("lab-dc.example.org");
+
+        var report = await new Scanner(registry, new Clock(Now)).RunAsync(new ScanRequest
+        {
+            Files = [FakeFile("generic.yaml", GenericPack), FakeFile("store.yaml", StorePack)],
+            Connection = connection, RunsDir = Runs, ImportsDir = Imports,
+            ResolveTargets = _ => ["dc1.example.org"],      // the store's list is overridden for this system only
+        }, CancellationToken.None);
+
+        var failing = Read<ResultRecord>(report, RunFolder.Results).Where(r => r.State == "fail").ToList();
+        Assert.Contains(failing, r => r.RuleId == "EX-DC" && r.EntityKey.Contains("lab-dc.example.org", StringComparison.Ordinal));
+        Assert.DoesNotContain(failing, r => r.RuleId == "EX-DC" && r.EntityKey.Contains("web.example.org", StringComparison.Ordinal));
+        Assert.Contains(failing, r => r.RuleId == "EX-ENDPOINT" && r.EntityKey.Contains("web.example.org", StringComparison.Ordinal));
+        Assert.DoesNotContain(failing, r => r.RuleId == "EX-ENDPOINT" && r.EntityKey.Contains("lab-dc", StringComparison.Ordinal));
+    }
+
     [Fact]
     public async Task Hosts_the_targets_where_could_not_judge_are_said_once_in_the_manifest()
     {

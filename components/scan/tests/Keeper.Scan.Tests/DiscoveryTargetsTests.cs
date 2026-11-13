@@ -179,7 +179,7 @@ public sealed class DiscoveryTargetsTests : IDisposable
     [Fact]
     public async Task The_store_lists_incompleteness_warning_does_not_apply_to_a_list_the_integration_named()
     {
-        var named = await RunWithFileTargetsAndStatus("targets: { entity: computer, field: dNSHostName }", new JsonObject { ["targets"] = new JsonArray("lab-pc-01") });
+        var named = await RunWithFileTargetsAndStatus("targets: { entity: computer, field: dNSHostName }", new JsonObject { ["targets.dynamic"] = new JsonArray("lab-pc-01") });
         var fromStore = await RunWithFileTargetsAndStatus("targets: { entity: computer, field: dNSHostName }", []);
 
         Assert.Equal("ok", named.Status);              // the hosts were named, nothing can be missing from the store's list
@@ -189,11 +189,23 @@ public sealed class DiscoveryTargetsTests : IDisposable
     [Fact]
     public async Task A_rule_file_that_finds_its_hosts_in_the_store_can_be_pointed_at_named_hosts_by_the_integration()
     {
-        var options = new JsonObject { ["targets"] = new JsonArray("lab-pc-01") };
+        var options = new JsonObject { ["targets.dynamic"] = new JsonArray("lab-pc-01") };
 
         var probe = await RunWithFileTargets("targets: { entity: computer, field: dNSHostName }", options);
 
         Assert.Equal(["lab-pc-01"], probe.Targets);
+    }
+
+    [Fact]
+    public async Task The_general_targets_option_does_not_replace_the_hosts_the_store_supplies()
+    {
+        // The general list is for files without a target list (TLS endpoints, ssh hosts); a file that reads, say,
+        // domain controllers from the store keeps reading them.
+        var options = new JsonObject { ["targets"] = new JsonArray("web.example.org") };
+
+        var probe = await RunWithFileTargets("targets: { entity: computer, field: dNSHostName }", options);
+
+        Assert.Equal(["from-the-store-1", "from-the-store-2"], probe.Targets.Order(StringComparer.Ordinal));
     }
 
     [Fact]
