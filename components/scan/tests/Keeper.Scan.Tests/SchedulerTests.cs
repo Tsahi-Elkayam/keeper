@@ -588,6 +588,56 @@ public sealed class PaceTests
         Assert.Throws<ArgumentException>(() => PaceProfile.From(new JsonObject { ["pace.hosts"] = "0" }));
     }
 
+    /// <summary>A clock that moves on 31 s each time it is read: no wait ever has to be slept.</summary>
+    private sealed class Jumping : TimeProvider
+    {
+        private DateTimeOffset _now = DateTimeOffset.UnixEpoch;
+
+        public override DateTimeOffset GetUtcNow() => _now = _now.AddSeconds(31);
+    }
+
+    [Fact]
+    public async Task A_host_held_at_the_longest_interval_is_stopped_and_a_read_in_flight_ends()
+    {
+        // Reads that succeed only after a runner's own retries never fail as a whole: without a bound the host would
+        // be read 30 s apart for as long as it has requests.
+        var pacer = new Pacer(PaceProfile.Gentle, new Jumping());
+        var pace = pacer.For("vc.example.org");
+        for (var i = 0; i < 10; i++)
+            pace.Signal(FailureKind.Throttled);
+
+        for (var i = 1; i < Pacer.MaxSlowRequests; i++)
+            await pace.WaitAsync(CancellationToken.None);
+        Assert.Null(pacer.Stopped("vc.example.org"));
+        await pace.WaitAsync(CancellationToken.None);
+        Assert.Contains("kept asking to slow down", pacer.Stopped("vc.example.org"), StringComparison.Ordinal);
+
+        var ended = await Assert.ThrowsAsync<RunnerFailureException>(() => pace.WaitAsync(CancellationToken.None));
+        Assert.Equal(FailureKind.Throttled, ended.Kind);
+    }
+
+    [Fact]
+    public async Task A_host_that_speeds_up_again_is_not_stopped()
+    {
+        var pacer = new Pacer(PaceProfile.Gentle, new Jumping());
+        var pace = pacer.For("vc.example.org");
+        for (var i = 0; i < 10; i++)
+            pace.Signal(FailureKind.Throttled);
+
+        for (var i = 0; i < 3 * Pacer.MaxSlowRequests; i++)
+        {
+            await pace.WaitAsync(CancellationToken.None);
+            if (i % 10 == 9)
+            {
+                pacer.Signal("vc.example.org", FailureKind.None);   // a clean read: the interval drops below the longest
+                await pace.WaitAsync(CancellationToken.None);       // one request at the shorter interval
+                pace.Signal(FailureKind.Throttled);                  // and the host pushes back again
+            }
+        }
+
+        Assert.Null(pacer.Stopped("vc.example.org"));
+    }
+
     [Fact]
     public void A_host_that_pushes_back_is_slowed_then_stopped_and_a_clean_answer_resets_the_streak()
     {

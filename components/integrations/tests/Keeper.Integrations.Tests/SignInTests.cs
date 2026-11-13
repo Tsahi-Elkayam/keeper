@@ -35,9 +35,11 @@ public sealed class SignInTests : IDisposable
     private sealed class Script(params Func<HttpResponseMessage>[] responses) : HttpMessageHandler
     {
         public int Requests;
+        public System.Collections.Concurrent.ConcurrentQueue<string> Sent { get; } = new();
 
         protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
         {
+            Sent.Enqueue($"{request.Method} {request.RequestUri!.AbsolutePath} {(request.Headers.TryGetValues("vmware-api-session-id", out var id) ? id.First() : "")}".TrimEnd());
             var index = Math.Min(Interlocked.Increment(ref Requests) - 1, responses.Length - 1);
             return Task.FromResult(responses[index]());
         }
@@ -48,7 +50,7 @@ public sealed class SignInTests : IDisposable
 
     private static HttpResponseMessage Token(string token = "tok-1") => Json($$"""{ "access_token": "{{token}}", "expires_in": 3600 }""");
 
-    private IntegrationConnection OAuth(Script script, string kind = "oauth-client-credentials")
+    private IntegrationConnection OAuth(Script script, string kind = "oauth-client-credentials", TimeSpan? cooldown = null)
     {
         var binding = IntegrationStore.Binding("app", kind == "vcenter-session" ? "password" : "clientSecret", "https://app.example.org");
         var name = kind == "vcenter-session" ? "password" : "clientSecret";
@@ -58,7 +60,7 @@ public sealed class SignInTests : IDisposable
             {
                 [name] = new(name, _vault.Seal("not-a-real-secret", binding), binding, "2026-11-13T00:00:00Z", null),
             });
-        return new IntegrationConnection(record, _vault) { SignInHandler = script, SignInBackoff = TimeSpan.FromMilliseconds(1), SessionRenewGrace = TimeSpan.Zero };
+        return new IntegrationConnection(record, _vault) { SignInHandler = script, SignInBackoff = TimeSpan.FromMilliseconds(1), SessionRenewGrace = TimeSpan.Zero, BusyCooldown = cooldown ?? TimeSpan.Zero };
     }
 
     private static async Task<string?> BearerOf(IntegrationConnection connection)
@@ -114,12 +116,27 @@ public sealed class SignInTests : IDisposable
         var record = new IntegrationRecord("app", "http", "https://app.example.org", "oauth-client-credentials", "reader",
             new JsonObject { ["tokenUrl"] = "https://login.example.org/token" }, true,
             new Dictionary<string, StoredSecret> { ["clientSecret"] = new("clientSecret", _vault.Seal("not-a-real-secret", binding), binding, "2026-11-13T00:00:00Z", null) });
-        using var connection = new IntegrationConnection(record, _vault) { SignInHandler = script, SignInBackoff = TimeSpan.FromMilliseconds(1) };
+        using var connection = new IntegrationConnection(record, _vault) { SignInHandler = script, SignInBackoff = TimeSpan.FromMilliseconds(1), BusyCooldown = TimeSpan.Zero };
 
         var failure = await Assert.ThrowsAsync<SignInException>(() => BearerOf(connection));
         Assert.Equal(FailureKind.Timeout, Failures.Classify(failure));
         await Assert.ThrowsAsync<SignInException>(() => BearerOf(connection));
-        Assert.Equal(6, script.Requests);          // asked again by the second query: 3 tries each
+        Assert.Equal(6, script.Requests);          // asked again by the second query once the cool-down is over: 3 tries each
+    }
+
+    [Fact]
+    public async Task A_sign_in_that_stays_busy_is_not_sent_again_for_every_read()
+    {
+        // A service that answers a locked account with 503 must not get three sign-ins per read until the host stops.
+        var script = new Script(() => Json("{}", HttpStatusCode.ServiceUnavailable));
+        using var connection = OAuth(script, cooldown: TimeSpan.FromMinutes(1));
+
+        for (var read = 0; read < 5; read++)
+        {
+            var failure = await Assert.ThrowsAsync<SignInException>(() => BearerOf(connection));
+            Assert.Equal(FailureKind.Throttled, Failures.Classify(failure));
+        }
+        Assert.Equal(3, script.Requests);          // one round of tries; the other reads fail as it did
     }
 
     private sealed class TimingOut : HttpMessageHandler
@@ -180,6 +197,21 @@ public sealed class SignInTests : IDisposable
         var refusal = await Assert.ThrowsAsync<SignInException>(() => BearerOf(connection));
         Assert.Equal(FailureKind.Refused, Failures.Classify(refusal));
         Assert.Equal(3, script.Requests);
+    }
+
+    [Fact]
+    public async Task A_vcenter_session_is_ended_after_the_scan_and_nothing_is_sent_when_none_was_opened()
+    {
+        var script = new Script(() => Json("\"session-1\""), () => Json("{}", HttpStatusCode.NoContent));
+        using var connection = OAuth(script, "vcenter-session");
+
+        await connection.SignOutAsync(CancellationToken.None);       // no session yet: nothing to end
+        Assert.Equal(0, script.Requests);
+
+        await BearerOf(connection);
+        await connection.SignOutAsync(CancellationToken.None);
+        await connection.SignOutAsync(CancellationToken.None);       // once only
+        Assert.Equal(["POST /api/session", "DELETE /api/session session-1"], script.Sent);
     }
 
     [Fact]

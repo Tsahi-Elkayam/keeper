@@ -393,7 +393,7 @@ public sealed class LdapRunner : ISessionRunner
     private static IEnumerable<object> RestOfRange(Wire wire, string dn, Range first)
     {
         var range = first;
-        for (var page = 0; range.High is { } high && page < 10_000; page++)
+        for (var page = 0; range.High is { } high && page < MaxRangePages; page++)
         {
             var response = (SearchResponse)wire.Send(
                 new SearchRequest(dn, "(objectClass=*)", SearchScope.Base, $"{range.Attribute};range={high + 1}-*"));
@@ -405,7 +405,13 @@ public sealed class LdapRunner : ISessionRunner
                 yield return value;
             range = RangeOf(next.Name)!;
         }
+        // Stopping at the cap must not look like the end of the list: a member rule would judge part of a group.
+        if (range.High is { } stoppedAt)
+            throw new FormatException($"{dn}: {range.Attribute} has more than {stoppedAt + 1} values; Keeper stops reading at {MaxRangePages} pages");
     }
+
+    /// <summary>Pages of one ranged attribute read at most (1,500 values a page on AD): a bound, never a silent end.</summary>
+    private const int MaxRangePages = 10_000;
 
     private static bool Balanced(string filter)
     {

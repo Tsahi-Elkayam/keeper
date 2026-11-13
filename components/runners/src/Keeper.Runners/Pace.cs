@@ -262,8 +262,15 @@ public sealed class Pacer(PaceProfile profile, TimeProvider? clock = null)
         public double Factor = 1;
         public int Streak;
         public int Signals;
+        public int AtMax;
         public string? Stopped;
     }
+
+    /// <summary>
+    /// Requests in a row a host may be read at the longest interval before it is stopped. A host whose reads succeed
+    /// only after a runner's own retries never builds a streak of failed reads, but must not hold the scan for hours.
+    /// </summary>
+    public const int MaxSlowRequests = 20;
 
     private TimeSpan BaseInterval => Profile.RequestsPerSecond <= 0 ? TimeSpan.Zero : TimeSpan.FromSeconds(1 / Profile.RequestsPerSecond);
 
@@ -296,8 +303,15 @@ public sealed class Pacer(PaceProfile profile, TimeProvider? clock = null)
             var now = _clock.GetUtcNow();
             var slot = state.Next > now ? state.Next : now;
             var interval = BaseInterval * state.Factor;
-            if (interval > PaceProfile.MaxInterval && BaseInterval > TimeSpan.Zero)
+            if (interval >= PaceProfile.MaxInterval && BaseInterval > TimeSpan.Zero)
+            {
                 interval = PaceProfile.MaxInterval;
+                if (++state.AtMax >= MaxSlowRequests && state.Stopped is null)
+                    state.Stopped = $"{host} kept asking to slow down: {state.AtMax} requests in a row {PaceProfile.MaxInterval.TotalSeconds:0} s apart - " +
+                                    "Keeper stopped reading it to spare it";
+            }
+            else
+                state.AtMax = 0;
             state.Next = slot + interval;
             wait = slot - now;
         }
@@ -361,9 +375,16 @@ public sealed class Pacer(PaceProfile profile, TimeProvider? clock = null)
         return state;
     }
 
+    /// <summary>
+    /// The pace a runner gets. Once the host is stopped, a read still in flight (a for_each with hundreds of children)
+    /// is ended too: its next request throws a Throttled failure instead of waiting its turn.
+    /// </summary>
     private sealed class HostPace(Pacer pacer, string host) : IPace
     {
-        public Task WaitAsync(CancellationToken cancellationToken) => pacer.WaitAsync(host, cancellationToken);
+        public Task WaitAsync(CancellationToken cancellationToken) =>
+            pacer.Stopped(host) is { } stopped
+                ? throw new RunnerFailureException($"not read: {stopped}", FailureKind.Throttled)
+                : pacer.WaitAsync(host, cancellationToken);
 
         public void Signal(FailureKind kind) => pacer.Signal(host, kind, countsTowardsStop: false);
     }

@@ -141,8 +141,17 @@ public static class ScanVerb
                 };
 
                 Console.WriteLine($"Scanning {systemName} through {record.Id} ({record.Type}){(test ? " - connection test" : "")}...");
-                var report = await scanner.RunAsync(request, CancellationToken.None);
-                request.Guard.OnRefused = null;
+                ScanReport report;
+                try
+                {
+                    report = await scanner.RunAsync(request, CancellationToken.None);
+                }
+                finally
+                {
+                    request.Guard.OnRefused = null;
+                    // vCenter and session-login products cap open sessions: the scan's is ended, not left to time out.
+                    await link.SignOutAsync(CancellationToken.None);
+                }
                 // A credential that read data in this scan and was not refused works: an old record of it is gone.
                 if (LogonGuard.PresentsSecret(link) && request.Guard.Refusal(link) is null && request.Guard.Proven(link))
                     TryKeep(() => refusals.Clear(link));

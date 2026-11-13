@@ -154,8 +154,8 @@ B1 an explicit null counts as `absent` (registry writes null for an unreadable v
 B2 query dedup ignores targets, entity and name; B3 a mask can leak through `name` across rules of one query;
 B5 per-host count rules report rule coverage ok despite a failed host; B6 `targets.where` drops hosts it cannot
 judge without saying so; B7/B10/B11 store reads without ORDER BY; B8 empty keys collapse; B9 one rule-wide
-override satisfies every required setting; GPO re-lists SYSVOL for each part; LDAP range retrieval is unbounded;
-vCenter/session-login sessions are never logged out and not renewed on a 401 mid-scan.
+override satisfies every required setting. (GPO re-listing, LDAP range bounds and vCenter/session-login sessions:
+done, section 10.)
 
 ### 7. Found while building (2026-11-13)
 
@@ -209,8 +209,19 @@ vCenter/session-login sessions are never logged out and not renewed on a 401 mid
   connection is paced; a push-back in `databases: all` keeps its kind on the partial result. for_each: a list or
   child that is partial with a refusal stops the children. `Scanner.Merge` is linear; merging keeps each spelling
   of a host as its own read.
-- Left as is: an HTTP session sign-in answered 429/5xx is retried within the read and not remembered (the host
-  stops after *stopAfter* such reads); a runner-signalled throttle can hold a host at the 30 s interval for long.
+- Then fixed (10): a busy sign-in is not sent again for `BusyCooldown` (1 min); a host held at the 30 s
+  interval for `Pacer.MaxSlowRequests` (20) requests in a row is stopped, and a runner's next wait on a stopped
+  host throws Throttled so a read in flight ends.
+
+### 10. Rate follow-ups (2026-11-13)
+
+- `IntegrationConnection.BusyCooldown`; `Pacer.MaxSlowRequests` and the throwing `HostPace`; the scanner waits on
+  the pacer directly (it checks Stopped itself).
+- `IntegrationConnection.SignOutAsync`, called by `keeper scan` when the scan ends: vCenter DELETE /api/session,
+  session-login POST to the option `logoutPath`. Best effort, 10 s.
+- LDAP ranged attributes: reaching the page cap is a failed read, never a silently short list.
+- Checked, already right: GPO lists SYSVOL once per scan (GpoSession); a vCenter or session-login token is
+  renewed once on a 401 mid-scan (RenewSessionAsync).
 
 ## Not in this change
 

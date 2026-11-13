@@ -38,6 +38,8 @@ public sealed partial class IntegrationConnection : IConnection, IAwsConnection,
     private string? _signedInAs;
     private DateTimeOffset _tokenIssued;
     private Exception? _tokenError;
+    private Exception? _busyError;
+    private DateTimeOffset _busyUntil;
 
     public IntegrationConnection(IntegrationRecord record, Keeper.Vault.Vault? vault)
     {
@@ -83,6 +85,13 @@ public sealed partial class IntegrationConnection : IConnection, IAwsConnection,
     /// together (the for_each children in flight) share the one new sign-in. A seam for tests.
     /// </summary>
     public TimeSpan SessionRenewGrace { get; init; } = TimeSpan.FromSeconds(30);
+
+    /// <summary>
+    /// How long a sign-in that was still busy after its tries (429, 5xx, a timeout) is not tried again: the reads in
+    /// between fail as it did, and the scan's pace slows or stops the host. Without it every read would send three more
+    /// sign-ins to a service that may be answering a locked account with a 503. A seam for tests.
+    /// </summary>
+    public TimeSpan BusyCooldown { get; init; } = TimeSpan.FromMinutes(1);
 
     /// <summary>Sign in to Entra again even when a cached token is valid: right after a PIM activation, so the new role is in it.</summary>
     public bool FreshSignIn { get; init; }
@@ -199,6 +208,8 @@ public sealed partial class IntegrationConnection : IConnection, IAwsConnection,
         {
             if (_tokenError is not null)
                 throw _tokenError;
+            if (_busyError is not null && DateTimeOffset.UtcNow < _busyUntil)
+                throw _busyError;
             if (_token is not null && DateTimeOffset.UtcNow < _tokenExpires.AddMinutes(-2)
                 && (!renew || DateTimeOffset.UtcNow - _tokenIssued < SessionRenewGrace))
                 return _token;
@@ -226,6 +237,13 @@ public sealed partial class IntegrationConnection : IConnection, IAwsConnection,
                 _tokenError = ex;
                 throw;
             }
+            catch (Exception ex) when (ex is SignInException or IntegrationException { Transient: true })
+            {
+                _busyError = ex;
+                _busyUntil = DateTimeOffset.UtcNow + BusyCooldown;
+                throw;
+            }
+            _busyError = null;
             return _token;
         }
         finally
@@ -251,6 +269,56 @@ public sealed partial class IntegrationConnection : IConnection, IAwsConnection,
         catch (Exception ex) when (ex is IntegrationException or SignInException)
         {
             return false;
+        }
+    }
+
+    /// <summary>
+    /// Ends the scan's session: vCenter's (DELETE /api/session) and a session-login product's when it names a
+    /// logoutPath. vCenter caps the sessions a user and the whole server may hold, and a session left open lives until
+    /// its idle timeout - a scan an hour must not use them up. Best effort: a sign-out that fails is not a failed scan.
+    /// </summary>
+    public async Task SignOutAsync(CancellationToken cancellationToken)
+    {
+        string? token;
+        await _tokenLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            token = _token;
+            _token = null;
+        }
+        finally
+        {
+            _tokenLock.Release();
+        }
+        if (token is null)
+            return;
+        HttpRequestMessage request;
+        if (_record.AuthKind == "vcenter-session")
+        {
+            request = new HttpRequestMessage(HttpMethod.Delete, new Uri(new Uri(_record.Endpoint), "/api/session"));
+            request.Headers.TryAddWithoutValidation("vmware-api-session-id", token);
+        }
+        else if (_record.AuthKind == "session-login" && _record.Options["logoutPath"]?.ToString() is { } logoutPath)
+        {
+            request = new HttpRequestMessage(HttpMethod.Post, LoginUri(_record.Endpoint, logoutPath))
+            {
+                Content = new StringContent("{}", Encoding.UTF8, "application/json"),
+            };
+            request.Headers.TryAddWithoutValidation(_record.Options["header"]?.ToString() ?? "Authorization", (_record.Options["prefix"]?.ToString() ?? "") + token);
+        }
+        else
+            return;
+        using (request)
+        using (var client = new HttpClient(SignInHandler ?? new SocketsHttpHandler { AllowAutoRedirect = false }, disposeHandler: SignInHandler is null) { Timeout = TimeSpan.FromSeconds(10) })
+        {
+            try
+            {
+                using var response = await client.SendAsync(request, cancellationToken).ConfigureAwait(false);
+            }
+            catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException)
+            {
+                // The session ends at its idle timeout instead.
+            }
         }
     }
 
@@ -292,7 +360,8 @@ public sealed partial class IntegrationConnection : IConnection, IAwsConnection,
     /// One sign-in request and its answer's text. A refusal (401, 403, 400 invalid_grant/invalid_client) throws a
     /// <see cref="SignInException"/> of kind Refused, which the connection remembers. A busy or silent service (408,
     /// 429, 5xx, a timeout, a reset) is tried again, at most twice more with a growing pause, and then fails as
-    /// Throttled, Timeout or Unreachable - never remembered as a refusal, so one slow minute does not end the scan's access.
+    /// Throttled, Timeout or Unreachable - never remembered as a refusal, so one slow minute does not end the scan's access;
+    /// the connection then waits <see cref="BusyCooldown"/> before signing in again.
     /// </summary>
     private async Task<string> SignInSendAsync(string host, Func<HttpRequestMessage> create, CancellationToken cancellationToken)
     {
@@ -388,7 +457,8 @@ public sealed partial class IntegrationConnection : IConnection, IAwsConnection,
     /// integration's own endpoint - never another host - with the user and password as JSON (or a form);
     /// the token is read from the answer by a field path. Options: loginPath (required), userField
     /// (user), passwordField (password), body (json|form), tokenField (token), header, prefix,
-    /// lifetimeMinutes (25), plus any fixed loginFields.* the product needs.
+    /// lifetimeMinutes (25), logoutPath (a path that ends the session, sent a POST with the token at the end of
+    /// a scan), plus any fixed loginFields.* the product needs.
     /// </summary>
     public static Uri LoginUri(string endpoint, string? loginPath)
     {

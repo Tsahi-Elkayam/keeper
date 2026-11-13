@@ -16,7 +16,7 @@ exist only for `graphql`) with none/basic/bearer/api-key/oauth-client-credential
 `session-login` auth (a POST sign-in on the integration's own endpoint with user and password or key
 pair, JSON or form body, the token read from a field of the answer and sent in a configurable header
 with an optional prefix; options `loginPath`, `userField`, `passwordField`, `body`, `tokenField`,
-`header`, `prefix`, `lifetimeMinutes`, fixed `loginFields.*`), `for_each` (one level), relative dates
+`header`, `prefix`, `lifetimeMinutes`, `logoutPath` (ends the session after a scan), fixed `loginFields.*`), `for_each` (one level), relative dates
 `{DAYS_AGO:n}`; `graph`,
 `sccm`, `prtg`, `servicenow`, `vcenter` are named http types; `cim`/`registry`/`eventlog` run per
 Windows host; `tls` handshakes per target; `file` reads json/xml/csv in `imports\`; `store` SQL

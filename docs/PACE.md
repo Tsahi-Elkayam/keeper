@@ -46,6 +46,14 @@ a WinRM quota or an AD lockout policy that is a password spray. The design is in
   quota or a reset connection doubles the host's interval (up to 30 s); clean answers bring it back. After
   *stopAfter* push-backs in a row the host is not read again in that scan; its remaining reads are failed
   (never empty), so nothing on it is retired or resolved by a read that did not happen.
+  A host whose reads succeed only after a runner's own retries never fails a read, so it has a second bound:
+  20 requests in a row at the 30 s interval stop it too, and a read in flight (a for_each) ends at its next
+  request.
+- **Busy sign-ins wait.** An HTTP sign-in (OAuth, vCenter, session-login) still answered 429/5xx or nothing after
+  its three tries is not sent again for a minute; reads in between fail as it did.
+- **Sessions are ended.** A vCenter session is signed out (DELETE /api/session) when the scan ends, and a
+  session-login product's too when the integration names `logoutPath`: vCenter caps the open sessions a user
+  and the server may hold.
 - **Merged reads.** Registry rules that read values under the same key are one read (716 baseline rules sit
   on 265 keys); each rule still sees only its own values. Two files that spell a host differently read it
   separately (over the one session), so each keeps its own spelling in its rows.

@@ -536,13 +536,13 @@ public sealed class Scanner(RunnerRegistry registry, TimeProvider? clock = null)
                             }
                             else
                             {
-                                await pace.WaitAsync(cancellationToken).ConfigureAwait(false);
+                                await pacer.WaitAsync(host, cancellationToken).ConfigureAwait(false);   // the scanner checked Stopped before this read
                                 result = await Safe(read.Runner.Protocol, () => sessionRunner.RunAsync(session.Session!, read.Query, context, cancellationToken), cancellationToken).ConfigureAwait(false);
                             }
                         }
                         else
                         {
-                            await pace.WaitAsync(cancellationToken).ConfigureAwait(false);
+                            await pacer.WaitAsync(host, cancellationToken).ConfigureAwait(false);   // the scanner checked Stopped before this read
                             result = await Safe(read.Runner.Protocol, () => read.Runner.RunAsync(read.Query, context, cancellationToken), cancellationToken).ConfigureAwait(false);
                         }
                         if (fresh)
