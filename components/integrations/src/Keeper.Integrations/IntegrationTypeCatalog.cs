@@ -45,9 +45,12 @@ public static class IntegrationTypeCatalog
         public List<string>? DeniedParameters { get; set; }
     }
 
+    // An unknown key is an error: a misspelt guard (readpaths) must not silently read everything. So is a key given
+    // twice: which of two read lists applies must not be a parser's choice.
     private static readonly IDeserializer Reader = new DeserializerBuilder()
         .WithNamingConvention(CamelCaseNamingConvention.Instance)
-        .Build();   // an unknown key is an error: a misspelt guard (readpaths) must not silently read everything
+        .WithDuplicateKeyChecking()
+        .Build();
 
     /// <summary>The catalog built into keeper.</summary>
     public static IReadOnlyList<IntegrationType> BuiltIn()
@@ -81,6 +84,8 @@ public static class IntegrationTypeCatalog
         var types = new List<IntegrationType>();
         foreach (var dto in file.Types ?? [])
         {
+            if (dto is null)
+                throw new IntegrationException($"{source}: an entry under types is empty.");
             var type = Build(dto, source, builtIn);
             if (types.Any(t => t.Id.Equals(type.Id, StringComparison.OrdinalIgnoreCase)))
                 throw new IntegrationException($"{source}: integration type '{type.Id}' is listed twice.");
@@ -113,7 +118,19 @@ public static class IntegrationTypeCatalog
         }
         var hosts = dto.Hosts ?? [];
         foreach (var host in hosts.Where(h => !IsHostPattern(h)))
-            throw new IntegrationException(Where($"host '{host}' must be a host name or *.suffix, without a scheme, port or path"));
+            throw new IntegrationException(Where($"host '{host}' must be a host name or *.suffix of at least two labels (*.example.org), without a scheme, port or path"));
+        if (builtIn is not null && hosts.Count == 0)
+        {
+            // Without a host list the endpoint may name any host. A tenant type may then sign in only the ways a
+            // built-in type does without a host list: an Entra, AWS or Google token, or a password grant, exists only
+            // behind one, and a type that dropped it would send that credential wherever its endpoint points.
+            foreach (var protocol in protocols)
+            {
+                foreach (var kind in auth.Where(k => !builtIn.Any(t => t.AllowedHosts.Count == 0 && t.Protocols.Contains(protocol) && t.AuthKinds.Contains(k))))
+                    throw new IntegrationException(Where($"auth kind '{kind}' over {protocol} needs hosts: the hosts its endpoint may name, " +
+                                                         "so the credential cannot be sent anywhere else"));
+            }
+        }
         if (dto.Endpoint is { } endpoint)
         {
             if (!Uri.TryCreate(endpoint, UriKind.Absolute, out var uri) || uri.Scheme != Uri.UriSchemeHttps)
@@ -148,7 +165,10 @@ public static class IntegrationTypeCatalog
 
     private static bool IsHostPattern(string host)
     {
-        var name = host.StartsWith("*.", StringComparison.Ordinal) ? host[2..] : host;
-        return name.Length > 0 && name.Split('.').All(label => label.Length > 0 && label.All(ch => char.IsAsciiLetterOrDigit(ch) || ch == '-'));
+        var wildcard = host.StartsWith("*.", StringComparison.Ordinal);
+        var labels = (wildcard ? host[2..] : host).Split('.');
+        // *.com would let the credential go to any host under a top-level domain.
+        return labels.Length >= (wildcard ? 2 : 1)
+               && labels.All(label => label.Length > 0 && label.All(ch => char.IsAsciiLetterOrDigit(ch) || ch == '-'));
     }
 }

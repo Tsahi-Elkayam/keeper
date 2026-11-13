@@ -303,6 +303,23 @@ override satisfies every required setting. (All done: sections 10 and 11.)
 - `IntegrationTypes.UseTenantFolder(settings/integration-types)` runs from `KeeperContext.Loaded`, which the keeper
   binary wires; `All` = built-in then tenant; `IntegrationType.Source` names a tenant type's file.
 
+### 17. Fourth review fixes (2026-11-13)
+
+- Tenant types: without `hosts`, each (protocol, auth kind) must be one a built-in type without hosts offers - an
+  Entra, AWS or Google sign-in needs hosts; wildcards need two labels; duplicate keys and empty entries are errors.
+  `keeper integration types` still lists the built-in types when a tenant file is broken.
+- `RunSessions`: every take and return, and each scan's start (`SweepAsync`), close sessions idle past `MaxIdle`;
+  a host the pace stopped (`Pacer.StoppedByHost`) is recorded and `Pacer.Stop`ped in the run's later scans.
+- `ScanWindow.ClosesAt` joins windows that meet (up to a week); an empty `window.days` is an error; messages show
+  the window's own clock (`ScanWindow.Local`). A read the closing window ended is not learned from (no push-back).
+- `LogonGuard.LimitDeniedSignIns` only lowers (one key for EXAMPLE\reader and OTHER\reader). Strikes persist:
+  `OnStrike` -> `SignInRefusals.RecordStrike`, `RestoreStrikes` once per process and integration; a proven scan
+  clears them. Before this, a wrong password answered as access denied cost one bad logon per scheduled scan.
+- `LockoutFor` gives one known domain's policy only to an identity that names no domain; the policy read is the
+  newest clean read of each query (a failed read keeps the last one, an empty clean one drops it).
+- Accepted as is: a shared connection keeps a non-transient token error for the rest of the run (a refusal, or a
+  configuration error that would fail again); a broken tenant type file stops every command that loads the home.
+
 ## Not in this change
 
 Nothing from the list in the pilot review is left. Not done: a live run on Windows and against a real AD (Samba AD

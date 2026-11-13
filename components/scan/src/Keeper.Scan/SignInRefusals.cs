@@ -21,7 +21,8 @@ namespace Keeper.Scan;
 /// </summary>
 public sealed class SignInRefusals(string file)
 {
-    private sealed record Entry(string Account, string Instance, string Credential, string Reason, string At);
+    /// <summary>A refusal (Strikes null), or the denied sign-ins kept for an integration (Strikes = their count).</summary>
+    private sealed record Entry(string Account, string Instance, string Credential, string Reason, string At, int? Strikes = null);
 
     /// <summary>A name for the credential as it is now: changes when a secret is set again.</summary>
     public static string Fingerprint(string instance, string? identity, string endpoint, string authKind, IEnumerable<string> secretsSetAt)
@@ -32,6 +33,8 @@ public sealed class SignInRefusals(string file)
 
     private static string SlotOf(string account, string instance) => $"{account}\n{instance}";
 
+    private static string StrikeSlotOf(string account, string instance) => $"strikes\n{account}\n{instance}";
+
     /// <summary>
     /// The refusal that holds for this integration's credential, or null. <paramref name="credentialOf"/> gives an
     /// integration's credential as it is now (null when it is gone); <paramref name="secretSetAt"/> is when this
@@ -40,7 +43,7 @@ public sealed class SignInRefusals(string file)
     public string? Find(IConnection connection, Func<string, string?> credentialOf, DateTimeOffset? secretSetAt)
     {
         var account = LogonGuard.KeyOf(connection);
-        foreach (var entry in Read().Values.Where(e => string.Equals(e.Account, account, StringComparison.OrdinalIgnoreCase)))
+        foreach (var entry in Read().Values.Where(e => e.Strikes is null && string.Equals(e.Account, account, StringComparison.OrdinalIgnoreCase)))
         {
             if (credentialOf(entry.Instance) != entry.Credential)
                 continue;   // that credential changed or is gone
@@ -57,11 +60,32 @@ public sealed class SignInRefusals(string file)
         Update(all => all[SlotOf(LogonGuard.KeyOf(connection), connection.Instance)] =
             new Entry(LogonGuard.KeyOf(connection), connection.Instance, credential, reason, Iso.Utc(at)));
 
-    /// <summary>This integration's refusal is gone: its credential read data. Others of the same account stay.</summary>
-    public void Clear(IConnection connection) =>
-        Update(all => all.Remove(SlotOf(LogonGuard.KeyOf(connection), connection.Instance)));
+    /// <summary>
+    /// Sign-ins of this integration's credential that were answered "access denied" with none accepted, kept so the
+    /// next process counts them (see <see cref="LogonGuard.OnStrike"/>). They hold while the credential is unchanged.
+    /// </summary>
+    public int Strikes(IConnection connection, string credential) =>
+        Read().GetValueOrDefault(StrikeSlotOf(LogonGuard.KeyOf(connection), connection.Instance)) is { Strikes: { } n } entry && entry.Credential == credential
+            ? n
+            : 0;
 
-    /// <summary>--retry-sign-in: every refusal of the account this integration signs in as is forgotten.</summary>
+    public void RecordStrike(IConnection connection, string credential, string host, DateTimeOffset at) =>
+        Update(all =>
+        {
+            var slot = StrikeSlotOf(LogonGuard.KeyOf(connection), connection.Instance);
+            var before = all.GetValueOrDefault(slot) is { Strikes: { } n } entry && entry.Credential == credential ? n : 0;
+            all[slot] = new Entry(LogonGuard.KeyOf(connection), connection.Instance, credential, $"denied at sign-in by {host}", Iso.Utc(at), before + 1);
+        });
+
+    /// <summary>This integration's refusal and strikes are gone: its credential read data. Others of the same account stay.</summary>
+    public void Clear(IConnection connection) =>
+        Update(all =>
+        {
+            all.Remove(SlotOf(LogonGuard.KeyOf(connection), connection.Instance));
+            all.Remove(StrikeSlotOf(LogonGuard.KeyOf(connection), connection.Instance));
+        });
+
+    /// <summary>--retry-sign-in: every refusal and strike of the account this integration signs in as is forgotten.</summary>
     public void ClearAccount(IConnection connection)
     {
         var account = LogonGuard.KeyOf(connection);

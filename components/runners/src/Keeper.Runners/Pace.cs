@@ -386,6 +386,20 @@ public sealed class Pacer(PaceProfile profile, TimeProvider? clock = null)
         }
     }
 
+    /// <summary>Why the host itself made the pace stop reading it (push-backs), or null - not the scan window.</summary>
+    public string? StoppedByHost(string host)
+    {
+        lock (_lock)
+            return _hosts.TryGetValue(host, out var state) ? state.Stopped : null;
+    }
+
+    /// <summary>Stops reading a host for a reason found before this scan (an earlier scan of the run stopped it).</summary>
+    public void Stop(string host, string reason)
+    {
+        lock (_lock)
+            State(host).Stopped ??= reason;
+    }
+
     /// <summary>Hosts that pushed back at least once, with the number of times, and whether they were stopped.</summary>
     public IReadOnlyList<(string Host, int Signals, bool Stopped)> PushedBack()
     {
@@ -430,6 +444,7 @@ public sealed class LogonGuard
     private readonly Dictionary<string, List<string>> _strikes = new(StringComparer.OrdinalIgnoreCase);
     private readonly HashSet<string> _accepted = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, int> _deniedAllowed = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, int> _earlierStrikes = new(StringComparer.OrdinalIgnoreCase);
     private readonly Lock _lock = new();
 
     /// <summary>
@@ -477,8 +492,40 @@ public sealed class LogonGuard
     /// </summary>
     public void LimitDeniedSignIns(IConnection connection, int allowed)
     {
+        // Only ever lowered: EXAMPLE\reader and OTHER\reader are one key, and the stricter domain must win.
+        var limit = Math.Clamp(allowed, 1, DeniedSignInsBeforeRefusal);
         lock (_lock)
-            _deniedAllowed[KeyOf(connection)] = Math.Clamp(allowed, 1, DeniedSignInsBeforeRefusal);
+            _deniedAllowed[KeyOf(connection)] = Math.Min(limit, _deniedAllowed.GetValueOrDefault(KeyOf(connection), limit));
+    }
+
+    /// <summary>
+    /// Called when a sign-in is answered "access denied" and that did not (yet) make a refusal: the binary keeps the
+    /// strike in the Keeper home, so the next process counts it. Otherwise a wrong password that DCOM answers as plain
+    /// access denied would cost one bad logon per scheduled scan, for ever, and lock the account.
+    /// </summary>
+    public Action<IConnection, string>? OnStrike { get; set; }
+
+    /// <summary>
+    /// Denied sign-ins earlier processes met with this integration's credential, none accepted since. Taken once per
+    /// process and integration: the strikes this process adds are counted as they happen.
+    /// </summary>
+    public void RestoreStrikes(IConnection connection, int earlier)
+    {
+        if (earlier <= 0 || !PresentsSecret(connection))
+            return;
+        string? text = null;
+        lock (_lock)
+        {
+            var key = ProofOf(connection);
+            if (_accepted.Contains(key) || !_earlierStrikes.TryAdd(key, earlier))
+                return;
+            if (earlier >= _deniedAllowed.GetValueOrDefault(KeyOf(connection), DeniedSignInsBeforeRefusal))
+                text = $"not tried: {connection.Identity ?? "the current user"} was denied at sign-in {earlier} time(s) by earlier scans with no host " +
+                       "accepting it - a wrong password can look like that, so Keeper stops using it so the account is not locked out; " +
+                       "check the credential and its rights, then scan again";
+        }
+        if (text is not null)
+            Record(connection, text);
     }
 
     /// <summary>How many sign-ins answered "access denied" make this account's credential refused.</summary>
@@ -505,6 +552,7 @@ public sealed class LogonGuard
         {
             _accepted.Add(ProofOf(connection));
             _strikes.Remove(ProofOf(connection));
+            _earlierStrikes.Remove(ProofOf(connection));
         }
     }
 
@@ -513,7 +561,7 @@ public sealed class LogonGuard
     {
         if (!PresentsSecret(connection))
             return false;
-        string text;
+        string? text;
         lock (_lock)
         {
             var key = ProofOf(connection);
@@ -522,12 +570,25 @@ public sealed class LogonGuard
                 return false;
             if (!_strikes.TryGetValue(key, out var hosts))
                 _strikes[key] = hosts = [];
-            if (!hosts.Contains(host, StringComparer.OrdinalIgnoreCase))
-                hosts.Add(host);
-            if (hosts.Count < _deniedAllowed.GetValueOrDefault(KeyOf(connection), DeniedSignInsBeforeRefusal))
-                return false;
-            text = $"not tried: {connection.Identity ?? "the current user"} was denied at sign-in by {string.Join(" and ", hosts)} with no host accepting it ({reason}) - " +
-                   "a wrong password can look like that, so Keeper stops using it so the account is not locked out; check the credential and its rights, then scan again";
+            if (hosts.Contains(host, StringComparer.OrdinalIgnoreCase))
+                return false;   // the lane does not sign in to a host twice; nothing new was presented
+            hosts.Add(host);
+            var earlier = _earlierStrikes.GetValueOrDefault(key);
+            if (earlier + hosts.Count < _deniedAllowed.GetValueOrDefault(KeyOf(connection), DeniedSignInsBeforeRefusal))
+            {
+                text = null;
+            }
+            else
+            {
+                text = $"not tried: {connection.Identity ?? "the current user"} was denied at sign-in by {string.Join(" and ", hosts)}" +
+                       (earlier > 0 ? $" and {earlier} time(s) by earlier scans" : "") + $" with no host accepting it ({reason}) - " +
+                       "a wrong password can look like that, so Keeper stops using it so the account is not locked out; check the credential and its rights, then scan again";
+            }
+        }
+        if (text is null)
+        {
+            OnStrike?.Invoke(connection, host);
+            return false;
         }
         Record(connection, text);
         return true;

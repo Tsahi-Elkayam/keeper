@@ -89,7 +89,7 @@ public static class ScanVerb
                 if (window is not null && window.ClosesAt(DateTimeOffset.UtcNow) is null)
                 {
                     Console.WriteLine($"Not scanning {systemName} through {record.Id}: outside its scan window ({window}); " +
-                                      $"it opens {window.NextOpen(DateTimeOffset.UtcNow).ToLocalTime():yyyy-MM-dd HH:mm}. Nothing was sent. " +
+                                      $"it opens {window.Local(window.NextOpen(DateTimeOffset.UtcNow))}. Nothing was sent. " +
                                       "--ignore-window scans now.");
                     return ExitCodes.NotNow;
                 }
@@ -138,8 +138,8 @@ public static class ScanVerb
                         Console.WriteLine($"  {lockout}");
                     if (ScanWindow.From(record.Options) is { } planWindow)
                         Console.WriteLine(planWindow.ClosesAt(DateTimeOffset.UtcNow) is { } closes
-                            ? $"  window: {planWindow} - open now, closes {closes.ToLocalTime():yyyy-MM-dd HH:mm}"
-                            : $"  window: {planWindow} - closed now, opens {planWindow.NextOpen(DateTimeOffset.UtcNow).ToLocalTime():yyyy-MM-dd HH:mm}");
+                            ? $"  window: {planWindow} - open now, closes {planWindow.Local(closes)}"
+                            : $"  window: {planWindow} - closed now, opens {planWindow.Local(planWindow.NextOpen(DateTimeOffset.UtcNow))}");
                     return ExitCodes.Ok;
                 }
                 Directory.CreateDirectory(runsDir);
@@ -162,14 +162,24 @@ public static class ScanVerb
                     TryKeep(() => refusals.ClearAccount(link));
                 else if (refusals.Find(link, id => id.Equals(record.Id, StringComparison.OrdinalIgnoreCase) ? credential : credentials.GetValueOrDefault(id), secretSetAt) is { } recorded)
                     request.Guard.Restore(link, recorded);
+                else
+                    request.Guard.RestoreStrikes(link, refusals.Strikes(link, credential));
                 // Kept the moment it happens: a scan stopped half-way (Ctrl-C, a crash) must not forget it.
                 request.Guard.OnRefused = (refusedConnection, text) =>
                 {
                     if (refusedConnection.Instance == link.Instance)
                         TryKeep(() => refusals.Record(link, credential, text, DateTimeOffset.UtcNow));
                 };
+                // A denied sign-in that is not yet a refusal is kept too: the next scheduled scan counts it.
+                request.Guard.OnStrike = (deniedConnection, host) =>
+                {
+                    if (deniedConnection.Instance == link.Instance && LogonGuard.PresentsSecret(link))
+                        TryKeep(() => refusals.RecordStrike(link, credential, host, DateTimeOffset.UtcNow));
+                };
 
                 Console.WriteLine($"Scanning {systemName} through {record.Id} ({record.Type}){(test ? " - connection test" : "")}...");
+                if (run is not null)
+                    await run.SweepAsync();   // sessions the run's earlier systems left idle too long are ended now
                 ScanReport report;
                 try
                 {
@@ -178,6 +188,7 @@ public static class ScanVerb
                 finally
                 {
                     request.Guard.OnRefused = null;
+                    request.Guard.OnStrike = null;
                     // vCenter and session-login products cap open sessions: the scan's is ended, not left to time out.
                     // Inside 'keeper run' the run ends it after its last scan.
                     if (own is not null)

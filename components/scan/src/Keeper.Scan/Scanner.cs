@@ -585,6 +585,8 @@ public sealed class Scanner(RunnerRegistry registry, TimeProvider? clock = null)
         var fromRun = new HashSet<string>(StringComparer.Ordinal);     // failures an earlier scan met: already learned from
         var opened = 0;
         var taken = 0;
+        if (request.Sessions?.StoppedHost(host) is { } stoppedBefore)
+            pacer.Stop(host, $"{stoppedBefore} (earlier in this run)");
         string? deniedHere = null;
         try
         {
@@ -661,7 +663,8 @@ public sealed class Scanner(RunnerRegistry registry, TimeProvider? clock = null)
                             await pacer.WaitAsync(host, cancellationToken).ConfigureAwait(false);   // the scanner checked Stopped before this read
                             result = await Safe(read.Runner.Protocol, () => read.Runner.RunAsync(read.Query, context, cancellationToken), cancellationToken).ConfigureAwait(false);
                         }
-                        if (fresh)
+                        // A read the closing window ended says nothing about the host: no push-back, no proof.
+                        if (fresh && !(pacer.WindowClosed && result.Failure == FailureKind.Throttled))
                             deniedHere = Learn(request, pacer, host, read, result) ?? deniedHere;
                     }
                     finally
@@ -679,6 +682,8 @@ public sealed class Scanner(RunnerRegistry registry, TimeProvider? clock = null)
         {
             if (request.Sessions is { } run)
             {
+                if (pacer.StoppedByHost(host) is { } stoppedHere)
+                    run.HostStopped(host, stoppedHere.Replace(" (earlier in this run)", "", StringComparison.Ordinal));
                 // Handed back, not closed: the run's next scan through this integration reads this host over them. A
                 // failure an earlier scan met is still in the run; a session a read failed on is closed by the run.
                 foreach (var (family, (session, failure)) in sessions)

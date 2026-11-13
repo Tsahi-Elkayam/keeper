@@ -29,6 +29,11 @@ public static class IntegrationVerb
                 catch (SettingsException)
                 {
                 }
+                catch (IntegrationException ex)
+                {
+                    // A tenant type file that is not valid: the built-in types are still worth listing.
+                    Console.Error.WriteLine($"warning: the tenant's own types are not listed: {ex.Message}");
+                }
                 return Types();
             }
 

@@ -77,8 +77,14 @@ public sealed class StoreInputs
                          WHERE json_valid(rs.attrs)
                            AND (json_extract(rs.attrs, '$.lockoutThreshold') IS NOT NULL
                                 OR json_extract(rs.attrs, '$."msDS-LockoutThreshold"') IS NOT NULL)),
+                     -- The newest clean read of each query that ever read a policy: one with no rows means the
+                     -- policies are gone, and a failed read says nothing.
                      newest AS (
-                         SELECT instance, query, MAX(started_at) AS started_at FROM policy GROUP BY instance, query)
+                         SELECT q.instance, q.query, MAX(r.started_at) AS started_at
+                         FROM (SELECT DISTINCT instance, query FROM policy) q
+                         JOIN run r ON r.instance = q.instance
+                         JOIN coverage c ON c.run_id = r.run_id AND c.scope = 'query' AND c.item = q.query AND c.state = 'ok'
+                         GROUP BY q.instance, q.query)
                      SELECT DISTINCT p.entity_key, p.entity_name, p.attrs, p.started_at
                      FROM policy p JOIN newest n ON n.instance = p.instance AND n.query = p.query AND n.started_at = p.started_at
                      ORDER BY p.started_at DESC, p.entity_key;
@@ -131,8 +137,10 @@ public sealed class StoreInputs
             domain = domains.FirstOrDefault(d => string.Equals(d.Name, netbios, StringComparison.OrdinalIgnoreCase)
                                                  || d.Domain.Split(',')[0].Equals("dc=" + netbios, StringComparison.OrdinalIgnoreCase));
         }
-        // One domain known and an identity that names none (or names it differently): that domain.
-        domain ??= domains.Select(d => d.Domain).Distinct(StringComparer.Ordinal).Count() == 1 ? domains[0] : null;
+        // One domain known and an identity that names no domain at all: that domain. One that names another domain is
+        // not given this one's policy.
+        if (domain is null && !identity.Contains('@', StringComparison.Ordinal) && !identity.Contains('\\', StringComparison.Ordinal))
+            domain = domains.Select(d => d.Domain).Distinct(StringComparer.Ordinal).Count() == 1 ? domains[0] : null;
         if (domain is null)
             return null;
         var applying = policies.Where(p => p.Domain == domain.Domain && (p == domain || p.FineGrained)).ToList();

@@ -75,6 +75,11 @@ public sealed class IntegrationTypeCatalogTests : IDisposable
     [InlineData("hosts: ['https://fw.example.org']", "host name")]
     [InlineData("readPosts: ['api/']", "must start with /")]
     [InlineData("id: Palo_Alto", "lower-case")]
+    [InlineData("auth: [entra-certificate]", "needs hosts")]           // a Graph token to whatever host the endpoint names
+    [InlineData("auth: [aws-access-key]", "needs hosts")]
+    [InlineData("auth: [gcp-service-account]", "needs hosts")]
+    [InlineData("hosts: ['*.com']", "two labels")]
+    [InlineData("readPaths: ['/a']\n    readPaths: ['/b']", "duplicate")]
     public void What_a_tenant_type_may_not_say_is_said(string line, string expected)
     {
         // The line replaces the type's own line with that key, or is added to it.
@@ -95,6 +100,22 @@ public sealed class IntegrationTypeCatalogTests : IDisposable
         var yaml = PaloAlto + "\n    hosts: ['*.paloaltonetworks.com']\n    endpoint: 'https://evil.example.org'";
 
         Assert.Throws<IntegrationException>(() => Tenant(yaml));
+    }
+
+    [Fact]
+    public void A_cloud_sign_in_behind_its_own_hosts_is_allowed()
+    {
+        var yaml = PaloAlto.Replace("auth: [api-key-header]", "auth: [entra-certificate]\n    hosts: ['*.contoso.example']", StringComparison.Ordinal);
+
+        var type = Assert.Single(Tenant(yaml));
+
+        Assert.False(type.AllowsHost("attacker.example"));
+    }
+
+    [Fact]
+    public void An_empty_entry_is_said()
+    {
+        Assert.Throws<IntegrationException>(() => Tenant("schema: keeper.integration-types/1\ntypes:\n  -\n"));
     }
 
     [Fact]

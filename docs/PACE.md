@@ -21,9 +21,10 @@ a WinRM quota or an AD lockout policy that is a password spray. The design is in
   connection that breaks is signed in again once per scan, never twice.
 - **One session per host for the whole `keeper run`.** The systems a run scans through one integration share its
   sign-in and its hosts' sessions: a Windows host read by the baseline, services and event-log systems is signed in
-  to once in the run, not once per system. A session idle more than 5 minutes is closed and signed in again (servers
-  drop idle connections), and so is one a read failed on. A host whose sign-in did not answer is not asked again by
-  the next system within those 5 minutes. Everything the run holds is ended after its last scan, before loading.
+  to once in the run, not once per system. A session idle more than 5 minutes is closed (at the next scan's start or
+  host, so hosts no later system reads are not left signed in) and signed in again when needed - servers drop idle
+  connections - and so is one a read failed on. A host whose sign-in did not answer is not asked again by the next
+  system within those 5 minutes, and a host the pace stopped is not read again by any later system of the run. Everything the run holds is ended after its last scan, before loading.
   `keeper run --dry-run` still counts sign-ins per system, so it is an upper bound.
 - **A refused credential stops.** Wrong password, locked, expired or disabled account, an HTTP 401: the
   credential is not presented again - on any host, for the rest of the scan and of `keeper run`, and by later
@@ -37,7 +38,10 @@ a WinRM quota or an AD lockout policy that is a password spray. The design is in
   password Keeper could have wrong: nothing is refused or kept for them, and their sign-ins are not serialized.
 - **The first sign-in proves the credential.** Until one sign-in was accepted, hosts sign in one at a time,
   so a wrong password meets one host, not four at once. Over DCOM a wrong password can come back as plain
-  "access denied": two hosts in a row that deny the sign-in, with none accepting it, stop the credential too.
+  "access denied": two hosts in a row that deny the sign-in, with none accepting it, stop the credential too. A denied
+  sign-in is kept in the same file as refusals, so the next scheduled scan counts it: two in all, across scans, and
+  the credential stops (one, where the domain locks at two). An accepted sign-in, a secret set again or
+  `--retry-sign-in` forgets them.
   Once a sign-in was accepted, a host that denies it is one where the account lacks the right. "Accepted" means
   a read came back with rows, or the host answered as the account (a registry provider's return code) - some
   kinds of access only sign in on the first read, and an empty answer can hide a read that never happened.
@@ -95,7 +99,8 @@ keeper integration set win-servers --option window.timeZone=Asia/Jerusalem   # d
 ```
 
 A window that ends at or before its start runs past midnight; `00:00-24:00` is the whole day. The days are the days
-the window opens (Thursday 20:00 runs into Friday 06:00). Outside the window `keeper scan` sends nothing and exits 4
+the window opens (Thursday 20:00 runs into Friday 06:00). Windows that meet are one (`00:00-24:00` on `Fri,Sat` runs
+from Friday 00:00 to Sunday 00:00), and times are shown on the window's own clock. Outside the window `keeper scan` sends nothing and exits 4
 (`keeper run` lists the system as not scanned). When the window closes during a scan, Keeper stops reading: the reads
 not made are failed, never empty, so nothing is retired, and the run notes say when it closed. `--ignore-window` scans
 now anyway; `--test` and `--plan` are not held to the window, and `--plan` shows it.

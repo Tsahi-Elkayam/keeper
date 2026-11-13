@@ -49,7 +49,7 @@ public sealed class StoreInputsTests : IDisposable
 
     private void Policies(string runId, string at, int domainThreshold, params (string Cn, int Threshold)[] fineGrained)
     {
-        Run(runId, "ad-main", "active-directory", at, ("query", DomainQuery, "ok", 1));
+        Run(runId, "ad-main", "active-directory", at, ("query", DomainQuery, "ok", 1), ("query", "q-pso", "ok", fineGrained.Length));
         Row(runId, DomainQuery, "domain", "DC=example,DC=org",
             $$"""{ "distinguishedName": "DC=example,DC=org", "name": "example", "lockoutThreshold": "{{domainThreshold}}" }""");
         foreach (var (cn, threshold) in fineGrained)
@@ -90,6 +90,21 @@ public sealed class StoreInputsTests : IDisposable
     }
 
     [Fact]
+    public void A_failed_read_keeps_the_last_clean_policy_and_an_empty_clean_one_drops_it()
+    {
+        Policies("ad1", "2026-10-20T06:00:00Z", domainThreshold: 10, ("Strict", 2));
+        Run("ad2", "ad-main", "active-directory", "2026-10-21T06:00:00Z", ("query", DomainQuery, "failed", 0), ("query", "q-pso", "failed", 0));
+
+        using (var connection = Store.OpenReadOnly())
+            Assert.Equal(2, StoreInputs.LockoutFor("EXAMPLE\\reader", new StoreInputs(connection).LockoutPolicies())!.Threshold);
+
+        Policies("ad3", "2026-10-22T06:00:00Z", domainThreshold: 10);   // the fine-grained policy was deleted
+
+        using (var connection = Store.OpenReadOnly())
+            Assert.Equal(10, StoreInputs.LockoutFor("EXAMPLE\\reader", new StoreInputs(connection).LockoutPolicies())!.Threshold);
+    }
+
+    [Fact]
     public void A_domain_that_never_locks_and_one_that_is_not_known()
     {
         Policies("ad1", "2026-10-20T06:00:00Z", domainThreshold: 0);
@@ -113,6 +128,7 @@ public sealed class StoreInputsTests : IDisposable
         var policies = new StoreInputs(connection).LockoutPolicies();
 
         Assert.Null(StoreInputs.LockoutFor("reader", policies));
+        Assert.Null(StoreInputs.LockoutFor("THIRD\\reader", policies));     // never another domain's policy
         Assert.Equal(1, StoreInputs.LockoutFor("OTHER\\reader", policies)!.Threshold);
         Assert.Equal(3, StoreInputs.LockoutFor("reader@example.org", policies)!.Threshold);
     }

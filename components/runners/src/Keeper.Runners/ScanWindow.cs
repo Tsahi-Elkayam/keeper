@@ -40,11 +40,17 @@ public sealed record ScanWindow(TimeSpan Start, TimeSpan End, IReadOnlySet<DayOf
             throw new ArgumentException($"window.timeZone '{zoneText}' is not a time zone this machine knows (for example Asia/Jerusalem).", ex);
         }
         var days = string.IsNullOrWhiteSpace(daysText) ? Week.ToHashSet() : Parse(daysText);
+        if (days.Count == 0)
+            throw new ArgumentException($"window.days names no day: '{daysText}'.");
         var shown = text.Trim() + (string.IsNullOrWhiteSpace(daysText) ? "" : $" {daysText.Trim()}") + (string.IsNullOrWhiteSpace(zoneText) ? "" : $" ({zoneText.Trim()})");
         return new ScanWindow(start, end, days, zone, shown);
     }
 
-    /// <summary>When the window that is open at <paramref name="now"/> closes, or null when it is not open.</summary>
+    /// <summary>
+    /// When the window that is open at <paramref name="now"/> closes, or null when it is not open. Windows that meet
+    /// (00:00-24:00 on Fri,Sat; 20:00-20:00) are one: a scan is not stopped at the instant the next one opens. A window
+    /// that never closes (00:00-24:00 every day) is given a close a week on.
+    /// </summary>
     public DateTimeOffset? ClosesAt(DateTimeOffset now)
     {
         // The window open now opened today or, running past midnight, yesterday (local days).
@@ -55,11 +61,22 @@ public sealed record ScanWindow(TimeSpan Start, TimeSpan End, IReadOnlySet<DayOf
             if (!Days.Contains(day.DayOfWeek))
                 continue;
             var (opens, closes) = Interval(day);
-            if (now >= opens && now < closes)
-                return closes;
+            if (now < opens || now >= closes)
+                continue;
+            for (var next = day.AddDays(1); next <= day.AddDays(7); next = next.AddDays(1))
+            {
+                if (!Days.Contains(next.DayOfWeek) || Interval(next).Opens > closes)
+                    break;
+                closes = Interval(next).Closes;
+            }
+            return closes;
         }
         return null;
     }
+
+    /// <summary>An instant as the window's own wall clock, for messages ("opens 2026-11-15 20:00 Asia/Jerusalem").</summary>
+    public string Local(DateTimeOffset instant) =>
+        $"{TimeZoneInfo.ConvertTime(instant, Zone):yyyy-MM-dd HH:mm} {(Zone == TimeZoneInfo.Local ? "" : Zone.Id)}".TrimEnd();
 
     /// <summary>When the window next opens after <paramref name="now"/> (now itself when it is open).</summary>
     public DateTimeOffset NextOpen(DateTimeOffset now)

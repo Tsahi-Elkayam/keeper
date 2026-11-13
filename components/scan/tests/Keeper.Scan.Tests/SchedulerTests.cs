@@ -303,6 +303,40 @@ public sealed class SchedulerTests : IDisposable
         Assert.Empty(runner.Log);
     }
 
+    [Fact]
+    public async Task A_session_no_later_system_reads_is_closed_after_its_idle_time()
+    {
+        var runner = new SessionRunner(_ => FailureKind.None);
+        var clock = new Settable();
+        await using var run = new RunSessions(clock);
+
+        await Scan(runner, queries: 1, ThreeHosts, sessions: run);
+        clock.Now += TimeSpan.FromMinutes(6);
+        await run.SweepAsync();                               // the next system, through another integration, starts
+
+        Assert.Equal(3, runner.Closes);
+    }
+
+    [Fact]
+    public async Task A_host_stopped_for_pushing_back_is_not_read_by_the_run_s_next_system()
+    {
+        var runner = new SessionRunner(_ => FailureKind.None,
+            read: (host, _) => host.StartsWith("pc01", StringComparison.Ordinal) ? RunnerResult.Failed("busy", FailureKind.Throttled) : null!);
+        await using var run = new RunSessions();
+        var pace = PaceProfile.Unlimited with { Hosts = 1, StopAfter = 2 };
+
+        await Scan(runner, queries: 5, ThreeHosts, pace: pace, sessions: run);
+        var pc01Reads = runner.Log.Count(l => l.StartsWith("read pc01", StringComparison.Ordinal));
+        var second = await Scan(runner, queries: 5, ThreeHosts, pace: pace, sessions: run);
+
+        Assert.Equal(2, pc01Reads);
+        Assert.Equal(pc01Reads, runner.Log.Count(l => l.StartsWith("read pc01", StringComparison.Ordinal)));   // not pressed again
+        Assert.Equal(1, runner.Log.Count(l => l.StartsWith("open pc01", StringComparison.Ordinal)));
+        Assert.Contains(second.Manifest.Notes, n => n.Contains("earlier in this run", StringComparison.Ordinal));
+        Assert.All(Coverage(second).Where(c => c.Scope == "target" && c.Item.Contains("pc01", StringComparison.Ordinal)),
+            c => Assert.Equal("failed", c.State));
+    }
+
     private sealed class Settable : TimeProvider
     {
         public DateTimeOffset Now { get; set; } = DateTimeOffset.UnixEpoch;
@@ -379,18 +413,37 @@ public sealed class SchedulerTests : IDisposable
         Assert.Contains(report.Manifest.Notes, n => n.Contains("denied at sign-in by pc01.example.org with no host", StringComparison.Ordinal));
     }
 
-    [Theory]
-    [InlineData(0, 2)]
-    [InlineData(1, 1)]
-    [InlineData(5, 2)]   // never more than the usual two
-    public void The_denials_risked_follow_the_limit(int allowed, int risked)
+    [Fact]
+    public void A_denial_limit_is_only_ever_lowered()
     {
         var guard = new LogonGuard();
-        guard.LimitDeniedSignIns(new Connection(), allowed == 0 ? 1 : allowed);
-        if (allowed == 0)
-            guard = new LogonGuard();
+        Assert.Equal(2, guard.DeniedSignInsFor(new Connection()));
 
-        Assert.Equal(risked, guard.DeniedSignInsFor(new Connection("reader@example.org")));   // one account however it is spelled
+        guard.LimitDeniedSignIns(new Connection("EXAMPLE\\reader"), 1);    // a domain that locks at two
+        guard.LimitDeniedSignIns(new Connection("OTHER\\reader"), 4);      // same account name, laxer domain
+
+        Assert.Equal(1, guard.DeniedSignInsFor(new Connection("reader@example.org")));
+    }
+
+    [Fact]
+    public void A_denied_sign_in_counts_in_the_next_process_too()
+    {
+        // A wrong password DCOM answers as access denied, one reachable server, a scan every few minutes.
+        var first = new LogonGuard();
+        var kept = new List<string>();
+        first.OnStrike = (_, host) => kept.Add(host);
+
+        Assert.False(first.DeniedAtSignIn(new Connection(), "srv1", "access denied"));
+        Assert.Equal(["srv1"], kept);
+
+        var next = new LogonGuard();                        // the next scheduled scan
+        next.RestoreStrikes(new Connection(), kept.Count);
+        Assert.True(next.DeniedAtSignIn(new Connection(), "srv1", "access denied"));   // two bad logons in all, then stop
+        Assert.Contains("1 time(s) by earlier scans", next.Refusal(new Connection()), StringComparison.Ordinal);
+
+        var third = new LogonGuard();
+        third.RestoreStrikes(new Connection(), 2);
+        Assert.NotNull(third.Refusal(new Connection()));    // nothing is presented at all
     }
 
     [Fact]
@@ -891,6 +944,26 @@ public sealed class SignInRefusalsTests : IDisposable
         again.Clear(connection);
         Assert.Null(again.Find(connection, _ => before, null));
         Assert.DoesNotContain("Right-Pass", File.ReadAllText(File_), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Strikes_are_kept_for_the_credential_and_are_not_a_refusal()
+    {
+        var connection = new Connection();
+        var file = new SignInRefusals(File_);
+        file.RecordStrike(connection, "cred-1", "srv1", DateTimeOffset.UnixEpoch);
+        file.RecordStrike(connection, "cred-1", "srv2", DateTimeOffset.UnixEpoch);
+
+        var later = new SignInRefusals(File_);
+        Assert.Equal(2, later.Strikes(connection, "cred-1"));
+        Assert.Null(later.Find(connection, _ => "cred-1", null));        // a strike is not a refusal by itself
+        Assert.Equal(0, later.Strikes(connection, "cred-2"));            // the secret was set again
+        later.Clear(connection);                                         // the credential read data
+        Assert.Equal(0, later.Strikes(connection, "cred-1"));
+
+        later.RecordStrike(connection, "cred-1", "srv1", DateTimeOffset.UnixEpoch);
+        later.ClearAccount(connection);                                  // --retry-sign-in
+        Assert.Equal(0, later.Strikes(connection, "cred-1"));
     }
 
     [Fact]

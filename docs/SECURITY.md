@@ -36,7 +36,7 @@ that estate's weaknesses. This page says how each is protected, and what is not 
 - **Sent only where they belong.** SaaS integration types have an allow-list of hosts. Requests go to
   paths relative to the integration's own endpoint, and a handler pins every request to that host. The types and
   their guards are built into keeper; a type a tenant adds (settings/integration-types) cannot replace a built-in
-  one or loosen its guards.
+  one, and may use a cloud sign-in (Entra, AWS, Google) only with a host list of its own.
 - **Held only by the scan that needs it.** A scan opens only its integration's secret. Inside `keeper run` the scans
   run one after another in one process, and an integration's signed-in connection is kept for that integration's
   later systems until the run's last scan, then ended.

@@ -49,8 +49,26 @@ public sealed class ScanWindowTests
         var weekend = Window("00:00-24:00", days: "Fri,Saturday");
 
         Assert.Null(weekend.ClosesAt(At(12, 23)));
-        Assert.Equal(At(14, 0), weekend.ClosesAt(At(13, 0)));
+        Assert.Equal(At(15, 0), weekend.ClosesAt(At(13, 0)));       // Friday and Saturday meet: one window to Sunday
         Assert.Equal(At(15, 0), weekend.ClosesAt(At(14, 23, 59)));
+    }
+
+    [Fact]
+    public void Windows_that_meet_are_one()
+    {
+        Assert.Equal(At(13, 23) + TimeSpan.FromDays(7) + TimeSpan.FromHours(1),
+            Window("00:00-24:00").ClosesAt(At(13, 23)));                 // every day, all day: not cut at midnight
+        Assert.Equal(At(13, 20) + TimeSpan.FromDays(7),
+            Window("20:00-20:00").ClosesAt(At(12, 21)));
+        Assert.Equal(At(13, 6), Window("20:00-06:00", days: "Thu,Fri").ClosesAt(At(12, 21)));   // a gap in the day: no join
+    }
+
+    [Fact]
+    public void A_time_is_said_on_the_window_s_own_clock()
+    {
+        var night = Window("20:00-06:00", zone: "Asia/Jerusalem");
+
+        Assert.Equal("2026-11-12 20:00 Asia/Jerusalem", night.Local(At(12, 18)));
     }
 
     [Fact]
@@ -79,6 +97,7 @@ public sealed class ScanWindowTests
     [InlineData("20:00-06:00", "Weekdays", null)]
     [InlineData("20:00-06:00", "Th", null)]
     [InlineData("20:00-06:00", null, "Mars/Olympus")]
+    [InlineData("20:00-06:00", ",", null)]
     public void What_is_not_a_window_is_said(string window, string? days, string? zone)
     {
         var options = new JsonObject { ["window"] = window, ["window.days"] = days, ["window.timeZone"] = zone };

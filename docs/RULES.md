@@ -337,7 +337,9 @@ types:
 Also `endpoint` (the default, https), `endpointPath`, `resource` (Entra) and `readCommand` (`field`, `allowed`,
 `parametersField`, `deniedParameters`), as the built-in types use them. A tenant type cannot replace a built-in one,
 may name only protocols Keeper has runners for (not `store`, `file` or `host`) and only auth kinds Keeper can sign in
-with; a field it does not know (a misspelt `readpaths`) is an error, never a guard left out. A file that is not valid
+with. Without `hosts` it may sign in only the ways a built-in type does without them: an Entra, AWS or Google
+sign-in needs `hosts`, so its token can go nowhere else, and a wildcard needs two labels (`*.example.org`, not
+`*.com`); a field it does not know (a misspelt `readpaths`) is an error, never a guard left out. A file that is not valid
 stops every command until it is fixed. `keeper integration types` lists them with the file that added each.
 
 ## Google Cloud
