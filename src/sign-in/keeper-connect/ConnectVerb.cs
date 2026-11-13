@@ -47,7 +47,7 @@ public static class ConnectVerb
                                          sign in again and list the missing permissions (after an admin granted more)
           keeper connect permissions     the Graph application permissions to grant the app, one per line
 
-        The app registration, its certificate and the permissions: docs/CONNECT-MICROSOFT.md. Keeper only reads;
+        The app registration, its certificate and the permissions: CONNECT-MICROSOFT.md beside keeper. Keeper only reads;
         every permission it asks for is a Read permission, and none that reads mail, files or secret values.
         """, asked);
 
@@ -67,7 +67,7 @@ public static class ConnectVerb
         // The certificate is checked here, on this machine, before anything is stored: the commonest first-run failure.
         if (FindCertificate(thumbprint) is not { } certificate)
             throw new ArgumentException($"No certificate {thumbprint} in the current user's certificate store (CurrentUser\\My) with its private key. " +
-                                        "docs/CONNECT-MICROSOFT.md shows how to create one and upload its public part to the app.");
+                                        "CONNECT-MICROSOFT.md, beside keeper, shows how to create one and upload its public part to the app.");
         Console.WriteLine($"Certificate: {certificate.Subject}, valid until {certificate.NotAfter.ToUniversalTime():yyyy-MM-dd}");
 
         var (_, paths) = KeeperContext.Load(cli);

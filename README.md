@@ -138,7 +138,7 @@ dry run unless `--apply`). `keeper run` calls them; `keeper help --all` lists th
 | `tests\<part>\` | Each project's tests, by the same parts; `tests\testkit\` holds what they share |
 | `rules\` | The generic rule packs, one file per system type |
 | `docs\` | `ARCHITECTURE.md`, `RULES.md` (the rule format), `DISCOVERY.md`, `KUBERNETES.md`, `NETWORK.md`, `PRINTERS.md`, `SECURITY.md`, `backlog\` (checks not yet rules, and why) |
-| `build\<runtime>\` | The binaries and the rules (`build.ps1` output; git ignores it) |
+| `build\<runtime>\` | What to copy to the machine that runs Keeper: `keeper` (one file), `rules\` and `CONNECT-MICROSOFT.md` (`build.ps1` output; git ignores it) |
 | `home\` | The Keeper home: your tenant's settings and data (git ignores it) |
 | `demo\` | A second home with sample data, for trying Keeper out (git ignores it) |
 

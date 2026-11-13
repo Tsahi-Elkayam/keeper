@@ -188,6 +188,8 @@ if ($onMac -and $Runtime -like 'osx-*') {
 $rulesOut = Join-Path $out 'rules'
 if (Test-Path $rulesOut) { Remove-Item $rulesOut -Recurse }
 Copy-Item (Join-Path $repo 'rules') $rulesOut -Recurse
+# The guide 'keeper connect' points to, beside the binary: the machine that runs Keeper has no repo.
+Copy-Item (Join-Path (Join-Path $repo 'docs') 'CONNECT-MICROSOFT.md') (Join-Path $out 'CONNECT-MICROSOFT.md')
 
 Write-Host "Built into ${out}: $(Split-Path $binary -Leaf) ($(if ($FrameworkDependent) { 'needs the .NET 10 runtime' } else { 'self-contained' }))"
 Write-Host "Keeper home: $keeperHome"
