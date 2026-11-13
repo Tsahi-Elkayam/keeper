@@ -333,8 +333,8 @@ override satisfies every required setting. (All done: sections 10 and 11.)
 
 ## Not in this change
 
-Nothing from the list in the pilot review is left. Not done: a live run on Windows and against a real AD (Samba AD
-lab in the Tests section), and `keeper config export` does not carry settings/integration-types.
+Nothing from the list in the pilot review is left. `keeper config export|import integration-types` carries the
+tenant's type files between homes. The live runs on Windows and against a real AD are in the Tests section.
 
 ## Tests
 
@@ -345,3 +345,21 @@ lab in the Tests section), and `keeper config export` does not carry settings/in
 - Mergers: registry/cim/ldap merge and split, masks preserved.
 - Live: a Samba AD DC in Docker with lockout threshold 3 and a wrong password - locked before, not after;
   logons counted with the right password. sshd in Docker with MaxStartups for the ssh family.
+
+Live results, 2026-11-13 (branch engine/pace-and-sessions):
+
+- Windows 11 ARM64 (a VM of its own), .NET SDK 10.0.404 x64: the whole suite builds and passes. One test, the
+  sign-in cool-down, kept time by the wall clock and failed once under load; it now uses a clock it moves.
+- Samba AD DC (EXAMPLE.ORG, lockout threshold 3), read by Keeper on that Windows VM over LDAP with Negotiate:
+  - Right password: 94 queries on one session and one sign-in, 1,823 rows, 46 findings. The run stored the lockout
+    policy, and the next scan's plan said "3 bad password(s) lock EXAMPLE\reader".
+  - Wrong password: four `keeper scan` commands and one `keeper run` cost the DC one bad password (badPwdCount 1;
+    not locked). The first scan sent one sign-in and marked the other 93 queries "not tried"; the later ones sent
+    none and named the recorded refusal.
+- CIM on that VM (integration `targets` set to itself, WinRM stopped): Keeper fell back from WS-Man to DCOM by
+  itself and read windows-baseline (690 rows), windows-server (930) and workstations (1,248). Reads an unelevated
+  account may not make (the Security log, BitLocker) and server namespaces a workstation lacks failed as failed
+  reads, and none counted as a refused sign-in. The live run showed the host named twice in a failure
+  ("PC01: PC01: Access denied"); the query's reason no longer repeats a host its runner already named.
+- sshd in Docker (pam_faillock, deny 3): one `keeper run` over sshd, nginx and docker signed in twice (it was six)
+  with the same rows and findings. A wrong password cost one failed sign-in in the whole run.

@@ -332,7 +332,7 @@ public sealed class Scanner(RunnerRegistry registry, TimeProvider? clock = null)
             : Targets.Any(t => t.State is "ok" or "partial") ? "partial"
             : "failed";
 
-        public string? Reason => string.Join("; ", Targets.Where(t => t.Reason is not null).Select(t => t.Target is null ? t.Reason : $"{t.Target}: {t.Reason}").Take(5));
+        public string? Reason => string.Join("; ", Targets.Where(t => t.Reason is not null).Select(t => t.Target is null || t.Reason!.StartsWith($"{t.Target}: ", StringComparison.OrdinalIgnoreCase) ? t.Reason : $"{t.Target}: {t.Reason}").Take(5));
     }
 
     /// <summary>One read the scan makes: one query (or several merged into one) on one host - or on the integration's endpoint.</summary>

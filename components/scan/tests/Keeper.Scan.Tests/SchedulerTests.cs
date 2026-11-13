@@ -530,11 +530,15 @@ public sealed class SchedulerTests : IDisposable
                 : RunnerResult.Ok([new JsonObject { ["host"] = host, ["value"] = 1 }]));
         var guard = new LogonGuard();
 
-        await Scan(runner, queries: 3, ["pc01.example.org", "pc02.example.org"], pace: PaceProfile.Unlimited with { Hosts = 1 }, guard: guard);
+        var report = await Scan(runner, queries: 3, ["pc01.example.org", "pc02.example.org"], pace: PaceProfile.Unlimited with { Hosts = 1 }, guard: guard);
 
         Assert.Equal(6, runner.Reads);
         Assert.True(guard.Proven(new Connection()));
         Assert.Null(guard.Refusal(new Connection()));
+        // The runner's reason already names the host: the query's reason does not name it twice.
+        var reasons = Coverage(report).Where(c => c.Scope != "target" && c.Reason is not null).Select(c => c.Reason!).ToList();
+        Assert.Contains(reasons, r => r.Contains("pc01.example.org: EnumValues returned 5", StringComparison.Ordinal));
+        Assert.DoesNotContain(reasons, r => r.Contains("pc01.example.org: pc01.example.org:", StringComparison.Ordinal));
     }
 
     [Fact]
