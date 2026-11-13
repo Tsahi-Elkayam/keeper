@@ -10,8 +10,11 @@ The overview page of `keeper ui` opens with a **health score**: one number and a
 by severity, per category and per system, with the formula one click away. It says how many checks it stands on and is
 marked provisional when fewer than 80% of the checks that ran gave a verdict.
 
-**Status:** every component is built and unit-tested against synthetic data. **No runner has touched
-a live system yet**, so the first real scan of each system is its real test (see *Trying it* below).
+**Status:** every component is built and unit-tested against synthetic data, on macOS and on Windows. Runners
+read live systems in labs: LDAP (a Samba AD domain controller), CIM, registry and event logs (Windows 11), SSH
+hosts, Kubernetes (kind), Docker and a network printer. The cloud and SaaS runners (Microsoft 365, Azure, AWS,
+GCP, FortiGate and the other REST products) have not read a live tenant yet, so their first real scan is their
+real test (see *Trying it* below).
 
 ## Rule zero: no tenant data in this repo
 
