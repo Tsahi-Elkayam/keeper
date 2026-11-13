@@ -33,6 +33,9 @@ public sealed record ScanRequest
     /// <summary>Why the resolved host list may be missing hosts (its source read was not clean), or null.</summary>
     public Func<TargetSpec, string?> TargetsIncomplete { get; init; } = _ => null;
 
+    /// <summary>Hosts a file's targets 'where' could not judge, as a note for the scan's manifest - or null.</summary>
+    public Func<TargetSpec, string?> TargetsUnjudged { get; init; } = _ => null;
+
     /// <summary>
     /// A read's history in this system's earlier scans, by coverage item (the query id, or query@host for a
     /// per-host query), or null when it never read cleanly.
@@ -117,6 +120,16 @@ public sealed class Scanner(RunnerRegistry registry, TimeProvider? clock = null)
             System.Globalization.CultureInfo.InvariantCulture, out var confirm) && confirm >= 1 ? confirm : DefaultDropConfirmScans;
         var confirmAge = TimeSpan.FromDays(double.TryParse(request.Threshold("scan.drop-confirm-days"), System.Globalization.NumberStyles.Float,
             System.Globalization.CultureInfo.InvariantCulture, out var days) && days >= 0 ? days : DefaultDropConfirmDays);
+        // Hosts left out because the targets' where could not judge them are said, once per target list.
+        if (request.Connection.Options["targets"] is not JsonArray)
+        {
+            foreach (var spec in request.Files.Select(f => f.Targets).OfType<TargetSpec>().Where(t => t.List.Count == 0)
+                         .DistinctBy(TargetsText, StringComparer.Ordinal))
+            {
+                if (request.TargetsUnjudged(spec) is { } unjudged)
+                    notes.Add(unjudged);
+            }
+        }
         var (fetched, cost, paceNotes) = await FetchAll(queries, request, cancellationToken).ConfigureAwait(false);
         foreach (var group in queries)
         {

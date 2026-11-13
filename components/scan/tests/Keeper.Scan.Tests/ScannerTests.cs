@@ -691,6 +691,36 @@ public sealed class ScannerTests : IDisposable
     }
 
     [Fact]
+    public async Task Hosts_the_targets_where_could_not_judge_are_said_once_in_the_manifest()
+    {
+        var registry = new RunnerRegistry([new FakeRunner(true, new() { ["pc01"] = 1 })]);
+        var body = """
+            schema: keeper.rules/1
+            system: example
+            integration: files
+            targets: { entity: computer, field: dNSHostName, where: { field: operatingSystem, op: match, value: '^Windows' } }
+            defaults: { lens: both, refresh: 1d, category: IAM, kind: misconfigured, severity: low, entity: member }
+            rules:
+              - id: RULE
+                title: Member
+                query: { protocol: fake, key: id }
+                each: any
+            """;
+        var first = FakeFile("w1.yaml", body.Replace("RULE", "EX-W1", StringComparison.Ordinal));
+        var second = FakeFile("w2.yaml", body.Replace("RULE", "EX-W2", StringComparison.Ordinal).Replace("key: id", "key: name", StringComparison.Ordinal));
+
+        var report = await new Scanner(registry, new Clock(Now)).RunAsync(new ScanRequest
+        {
+            Files = [first, second], Connection = new FilesConnection(), RunsDir = Runs, ImportsDir = Imports,
+            ResolveTargets = _ => ["pc01"],
+            TargetsUnjudged = _ => "1 computer host(s) are not read: the targets' where could not judge them (pc03)",
+        }, CancellationToken.None);
+
+        Assert.Equal("ok", report.Manifest.Status);                      // a note, not a partial scan
+        Assert.Single(report.Manifest.Notes, n => n.Contains("could not judge", StringComparison.Ordinal));
+    }
+
+    [Fact]
     public async Task A_field_one_rule_masks_does_not_leak_through_another_rule_s_name()
     {
         var registry = new RunnerRegistry([new FakeRunner(false, new() { ["-"] = 1 })]);

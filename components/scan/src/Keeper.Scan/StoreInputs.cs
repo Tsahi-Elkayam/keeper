@@ -149,7 +149,11 @@ public sealed class StoreInputs
         return byHost;
     }
 
-    private IEnumerable<(string Host, JsonObject Attrs)> MatchingHosts(TargetSpec spec, DateTimeOffset now)
+    private IEnumerable<(string Host, JsonObject Attrs)> MatchingHosts(TargetSpec spec, DateTimeOffset now) =>
+        Judged(spec, now).Where(h => h.Matches == true).Select(h => (h.Host, h.Attrs));
+
+    /// <summary>Every known host of the entity type with what 'where' says of it: true, false, or null when it cannot tell.</summary>
+    private IEnumerable<(string Host, JsonObject Attrs, bool? Matches)> Judged(TargetSpec spec, DateTimeOffset now)
     {
         if (spec.Entity is null || spec.Field is null)
             yield break;
@@ -160,10 +164,9 @@ public sealed class StoreInputs
         {
             if (JsonNode.Parse((string)row["attrs"]!) is not JsonObject attrs)
                 continue;
-            if (spec.Where is not null && evaluator.Each(spec.Where, attrs).Fails != true)
+            if (Values.Text(FieldPath.First(attrs, spec.Field)) is not { Length: > 0 } host)
                 continue;
-            if (Values.Text(FieldPath.First(attrs, spec.Field)) is { Length: > 0 } host)
-                yield return (host, attrs);
+            yield return (host, attrs, spec.Where is null ? true : evaluator.Each(spec.Where, attrs).Fails);
         }
     }
 
@@ -171,6 +174,22 @@ public sealed class StoreInputs
     /// Why the host list from <see cref="Targets"/> may be missing hosts, or null when every read that supplied
     /// it was clean. A host missing from an incomplete list is not a retired host, and must not be judged as one.
     /// </summary>
+    /// <summary>
+    /// Hosts the targets' 'where' could not judge (the field it asks about is missing: a computer that never signed
+    /// in has no lastLogonTimestamp), said rather than dropped silently - or null. A note, not an incomplete list:
+    /// such objects are common and mostly rightly out, and an incomplete list would keep every finding open.
+    /// </summary>
+    public string? TargetsUnjudged(TargetSpec spec, DateTimeOffset now)
+    {
+        if (spec.Where is null)
+            return null;
+        var unjudged = Judged(spec, now).Where(h => h.Matches is null).Select(h => h.Host)
+            .Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+        return unjudged.Count == 0 ? null
+            : $"{unjudged.Count} {spec.Entity} host(s) are not read: the targets' where could not judge them, a field it asks about is missing " +
+              $"({string.Join(", ", unjudged.Take(3))}{(unjudged.Count > 3 ? ", ..." : "")})";
+    }
+
     public string? TargetsIncomplete(TargetSpec spec)
     {
         if (spec.Entity is null || spec.Field is null)

@@ -98,6 +98,7 @@ public static class ScanVerb
                     ResolveTargets = spec => inputs.Targets(spec, started),
                     ResolveTargetAttributes = spec => inputs.TargetAttributes(spec, started),
                     TargetsIncomplete = inputs.TargetsIncomplete,
+                    TargetsUnjudged = spec => inputs.TargetsUnjudged(spec, started),
                     // A connection test reads one rule once; comparing it with a full scan would only confuse the result.
                     PreviousRows = test ? _ => null : item => previous.GetValueOrDefault(item),
                     LastCleanRows = test ? _ => new Dictionary<string, CleanRead>() : query => inputs.LastCleanRows(record.Id, systemName, query),

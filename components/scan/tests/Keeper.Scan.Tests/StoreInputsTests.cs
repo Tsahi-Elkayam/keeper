@@ -1,3 +1,4 @@
+using System.Text.Json.Nodes;
 using Keeper.Rules;
 using Keeper.Store;
 
@@ -62,6 +63,25 @@ public sealed class StoreInputsTests : IDisposable
 
         Assert.Equal(new[] { "pc01.example.org", "pc02.example.org" }, inputs.Targets(spec, DateTimeOffset.UtcNow));
         Assert.Equal(incomplete, inputs.TargetsIncomplete(spec) is not null);
+    }
+
+    [Fact]
+    public void A_host_the_where_cannot_judge_is_not_dropped_silently()
+    {
+        Run("ad1", "ad-main", "active-directory", "2026-10-20T06:00:00Z", ("query", "q-computers", "ok", 3));
+        Row("ad1", "q-computers", "computer", "PC01", """{ "dNSHostName": "pc01.example.org", "operatingSystem": "Windows 11 Pro" }""");
+        Row("ad1", "q-computers", "computer", "PC02", """{ "dNSHostName": "pc02.example.org", "operatingSystem": "Ubuntu" }""");
+        Row("ad1", "q-computers", "computer", "PC03", """{ "dNSHostName": "pc03.example.org" }""");   // no operatingSystem read
+
+        using var connection = Store.OpenReadOnly();
+        var inputs = new StoreInputs(connection);
+        var spec = new TargetSpec("computer", new LeafCondition("operatingSystem", "match", JsonValue.Create("^Windows"), null), "dNSHostName", []);
+
+        Assert.Equal(new[] { "pc01.example.org" }, inputs.Targets(spec, DateTimeOffset.UtcNow));
+        var why = inputs.TargetsUnjudged(spec, DateTimeOffset.UtcNow);
+        Assert.Contains("1 computer host(s) are not read", why, StringComparison.Ordinal);
+        Assert.Contains("pc03.example.org", why, StringComparison.Ordinal);
+        Assert.Null(inputs.TargetsIncomplete(spec));       // a note, not an incomplete list: findings can still be resolved
     }
 
     [Fact]
