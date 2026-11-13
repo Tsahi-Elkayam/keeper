@@ -6,31 +6,33 @@ using Keeper.Home;
 
 // keeper <verb> ...: the one binary. Every verb runs in this process; a word that is not a verb is
 // taken as a question (keeper broken == keeper query broken). setup and help live here.
-var verbs = new (string Name, string What, Func<string[], int> Run)[]
+// Each verb belongs to one part of Keeper; 'keeper help' shows the parts in this order, the engine's own verbs only
+// with --all (the daily run calls them; a person rarely needs to).
+var verbs = new (string Part, string Name, string What, Func<string[], int> Run)[]
 {
-    ("run", "the daily pipeline: scan, load, track, rank, then today's list", RunVerb.Run),
-    ("today", "what to do today", TodayVerb.Run),
-    ("discover", "discover machines on the network and update the discovery inventory", DiscoverVerb.Run),
-    ("scan", "scan one system through its integration (read-only towards it)", ScanVerb.Run),
-    ("certs", "which certificates a server presents, valid or not, until when (you start it)", CertsVerb.Run),
-    ("load", "queue the scans the store has not taken in", LoadVerb.Run),
-    ("track", "turn the newest scans into the findings register", TrackVerb.Run),
-    ("rank", "order the open findings into today's list", RankVerb.Run),
-    ("qm", "the queue manager, the only writer of the store", QmVerb.Run),
-    ("query", "answer a named question (keeper query list)", QueryVerb.Run),
-    ("report", "posture, summary, security, expiring, changes, trends, finance and evidence reports", ReportVerb.Run),
-    ("ui", "the interactive page: everything Keeper knows, in one file you open in a browser", args => ReportVerb.Run(["ui", .. args])),
-    ("decide", "snooze, delegate, accept or disable a finding; set a threshold", DecideVerb.Run),
-    ("system", "the systems Keeper knows and what maps to them", SystemVerb.Run),
-    ("register", "vendors, contracts, licences, key dates, initiatives", RegisterVerb.Run),
-    ("integration", "how Keeper reaches each system, and its encrypted secrets", IntegrationVerb.Run),
-    ("connect", "connect a Microsoft 365 tenant in one step and check its permissions", ConnectVerb.Run),
-    ("config", "export and import the client configuration as files (systems, settings, overrides, registers, integrations)", ConfigVerb.Run),
-    ("rules", "validate, list and explain rule files", RulesVerb.Run),
-    ("push", "open tickets for delegated findings (plan, apply, sync)", PushVerb.Run),
-    ("db", "the store: status, init, migrate, backup", DbVerb.Run),
+    ("scan", "run", "scan everything that is set up, take the results in, then today's list", RunVerb.Run),
+    ("scan", "scan", "scan one system now (keeper scan --list shows them)", ScanVerb.Run),
+    ("scan", "discover", "find the machines on the networks you allow", DiscoverVerb.Run),
+    ("scan", "certs", "which certificates a server presents, and until when", CertsVerb.Run),
+    ("sign-in", "connect", "connect a Microsoft 365 tenant in one step and check its permissions", ConnectVerb.Run),
+    ("sign-in", "integration", "how Keeper reaches each system, and its encrypted secrets", IntegrationVerb.Run),
+    ("sign-in", "config", "export or import the whole configuration as files", ConfigVerb.Run),
+    ("rules", "rules", "list, explain and validate the rules", RulesVerb.Run),
+    ("rules", "query", "the questions Keeper answers (keeper query list)", QueryVerb.Run),
+    ("reports", "today", "what to do today", TodayVerb.Run),
+    ("reports", "report", "posture, security, expiring, changes, trends, finance, evidence and more", ReportVerb.Run),
+    ("reports", "ui", "everything Keeper knows, as one page you open in a browser", args => ReportVerb.Run(["ui", .. args])),
+    ("reports", "push", "open tickets for delegated findings (ServiceNow, monday.com)", PushVerb.Run),
+    ("decide", "decide", "snooze, delegate, accept or disable a finding; set a threshold", DecideVerb.Run),
+    ("decide", "system", "the systems findings are grouped and routed by", SystemVerb.Run),
+    ("decide", "register", "vendors, contracts, licences, key dates, initiatives", RegisterVerb.Run),
+    ("engine", "load", "queue the scans the store has not taken in", LoadVerb.Run),
+    ("engine", "track", "turn the newest scans into the findings register", TrackVerb.Run),
+    ("engine", "rank", "order the open findings into today's list", RankVerb.Run),
+    ("engine", "qm", "the queue manager, the only writer of the store", QmVerb.Run),
+    ("engine", "db", "the store: status, init, migrate, backup", DbVerb.Run),
 };
-foreach (var (name, _, run) in verbs)
+foreach (var (_, name, _, run) in verbs)
     Commands.Add(name, run);
 // Integration types a tenant adds (settings/integration-types/*.yaml) are known to every verb once it loads the home.
 KeeperContext.Loaded += paths => Keeper.Integrations.IntegrationTypes.UseTenantFolder(Path.Combine(paths.SettingsDir, "integration-types"));
@@ -42,7 +44,7 @@ try
     switch (verb)
     {
         case "help" or "--help" or "-h" or "/?":
-            return Help(verbs);
+            return Help(verbs, all: rest.Contains("--all"));
         case "version" or "--version":
             Console.WriteLine($"keeper {Assembly.GetExecutingAssembly().GetName().Version}");
             return ExitCodes.Ok;
@@ -70,24 +72,55 @@ catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
     return ExitCodes.Failed;
 }
 
-static int Help((string Name, string What, Func<string[], int> Run)[] verbs)
+static int Help((string Part, string Name, string What, Func<string[], int> Run)[] verbs, bool all)
 {
-    Console.WriteLine("""
-        keeper - tells you what to do today
+    var version = Assembly.GetExecutingAssembly().GetName().Version;
+    Console.WriteLine($"""
+        Keeper {version?.ToString(3)} - a linter for systems. It reads them, never changes them, and says what is
+        broken, misconfigured, missing or expiring, and what to do about it today.
 
-          keeper setup --tenant <name> [--apply]   create the Keeper home and the store (dry run without --apply)
+        Start
+          keeper setup --tenant <name> --apply    the Keeper home and its store
+          keeper connect microsoft ...            sign in to a Microsoft 365 tenant (keeper connect --help)
+          keeper run                              scan, then today's list
+
         """);
-    foreach (var (verb, what, _) in verbs)
-        Console.WriteLine($"  keeper {verb,-12} {what}");
-    Console.WriteLine("""
-
-          keeper <question>      any question from 'keeper query list', e.g. keeper broken, keeper expiring
-          keeper <verb> --help   the verb's own flags
-
-        Every verb reads the Keeper home: KEEPER_HOME, else the keeper folder's home\ (git ignores it).
-        --settings <file> points one command at another home's settings.json.
-        """);
+    (string Part, string Title, string What)[] parts =
+    [
+        ("scan", "Scan", "reads systems, read-only"),
+        ("sign-in", "Sign-in", "how Keeper reaches what it reads"),
+        ("rules", "Rules", "what is checked, and the questions you can ask"),
+        ("reports", "Reports", "what was found, for you and for management"),
+        ("decide", "Decisions", "what you decided about findings, and the records rules read"),
+        ("engine", "Engine", "the steps 'keeper run' takes; rarely run by hand"),
+    ];
+    foreach (var (part, title, what) in parts)
+    {
+        if (part == "engine" && !all)
+            continue;
+        Console.WriteLine($"{title} - {what}");
+        foreach (var (_, verb, text, _) in verbs.Where(v => v.Part == part))
+            Console.WriteLine(Line($"keeper {verb}", text));
+        if (part == "reports")
+        {
+            Console.WriteLine();
+            Console.WriteLine("Trends - what changed, and whether it is getting better");
+            Console.WriteLine(Line("keeper report trends", "each system now against 30 and 90 days ago: fixed, new, open"));
+            Console.WriteLine(Line("keeper trend", "the daily rows behind it (--system <id>)"));
+            Console.WriteLine(Line("keeper changed", "what appeared and what went away (--since <date>)"));
+        }
+        Console.WriteLine();
+    }
+    Console.WriteLine("Ask");
+    Console.WriteLine(Line("keeper <question>", "broken, misconfigured, missing, expiring, blind-spots, ... (keeper query list)"));
+    Console.WriteLine(Line("keeper <verb> --help", "a verb's own options"));
+    if (!all)
+        Console.WriteLine(Line("keeper help --all", "also the engine's own steps (load, track, rank, qm, db)"));
+    Console.WriteLine();
+    Console.WriteLine($"Keeper home: {KeeperHome.Resolve()}  (KEEPER_HOME moves it; one home per tenant)");
     return ExitCodes.Ok;
+
+    static string Line(string command, string text) => $"  {command,-22} {text}";
 }
 
 static int Setup(CliArgs cli)

@@ -182,7 +182,7 @@ public static class RulesVerb
 
         static int Usage(bool asked = false) =>
             CliUsage.Print("""
-                keeper rules - rule files
+                keeper rules - what Keeper checks: list, explain and validate the rules
 
                   keeper rules validate [<folder>...]   check rule files (with folders: no Keeper home needed)
                   keeper rules list [--system <s>]      every rule, one line each

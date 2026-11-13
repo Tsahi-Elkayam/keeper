@@ -25,7 +25,17 @@ public static class QueryHost
 
             var question = cli.At(0);
             if (question is null or "list")
+            {
+                if (cli.Help)
+                    Console.WriteLine($"""
+                        {name} - the questions Keeper answers from the store (read-only)
+
+                          keeper <question> [--<parameter> <value>] [--format table|jsonl] [--out <file>]
+                          keeper <question> --help    the question's parameters
+
+                        """);
                 return List(catalog);
+            }
 
             if (!catalog.TryGetValue(question, out var query))
             {

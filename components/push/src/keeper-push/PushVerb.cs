@@ -119,7 +119,7 @@ public static class PushVerb
 
         static int Usage(bool asked = false) =>
             CliUsage.Print("""
-                keeper push - tickets for findings handed off to someone (the only binary that changes anything outside Keeper)
+                keeper push - tickets for findings handed off to someone (the only verb that changes anything outside Keeper)
 
                   keeper push plan  [--tracker servicenow|monday] [--finding <key-prefix> ...]   what would be opened (default)
                   keeper push apply [--tracker ...] [--finding ...]                              open them, after you confirm

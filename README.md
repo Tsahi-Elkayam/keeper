@@ -90,27 +90,22 @@ A scan reads; it never changes the system it reads. Keeper writes only its own s
 
 Every change needs `--reason "<why>"`; `--now` applies it straight away.
 
-## One binary
+## One binary, five parts
 
-`keeper.exe` is the only executable; everything else is a verb and its flags (`keeper <verb> --help`).
-Every verb runs inside that one process - Keeper never starts another program.
+`keeper.exe` is the only executable. Every verb runs inside that one process; Keeper never starts another
+program. `keeper help` shows the verbs by part, the same way as this table.
 
-| Verb | Job |
-|---|---|
-| `keeper setup`, `keeper help` | Create the home; list the verbs |
-| `keeper run` | The daily loop above (`--discover` runs `keeper discover` first) |
-| `keeper discover` | Network discovery (`free` or `manual` mode) -> `data\imports\discovery\inventory.json` |
-| `keeper scan` | One system through one integration; writes a verified run folder |
-| `keeper load`, `keeper track`, `keeper rank` | Run folders into the store; findings; today's ranking |
-| `keeper qm` | The queue manager: the only writer of the store |
-| `keeper query` | Questions, read-only (`keeper <question>` for short) |
-| `keeper today`, `keeper report` | Today's list; reports (text, Markdown, HTML) |
-| `keeper decide`, `keeper system`, `keeper register`, `keeper config` | Decisions, systems, registers, config files |
-| `keeper integration` | Integrations and their encrypted secrets |
-| `keeper rules` | `validate`, `list`, `explain`, `load` |
-| `keeper certs` | Which certificates servers present |
-| `keeper push` | Tickets out, ticket state back |
-| `keeper db` | The store: `status`, `init`, `migrate`, `backup` (dry run unless `--apply`) |
+| Part | Verbs | Job |
+|---|---|---|
+| Scan | `run`, `scan`, `discover`, `certs` | Read systems, read-only; `run` is the whole daily loop (`--discover` runs discovery first) |
+| Sign-in | `connect`, `integration`, `config` | How Keeper reaches each system: one-step tenant connection, integrations and their encrypted secrets, the configuration as files |
+| Rules | `rules`, `query` | What is checked (`list`, `explain`, `validate`, `load`) and the questions it answers (`keeper <question>` for short) |
+| Reports | `today`, `report`, `ui`, `push` | Today's list; reports in text, Markdown and HTML; the one-page browser view; tickets out and their state back |
+| Trends | `report trends`, `trend`, `changed` | Each system against 30 and 90 days ago; the daily rows; what appeared and went away |
+
+Your decisions sit beside them: `decide`, `system` and `register`. The engine's own steps are `load`, `track`,
+`rank`, `qm` (the queue manager, the only writer of the store) and `db` (`status`, `init`, `migrate`, `backup`,
+dry run unless `--apply`). `keeper run` calls them; `keeper help --all` lists them.
 
 ## Design rules
 

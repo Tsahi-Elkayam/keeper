@@ -16,6 +16,13 @@ public static class ReportVerb
         try
         {
             var cli = new CliArgs(args, flags: ["pack"]);
+            if (cli.Help && cli.At(0) == "ui")
+                return CliUsage.Print("""
+                    keeper ui - everything Keeper knows, as one page you open in a browser (read-only)
+
+                      keeper ui [--out <file>]   overview, findings with every object, what is correct, what could not be checked
+                                                 written to data\reports\<date>-keeper.html unless --out says where
+                    """, asked: true);
             if (cli.Help)
                 return CliUsage.Print($"""
                     keeper report - reports for people who read rather than act (read-only; writes under data\reports\)
