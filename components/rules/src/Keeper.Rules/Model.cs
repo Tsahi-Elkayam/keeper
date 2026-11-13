@@ -156,6 +156,25 @@ public sealed record Rule
         .Concat(AllLeaves.Any(l => l.Op.StartsWith("hour-", StringComparison.Ordinal)) ? [TimeZoneSetting] : [])
         .Distinct(StringComparer.Ordinal)];
 
+    /// <summary>The thresholds this rule's conditions and count compare with, by name: what a rule-level override may replace.</summary>
+    public IReadOnlyList<string> ThresholdNames => [.. AllLeaves.Select(l => l.Threshold).Append(Count?.Threshold).OfType<string>()
+        .Distinct(StringComparer.Ordinal)];
+
+    /// <summary>
+    /// The value a rule-level threshold override gives <paramref name="name"/>, or null. The override is this rule's
+    /// own threshold, never another setting (the time zone): with one threshold the value is it; with several it must
+    /// name which, as name=value - one value for every threshold would satisfy each required one with the wrong thing.
+    /// </summary>
+    public string? OverrideFor(string name, string? value)
+    {
+        if (value is null || !ThresholdNames.Contains(name, StringComparer.Ordinal))
+            return null;
+        var at = value.IndexOf('=', StringComparison.Ordinal);
+        if (at > 0 && ThresholdNames.Contains(value[..at].Trim(), StringComparer.Ordinal))
+            return value[..at].Trim() == name ? value[(at + 1)..].Trim() : null;
+        return ThresholdNames.Count == 1 ? value : null;
+    }
+
     /// <summary>The setting (threshold.time-zone) that names the organisation's time zone: Asia/Jerusalem, or a Windows id.</summary>
     public const string TimeZoneSetting = "time-zone";
 

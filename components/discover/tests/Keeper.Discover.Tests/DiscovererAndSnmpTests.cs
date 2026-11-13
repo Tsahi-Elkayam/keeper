@@ -216,6 +216,8 @@ public sealed class DiscovererAndSnmpTests : IDisposable
             """
             CREATE TABLE setting (key TEXT PRIMARY KEY, value TEXT NOT NULL);
             CREATE TABLE override (
+                override_id TEXT PRIMARY KEY,
+                at TEXT NOT NULL DEFAULT '',
                 check_id TEXT NOT NULL,
                 entity TEXT NOT NULL,
                 decision TEXT NOT NULL,

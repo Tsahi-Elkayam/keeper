@@ -94,7 +94,7 @@ public static class ScanVerb
                     ImportsDir = paths.Imports,
                     StoreFile = paths.Database,
                     Threshold = inputs.Threshold,
-                    OverrideThreshold = inputs.OverrideThreshold,
+                    OverrideThresholds = inputs.OverrideThresholds,
                     ResolveTargets = spec => inputs.Targets(spec, started),
                     ResolveTargetAttributes = spec => inputs.TargetAttributes(spec, started),
                     TargetsIncomplete = inputs.TargetsIncomplete,

@@ -70,6 +70,42 @@ public sealed class LoaderTests : IDisposable
     }
 
     [Fact]
+    public void A_rule_override_replaces_only_the_rule_s_own_threshold()
+    {
+        var file = RuleLoader.LoadFile(Write("thresholds.yaml", """
+            schema: keeper.rules/1
+            system: example
+            integration: ldap
+            defaults: { lens: security, category: IAM, refresh: 1d, entity: user, kind: misconfigured, severity: medium }
+            rules:
+              - id: EX-ONE
+                title: Stale
+                query: { protocol: ldap, filter: "(x=1)", key: id }
+                each: { field: lastLogon, op: age-gt, value: 90, threshold: ex.stale-days }
+              - id: EX-TWO
+                title: Stale and not allowed
+                query: { protocol: ldap, filter: "(x=2)", key: id }
+                each:
+                  all:
+                    - { field: lastLogon, op: age-gt, value: 90, threshold: ex.stale-days }
+                    - { field: name, op: notin, value: [], threshold: ex.allowed, required: true }
+                    - { field: lastLogon, op: hour-in, value: '20-23' }
+            """), "builtin", Protocols);
+        var one = file.Rules[0];
+        var two = file.Rules[1];
+
+        Assert.Equal("120", one.OverrideFor("ex.stale-days", "120"));
+        Assert.Null(one.OverrideFor(Rule.TimeZoneSetting, "120"));         // never another setting
+        // Two thresholds: a bare value names neither - it would satisfy the required list with a number of days.
+        Assert.Null(two.OverrideFor("ex.stale-days", "120"));
+        Assert.Null(two.OverrideFor("ex.allowed", "120"));
+        Assert.Equal("120", two.OverrideFor("ex.stale-days", "ex.stale-days=120"));
+        Assert.Null(two.OverrideFor("ex.allowed", "ex.stale-days=120"));
+        Assert.Equal("alice,bob", two.OverrideFor("ex.allowed", "ex.allowed = alice,bob"));
+        Assert.Null(two.OverrideFor(Rule.TimeZoneSetting, "ex.stale-days=120"));
+    }
+
+    [Fact]
     public void Element_conditions_and_grouped_counts_load()
     {
         var file = RuleLoader.LoadFile(Write("ok.yaml", """

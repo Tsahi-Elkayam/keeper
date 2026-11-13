@@ -108,6 +108,7 @@ public static class DecideVerb
                   keeper decide accept <key> [--until <date|26w>]         accept this one entity as it is (an exception)
                   keeper decide disable <rule-id> [--until <date|4w>]     stop reporting a rule (prefix* allowed)
                   keeper decide threshold <rule-id> <value> [--until ..]  this rule's threshold, for this tenant
+                                                                          (a rule with several: name=value, e.g. ad.stale-user-days=120)
                                                                           --until: the last day it holds; then the finding is back
                   keeper decide undo <OVR-0001>                           remove an exception, disable or threshold
                   keeper decide setting <key> <value> | --remove          e.g. threshold.ad.stale-user-days 120

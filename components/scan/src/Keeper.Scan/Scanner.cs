@@ -19,7 +19,8 @@ public sealed record ScanRequest
     public Func<string, string?> Threshold { get; init; } = _ => null;
 
     /// <summary>A threshold override for one rule (and entity), or null.</summary>
-    public Func<string, string, string?> OverrideThreshold { get; init; } = (_, _) => null;
+    /// <summary>A rule's threshold overrides for an entity ("-" for the rule as a whole), most specific first.</summary>
+    public Func<string, string, IReadOnlyList<string>> OverrideThresholds { get; init; } = (_, _) => [];
 
     /// <summary>Hosts for per-target rules, from what earlier scans saw.</summary>
     public Func<TargetSpec, IReadOnlyList<string>> ResolveTargets { get; init; } = _ => [];
@@ -709,6 +710,16 @@ public sealed class Scanner(RunnerRegistry registry, TimeProvider? clock = null)
         return deniedHere;
     }
 
+    /// <summary>
+    /// A rule's settings for one entity: its own overrides first (each for the threshold it names - see
+    /// <see cref="Rule.OverrideFor"/>), then the tenant's setting.
+    /// </summary>
+    private static Func<string, string?> Threshold(ScanRequest request, Rule rule, string entity)
+    {
+        var overrides = request.OverrideThresholds(rule.Id, entity);
+        return name => overrides.Select(value => rule.OverrideFor(name, value)).FirstOrDefault(v => v is not null) ?? request.Threshold(name);
+    }
+
     /// <summary>The host of an endpoint: a URL's host, or the endpoint itself (a host or a domain name).</summary>
     private static string EndpointHost(string? endpoint) =>
         string.IsNullOrWhiteSpace(endpoint) ? "(integration)"
@@ -801,7 +812,7 @@ public sealed class Scanner(RunnerRegistry registry, TimeProvider? clock = null)
 
         // A rule that compares with the tenant's own list (names of its agents, its admin groups) says nothing
         // until the list is set: not configured, never a pass.
-        var unset = rule.RequiredSettings.Where(name => (request.OverrideThreshold(rule.Id, "-") ?? request.Threshold(name)) is not { Length: > 0 }).ToList();
+        var unset = rule.RequiredSettings.Where(name => Threshold(request, rule, "-")(name) is not { Length: > 0 }).ToList();
         if (unset.Count > 0)
         {
             var reason = $"not configured: set {string.Join(", ", unset.Select(n => "threshold." + n))} ('keeper decide setting threshold.{unset[0]} <value>')";
@@ -887,7 +898,7 @@ public sealed class Scanner(RunnerRegistry registry, TimeProvider? clock = null)
                 var key = KeyOf(rule.Query, row, target);
                 if (NotJudged(target, key))
                     continue;
-                var evaluator = new Evaluator(name => request.OverrideThreshold(rule.Id, key) ?? request.Threshold(name), now) { Mask = outcome.Mask };
+                var evaluator = new Evaluator(Threshold(request, rule, key), now) { Mask = outcome.Mask };
                 var verdict = evaluator.Each(rule.Each!, row);
                 Result(rule.EntityType, key, verdict);
                 if (verdict.Fails != true)
@@ -927,7 +938,7 @@ public sealed class Scanner(RunnerRegistry registry, TimeProvider? clock = null)
             // Rows whose group cannot be read could belong to any group: not a group that could pass, and they could
             // add to every other group's count.
             var orphans = groups.FirstOrDefault(g => g.Key is null)?.ToList() ?? [];
-            var evaluator = new Evaluator(name => request.OverrideThreshold(rule.Id, target) ?? request.Threshold(name), now);
+            var evaluator = new Evaluator(Threshold(request, rule, target), now);
             var mayCount = rule.Count.Where is null ? orphans.Count : orphans.Count(o => evaluator.Each(rule.Count.Where, o.Row).Fails != false);
             var total = 0;
             foreach (var group in groups)
@@ -955,7 +966,7 @@ public sealed class Scanner(RunnerRegistry registry, TimeProvider? clock = null)
             double mayJoin, double extraUnknown)
         {
             var count = rule.Count!;
-            var evaluator = new Evaluator(name => request.OverrideThreshold(rule.Id, target) ?? request.Threshold(name), now);
+            var evaluator = new Evaluator(Threshold(request, rule, target), now);
             var judged = count.Where is null
                 ? rows.Select(r => (r.Row, r.Target, Fails: (bool?)true)).ToList()
                 : rows.Select(r => (r.Row, r.Target, evaluator.Each(count.Where, r.Row).Fails)).ToList();

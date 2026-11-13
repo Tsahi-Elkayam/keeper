@@ -31,7 +31,12 @@ public sealed class StoreInputs
         _thresholds = Sql.Rows(readOnly, "SELECT key, value FROM setting WHERE key LIKE 'threshold.%';")
             .ToDictionary(r => ((string)r["key"]!)["threshold.".Length..], r => (string)r["value"]!, StringComparer.Ordinal);
         _overrides = Sql.Rows(readOnly,
-                "SELECT check_id, entity, value FROM override WHERE active = 1 AND decision = 'threshold' AND (until IS NULL OR until >= COALESCE(:today, date('now')));",
+                // Most specific first: an exact rule id before a prefix*, a longer prefix before a shorter, the newest first.
+                """
+                SELECT check_id, entity, value FROM override
+                WHERE active = 1 AND decision = 'threshold' AND (until IS NULL OR until >= COALESCE(:today, date('now')))
+                ORDER BY (substr(check_id, -1) = '*'), length(check_id) DESC, at DESC, override_id DESC;
+                """,
                 null, (":today", today))
             .Select(r => ((string)r["check_id"]!, (string)r["entity"]!, (string)r["value"]!))
             .ToList();
@@ -39,14 +44,17 @@ public sealed class StoreInputs
 
     public string? Threshold(string name) => _thresholds.GetValueOrDefault(name);
 
-    /// <summary>An override for this rule and entity wins over one for the whole rule.</summary>
-    public string? OverrideThreshold(string ruleId, string entity)
+    /// <summary>
+    /// The threshold overrides of this rule, most specific first: those for this entity, then those for the whole
+    /// rule; within each, an exact rule id before a prefix and the newest first.
+    /// </summary>
+    public IReadOnlyList<string> OverrideThresholds(string ruleId, string entity)
     {
         bool Matches(string pattern) => pattern.EndsWith('*')
             ? ruleId.StartsWith(pattern[..^1], StringComparison.OrdinalIgnoreCase)
             : ruleId.Equals(pattern, StringComparison.OrdinalIgnoreCase);
-        return _overrides.Where(o => Matches(o.Check) && o.Entity.Equals(entity, StringComparison.OrdinalIgnoreCase)).Select(o => o.Value).FirstOrDefault()
-            ?? _overrides.Where(o => Matches(o.Check) && o.Entity.Length == 0).Select(o => o.Value).FirstOrDefault();
+        return [.. _overrides.Where(o => Matches(o.Check) && o.Entity.Equals(entity, StringComparison.OrdinalIgnoreCase)).Select(o => o.Value)
+            .Concat(_overrides.Where(o => Matches(o.Check) && o.Entity.Length == 0).Select(o => o.Value))];
     }
 
     /// <summary>
@@ -159,7 +167,8 @@ public sealed class StoreInputs
             yield break;
         var evaluator = new Evaluator(_ => null, now);
         foreach (var row in Sql.Rows(_connection,
-                     "SELECT rs.attrs FROM row_seen rs JOIN latest_run lr ON lr.run_id = rs.run_id WHERE rs.entity_type = :t;",
+                     // Oldest first: a host two systems list keeps the attributes of the newest read (TargetAttributes: the last one wins).
+                     "SELECT rs.attrs FROM row_seen rs JOIN latest_run lr ON lr.run_id = rs.run_id WHERE rs.entity_type = :t ORDER BY lr.started_at, lr.run_id, rs.observed_at;",
                      null, (":t", spec.Entity)))
         {
             if (JsonNode.Parse((string)row["attrs"]!) is not JsonObject attrs)
@@ -207,7 +216,8 @@ public sealed class StoreInputs
             JOIN latest_run lr ON lr.instance = s.instance AND lr.system = s.system
             LEFT JOIN coverage c ON c.run_id = lr.run_id AND c.scope = 'query' AND c.item = s.query
             -- A query the newest scan no longer runs supplied none of today's list: it cannot have dropped hosts from it.
-            WHERE (c.state IS NOT NULL AND c.state <> 'ok') OR (c.state IS NULL AND lr.status = 'failed');
+            WHERE (c.state IS NOT NULL AND c.state <> 'ok') OR (c.state IS NULL AND lr.status = 'failed')
+            ORDER BY s.system, s.query;
             """,
             null, (":t", spec.Entity));
         return unclean.Count == 0 ? null
