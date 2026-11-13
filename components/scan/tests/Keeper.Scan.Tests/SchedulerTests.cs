@@ -447,6 +447,23 @@ public sealed class SchedulerTests : IDisposable
     }
 
     [Fact]
+    public void A_process_does_not_count_its_own_strikes_twice_and_a_proof_forgets_them()
+    {
+        var guard = new LogonGuard();
+        var proven = 0;
+        guard.OnProven = _ => proven++;
+        guard.LimitDeniedSignIns(new Connection(), 2);
+        guard.RestoreStrikes(new Connection(), 0);          // the run's first scan: none kept
+        Assert.False(guard.DeniedAtSignIn(new Connection(), "srv1", "access denied"));
+        guard.RestoreStrikes(new Connection(), 1);          // its second scan reads back the strike it wrote itself
+        Assert.Null(guard.Refusal(new Connection()));
+
+        guard.Accepted(new Connection());
+        guard.Accepted(new Connection());
+        Assert.Equal(1, proven);                            // once: the kept strikes are cleared then
+    }
+
+    [Fact]
     public async Task Access_denied_on_hosts_after_an_accepted_sign_in_is_about_those_hosts()
     {
         var runner = new SessionRunner(host => host.StartsWith("pc01", StringComparison.Ordinal) ? FailureKind.None : FailureKind.Denied);
@@ -955,15 +972,17 @@ public sealed class SignInRefusalsTests : IDisposable
         file.RecordStrike(connection, "cred-1", "srv2", DateTimeOffset.UnixEpoch);
 
         var later = new SignInRefusals(File_);
-        Assert.Equal(2, later.Strikes(connection, "cred-1"));
+        var soon = DateTimeOffset.UnixEpoch.AddHours(1);
+        Assert.Equal(2, later.Strikes(connection, "cred-1", soon));
+        Assert.Equal(0, later.Strikes(connection, "cred-1", DateTimeOffset.UnixEpoch.AddDays(2)));   // a day on, they count for nothing
         Assert.Null(later.Find(connection, _ => "cred-1", null));        // a strike is not a refusal by itself
-        Assert.Equal(0, later.Strikes(connection, "cred-2"));            // the secret was set again
-        later.Clear(connection);                                         // the credential read data
-        Assert.Equal(0, later.Strikes(connection, "cred-1"));
+        Assert.Equal(0, later.Strikes(connection, "cred-2", soon));      // the secret was set again
+        later.ClearStrikes(connection);                                  // a host accepted it
+        Assert.Equal(0, later.Strikes(connection, "cred-1", soon));
 
         later.RecordStrike(connection, "cred-1", "srv1", DateTimeOffset.UnixEpoch);
         later.ClearAccount(connection);                                  // --retry-sign-in
-        Assert.Equal(0, later.Strikes(connection, "cred-1"));
+        Assert.Equal(0, later.Strikes(connection, "cred-1", soon));
     }
 
     [Fact]

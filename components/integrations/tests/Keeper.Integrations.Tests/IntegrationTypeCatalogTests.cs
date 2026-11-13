@@ -79,6 +79,10 @@ public sealed class IntegrationTypeCatalogTests : IDisposable
     [InlineData("auth: [aws-access-key]", "needs hosts")]
     [InlineData("auth: [gcp-service-account]", "needs hosts")]
     [InlineData("hosts: ['*.com']", "two labels")]
+    [InlineData("hosts: ['*.co.uk']", "anyone can register")]
+    [InlineData("hosts: ['*.github.io']", "anyone can register")]
+    [InlineData("hosts: [~]", "empty entry")]
+    [InlineData("auth: [api-key-header, ~]", "empty entry")]
     [InlineData("readPaths: ['/a']\n    readPaths: ['/b']", "duplicate")]
     public void What_a_tenant_type_may_not_say_is_said(string line, string expected)
     {

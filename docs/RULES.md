@@ -339,7 +339,7 @@ Also `endpoint` (the default, https), `endpointPath`, `resource` (Entra) and `re
 may name only protocols Keeper has runners for (not `store`, `file` or `host`) and only auth kinds Keeper can sign in
 with. Without `hosts` it may sign in only the ways a built-in type does without them: an Entra, AWS or Google
 sign-in needs `hosts`, so its token can go nowhere else, and a wildcard needs two labels (`*.example.org`, not
-`*.com`); a field it does not know (a misspelt `readpaths`) is an error, never a guard left out. A file that is not valid
+`*.com`) and may not cover a public suffix (`*.co.uk`, `*.github.io`; a short list, not the full public suffix list); a field it does not know (a misspelt `readpaths`) is an error, never a guard left out. A file that is not valid
 stops every command until it is fixed. `keeper integration types` lists them with the file that added each.
 
 ## Google Cloud

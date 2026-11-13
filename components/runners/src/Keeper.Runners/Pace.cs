@@ -511,15 +511,17 @@ public sealed class LogonGuard
     /// </summary>
     public void RestoreStrikes(IConnection connection, int earlier)
     {
-        if (earlier <= 0 || !PresentsSecret(connection))
+        if (!PresentsSecret(connection))
             return;
         string? text = null;
         lock (_lock)
         {
+            // The baseline is taken once even when it is none: a later scan of this process would otherwise read back
+            // the strikes this process wrote and count them twice.
             var key = ProofOf(connection);
-            if (_accepted.Contains(key) || !_earlierStrikes.TryAdd(key, earlier))
+            if (_accepted.Contains(key) || !_earlierStrikes.TryAdd(key, Math.Max(0, earlier)))
                 return;
-            if (earlier >= _deniedAllowed.GetValueOrDefault(KeyOf(connection), DeniedSignInsBeforeRefusal))
+            if (earlier > 0 && earlier >= _deniedAllowed.GetValueOrDefault(KeyOf(connection), DeniedSignInsBeforeRefusal))
                 text = $"not tried: {connection.Identity ?? "the current user"} was denied at sign-in {earlier} time(s) by earlier scans with no host " +
                        "accepting it - a wrong password can look like that, so Keeper stops using it so the account is not locked out; " +
                        "check the credential and its rights, then scan again";
@@ -548,13 +550,19 @@ public sealed class LogonGuard
     /// <summary>A sign-in was accepted: the credential works, and "access denied" at sign-in is from now on about the host.</summary>
     public void Accepted(IConnection connection)
     {
+        bool first;
         lock (_lock)
         {
-            _accepted.Add(ProofOf(connection));
+            first = _accepted.Add(ProofOf(connection));
             _strikes.Remove(ProofOf(connection));
-            _earlierStrikes.Remove(ProofOf(connection));
+            _earlierStrikes[ProofOf(connection)] = 0;
         }
+        if (first)
+            OnProven?.Invoke(connection);
     }
+
+    /// <summary>Called the first time a credential is accepted: the binary forgets its kept strikes right away.</summary>
+    public Action<IConnection>? OnProven { get; set; }
 
     /// <summary>A sign-in was answered "access denied". Returns true when that made the credential refused.</summary>
     public bool DeniedAtSignIn(IConnection connection, string host, string reason)

@@ -26,7 +26,7 @@ public sealed record LockoutPolicy(string Key, string? Name, bool FineGrained, i
 }
 
 /// <summary>What Keeper knows about how many bad passwords lock an account, and from where.</summary>
-public sealed record LockoutKnown(int Threshold, string Domain, string At, bool FineGrained)
+public sealed record LockoutKnown(int Threshold, string Domain, string At, bool FineGrained, bool Guessed = false)
 {
     /// <summary>How many sign-ins answered "access denied" may be risked: never as many as lock the account.</summary>
     public int DeniedSignInsAllowed => Threshold == 0 ? int.MaxValue : Math.Max(1, Threshold - 1);
@@ -83,7 +83,9 @@ public sealed class StoreInputs
                          SELECT q.instance, q.query, MAX(r.started_at) AS started_at
                          FROM (SELECT DISTINCT instance, query FROM policy) q
                          JOIN run r ON r.instance = q.instance
-                         JOIN coverage c ON c.run_id = r.run_id AND c.scope = 'query' AND c.item = q.query AND c.state = 'ok'
+                         JOIN coverage c ON c.run_id = r.run_id AND c.state = 'ok'
+                              AND ((c.scope = 'query' AND c.item = q.query)
+                                   OR (c.scope = 'target' AND substr(c.item, 1, length(q.query) + 1) = q.query || '@'))
                          GROUP BY q.instance, q.query)
                      SELECT DISTINCT p.entity_key, p.entity_name, p.attrs, p.started_at
                      FROM policy p JOIN newest n ON n.instance = p.instance AND n.query = p.query AND n.started_at = p.started_at
@@ -137,12 +139,18 @@ public sealed class StoreInputs
             domain = domains.FirstOrDefault(d => string.Equals(d.Name, netbios, StringComparison.OrdinalIgnoreCase)
                                                  || d.Domain.Split(',')[0].Equals("dc=" + netbios, StringComparison.OrdinalIgnoreCase));
         }
-        // One domain known and an identity that names no domain at all: that domain. One that names another domain is
-        // not given this one's policy.
+        // One domain known and an identity that names no domain at all: that domain.
         if (domain is null && !identity.Contains('@', StringComparison.Ordinal) && !identity.Contains('\\', StringComparison.Ordinal))
             domain = domains.Select(d => d.Domain).Distinct(StringComparer.Ordinal).Count() == 1 ? domains[0] : null;
         if (domain is null)
-            return null;
+        {
+            // The account's domain is not one Keeper can match (a UPN suffix that is not the DNS name, a NetBIOS name
+            // that is not the first label): the strictest policy known is the safe guess, and it is said to be one.
+            var locks = policies.Where(p => p.Threshold > 0).ToList();
+            var strictestKnown = locks.Count > 0 ? locks.MinBy(p => p.Threshold)! : domains[0];
+            return new LockoutKnown(strictestKnown.Threshold, strictestKnown.Name ?? strictestKnown.Domain, strictestKnown.At,
+                strictestKnown.FineGrained, Guessed: true);
+        }
         var applying = policies.Where(p => p.Domain == domain.Domain && (p == domain || p.FineGrained)).ToList();
         var locking = applying.Where(p => p.Threshold > 0).ToList();
         var strictest = locking.Count > 0 ? locking.MinBy(p => p.Threshold)! : domain;

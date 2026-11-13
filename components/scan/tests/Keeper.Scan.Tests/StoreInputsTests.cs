@@ -127,10 +127,16 @@ public sealed class StoreInputsTests : IDisposable
         using var connection = Store.OpenReadOnly();
         var policies = new StoreInputs(connection).LockoutPolicies();
 
-        Assert.Null(StoreInputs.LockoutFor("reader", policies));
-        Assert.Null(StoreInputs.LockoutFor("THIRD\\reader", policies));     // never another domain's policy
         Assert.Equal(1, StoreInputs.LockoutFor("OTHER\\reader", policies)!.Threshold);
         Assert.Equal(3, StoreInputs.LockoutFor("reader@example.org", policies)!.Threshold);
+        Assert.False(StoreInputs.LockoutFor("reader@example.org", policies)!.Guessed);
+        // Not matched (a UPN suffix that is not the DNS name, two domains and none named): the strictest, said to be a guess.
+        foreach (var unmatched in new[] { "reader", "THIRD\\reader", "reader@corp.example.com" })
+        {
+            var guess = StoreInputs.LockoutFor(unmatched, policies)!;
+            Assert.Equal(1, guess.Threshold);
+            Assert.True(guess.Guessed);
+        }
     }
 
     [Theory]

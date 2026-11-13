@@ -163,12 +163,19 @@ public static class ScanVerb
                 else if (refusals.Find(link, id => id.Equals(record.Id, StringComparison.OrdinalIgnoreCase) ? credential : credentials.GetValueOrDefault(id), secretSetAt) is { } recorded)
                     request.Guard.Restore(link, recorded);
                 else
-                    request.Guard.RestoreStrikes(link, refusals.Strikes(link, credential));
+                    request.Guard.RestoreStrikes(link, refusals.Strikes(link, credential, DateTimeOffset.UtcNow));
                 // Kept the moment it happens: a scan stopped half-way (Ctrl-C, a crash) must not forget it.
                 request.Guard.OnRefused = (refusedConnection, text) =>
                 {
                     if (refusedConnection.Instance == link.Instance)
                         TryKeep(() => refusals.Record(link, credential, text, DateTimeOffset.UtcNow));
+                };
+                // Kept strikes go the moment a host accepts the credential, not at the end of the scan: a scan that stops
+                // half-way must not leave a strike that refuses a working password later.
+                request.Guard.OnProven = provenConnection =>
+                {
+                    if (provenConnection.Instance == link.Instance && LogonGuard.PresentsSecret(link))
+                        TryKeep(() => refusals.ClearStrikes(link));
                 };
                 // A denied sign-in that is not yet a refusal is kept too: the next scheduled scan counts it.
                 request.Guard.OnStrike = (deniedConnection, host) =>
@@ -189,6 +196,7 @@ public static class ScanVerb
                 {
                     request.Guard.OnRefused = null;
                     request.Guard.OnStrike = null;
+                    request.Guard.OnProven = null;
                     // vCenter and session-login products cap open sessions: the scan's is ended, not left to time out.
                     // Inside 'keeper run' the run ends it after its last scan.
                     if (own is not null)
@@ -256,10 +264,11 @@ public static class ScanVerb
             return $"lockout: the lockout policy of {link.Identity}'s domain is not known yet (an active-directory scan stores it); " +
                    $"Keeper risks at most {LogonGuard.DeniedSignInsBeforeRefusal} sign-ins answered access denied";
         guard.LimitDeniedSignIns(link, known.DeniedSignInsAllowed);
-        var source = $"{(known.FineGrained ? "a fine-grained policy of " : "")}{known.Domain}, active-directory scan of {known.At[..Math.Min(10, known.At.Length)]}";
+        var source = $"{(known.FineGrained ? "a fine-grained policy of " : "")}{known.Domain}, active-directory scan of {known.At[..Math.Min(10, known.At.Length)]}" +
+                     (known.Guessed ? $"; {link.Identity}'s own domain could not be matched, so the strictest known policy is used" : "");
         return known.Threshold == 0
-            ? $"lockout: {known.Domain} does not lock accounts ({source})"
-            : $"lockout: {known.Threshold} bad password(s) lock {link.Identity} ({source}); Keeper presents a refused password " +
+            ? $"lockout: {(known.Guessed ? "no known domain locks accounts" : $"{known.Domain} does not lock accounts")} ({source})"
+            : $"lockout: {known.Threshold} bad password(s) {(known.Guessed ? "may lock" : "lock")} {link.Identity} ({source}); Keeper presents a refused password " +
               $"once and risks at most {guard.DeniedSignInsFor(link)} sign-in(s) answered access denied" +
               (known.Threshold == 1 ? " - one wrong password locks this account: check it with 'keeper scan <system> --test' first" : "");
     }

@@ -64,18 +64,33 @@ public sealed class SignInRefusals(string file)
     /// Sign-ins of this integration's credential that were answered "access denied" with none accepted, kept so the
     /// next process counts them (see <see cref="LogonGuard.OnStrike"/>). They hold while the credential is unchanged.
     /// </summary>
-    public int Strikes(IConnection connection, string credential) =>
-        Read().GetValueOrDefault(StrikeSlotOf(LogonGuard.KeyOf(connection), connection.Instance)) is { Strikes: { } n } entry && entry.Credential == credential
+    /// <remarks>
+    /// Strikes older than <see cref="StrikeLifetime"/> count for nothing: a domain forgets bad passwords after its
+    /// observation window (minutes to hours), and one denial a month ago must not refuse a credential today.
+    /// </remarks>
+    public int Strikes(IConnection connection, string credential, DateTimeOffset now) =>
+        Read().GetValueOrDefault(StrikeSlotOf(LogonGuard.KeyOf(connection), connection.Instance)) is { Strikes: { } n } entry
+        && entry.Credential == credential && Fresh(entry, now)
             ? n
             : 0;
+
+    /// <summary>How long a kept strike counts.</summary>
+    public static readonly TimeSpan StrikeLifetime = TimeSpan.FromHours(24);
+
+    private static bool Fresh(Entry entry, DateTimeOffset now) =>
+        DateTimeOffset.TryParse(entry.At, CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal, out var at) && now - at < StrikeLifetime;
 
     public void RecordStrike(IConnection connection, string credential, string host, DateTimeOffset at) =>
         Update(all =>
         {
             var slot = StrikeSlotOf(LogonGuard.KeyOf(connection), connection.Instance);
-            var before = all.GetValueOrDefault(slot) is { Strikes: { } n } entry && entry.Credential == credential ? n : 0;
+            var before = all.GetValueOrDefault(slot) is { Strikes: { } n } entry && entry.Credential == credential && Fresh(entry, at) ? n : 0;
             all[slot] = new Entry(LogonGuard.KeyOf(connection), connection.Instance, credential, $"denied at sign-in by {host}", Iso.Utc(at), before + 1);
         });
+
+    /// <summary>This integration's strikes are gone: a host accepted its credential.</summary>
+    public void ClearStrikes(IConnection connection) =>
+        Update(all => all.Remove(StrikeSlotOf(LogonGuard.KeyOf(connection), connection.Instance)));
 
     /// <summary>This integration's refusal and strikes are gone: its credential read data. Others of the same account stay.</summary>
     public void Clear(IConnection connection) =>

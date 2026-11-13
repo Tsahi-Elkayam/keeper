@@ -320,6 +320,17 @@ override satisfies every required setting. (All done: sections 10 and 11.)
 - Accepted as is: a shared connection keeps a non-transient token error for the rest of the run (a refusal, or a
   configuration error that would fail again); a broken tenant type file stops every command that loads the home.
 
+### 18. Fifth review fixes (2026-11-13)
+
+- `LockoutFor`: an identity whose domain cannot be matched gets the strictest known policy, `Guessed` (was: none,
+  so the default two denials even in a domain that locks at two).
+- Strikes: `RestoreStrikes` takes its baseline once even when zero (no double count inside one run); `OnProven`
+  clears kept strikes at the first accepted sign-in (`SignInRefusals.ClearStrikes`); kept strikes count for
+  `StrikeLifetime` (24 h). Accepted: a right password whose only host denies the account is refused after two
+  scans; `--retry-sign-in` after fixing the rights.
+- Tenant hosts: no wildcard over a registry second level (`*.co.uk`) or shared hosting (`*.github.io`), best effort;
+  no empty list entries. The policy read also takes per-host coverage (`query@host`).
+
 ## Not in this change
 
 Nothing from the list in the pilot review is left. Not done: a live run on Windows and against a real AD (Samba AD

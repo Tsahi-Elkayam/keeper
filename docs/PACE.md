@@ -40,8 +40,9 @@ a WinRM quota or an AD lockout policy that is a password spray. The design is in
   so a wrong password meets one host, not four at once. Over DCOM a wrong password can come back as plain
   "access denied": two hosts in a row that deny the sign-in, with none accepting it, stop the credential too. A denied
   sign-in is kept in the same file as refusals, so the next scheduled scan counts it: two in all, across scans, and
-  the credential stops (one, where the domain locks at two). An accepted sign-in, a secret set again or
-  `--retry-sign-in` forgets them.
+  the credential stops (one, where the domain locks at two). A kept strike counts for 24 hours; the first accepted
+  sign-in, a secret set again or `--retry-sign-in` forgets them at once. A right password on an estate whose only
+  host denies the account is therefore stopped after two scans: give the account its rights, then `--retry-sign-in`.
   Once a sign-in was accepted, a host that denies it is one where the account lacks the right. "Accepted" means
   a read came back with rows, or the host answered as the account (a registry provider's return code) - some
   kinds of access only sign in on the first read, and an empty answer can hide a read that never happened.
@@ -53,7 +54,8 @@ a WinRM quota or an AD lockout policy that is a password spray. The design is in
   active-directory scan's `lockoutThreshold` (and the strictest fine-grained `msDS-LockoutThreshold` of that domain:
   which one applies needs the account's groups) says how many bad passwords lock it. Where that is two, one "access
   denied" sign-in stops the credential instead of two. The run notes and `--plan` say the policy and where it came
-  from, or that it is not known yet. Nothing is sent to read it: a sign-in to read the policy would be one more chance
+  from, or that it is not known yet. When the account's domain cannot be matched (a UPN suffix that is not the
+  domain's DNS name), the strictest policy known is used and the note says it is a guess. Nothing is sent to read it: a sign-in to read the policy would be one more chance
   to lock the account. A threshold of one is said loudly: one wrong password locks that account.
 - **One Windows account, one credential.** EXAMPLE\reader refused through the ldap integration is not presented
   again through the cim or sql integration either. A proof is per integration: two integrations may hold

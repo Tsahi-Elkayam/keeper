@@ -100,6 +100,12 @@ public static class IntegrationTypeCatalog
         string Where(string what) => $"{source}: integration type '{id}': {what}";
         if (!IntegrationTypes.IsValidId(id))
             throw new IntegrationException(Where("the id must be lower-case letters, digits and dashes"));
+        foreach (var (name, list) in new[] { ("protocols", dto.Protocols), ("auth", dto.Auth), ("hosts", dto.Hosts), ("readPosts", dto.ReadPosts),
+                     ("readPaths", dto.ReadPaths), ("readCommand.allowed", dto.ReadCommand?.Allowed), ("readCommand.deniedParameters", dto.ReadCommand?.DeniedParameters) })
+        {
+            if (list?.Any(string.IsNullOrWhiteSpace) == true)
+                throw new IntegrationException(Where($"{name} has an empty entry"));
+        }
         if (string.IsNullOrWhiteSpace(dto.Description))
             throw new IntegrationException(Where("description is required"));
         if (dto.Protocols is not { Count: > 0 } protocols)
@@ -119,6 +125,8 @@ public static class IntegrationTypeCatalog
         var hosts = dto.Hosts ?? [];
         foreach (var host in hosts.Where(h => !IsHostPattern(h)))
             throw new IntegrationException(Where($"host '{host}' must be a host name or *.suffix of at least two labels (*.example.org), without a scheme, port or path"));
+        foreach (var host in hosts.Where(h => builtIn is not null && IsSharedSuffix(h)))
+            throw new IntegrationException(Where($"host '{host}' covers names anyone can register or host under; name the organisation's own domain"));
         if (builtIn is not null && hosts.Count == 0)
         {
             // Without a host list the endpoint may name any host. A tenant type may then sign in only the ways a
@@ -161,6 +169,30 @@ public static class IntegrationTypeCatalog
         if (dto.Endpoint is { } given && !type.AllowsHost(new Uri(given).Host))
             throw new IntegrationException(Where($"endpoint '{given}' is not on one of its own hosts"));
         return type;
+    }
+
+    /// <summary>Second-level labels registries sell under (co.uk, com.au, org.il) and suffixes shared hosting hands out.</summary>
+    private static readonly string[] RegistrySecondLevel = ["co", "com", "net", "org", "gov", "ac", "edu", "ne", "or", "go", "gv", "mil", "ltd", "plc", "nom", "sch", "muni", "idf", "k12"];
+
+    private static readonly string[] SharedHosting =
+    [
+        "github.io", "gitlab.io", "azurewebsites.net", "cloudapp.net", "cloudapp.azure.com", "blob.core.windows.net", "web.core.windows.net",
+        "herokuapp.com", "appspot.com", "web.app", "firebaseapp.com", "netlify.app", "vercel.app", "pages.dev", "workers.dev",
+        "amazonaws.com", "s3.amazonaws.com", "cloudfront.net", "elasticbeanstalk.com", "ngrok.io", "ngrok-free.app", "trycloudflare.com",
+    ];
+
+    /// <summary>
+    /// A wildcard over a public suffix (*.co.uk, *.github.io): best effort, not the full public suffix list - it stops
+    /// the plain mistakes; the settings folder is the tenant administrator's own.
+    /// </summary>
+    private static bool IsSharedSuffix(string host)
+    {
+        if (!host.StartsWith("*.", StringComparison.Ordinal))
+            return false;
+        var suffix = host[2..].ToLowerInvariant();
+        var labels = suffix.Split('.');
+        return SharedHosting.Contains(suffix, StringComparer.Ordinal)
+               || (labels.Length == 2 && RegistrySecondLevel.Contains(labels[0], StringComparer.Ordinal) && labels[1].Length == 2);
     }
 
     private static bool IsHostPattern(string host)
