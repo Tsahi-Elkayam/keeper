@@ -78,7 +78,8 @@ public static class TodayBuilder
         var since = Iso.Utc(now.AddDays(-1));
         var fresh = Sql.Rows(connection,
             """
-            SELECT f.title FROM finding_event e JOIN finding f ON f.finding_key = e.finding_key
+            SELECT f.title, COALESCE(NULLIF(f.entity_name, ''), NULLIF(f.target, '-'), f.system) AS about
+            FROM finding_event e JOIN finding f ON f.finding_key = e.finding_key
             WHERE e.event IN ('new', 'reopened') AND e.at >= :since ORDER BY e.at DESC;
             """, null, (":since", since));
 
@@ -134,7 +135,7 @@ public static class TodayBuilder
 
         var rankedAt = Sql.Scalar(connection, "SELECT at FROM rank_build ORDER BY build_id DESC LIMIT 1;") as string;
         return new TodayReport(Iso.Utc(now), rankedAt, Setting("rank.daily-minutes", 120), today, waiting, fresh.Count,
-            fresh.Take(5).Select(f => (string)f["title"]!).ToList(), blind, stale, due) { NeverScanned = neverScanned };
+            NewLines(fresh), blind, stale, due) { NeverScanned = neverScanned };
     }
 
     /// <summary>
@@ -156,4 +157,23 @@ public static class TodayBuilder
         }
         return result;
     }
+
+    /// <summary>
+    /// The new findings as a person reads them: one line per title, with what each is about, so five findings of
+    /// one check read as one line that names the five, not as the same title five times.
+    /// </summary>
+    public static IReadOnlyList<string> NewLines(IReadOnlyList<IReadOnlyDictionary<string, object?>> fresh) =>
+        fresh.GroupBy(f => (string)f["title"]!, StringComparer.Ordinal)
+            .Take(5)
+            .Select(g =>
+            {
+                var about = g.Select(f => f["about"] as string).OfType<string>().Distinct(StringComparer.Ordinal).ToList();
+                return about.Count switch
+                {
+                    0 => g.Key,
+                    <= 4 => $"{g.Key}: {string.Join(", ", about)}",
+                    _ => $"{g.Key}: {string.Join(", ", about.Take(3))} and {about.Count - 3} more",
+                };
+            })
+            .ToList();
 }

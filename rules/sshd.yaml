@@ -5,7 +5,8 @@ integration: host
 
 # Reads /etc/ssh/sshd_config (and what it includes) on the machine Keeper runs on. sshd keeps the FIRST value it
 # finds for a keyword and ignores the rest, and what follows a "Match" line holds only for that match, so every
-# rule looks at occurrence 1 outside any Match block. A machine without sshd_config answers "unknown", not a pass.
+# rule looks at occurrence 1 outside any Match block. A machine without sshd_config (no OpenSSH server, or a
+# Windows machine) has no rows and nothing is reported for it; a file that is there but cannot be read still fails.
 
 defaults:
   lens: security
@@ -21,7 +22,7 @@ rules:
     why: Root is the one account every attacker tries first. A password for it can be guessed from anywhere sshd is reachable.
     fix: Set "PermitRootLogin prohibit-password" (or "no") in sshd_config and reload sshd. Administer through a named account and sudo.
     refs: [NIST-800-53:AC-6, NIST-800-53:AC-17]
-    query: { protocol: host, read: file, path: /etc/ssh/sshd_config, format: kv, key: "{file}|{line}", name: key }
+    query: { protocol: host, read: file, path: /etc/ssh/sshd_config, format: kv, optional: true, key: "{file}|{line}", name: key }
     each:
       all:
         - { field: name, op: eq, value: permitrootlogin }
@@ -36,7 +37,7 @@ rules:
     why: An account with no password becomes a way in for anyone who can reach sshd.
     fix: Set "PermitEmptyPasswords no" in sshd_config and reload sshd.
     refs: [NIST-800-53:IA-5]
-    query: { protocol: host, read: file, path: /etc/ssh/sshd_config, format: kv, key: "{file}|{line}", name: key }
+    query: { protocol: host, read: file, path: /etc/ssh/sshd_config, format: kv, optional: true, key: "{file}|{line}", name: key }
     each:
       all:
         - { field: name, op: eq, value: permitemptypasswords }
@@ -52,7 +53,7 @@ rules:
     why: sshd allows passwords unless told otherwise, so every reachable account can be guessed at. Keys cannot be guessed that way.
     fix: Set "PasswordAuthentication no" in sshd_config (after keys are in place for the people who need access) and reload sshd.
     refs: [NIST-800-53:IA-2, NIST-800-53:IA-5]
-    query: { protocol: host, read: file, path: /etc/ssh/sshd_config, format: kv, key: "{file}|{line}", name: key }
+    query: { protocol: host, read: file, path: /etc/ssh/sshd_config, format: kv, optional: true, key: "{file}|{line}", name: key }
     count:
       op: lt
       value: 1
@@ -70,7 +71,7 @@ rules:
     why: Every extra attempt per connection makes guessing cheaper.
     fix: Set "MaxAuthTries 4" (or lower) in sshd_config and reload sshd.
     refs: [NIST-800-53:AC-7]
-    query: { protocol: host, read: file, path: /etc/ssh/sshd_config, format: kv, key: "{file}|{line}", name: key }
+    query: { protocol: host, read: file, path: /etc/ssh/sshd_config, format: kv, optional: true, key: "{file}|{line}", name: key }
     each:
       all:
         - { field: name, op: eq, value: maxauthtries }
@@ -85,7 +86,7 @@ rules:
     why: X11 forwarding gives the remote side a path onto the user's display, which is rarely needed on a server.
     fix: Set "X11Forwarding no" in sshd_config unless graphical programs are run over ssh, and reload sshd.
     refs: [NIST-800-53:CM-7]
-    query: { protocol: host, read: file, path: /etc/ssh/sshd_config, format: kv, key: "{file}|{line}", name: key }
+    query: { protocol: host, read: file, path: /etc/ssh/sshd_config, format: kv, optional: true, key: "{file}|{line}", name: key }
     each:
       all:
         - { field: name, op: eq, value: x11forwarding }

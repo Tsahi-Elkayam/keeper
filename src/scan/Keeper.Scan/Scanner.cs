@@ -309,12 +309,16 @@ public sealed class Scanner(RunnerRegistry registry, TimeProvider? clock = null)
         }
     }
 
-    private sealed record TargetOutcome(string? Target, string State, string? Reason, int Count);
+    /// <param name="Absent">An optional read found nothing there to read (see <see cref="RunnerResult.Absent"/>).</param>
+    private sealed record TargetOutcome(string? Target, string State, string? Reason, int Count, bool Absent = false);
 
     private sealed record QueryOutcome(List<(JsonObject Row, string? Target)> Rows, List<TargetOutcome> Targets)
     {
         /// <summary>Fields masked in what the scan keeps.</summary>
         public IReadOnlyList<string> Mask { get; set; } = [];
+
+        /// <summary>Every host's optional read found nothing there: nothing to count.</summary>
+        public bool Absent => Targets.Count > 0 && Targets.All(t => t.Absent);
 
         /// <summary>The row as the scan may keep it: a copy with the masked fields replaced, or the row itself.</summary>
         public JsonObject Masked(JsonObject row)
@@ -383,7 +387,7 @@ public sealed class Scanner(RunnerRegistry registry, TimeProvider? clock = null)
             {
                 var result = results[(id, target)];
                 outcome.Rows.AddRange(result.Rows.Select(r => (r, target)));
-                outcome.Targets.Add(new TargetOutcome(target, result.State, result.Reason, result.Rows.Count));
+                outcome.Targets.Add(new TargetOutcome(target, result.State, result.Reason, result.Rows.Count, result.Absent));
             }
         }
 
@@ -768,7 +772,7 @@ public sealed class Scanner(RunnerRegistry registry, TimeProvider? clock = null)
                                          && LogonGuard.PresentsSecret(connection) && !request.Guard.Proven(connection):
                 var reason = Redactor.Clean(result.Reason) ?? "access denied";
                 request.Guard.DeniedAtSignIn(connection, target ?? host, reason);
-                deniedHere = $"not tried: {target ?? host} denied {connection.Identity ?? "the current user"} before any host accepted it ({reason}) - " +
+                deniedHere = $"not tried: {target ?? host} denied {connection.Who} before any host accepted it ({reason}) - " +
                              "the rest of this host is skipped so a wrong password is not presented again";
                 break;
             case FailureKind.Throttled or FailureKind.Timeout:
@@ -1014,7 +1018,7 @@ public sealed class Scanner(RunnerRegistry registry, TimeProvider? clock = null)
                 var byTarget = outcome.Rows.ToLookup(r => r.Target, StringComparer.OrdinalIgnoreCase);
                 foreach (var target in outcome.Targets.Where(t => t.Target is not null))
                 {
-                    if (NotJudged(target.Target!, target.Target!))
+                    if (NotJudged(target.Target!, target.Target!) || target.Absent)
                         continue;
                     if (target.State == "failed")
                     {
@@ -1029,7 +1033,7 @@ public sealed class Scanner(RunnerRegistry registry, TimeProvider? clock = null)
                     findings += CountRows(byTarget[target.Target].ToList(), rule.EntityType, target.Target!, target.State == "partial" ? target.Reason : null);
                 }
             }
-            else
+            else if (!outcome.Absent)
             {
                 findings += CountRows(outcome.Rows, "instance", "-", outcome.State == "partial" ? outcome.Reason : null);
             }

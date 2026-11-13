@@ -18,6 +18,15 @@ public sealed record RunnerResult(IReadOnlyList<JsonObject> Rows, string State, 
 
     public static RunnerResult Ok(IReadOnlyList<JsonObject> rows) => new(rows, "ok", null);
 
+    /// <summary>
+    /// What an optional read (optional: true) reads is not on this host - no sshd_config, no Docker, no CUPS: no rows,
+    /// and nothing to judge. A count rule ("fewer than 1 line that switches passwords off") says nothing about such a
+    /// host, where an empty answer from something that IS there would still count.
+    /// </summary>
+    public bool Absent { get; init; }
+
+    public static RunnerResult NotHere() => new([], "ok", null) { Absent = true };
+
     public static RunnerResult Partial(IReadOnlyList<JsonObject> rows, string reason) => new(rows, "partial", reason);
 
     public static RunnerResult Failed(string reason, FailureKind failure = FailureKind.Error) => new([], "failed", reason) { Failure = failure };
@@ -67,6 +76,12 @@ public interface IConnection
     /// negotiate sign-in runs as. Null until known, or when it is simply <see cref="Identity"/>.
     /// </summary>
     string? SignedInAs => null;
+
+    /// <summary>
+    /// Who signs in, as a message names it: the identity, else the app registration (a certificate sign-in reads as
+    /// the app, never as a person), else the user Keeper runs as. Wording only; nothing is recorded under it.
+    /// </summary>
+    string Who => Identity ?? (AuthKind == "entra-certificate" ? "the app registration" : "the current user");
 
     /// <summary>
     /// Paths (relative to the endpoint, '*' within one segment) where this integration's type answers a POST

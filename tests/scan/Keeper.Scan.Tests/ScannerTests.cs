@@ -156,6 +156,8 @@ public sealed class ScannerTests : IDisposable
         public Task<RunnerResult> RunAsync(QuerySpec query, RunnerContext context, CancellationToken cancellationToken)
         {
             var host = context.Target ?? "-";
+            if (rowsPerHost.GetValueOrDefault(host) == NotHere)
+                return Task.FromResult(RunnerResult.NotHere());
             if (rowsPerHost.GetValueOrDefault(host) < 0)
                 return Task.FromResult(RunnerResult.Failed($"{host}: not reachable", FailureKind.Unreachable));
             var rows = Enumerable.Range(1, rowsPerHost.GetValueOrDefault(host))
@@ -180,6 +182,44 @@ public sealed class ScannerTests : IDisposable
             query: { protocol: fake, key: name }
             count: { op: gt, value: 2 }
         """;
+
+    /// <summary>A host on which the fake runner's optional read finds nothing to read.</summary>
+    private const int NotHere = -2;
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task A_count_rule_says_nothing_about_a_host_where_its_optional_read_found_nothing_there(bool perTarget)
+    {
+        var path = Path.Combine(_dir, "count.yaml");
+        File.WriteAllText(path, $$"""
+            schema: keeper.rules/1
+            system: example
+            integration: files
+            {{(perTarget ? "targets: { list: [pc01.example.org, pc02.example.org] }" : "")}}
+            rules:
+              - id: EX-NO-SETTING
+                title: The setting is not there
+                kind: missing
+                lens: security
+                category: CFG
+                severity: medium
+                entity: setting
+                query: { protocol: fake, key: name }
+                count: { op: lt, value: 1 }
+            """);
+        var hosts = perTarget ? new Dictionary<string, int> { ["pc01.example.org"] = NotHere, ["pc02.example.org"] = 0 } : new() { ["-"] = NotHere };
+        var registry = new RunnerRegistry([new FakeRunner(perTarget, hosts)]);
+        var report = await new Scanner(registry, new Clock(Now)).RunAsync(new ScanRequest
+        {
+            Files = [RuleLoader.LoadFile(path, "test", registry.Validators)], Connection = new FilesConnection(), RunsDir = Runs, ImportsDir = Imports,
+        }, CancellationToken.None);
+
+        var findings = Read<FindingRecord>(report, RunFolder.Findings);
+        // A host where the thing is not installed: no finding. A host where it is there and empty: the finding.
+        Assert.Equal(perTarget ? ["pc02.example.org"] : [], findings.Select(f => f.Target).ToList());
+        Assert.Equal("ok", report.Manifest.Status);
+    }
 
     private static Func<string, PreviousRead?> Clean(int? rows, params PartialRead[] since) => _ => rows is int n ? new PreviousRead(n, since) : null;
 

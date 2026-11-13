@@ -199,7 +199,7 @@ public sealed class HostRunner(Func<RunnerContext, IHostSession>? remote = null)
         var path = session.Normalize(query.Text("path")!);
         var optional = Flag(query, "optional", false);
         if (!session.FileExists(path))
-            return optional ? RunnerResult.Ok([]) : RunnerResult.Failed($"{path} does not exist");
+            return optional ? RunnerResult.NotHere() : RunnerResult.Failed($"{path} does not exist");
         if (session.ReadProblem(path) is { } problem)
             return RunnerResult.Failed($"{path} was not read: {problem}");
 
@@ -320,7 +320,7 @@ public sealed class HostRunner(Func<RunnerContext, IHostSession>? remote = null)
                 await context.Pace.WaitAsync(cancellationToken).ConfigureAwait(false);
             var output = await session.RunAsync(name, [], timeout, cancellationToken).ConfigureAwait(false);
             if (!output.Found)
-                return (null, optional ? RunnerResult.Ok([]) : RunnerResult.Failed("CUPS (lpstat) is not installed on this machine"));
+                return (null, optional ? RunnerResult.NotHere() : RunnerResult.Failed("CUPS (lpstat) is not installed on this machine"));
             if (output.TimedOut)
                 return (null, RunnerResult.Failed($"CUPS did not answer in {timeout.TotalSeconds:0} s"));
             // lpstat exits non-zero when there is no scheduler running or nothing to list.
@@ -333,7 +333,7 @@ public sealed class HostRunner(Func<RunnerContext, IHostSession>? remote = null)
         {
             var log = session.Normalize(query.Text("path") ?? DefaultPageLog);
             if (!session.FileExists(log))
-                return optional ? RunnerResult.Ok([]) : RunnerResult.Failed($"there is no CUPS page log at {log}: nothing has been printed through this machine, or page logging is off");
+                return optional ? RunnerResult.NotHere() : RunnerResult.Failed($"there is no CUPS page log at {log}: nothing has been printed through this machine, or page logging is off");
             if (session.ReadProblem(log) is { } unreadable)
                 return RunnerResult.Failed($"the CUPS page log {log} was not read: {unreadable}");
             return RunnerResult.Ok(CupsReader.PageCounts(session.HostName, session.ReadAllText(log).Split('\n')));
@@ -460,7 +460,7 @@ public sealed class HostRunner(Func<RunnerContext, IHostSession>? remote = null)
                 await context.Pace.WaitAsync(cancellationToken).ConfigureAwait(false);
             var output = await session.RunAsync(name, args, timeout, cancellationToken).ConfigureAwait(false);
             if (!output.Found)
-                return (null, optional ? RunnerResult.Ok([]) : RunnerResult.Failed("docker is not installed on this machine"));
+                return (null, optional ? RunnerResult.NotHere() : RunnerResult.Failed("docker is not installed on this machine"));
             if (output.TimedOut)
                 return (null, RunnerResult.Failed($"docker did not answer in {timeout.TotalSeconds:0} s"));
             if (output.ExitCode != 0)

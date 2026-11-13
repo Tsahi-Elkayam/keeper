@@ -522,7 +522,7 @@ public sealed class LogonGuard
             if (_accepted.Contains(key) || !_earlierStrikes.TryAdd(key, Math.Max(0, earlier)))
                 return;
             if (earlier > 0 && earlier >= _deniedAllowed.GetValueOrDefault(KeyOf(connection), DeniedSignInsBeforeRefusal))
-                text = $"not tried: {connection.Identity ?? "the current user"} was denied at sign-in {earlier} time(s) by earlier scans with no host " +
+                text = $"not tried: {connection.Who} was denied at sign-in {earlier} time(s) by earlier scans with no host " +
                        "accepting it - a wrong password can look like that, so Keeper stops using it so the account is not locked out; " +
                        "check the credential and its rights, then scan again";
         }
@@ -588,7 +588,7 @@ public sealed class LogonGuard
             }
             else
             {
-                text = $"not tried: {connection.Identity ?? "the current user"} was denied at sign-in by {string.Join(" and ", hosts)}" +
+                text = $"not tried: {connection.Who} was denied at sign-in by {string.Join(" and ", hosts)}" +
                        (earlier > 0 ? $" and {earlier} time(s) by earlier scans" : "") + $" with no host accepting it ({reason}) - " +
                        "a wrong password can look like that, so Keeper stops using it so the account is not locked out; check the credential and its rights, then scan again";
             }
@@ -613,7 +613,7 @@ public sealed class LogonGuard
     public void Refuse(IConnection connection, string? host, string reason)
     {
         if (PresentsSecret(connection))
-            Record(connection, $"not tried: {connection.Identity ?? "the current user"} was refused{(host is null ? "" : $" by {host}")} ({reason}) - " +
+            Record(connection, $"not tried: {connection.Who} was refused{(host is null ? "" : $" by {host}")} ({reason}) - " +
                    "Keeper stops using it so the account is not locked out; fix the credential, then scan again");
     }
 
