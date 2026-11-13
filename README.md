@@ -111,6 +111,10 @@ Every verb runs inside that one process - Keeper never starts another program.
   (LAPS passwords and the like) are never requested.
 - **Secrets are encrypted in the store** (AES-256-GCM, the key protected by Windows DPAPI for the
   user, or by an owner-only key file on macOS and Linux), bound to their integration and endpoint, and never shown. See `docs\SECURITY.md`.
+- **Gentle on the estate.** One session (one sign-in) per host per scan, a pace per host, a host that
+  pushes back is slowed and then left alone, and a refused credential is never presented again - so a scan
+  does not look like an attack or lock an account out. `keeper scan <system> --plan` shows the cost first.
+  See `docs\PACE.md`.
 - **No data is not a pass.** A query that fails makes its rules *unknown*, and what Keeper cannot see
   is a section of today's list (`blind-spots`).
 - **Seen once, checked everywhere.** A problem found on one machine or account becomes a rule over
