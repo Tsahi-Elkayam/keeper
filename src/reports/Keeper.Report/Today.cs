@@ -30,7 +30,8 @@ public sealed record TodayReport(
     IReadOnlyList<DueItem> DueSoon)
 {
     /// <summary>System types Keeper has rules for that have never been scanned: none of their checks has run.</summary>
-    public IReadOnlyList<string> NeverScanned { get; init; } = [];
+    /// <summary>System types no scan has reached, with their rule counts.</summary>
+    public IReadOnlyList<(string System, long Rules)> NeverScanned { get; init; } = [];
 }
 
 /// <summary>Builds today's page from the store (read-only): the ranked list and what the ranking cannot show.</summary>
@@ -130,7 +131,7 @@ public static class TodayBuilder
                 WHERE system NOT IN (SELECT DISTINCT system FROM run) AND COALESCE(integration, '') <> 'keeper'
                 GROUP BY system ORDER BY system;
                 """)
-            .Select(r => $"{r["system"]} ({r["rules"]} rules)")
+            .Select(r => ((string)r["system"]!, Convert.ToInt64(r["rules"], System.Globalization.CultureInfo.InvariantCulture)))
             .ToList();
 
         var rankedAt = Sql.Scalar(connection, "SELECT at FROM rank_build ORDER BY build_id DESC LIMIT 1;") as string;

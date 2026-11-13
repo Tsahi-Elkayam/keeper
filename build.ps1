@@ -57,6 +57,20 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+
+# Runs a native program and leaves the verdict to its exit code. Windows PowerShell 5.1 turns each line a program
+# writes to stderr into an error record once output is redirected (.\build.ps1 *> build.log), and 'Stop' would
+# make the first such line - a warning, an empty line - fatal.
+function Invoke-Native([scriptblock]$Command) {
+    $saved = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        & $Command 2>&1 | ForEach-Object { if ($_ -is [System.Management.Automation.ErrorRecord]) { "$($_.Exception.Message)" } else { $_ } }
+    }
+    finally {
+        $ErrorActionPreference = $saved
+    }
+}
 $repo = $PSScriptRoot
 # Windows PowerShell 5.1 has no $IsWindows/$IsMacOS: there it is always Windows.
 $onWindows = $PSVersionTable.PSEdition -ne 'Core' -or $IsWindows
@@ -137,12 +151,12 @@ else {
 # 3. Every rule file loads, and ids are unique across them
 $keeperProject = [IO.Path]::Combine($repo, 'src', 'engine', 'keeper', 'keeper.csproj')
 # No --nologo here: dotnet run hands options it does not know to the program, which would read it as its own.
-& dotnet run --project $keeperProject -c $Configuration -- rules validate (Join-Path $repo 'rules')
+Invoke-Native { dotnet run --project $keeperProject -c $Configuration -- rules validate (Join-Path $repo 'rules') }
 if ($LASTEXITCODE -ne 0) { throw "Rule validation failed (exit $LASTEXITCODE): fix the file:line:col above." }
 
 # 4. Tests
 if ($Test) {
-    & dotnet test (Join-Path $repo 'Keeper.slnx') -c $Configuration --nologo
+    Invoke-Native { dotnet test (Join-Path $repo 'Keeper.slnx') -c $Configuration --nologo }
     if ($LASTEXITCODE -ne 0) { throw "Tests failed (exit $LASTEXITCODE)." }
 }
 
@@ -159,14 +173,14 @@ $publishArgs = if ($FrameworkDependent) { @('--self-contained', 'false') }
 # Symbols inside the assemblies: stack traces keep their line numbers and the build folder holds no .pdb files.
 $publishArgs += '-p:DebugType=embedded'
 Get-ChildItem $out -File -Filter '*.pdb' -ErrorAction SilentlyContinue | Remove-Item
-& dotnet publish $keeperProject -c $Configuration -r $Runtime @publishArgs -o $out --nologo -v q
+Invoke-Native { dotnet publish $keeperProject -c $Configuration -r $Runtime @publishArgs -o $out --nologo -v q }
 if ($LASTEXITCODE -ne 0) {
     throw "dotnet publish of keeper for $Runtime failed (exit $LASTEXITCODE). Needs the .NET 10 SDK."
 }
 $binary = Join-Path $out $(if ($Runtime -like 'win-*') { 'keeper.exe' } else { 'keeper' })
 if ($onMac -and $Runtime -like 'osx-*') {
     # Apple Silicon runs only signed code; an ad hoc signature is enough on the machine that built it.
-    & codesign --force --sign - $binary
+    Invoke-Native { codesign --force --sign - $binary }
     if ($LASTEXITCODE -ne 0) { throw "codesign of $binary failed (exit $LASTEXITCODE)." }
 }
 

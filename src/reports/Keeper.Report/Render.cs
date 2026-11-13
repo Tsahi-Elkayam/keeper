@@ -209,10 +209,23 @@ public static class TodayDocument
                 new Section("Blind spots",
                     [.. report.StaleScans.Select(s => "Not scanned recently: " + s),
                      .. BlindSpotLines(report.BlindSpots),
-                     .. report.NeverScanned.Count == 0 ? Array.Empty<string>()
-                         : [$"Not covered - no scan has reached these system types, so none of their checks ran (live systems: 'keeper integration types'; tools' reports: data/imports/<tool>): {string.Join(", ", report.NeverScanned)}"]],
+                     .. NotCoveredLines(report.NeverScanned)],
                     "Every source answered in its newest scan."),
             ]);
+    }
+
+    /// <summary>
+    /// The system types no scan has reached: named when they are a few, counted when they are many (a first run
+    /// that connected one tenant is not told about forty kinds of system it never asked about, one by one).
+    /// </summary>
+    public static IReadOnlyList<string> NotCoveredLines(IReadOnlyList<(string System, long Rules)> never)
+    {
+        if (never.Count == 0)
+            return [];
+        const string how = "'keeper integration types' shows how to reach a live system; a tool's report goes in data/imports/<tool>";
+        return never.Count <= 6
+            ? [$"Not covered - no scan has reached {string.Join(", ", never.Select(n => $"{n.System} ({n.Rules} rules)"))}: {how}"]
+            : [$"Not covered - {never.Count} system types ({never.Sum(n => n.Rules):N0} rules) no scan has reached; 'keeper report coverage' lists them, {how}"];
     }
 
     private static string Short(string text, int max) => text.Length <= max ? text : text[..max] + "...";
