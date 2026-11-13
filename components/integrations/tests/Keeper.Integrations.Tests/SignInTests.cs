@@ -215,6 +215,37 @@ public sealed class SignInTests : IDisposable
     }
 
     [Fact]
+    public async Task A_session_login_product_is_signed_out_through_its_logout_path()
+    {
+        var script = new Script(() => Json("""{ "sid": "s-1" }"""), () => Json("{}"));
+        var binding = IntegrationStore.Binding("fw", "password", "https://fw.example.org");
+        var record = new IntegrationRecord("fw", "http", "https://fw.example.org", "session-login", "reader",
+            new JsonObject { ["loginPath"] = "/web_api/login", ["logoutPath"] = "/web_api/logout", ["tokenField"] = "sid", ["header"] = "X-chkp-sid" }, true,
+            new Dictionary<string, StoredSecret> { ["password"] = new("password", _vault.Seal("not-a-real-secret", binding), binding, "2026-11-13T00:00:00Z", null) });
+        using var connection = new IntegrationConnection(record, _vault) { SignInHandler = script };
+        using var request = new HttpRequestMessage(HttpMethod.Get, "https://fw.example.org/web_api/show-hosts");
+        await connection.AuthorizeAsync(request, CancellationToken.None);
+
+        await connection.SignOutAsync(CancellationToken.None);
+
+        Assert.Equal(["POST /web_api/login", "POST /web_api/logout"], script.Sent);
+    }
+
+    [Fact]
+    public async Task A_busy_sign_in_is_tried_again_once_the_cool_down_is_over()
+    {
+        var calls = 0;
+        var script = new Script(() => ++calls <= 3 ? Json("{}", HttpStatusCode.ServiceUnavailable) : Token("tok-4"));
+        using var connection = OAuth(script, cooldown: TimeSpan.FromMilliseconds(200));
+
+        await Assert.ThrowsAsync<SignInException>(() => BearerOf(connection));
+        await Assert.ThrowsAsync<SignInException>(() => BearerOf(connection));   // within the cool-down: nothing sent
+        Assert.Equal(3, script.Requests);
+        await Task.Delay(300);
+        Assert.Equal("tok-4", await BearerOf(connection));
+    }
+
+    [Fact]
     public async Task Reads_that_fail_together_share_one_new_session()
     {
         var script = new Script(() => Json("\"session-1\""), () => Json("\"session-2\""));

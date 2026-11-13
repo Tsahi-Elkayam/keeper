@@ -211,7 +211,15 @@ public static partial class PerObject
                 // Checked before the pace wait and again after it: a child that waited while another was refused is not sent.
                 if (breaker.Stopped)
                     return (Parent: parent, Result: RunnerResult.Failed("not sent", breaker.Kind), Skipped: true);
-                await context.Pace.WaitAsync(cancellationToken).ConfigureAwait(false);
+                try
+                {
+                    await context.Pace.WaitAsync(cancellationToken).ConfigureAwait(false);
+                }
+                catch (RunnerFailureException ex)
+                {
+                    // The scan stopped reading this host: this child is not sent, and the children already read stay.
+                    return (Parent: parent, Result: RunnerResult.Failed(ex.Message, ex.Kind), Skipped: true);
+                }
                 if (breaker.Stopped)
                     return (Parent: parent, Result: RunnerResult.Failed("not sent", breaker.Kind), Skipped: true);
                 var fields = (JsonObject)childFields.DeepClone();
@@ -220,6 +228,8 @@ public static partial class PerObject
                     fields["params"] = parameters;
                 var result = await run(new QuerySpec(query.Protocol, fields, query.Key, query.Name), cancellationToken).ConfigureAwait(false);
                 breaker.Record(result);
+                if (result.State == "ok")
+                    context.Pace.Signal(FailureKind.None);
                 return (Parent: parent, Result: result, Skipped: false);
             }
             finally
@@ -244,6 +254,10 @@ public static partial class PerObject
         }
 
         var notSent = results.Count(r => r.Skipped);
+        // Why children were not sent: the breaker, or the scan having stopped reading the host (its kind, Throttled).
+        var skipped = results.FirstOrDefault(r => r.Skipped).Result;
+        var notSentWhy = breaker.Stopped ? breaker.Why : skipped?.Reason ?? "";
+        var notSentKind = breaker.Stopped ? breaker.Kind : skipped?.Failure ?? FailureKind.None;
         var failed = results.Where(r => !r.Skipped && r.Result.State == "failed").ToList();
         var partial = results.Where(r => r.Result.State == "partial").ToList();
         var absent = results.Count(r => r.Result.State == "ok" && r.Result.Reason == RunnerResult.NotFound);
@@ -258,7 +272,7 @@ public static partial class PerObject
         if (failed.Count > 0)
             notes.Add($"{failed.Count} of {parents.Count} objects failed: {string.Join("; ", failed.Take(3).Select(f => f.Result.Reason))}");
         if (notSent > 0)
-            notes.Add($"{notSent} of {parents.Count} objects were not sent: {breaker.Why}");
+            notes.Add($"{notSent} of {parents.Count} objects were not sent: {notSentWhy}");
         if (partial.Count > 0)
             notes.Add($"{partial.Count} of {parents.Count} objects were read only in part: {string.Join("; ", partial.Take(3).Select(p => p.Result.Reason))}");
         if (list.State == "partial")
@@ -268,14 +282,14 @@ public static partial class PerObject
         {
             // Every object failed: the read failed, as what turned the children away - or the one kind they all share.
             var kinds = failed.Select(f => f.Result.Failure).Distinct().ToList();
-            var kind = breaker.Stopped ? breaker.Kind : kinds.Count == 1 ? kinds[0] : FailureKind.Error;
+            var kind = notSent > 0 ? notSentKind : kinds.Count == 1 ? kinds[0] : FailureKind.Error;
             return RunnerResult.Failed(string.Join("; ", notes), kind);
         }
         if (notes.Count > 0)
             // Some children read before the breaker tripped: partial, but the refusal (or denial) still reaches the scan.
             return RunnerResult.Partial(rows, string.Join("; ", info is null ? notes : [.. notes, info])) with
             {
-                Failure = breaker.Stopped ? breaker.Kind : FailureKind.None,
+                Failure = notSent > 0 ? notSentKind : FailureKind.None,
             };
         return new RunnerResult(rows, "ok", info);
     }

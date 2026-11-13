@@ -199,7 +199,7 @@ public sealed partial class IntegrationConnection : IConnection, IAwsConnection,
     /// because the system said it has expired). What is remembered for the whole scan: a sign-in that cannot work
     /// as set up (a wrong or missing credential, an answer that is no token) - asking again for every query would
     /// open a sign-in window per query, or repeat a wrong password until the account locks. What is not: a busy or
-    /// silent service (429, 5xx, a timeout, a reset). That is tried again by the next read, after the pace.
+    /// silent service (429, 5xx, a timeout, a reset). That is tried again by a read after <see cref="BusyCooldown"/>.
     /// </summary>
     private async Task<string> EnsureTokenAsync(bool renew, CancellationToken cancellationToken)
     {
@@ -208,11 +208,12 @@ public sealed partial class IntegrationConnection : IConnection, IAwsConnection,
         {
             if (_tokenError is not null)
                 throw _tokenError;
-            if (_busyError is not null && DateTimeOffset.UtcNow < _busyUntil)
-                throw _busyError;
             if (_token is not null && DateTimeOffset.UtcNow < _tokenExpires.AddMinutes(-2)
                 && (!renew || DateTimeOffset.UtcNow - _tokenIssued < SessionRenewGrace))
                 return _token;
+            // A token still held is used above; only a new sign-in waits out a busy service.
+            if (_busyError is not null && DateTimeOffset.UtcNow < _busyUntil)
+                throw _busyError;
             try
             {
                 (_token, _tokenExpires) = _record.AuthKind switch

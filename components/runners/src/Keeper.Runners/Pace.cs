@@ -303,7 +303,8 @@ public sealed class Pacer(PaceProfile profile, TimeProvider? clock = null)
             var now = _clock.GetUtcNow();
             var slot = state.Next > now ? state.Next : now;
             var interval = BaseInterval * state.Factor;
-            if (interval >= PaceProfile.MaxInterval && BaseInterval > TimeSpan.Zero)
+            // Only a host that pushed the interval up counts: an operator's own slow pace (requestsPerSecond 0.01) is not a push-back.
+            if (interval >= PaceProfile.MaxInterval && BaseInterval > TimeSpan.Zero && state.Factor > 1)
             {
                 interval = PaceProfile.MaxInterval;
                 if (++state.AtMax >= MaxSlowRequests && state.Stopped is null)
@@ -329,6 +330,13 @@ public sealed class Pacer(PaceProfile profile, TimeProvider? clock = null)
         lock (_lock)
         {
             var state = State(host);
+            // A runner's clean answer inside one long read (a for_each child) lets the host speed up again, without
+            // touching the scanner's streak of failed whole reads.
+            if (kind is FailureKind.None && !countsTowardsStop)
+            {
+                state.Factor = Math.Max(1, state.Factor * 0.75);
+                return;
+            }
             if (kind is FailureKind.Throttled or FailureKind.Timeout && !countsTowardsStop)
             {
                 if (BaseInterval > TimeSpan.Zero)
@@ -364,7 +372,7 @@ public sealed class Pacer(PaceProfile profile, TimeProvider? clock = null)
     public IReadOnlyList<(string Host, int Signals, bool Stopped)> PushedBack()
     {
         lock (_lock)
-            return [.. _hosts.Where(h => h.Value.Signals > 0).OrderBy(h => h.Key, StringComparer.OrdinalIgnoreCase)
+            return [.. _hosts.Where(h => h.Value.Signals > 0 || h.Value.Stopped is not null).OrderBy(h => h.Key, StringComparer.OrdinalIgnoreCase)
                 .Select(h => (h.Key, h.Value.Signals, h.Value.Stopped is not null))];
     }
 

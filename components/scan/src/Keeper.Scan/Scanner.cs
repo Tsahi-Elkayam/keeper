@@ -112,7 +112,7 @@ public sealed class Scanner(RunnerRegistry registry, TimeProvider? clock = null)
 
         using var run = new RunWriter(request.RunsDir, instance, system, started);
         var rules = request.Files.SelectMany(f => f.Rules.Select(r => (Rule: r, File: f))).ToList();
-        var (queries, readOf) = Group(rules);
+        var (queries, readOf) = Group(rules, request.Connection);
         var outcomes = new Dictionary<string, QueryOutcome>(StringComparer.Ordinal);
 
         var dropRatio = double.TryParse(request.Threshold("scan.row-drop-ratio"), System.Globalization.NumberStyles.Float,
@@ -121,6 +121,18 @@ public sealed class Scanner(RunnerRegistry registry, TimeProvider? clock = null)
             System.Globalization.CultureInfo.InvariantCulture, out var confirm) && confirm >= 1 ? confirm : DefaultDropConfirmScans;
         var confirmAge = TimeSpan.FromDays(double.TryParse(request.Threshold("scan.drop-confirm-days"), System.Globalization.NumberStyles.Float,
             System.Globalization.CultureInfo.InvariantCulture, out var days) && days >= 0 ? days : DefaultDropConfirmDays);
+        // A rule-wide threshold override that names none of the rule's thresholds sets nothing: said, not ignored silently.
+        foreach (var (rule, _) in rules.DistinctBy(r => r.Rule.Id, StringComparer.Ordinal))
+        {
+            foreach (var value in request.OverrideThresholds(rule.Id, "-"))
+            {
+                if (!rule.ThresholdNames.Any(name => rule.OverrideFor(name, value) is not null))
+                    notes.Add(rule.ThresholdNames.Count == 0
+                        ? $"{rule.Id}: a threshold override ({value}) is ignored: the rule has no threshold"
+                        : $"{rule.Id}: a threshold override ({value}) is ignored: the rule has {rule.ThresholdNames.Count} thresholds " +
+                          $"({string.Join(", ", rule.ThresholdNames)}), so the override must name one as name=value");
+            }
+        }
         // Hosts left out because the targets' where could not judge them are said, once per target list.
         if (request.Connection.Options["targets"] is not JsonArray)
         {
@@ -144,9 +156,9 @@ public sealed class Scanner(RunnerRegistry registry, TimeProvider? clock = null)
             Distrust(outcome, group.Key, group.Max(g => g.Rule.Query.MinRows), dropCheck ? request.PreviousRows : _ => null, dropRatio,
                 confirmScans, confirmAge, started);
             outcomes[group.Key] = outcome;
-            AssignKeyless(outcome, rule.Query);
             // A field any rule of the query masks is masked in every row the scan keeps; conditions read the real value.
             outcome.Mask = [.. group.SelectMany(g => g.Rule.Mask).Distinct(StringComparer.OrdinalIgnoreCase)];
+            AssignKeyless(outcome, rule.Query);
 
             foreach (var (row, target) in outcome.Rows)
             {
@@ -430,7 +442,7 @@ public sealed class Scanner(RunnerRegistry registry, TimeProvider? clock = null)
     /// </summary>
     public ScanPlan Plan(ScanRequest request)
     {
-        var (queries, _) = Group([.. request.Files.SelectMany(f => f.Rules.Select(r => (Rule: r, File: f)))]);
+        var (queries, _) = Group([.. request.Files.SelectMany(f => f.Rules.Select(r => (Rule: r, File: f)))], request.Connection);
         var (outcomes, _, reads) = BuildPlan(queries, request);
         var profile = Profile(request);
         var endpointHost = EndpointHost(request.Connection.Endpoint);
@@ -455,13 +467,17 @@ public sealed class Scanner(RunnerRegistry registry, TimeProvider? clock = null)
     /// "~" and a hash of its targets, so neither reads the other's hosts. Returns the groups and each rule's group.
     /// </summary>
     private static (List<IGrouping<string, (Rule Rule, RuleFile File)>> Groups, Dictionary<(Rule, RuleFile), string> ReadOf) Group(
-        List<(Rule Rule, RuleFile File)> rules)
+        List<(Rule Rule, RuleFile File)> rules, IConnection connection)
     {
         var firstTargets = new Dictionary<string, string>(StringComparer.Ordinal);
         var readOf = new Dictionary<(Rule, RuleFile), string>();
         foreach (var (rule, file) in rules)
         {
-            var targets = TargetsText(file.Targets);
+            // The hosts the file will really read (as ResolveTargets picks them): its own fixed list, else the
+            // integration's targets option, which then stands for every file, else its target spec.
+            var targets = file.Targets is { List.Count: > 0 } fixedList ? TargetsText(fixedList)
+                : connection.Options["targets"] is JsonArray ? "(integration targets)"
+                : TargetsText(file.Targets);
             var id = rule.Query.Id;
             if (!firstTargets.TryAdd(id, targets) && firstTargets[id] != targets)
                 id = $"{id}~{Convert.ToHexStringLower(System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(targets)))[..6]}";
@@ -471,8 +487,9 @@ public sealed class Scanner(RunnerRegistry registry, TimeProvider? clock = null)
     }
 
     /// <summary>A target list as text, equal for equal lists whichever file they are in.</summary>
-    private static string TargetsText(TargetSpec? spec) => spec is null ? "" :
-        $"{spec.Entity}|{spec.Field}|{string.Join(",", spec.List)}|{ConditionText(spec.Where)}";
+    private static string TargetsText(TargetSpec? spec) =>
+        spec is null || (spec.Entity is null && spec.Field is null && spec.List.Count == 0 && spec.Where is null) ? ""
+            : $"{spec.Entity}|{spec.Field}|{string.Join(",", spec.List)}|{ConditionText(spec.Where)}";
 
     private static string ConditionText(Condition? condition) => condition switch
     {
@@ -721,13 +738,16 @@ public sealed class Scanner(RunnerRegistry registry, TimeProvider? clock = null)
         return name => overrides.Select(value => rule.OverrideFor(name, value)).FirstOrDefault(v => v is not null) ?? request.Threshold(name);
     }
 
-    /// <summary>The row's own key, or null when the key field (or a part of a key template) is empty.</summary>
+    /// <summary>
+    /// The row's own key, or null when it has none: the key field is empty, or every part of a key template is. A
+    /// template with some parts empty is still a key ("{host}|{id}|{param1}" with no param1 is one event): those keys
+    /// are what earlier scans stored, and changing them would close and reopen every such finding.
+    /// </summary>
     private static string? OwnKey(QuerySpec query, JsonObject row)
     {
         if (!query.Key.Contains('{', StringComparison.Ordinal))
             return Values.Text(FieldPath.First(row, query.Key)) is { Length: > 0 } key ? key : null;
-        // A template with an empty part ("{host}|{name}" with no name) would give every such row one key.
-        return Templates.Placeholders(query.Key).All(p => Values.Text(FieldPath.First(row, p)) is { Length: > 0 })
+        return Templates.Placeholders(query.Key).Any(p => Values.Text(FieldPath.First(row, p)) is { Length: > 0 })
             ? Templates.Render(query.Key, row) : null;
     }
 
@@ -747,9 +767,10 @@ public sealed class Scanner(RunnerRegistry registry, TimeProvider? clock = null)
                 continue;
             foreach (var (row, target) in group)
             {
+                // Over the row as kept: a masked value must not be guessable from its key.
                 var content = Convert.ToHexStringLower(System.Security.Cryptography.SHA256.HashData(
-                    System.Text.Encoding.UTF8.GetBytes(CanonicalJson(row))))[..10];
-                var name = $"(no {query.Key}: {content})";
+                    System.Text.Encoding.UTF8.GetBytes(CanonicalJson(outcome.Masked(row)))))[..10];
+                var name = query.Key.Contains('{', StringComparison.Ordinal) ? $"(no key: {content})" : $"(no {query.Key}: {content})";
                 Keyless.AddOrUpdate(row, target is null ? name : $"{target}|{name}");
             }
         }

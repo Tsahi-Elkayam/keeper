@@ -56,6 +56,35 @@ public sealed class PerObjectTests
         Assert.DoesNotContain(runner.Paths, p => p.Contains("..", StringComparison.Ordinal) || p == "/servicePrincipals/jobs");
     }
 
+    /// <summary>A pace that lets <paramref name="allowed"/> requests through, then says the scan stopped reading the host.</summary>
+    private sealed class StoppingPace(int allowed) : IPace
+    {
+        private int _sent;
+
+        public Task WaitAsync(CancellationToken cancellationToken) =>
+            Interlocked.Increment(ref _sent) <= allowed ? Task.CompletedTask
+                : throw new RunnerFailureException("not read: the host kept asking to slow down", FailureKind.Throttled);
+
+        public void Signal(FailureKind kind)
+        {
+        }
+    }
+
+    [Fact]
+    public async Task Children_already_read_stay_when_the_scan_stops_reading_the_host()
+    {
+        var runner = new PathRunner();
+        var query = Query("/sites/{id}/lists", new JsonObject { ["path"] = "/sites", ["field"] = "id" });
+        var context = Context.For(new FakeConnection("")) with { Pace = new StoppingPace(1) };
+
+        var result = await runner.RunAsync(query, context, CancellationToken.None);
+
+        Assert.Equal("partial", result.State);                     // the first site's lists, not a failed read
+        Assert.Equal(FailureKind.Throttled, result.Failure);
+        Assert.Contains("kept asking to slow down", result.Reason, StringComparison.Ordinal);
+        Assert.Single(result.Rows);
+    }
+
     [Fact]
     public async Task A_list_that_met_a_refused_credential_sends_no_child()
     {

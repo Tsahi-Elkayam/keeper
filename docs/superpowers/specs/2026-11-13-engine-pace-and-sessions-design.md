@@ -236,6 +236,31 @@ override satisfies every required setting. (All done: sections 10 and 11.)
 - B8: several keyless rows of one read and host get host|(no key: content hash); one keeps its old key.
 - B9: a rule override sets only the rule's own threshold (name=value when it has several), never the time zone.
 
+### 12. Third review fixes (2026-11-13)
+
+- **B8 kept old keys.** A key template counts as missing only when none of its placeholders has a value: a
+  template with one empty part (`{id}|{param1}`) keeps the keys it always had. The content-hash key is given
+  only when two or more keyless rows of one read share a host, and it hashes the row after masking, so a masked
+  secret never shapes a key.
+- **An operator's slow pace is not a push-back.** The 20-requests-at-30-s stop counts only while the host itself
+  pushed the interval up (factor above 1); `requestsPerSecond: 0.01` no longer stops hosts.
+- **Clean answers inside one long read speed the host up again.** A for_each child that answers ok decays the
+  host's factor without resetting the stop count; a stopped host is listed among the hosts that pushed back.
+- **A for_each stopped mid-read keeps what it read.** A child whose pace wait throws (the host was stopped) is
+  not sent; the result is partial with the stop's kind, the children already read stay.
+- **B2 groups by the effective targets.** Rules whose targets come from the integration share one group whatever
+  their spec says; a fixed list is its own group.
+- **B9 says what it ignores.** A rule-wide override on a rule with several thresholds that names none of them is
+  a run note, not silently dropped.
+- **Sign-out never fails a scan.** A sign-out that throws is a warning: the session ends at its idle timeout.
+- **A cached token is used during a busy cool-down.** Only a new sign-in waits out `BusyCooldown`.
+- **One-time history break (accepted).** B2's per-row rule changes the stored entity type of 21 shipped query
+  groups where a count rule used to come first (for example aws `instance` to `trail`, entra `tenant` to
+  `conditional-access-policy`). Entities and results are keyed by type, so those entities start a new history
+  under the new type on the first scan after upgrade, and the old ones stop being seen.
+- Not covered by tests: the LDAP range cap needs a directory server; a registry `_unread` that is not merged runs
+  on Windows only. The B6 note shows in every scan of an AD estate with computer objects that never signed in.
+
 ## Not in this change
 
 Sharing sessions across the systems of one `keeper run`; scan windows (only at night); reading the account's lockout policy

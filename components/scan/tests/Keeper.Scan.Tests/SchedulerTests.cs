@@ -588,12 +588,12 @@ public sealed class PaceTests
         Assert.Throws<ArgumentException>(() => PaceProfile.From(new JsonObject { ["pace.hosts"] = "0" }));
     }
 
-    /// <summary>A clock that moves on 31 s each time it is read: no wait ever has to be slept.</summary>
-    private sealed class Jumping : TimeProvider
+    /// <summary>A clock that moves on <paramref name="seconds"/> each time it is read, past any interval: no wait ever has to be slept.</summary>
+    private sealed class Jumping(int seconds = 31) : TimeProvider
     {
         private DateTimeOffset _now = DateTimeOffset.UnixEpoch;
 
-        public override DateTimeOffset GetUtcNow() => _now = _now.AddSeconds(31);
+        public override DateTimeOffset GetUtcNow() => _now = _now.AddSeconds(seconds);
     }
 
     [Fact]
@@ -614,6 +614,40 @@ public sealed class PaceTests
 
         var ended = await Assert.ThrowsAsync<RunnerFailureException>(() => pace.WaitAsync(CancellationToken.None));
         Assert.Equal(FailureKind.Throttled, ended.Kind);
+    }
+
+    [Fact]
+    public async Task An_operator_s_own_slow_pace_is_not_a_push_back()
+    {
+        var pacer = new Pacer(PaceProfile.Gentle with { RequestsPerSecond = 0.01 }, new Jumping(101));   // 100 s apart, by choice
+        var pace = pacer.For("fragile.example.org");
+
+        for (var i = 0; i < 3 * Pacer.MaxSlowRequests; i++)
+            await pace.WaitAsync(CancellationToken.None);
+
+        Assert.Null(pacer.Stopped("fragile.example.org"));
+    }
+
+    [Fact]
+    public async Task Clean_answers_inside_one_long_read_let_the_host_speed_up_and_a_stop_is_listed()
+    {
+        var pacer = new Pacer(PaceProfile.Gentle, new Jumping());
+        var pace = pacer.For("vc.example.org");
+        for (var i = 0; i < 10; i++)
+            pace.Signal(FailureKind.Throttled);
+        for (var i = 0; i < 3 * Pacer.MaxSlowRequests; i++)
+        {
+            await pace.WaitAsync(CancellationToken.None);
+            pace.Signal(FailureKind.None);                       // a for_each child that came back clean
+        }
+        Assert.Null(pacer.Stopped("vc.example.org"));
+
+        var other = pacer.For("slow.example.org");
+        for (var i = 0; i < 10; i++)
+            other.Signal(FailureKind.Throttled);
+        for (var i = 0; i < Pacer.MaxSlowRequests; i++)
+            await other.WaitAsync(CancellationToken.None);
+        Assert.Contains(("slow.example.org", 0, true), pacer.PushedBack());   // the manifest names the stopped host
     }
 
     [Fact]

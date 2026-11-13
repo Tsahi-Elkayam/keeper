@@ -151,7 +151,17 @@ public static class ScanVerb
                 {
                     request.Guard.OnRefused = null;
                     // vCenter and session-login products cap open sessions: the scan's is ended, not left to time out.
-                    await link.SignOutAsync(CancellationToken.None);
+                    // Best effort: the run is written by now, and a sign-out that fails must not replace its result.
+                    try
+                    {
+                        await link.SignOutAsync(CancellationToken.None);
+                    }
+#pragma warning disable CA1031 // Ending the session is a courtesy; its failure is said and the scan's own result stands.
+                    catch (Exception ex)
+#pragma warning restore CA1031
+                    {
+                        Console.Error.WriteLine($"  warning: the session was not ended ({Redactor.Clean(ex.Message)}); it ends at its idle timeout");
+                    }
                 }
                 // A credential that read data in this scan and was not refused works: an old record of it is gone.
                 if (LogonGuard.PresentsSecret(link) && request.Guard.Refusal(link) is null && request.Guard.Proven(link))

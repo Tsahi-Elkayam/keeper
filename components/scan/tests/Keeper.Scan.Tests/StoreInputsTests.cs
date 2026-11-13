@@ -66,6 +66,27 @@ public sealed class StoreInputsTests : IDisposable
     }
 
     [Fact]
+    public void Threshold_overrides_come_most_specific_first()
+    {
+        using (var connection = Store.OpenReadWrite())
+        {
+            void Add(string id, string check, string entity, string value, string at) => Sql.Execute(connection,
+                "INSERT INTO override (override_id, check_id, decision, entity, value, actor, at, why) VALUES (:id, :c, 'threshold', :e, :v, 'test', :at, 'test');",
+                null, (":id", id), (":c", check), (":e", entity), (":v", value), (":at", at));
+            Add("OVR-0001", "AD-*", "", "prefix", "2026-11-01T00:00:00Z");
+            Add("OVR-0002", "AD-STALE-*", "", "longer prefix", "2026-10-01T00:00:00Z");
+            Add("OVR-0003", "AD-STALE-USER", "", "exact, older", "2026-09-01T00:00:00Z");
+            Add("OVR-0004", "AD-STALE-USER", "", "exact, newer", "2026-10-15T00:00:00Z");
+            Add("OVR-0005", "AD-STALE-USER", "alice", "for alice", "2026-08-01T00:00:00Z");
+        }
+        using var read = Store.OpenReadOnly();
+        var inputs = new StoreInputs(read, "2026-11-13");
+
+        Assert.Equal(["for alice", "exact, newer", "exact, older", "longer prefix", "prefix"], inputs.OverrideThresholds("AD-STALE-USER", "alice"));
+        Assert.Equal(["exact, newer", "exact, older", "longer prefix", "prefix"], inputs.OverrideThresholds("AD-STALE-USER", "bob"));
+    }
+
+    [Fact]
     public void A_host_the_where_cannot_judge_is_not_dropped_silently()
     {
         Run("ad1", "ad-main", "active-directory", "2026-10-20T06:00:00Z", ("query", "q-computers", "ok", 3));

@@ -765,6 +765,62 @@ public sealed class ScannerTests : IDisposable
     }
 
     [Fact]
+    public async Task A_key_template_with_an_empty_part_keeps_its_keys()
+    {
+        // {host}|{id}|{param1}: events with no param1 are still keyed by their id, as earlier scans stored them.
+        var registry = new RunnerRegistry([new KeylessRunner(new JsonObject { ["id"] = "a" }, new JsonObject { ["id"] = "b" })]);
+        var file = FakeFile("template.yaml", """
+            schema: keeper.rules/1
+            system: example
+            integration: files
+            targets: { list: [pc01] }
+            defaults: { lens: both, refresh: 1d, category: IAM, kind: misconfigured, severity: low, entity: event }
+            rules:
+              - id: EX-EVENT
+                title: Event
+                query: { protocol: fake, key: "{id}|{param1}" }
+                each: any
+            """);
+
+        var report = await new Scanner(registry, new Clock(Now)).RunAsync(new ScanRequest
+        {
+            Files = [file], Connection = new FilesConnection(), RunsDir = Runs, ImportsDir = Imports,
+        }, CancellationToken.None);
+
+        Assert.Equal(["pc01|a|", "pc01|b|"], Read<FindingRecord>(report, RunFolder.Findings).Select(f => f.Target).Order(StringComparer.Ordinal));
+    }
+
+    [Fact]
+    public async Task A_rule_override_that_names_none_of_the_rule_s_thresholds_is_said()
+    {
+        var registry = new RunnerRegistry([new FakeRunner(false, new() { ["-"] = 1 })]);
+        var file = FakeFile("override.yaml", """
+            schema: keeper.rules/1
+            system: example
+            integration: files
+            defaults: { lens: both, refresh: 1d, category: IAM, kind: misconfigured, severity: low, entity: member }
+            rules:
+              - id: EX-TWO
+                title: Two thresholds
+                query: { protocol: fake, key: id }
+                each:
+                  all:
+                    - { field: id, op: ne, value: x, threshold: ex.one }
+                    - { field: id, op: ne, value: y, threshold: ex.two }
+            """);
+
+        var report = await new Scanner(registry, new Clock(Now)).RunAsync(new ScanRequest
+        {
+            Files = [file], Connection = new FilesConnection(), RunsDir = Runs, ImportsDir = Imports,
+            OverrideThresholds = (rule, entity) => entity == "-" ? ["120", "ex.two=z"] : [],
+        }, CancellationToken.None);
+
+        var note = Assert.Single(report.Manifest.Notes, n => n.Contains("is ignored", StringComparison.Ordinal));
+        Assert.Contains("EX-TWO: a threshold override (120)", note, StringComparison.Ordinal);
+        Assert.Contains("name=value", note, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task A_field_one_rule_masks_does_not_leak_through_another_rule_s_name()
     {
         var registry = new RunnerRegistry([new FakeRunner(false, new() { ["-"] = 1 })]);
