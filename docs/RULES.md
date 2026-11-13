@@ -341,6 +341,9 @@ with. Without `hosts` it may sign in only the ways a built-in type does without 
 sign-in needs `hosts`, so its token can go nowhere else, and a wildcard needs two labels (`*.example.org`, not
 `*.com`) and may not cover a public suffix (`*.co.uk`, `*.github.io`; a short list, not the full public suffix list); a field it does not know (a misspelt `readpaths`) is an error, never a guard left out. A file that is not valid
 stops every command until it is fixed. `keeper integration types` lists them with the file that added each.
+`keeper config export integration-types` copies them to `<config>/integration-types/` with the rest of the client's
+config, and `keeper config import integration-types` copies them back into another home; neither writes anything
+unless the folder it writes to would load.
 
 ## Google Cloud
 

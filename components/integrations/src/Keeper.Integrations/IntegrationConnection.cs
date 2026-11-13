@@ -93,6 +93,9 @@ public sealed partial class IntegrationConnection : IConnection, IAwsConnection,
     /// </summary>
     public TimeSpan BusyCooldown { get; init; } = TimeSpan.FromMinutes(1);
 
+    /// <summary>The clock the cool-down is kept by. A seam for tests.</summary>
+    public Func<DateTimeOffset> Now { get; init; } = () => DateTimeOffset.UtcNow;
+
     /// <summary>Sign in to Entra again even when a cached token is valid: right after a PIM activation, so the new role is in it.</summary>
     public bool FreshSignIn { get; init; }
 
@@ -212,7 +215,7 @@ public sealed partial class IntegrationConnection : IConnection, IAwsConnection,
                 && (!renew || DateTimeOffset.UtcNow - _tokenIssued < SessionRenewGrace))
                 return _token;
             // A token still held is used above; only a new sign-in waits out a busy service.
-            if (_busyError is not null && DateTimeOffset.UtcNow < _busyUntil)
+            if (_busyError is not null && Now() < _busyUntil)
                 throw _busyError;
             try
             {
@@ -241,7 +244,7 @@ public sealed partial class IntegrationConnection : IConnection, IAwsConnection,
             catch (Exception ex) when (ex is SignInException or IntegrationException { Transient: true })
             {
                 _busyError = ex;
-                _busyUntil = DateTimeOffset.UtcNow + BusyCooldown;
+                _busyUntil = Now() + BusyCooldown;
                 throw;
             }
             _busyError = null;

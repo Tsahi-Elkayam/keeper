@@ -50,7 +50,7 @@ public sealed class SignInTests : IDisposable
 
     private static HttpResponseMessage Token(string token = "tok-1") => Json($$"""{ "access_token": "{{token}}", "expires_in": 3600 }""");
 
-    private IntegrationConnection OAuth(Script script, string kind = "oauth-client-credentials", TimeSpan? cooldown = null)
+    private IntegrationConnection OAuth(Script script, string kind = "oauth-client-credentials", TimeSpan? cooldown = null, Func<DateTimeOffset>? now = null)
     {
         var binding = IntegrationStore.Binding("app", kind == "vcenter-session" ? "password" : "clientSecret", "https://app.example.org");
         var name = kind == "vcenter-session" ? "password" : "clientSecret";
@@ -60,7 +60,7 @@ public sealed class SignInTests : IDisposable
             {
                 [name] = new(name, _vault.Seal("not-a-real-secret", binding), binding, "2026-11-13T00:00:00Z", null),
             });
-        return new IntegrationConnection(record, _vault) { SignInHandler = script, SignInBackoff = TimeSpan.FromMilliseconds(1), SessionRenewGrace = TimeSpan.Zero, BusyCooldown = cooldown ?? TimeSpan.Zero };
+        return new IntegrationConnection(record, _vault) { SignInHandler = script, SignInBackoff = TimeSpan.FromMilliseconds(1), SessionRenewGrace = TimeSpan.Zero, BusyCooldown = cooldown ?? TimeSpan.Zero, Now = now ?? (() => DateTimeOffset.UtcNow) };
     }
 
     private static async Task<string?> BearerOf(IntegrationConnection connection)
@@ -236,12 +236,14 @@ public sealed class SignInTests : IDisposable
     {
         var calls = 0;
         var script = new Script(() => ++calls <= 3 ? Json("{}", HttpStatusCode.ServiceUnavailable) : Token("tok-4"));
-        using var connection = OAuth(script, cooldown: TimeSpan.FromMilliseconds(200));
+        var now = DateTimeOffset.Parse("2026-11-13T10:00:00Z", System.Globalization.CultureInfo.InvariantCulture);
+        using var connection = OAuth(script, cooldown: TimeSpan.FromMinutes(1), now: () => now);
 
         await Assert.ThrowsAsync<SignInException>(() => BearerOf(connection));
+        now = now.AddSeconds(59);
         await Assert.ThrowsAsync<SignInException>(() => BearerOf(connection));   // within the cool-down: nothing sent
         Assert.Equal(3, script.Requests);
-        await Task.Delay(300);
+        now = now.AddSeconds(2);
         Assert.Equal("tok-4", await BearerOf(connection));
     }
 

@@ -12,7 +12,7 @@ using Microsoft.Data.Sqlite;
 
 // keeper config: moves the client's configuration between the files that are its source of truth
 // (clients\<client>\config\, or home\config\) and the store (keeper.db), which keeps it as data plus a
-// cache. This increment covers systems, settings, overrides, registers and integrations. Writes to the store
+// cache. This increment covers systems, settings, overrides, registers, integrations and integration types. Writes to the store
 // go through the one-writer queue + qm, exactly as 'keeper system' does. Integration secrets are the one thing
 // that never travels this path: the file records a secret's NAME only, and no queued payload carries a value.
 public static class ConfigVerb
@@ -35,6 +35,7 @@ public static class ConfigVerb
                         "overrides" => ExportOverrides(r),
                         "registers" => ExportRegisters(r),
                         "integration" or "integrations" => ExportIntegrations(r),
+                        "integration-types" => ExportIntegrationTypes(r),
                         _ => Unsupported(noun),
                     };
                 case "import":
@@ -45,6 +46,7 @@ public static class ConfigVerb
                         "overrides" => ImportOverrides(r),
                         "registers" => ImportRegisters(r),
                         "integration" or "integrations" => ImportIntegrations(r),
+                        "integration-types" => ImportIntegrationTypes(r),
                         _ => Unsupported(noun),
                     };
                 default:
@@ -54,7 +56,7 @@ public static class ConfigVerb
 
         static int Unsupported(string? noun)
         {
-            Console.Error.WriteLine($"Config part must be systems, settings, overrides, registers or integrations{(noun is null ? "" : $", not '{noun}'")}.");
+            Console.Error.WriteLine($"Config part must be systems, settings, overrides, registers, integrations or integration-types{(noun is null ? "" : $", not '{noun}'")}.");
             return ExitCodes.Usage;
         }
 
@@ -412,6 +414,62 @@ public static class ConfigVerb
             return ApplyOrQueue(r, added + changed, "integrations.upsert");
         }
 
+        // Integration types ------------------------------------------------------------------
+        // The types a tenant adds (settings\integration-types\*.yaml) are settings files, not store data: they are
+        // copied byte for byte to and from <config>\integration-types\, and nothing is written unless the folder it
+        // lands in would load. A file in the target but not the source is left alone and reported.
+
+        static string TypesFolder(RequestCli r, string option) =>
+            r.Cli.Get(option) is { Length: > 0 } folder ? Path.GetFullPath(folder)
+            : Path.Combine(r.Cli.Get("config") is { Length: > 0 } config ? Path.GetFullPath(config) : r.Paths.Config, "integration-types");
+
+        static string TenantTypes(RequestCli r) => Path.Combine(r.Paths.SettingsDir, "integration-types");
+
+        static int ExportIntegrationTypes(RequestCli r)
+        {
+            var to = TypesFolder(r, "out");
+            var result = CopyTypes(TenantTypes(r), to);
+            if (result is null)
+                return ExitCodes.Usage;
+            Console.WriteLine($"Wrote {result.Written} integration type file(s) to {to} ({result.Unchanged.Count} unchanged).");
+            ReportOnlyInStore("integration type files, in the folder but not in settings", result.OnlyInTarget);
+            return ExitCodes.Ok;
+        }
+
+        static int ImportIntegrationTypes(RequestCli r)
+        {
+            // No --reason: these are settings files people also edit by hand, and no queued change would keep one.
+            var from = TypesFolder(r, "in");
+            if (Keeper.Integrations.IntegrationTypeFiles.In(from).Count == 0)
+            {
+                Console.Error.WriteLine($"No integration type files (*.yaml) in {from}. 'keeper config export integration-types' writes them.");
+                return ExitCodes.Usage;
+            }
+            var to = TenantTypes(r);
+            var result = CopyTypes(from, to);
+            if (result is null)
+                return ExitCodes.Usage;
+            Console.WriteLine($"{from}: {result.Added.Count + result.Changed.Count + result.Unchanged.Count} integration type file(s) - "
+                + $"{result.Added.Count} new, {result.Changed.Count} changed, {result.Unchanged.Count} unchanged.");
+            ReportOnlyInStore("integration type files, in settings but not in the folder", result.OnlyInTarget);
+            if (result.Written > 0)
+                Console.WriteLine($"Written to {to}; the next keeper command loads them ('keeper integration types' lists them).");
+            return ExitCodes.Ok;
+        }
+
+        static Keeper.Integrations.IntegrationTypeFiles.Result? CopyTypes(string from, string to)
+        {
+            try
+            {
+                return Keeper.Integrations.IntegrationTypeFiles.Copy(from, to);
+            }
+            catch (Keeper.Integrations.IntegrationException ex)
+            {
+                Console.Error.WriteLine($"Nothing was written: {ex.Message}");
+                return null;
+            }
+        }
+
         // Read-only on the integration and vault tables, which another component (keeper integration) owns; a store
         // that has never had integrations initialised says so, the same way 'keeper integration list' would.
         static SqliteConnection IntegrationRead(RequestCli r)
@@ -546,6 +604,12 @@ public static class ConfigVerb
 
                   keeper config export systems|settings|overrides|registers|integrations [--out <file>] [--config <dir>] [--client <name>]
                       Writes the config file from the store (schema keeper.config/1), records ordered deterministically.
+
+                  keeper config export integration-types [--out <folder>] [--config <dir>]
+                  keeper config import integration-types [--in <folder>] [--config <dir>]
+                      Copies the tenant's own integration types (settings\integration-types\*.yaml) to or from
+                      <config>\integration-types\, byte for byte. Nothing is written unless the result loads. These are
+                      settings files: written straight away, with no queue and no --reason.
 
                   keeper config import systems|settings|overrides|registers|integrations [--in <file>] [--config <dir>] --reason "<why>" [--now]
                       Upserts each record in the file into the store through the one-writer queue. Idempotent: a record

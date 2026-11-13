@@ -99,23 +99,8 @@ public static partial class IntegrationTypes
     /// a folder gave before. A missing folder adds none. A file that is not valid stops the command: an integration of
     /// a type that half-loaded could read more than its author meant.
     /// </summary>
-    public static void UseTenantFolder(string folder)
-    {
-        var types = new List<IntegrationType>();
-        if (Directory.Exists(folder))
-        {
-            foreach (var file in Directory.EnumerateFiles(folder, "*.yaml").Order(StringComparer.Ordinal))
-            {
-                foreach (var type in IntegrationTypeCatalog.Parse(File.ReadAllText(file), file, BuiltIn))
-                {
-                    if (types.Any(t => t.Id.Equals(type.Id, StringComparison.OrdinalIgnoreCase)))
-                        throw new IntegrationException($"{file}: integration type '{type.Id}' is also defined in {types.First(t => t.Id.Equals(type.Id, StringComparison.OrdinalIgnoreCase)).Source}.");
-                    types.Add(type);
-                }
-            }
-        }
-        _tenant = types;
-    }
+    public static void UseTenantFolder(string folder) =>
+        _tenant = IntegrationTypeFiles.Validate(IntegrationTypeFiles.In(folder).Select(file => (file, File.ReadAllText(file))));
 
     /// <summary>
     /// Whether an integration of type <paramref name="integrationType"/> can run rules written for <paramref name="ruleType"/>.
