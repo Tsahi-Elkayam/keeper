@@ -139,8 +139,20 @@ public sealed class Evaluator(Func<string, string?> threshold, DateTimeOffset no
 
     private static Verdict Invert(Verdict v) => v with { Fails = v.Fails is null ? null : !v.Fails };
 
+    /// <summary>
+    /// The row field a runner lists the fields in whose value is there but could not be read (a registry value the
+    /// provider would not return). Such a field is unknown, never absent: null alone means "not set" (Graph's unset).
+    /// </summary>
+    public const string UnreadField = "_unread";
+
+    private static bool Unread(JsonNode? row, string field) =>
+        row?[UnreadField] is JsonArray names && names.Any(n => n?.ToString() is { } name
+            && (field.Equals(name, StringComparison.OrdinalIgnoreCase) || field.StartsWith(name + ".", StringComparison.OrdinalIgnoreCase)));
+
     private Verdict Leaf(LeafCondition leaf, JsonNode? row)
     {
+        if (Unread(row, leaf.Field))
+            return new Verdict(null, null, null, $"{leaf.Field} could not be read");
         if (leaf.Op == "changed")
             return Changed(leaf.Field, row);
         // With no earlier read, _new and _previous are missing, not false or empty: "absent" there is no finding.

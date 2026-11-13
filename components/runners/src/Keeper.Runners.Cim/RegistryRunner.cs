@@ -97,8 +97,8 @@ public sealed partial class RegistryRunner : ISessionRunner, IQueryMerger
     /// <summary>Added to a merged query so its row carries the names it could not read, for <see cref="Split"/>. Never set on a query of its own.</summary>
     private const string MergedMarker = "_merged";
 
-    /// <summary>The row field that carries the unread value names of a merged read. A NUL cannot be part of a registry value name.</summary>
-    private const string UnreadField = "\0unread";
+    /// <summary>The row field that names the values that are there but could not be read: rules on them are unknown, never absent.</summary>
+    private const string UnreadField = Keeper.Rules.Evaluator.UnreadField;
 
     public string? MergeKey(QuerySpec query)
     {
@@ -152,8 +152,10 @@ public sealed partial class RegistryRunner : ISessionRunner, IQueryMerger
             {
                 if (name == UnreadField)
                 {
-                    if (value is JsonArray names)
-                        unread.AddRange(names.Select(n => n?.ToString() ?? "").Where(n => Wanted(n)));
+                    var mine = value is JsonArray names ? names.Select(n => n?.ToString() ?? "").Where(n => Wanted(n)).ToList() : [];
+                    unread.AddRange(mine);
+                    if (mine.Count > 0)
+                        own[UnreadField] = new JsonArray([.. mine.Select(n => (JsonNode)JsonValue.Create(n))]);
                 }
                 else if (name is "host" or "key" or "exists" || Wanted(name))
                 {
@@ -255,9 +257,8 @@ public sealed partial class RegistryRunner : ISessionRunner, IQueryMerger
             // A value that is there but could not be read is unknown, never absent.
             if (unread.Count == 0)
                 return RunnerResult.Ok([row]);
-            // A merged read keeps the names in the row, so Split can tell which of its queries they belong to.
-            if (query.Fields[MergedMarker] is not null)
-                row[UnreadField] = new JsonArray([.. unread.Select(n => (JsonNode)JsonValue.Create(n))]);
+            // The names stay in the row: the evaluator judges them unknown, and Split tells which of its queries they belong to.
+            row[UnreadField] = new JsonArray([.. unread.Select(n => (JsonNode)JsonValue.Create(n))]);
             return RunnerResult.Partial([row], UnreadReason(host, key, unread));
         }
         catch (CimException ex)

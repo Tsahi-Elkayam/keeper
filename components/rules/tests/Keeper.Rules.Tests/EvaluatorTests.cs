@@ -306,6 +306,19 @@ public sealed class EvaluatorTests
     }
 
     [Fact]
+    public void A_value_that_could_not_be_read_is_unknown_never_absent()
+    {
+        // The registry returns null for a value it would not read, and names it in _unread; Graph's null is "not set".
+        var row = new JsonObject { ["AutoAdminLogon"] = null, ["Shell"] = null, ["_unread"] = new JsonArray("AutoAdminLogon") };
+
+        var unread = Engine().Each(Leaf("AutoAdminLogon", "absent"), row);
+        Assert.Null(unread.Fails);
+        Assert.Contains("could not be read", unread.Why, StringComparison.Ordinal);
+        Assert.Null(Engine().Each(Leaf("autoadminlogon", "eq", "1"), row).Fails);
+        Assert.Equal(true, Engine().Each(Leaf("Shell", "absent"), row).Fails);          // null and not unread: not set
+    }
+
+    [Fact]
     public void All_any_and_not_use_three_valued_logic()
     {
         var neverExpires = Leaf("userAccountControl", "flag", "65536");

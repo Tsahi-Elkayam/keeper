@@ -199,23 +199,23 @@ public sealed class RegistryMergeTests
     [Fact]
     public void A_value_only_another_query_could_not_read_does_not_make_this_one_partial()
     {
-        var merged = RunnerResult.Partial([Row(("A", 1), ("B", null), ("\0unread", new JsonArray("B")))], "PC01: 1 value(s) of SOFTWARE\\Test could not be read (B)");
+        var merged = RunnerResult.Partial([Row(("A", 1), ("B", null), ("_unread", new JsonArray("B")))], "PC01: 1 value(s) of SOFTWARE\\Test could not be read (B)");
 
         var forA = Runner.Split(Q("a", "A"), merged);
         var forB = Runner.Split(Q("a", "B"), merged);
 
         Assert.Equal("ok", forA.State);
         Assert.Null(forA.Reason);
-        Assert.False(Assert.Single(forA.Rows).ContainsKey("\0unread"));
+        Assert.False(Assert.Single(forA.Rows).ContainsKey("_unread"));     // A's rules see only what A asked for
         Assert.Equal("partial", forB.State);
         Assert.Contains("(B)", forB.Reason);
-        Assert.False(Assert.Single(forB.Rows).ContainsKey("\0unread"));
+        Assert.Equal(["B"], Assert.Single(forB.Rows)["_unread"]!.AsArray().Select(n => n!.ToString()));   // B's rules: unknown
     }
 
     [Fact]
     public void Partial_names_only_the_originals_unread_values()
     {
-        var merged = RunnerResult.Partial([Row(("A", null), ("B", null), ("\0unread", new JsonArray("A", "B")))], "r");
+        var merged = RunnerResult.Partial([Row(("A", null), ("B", null), ("_unread", new JsonArray("A", "B")))], "r");
 
         var split = Runner.Split(Q("a", "A,Z"), merged);
 
