@@ -19,6 +19,12 @@ a WinRM quota or an AD lockout policy that is a password spray. The design is in
   exceptions, each one more sign-in: a rule with its own `fallback_chain` opens one more CIM session per host
   (kept for the scan); an Azure SQL database that cannot be switched to gets its own connection; a SQL
   connection that breaks is signed in again once per scan, never twice.
+- **One session per host for the whole `keeper run`.** The systems a run scans through one integration share its
+  sign-in and its hosts' sessions: a Windows host read by the baseline, services and event-log systems is signed in
+  to once in the run, not once per system. A session idle more than 5 minutes is closed and signed in again (servers
+  drop idle connections), and so is one a read failed on. A host whose sign-in did not answer is not asked again by
+  the next system within those 5 minutes. Everything the run holds is ended after its last scan, before loading.
+  `keeper run --dry-run` still counts sign-ins per system, so it is an upper bound.
 - **A refused credential stops.** Wrong password, locked, expired or disabled account, an HTTP 401: the
   credential is not presented again - on any host, for the rest of the scan and of `keeper run`, and by later
   `keeper scan` commands too, through any integration that signs in as the same account: the refusal is kept in
@@ -100,6 +106,9 @@ docker packs as three separate `keeper scan` commands (8 queries):
 | wrong password: failed sign-ins | 4 in the first scan alone - account locked | 1 in all - not locked |
 | right password: sign-ins | 16 (two per query: ssh and sftp) | 6 (ssh once per scan, sftp once when files are read) |
 | right password: results | 15 rows, 2 findings | the same |
+
+The same three systems as one `keeper run --scan sshd,nginx,docker`, sessions shared across the run: 2 sign-ins
+(ssh and sftp, once each) with the same results; a wrong password: 1 failed sign-in, not locked.
 
 The lab is in `_claude-tmp/2026-11-13-keeper-lab` on the build machine (Dockerfile and `lab.sh`).
 

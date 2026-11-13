@@ -49,6 +49,7 @@ public sealed class SchedulerTests : IDisposable
         public ConcurrentQueue<string> Log { get; } = new();
         public int Opens => Log.Count(l => l.StartsWith("open ", StringComparison.Ordinal));
         public int Reads => Log.Count(l => l.StartsWith("read ", StringComparison.Ordinal));
+        public int Closes => Log.Count(l => l.StartsWith("close ", StringComparison.Ordinal));
         private int _inFlight;
         private readonly ConcurrentDictionary<string, int> _perHost = new();
         public int MaxInFlight { get; private set; }
@@ -62,14 +63,16 @@ public sealed class SchedulerTests : IDisposable
         public Task<RunnerResult> RunAsync(QuerySpec query, RunnerContext context, CancellationToken cancellationToken) =>
             throw new InvalidOperationException("a session runner is read over its session");
 
-        private sealed class Session(string host) : IRunnerSession
+        private sealed class Session(string host, ConcurrentQueue<string> log) : IRunnerSession
         {
             public string Host { get; } = host;
             public bool Closed { get; private set; }
 
             public ValueTask DisposeAsync()
             {
+                Assert.False(Closed);   // closed once, by whoever owns it
                 Closed = true;
+                log.Enqueue($"close {Host}");
                 return ValueTask.CompletedTask;
             }
         }
@@ -81,7 +84,7 @@ public sealed class SchedulerTests : IDisposable
             var kind = open(host);
             if (kind != FailureKind.None)
                 throw new RunnerFailureException($"{host}: sign-in failed ({kind})", kind);
-            return Task.FromResult<IRunnerSession>(new Session(host));
+            return Task.FromResult<IRunnerSession>(new Session(host, Log));
         }
 
         public async Task<RunnerResult> RunAsync(IRunnerSession session, QuerySpec query, RunnerContext context, CancellationToken cancellationToken)
@@ -140,7 +143,7 @@ public sealed class SchedulerTests : IDisposable
     }
 
     private async Task<ScanReport> Scan(SessionRunner runner, int queries, IReadOnlyList<string> hosts, PaceProfile? pace = null,
-        LogonGuard? guard = null, bool sharedPath = false, IConnection? connection = null)
+        LogonGuard? guard = null, bool sharedPath = false, IConnection? connection = null, RunSessions? sessions = null)
     {
         var registry = new RunnerRegistry([runner]);
         return await new Scanner(registry).RunAsync(new ScanRequest
@@ -151,6 +154,7 @@ public sealed class SchedulerTests : IDisposable
             ImportsDir = _dir,
             Pace = pace ?? PaceProfile.Unlimited,
             Guard = guard ?? new LogonGuard(),
+            Sessions = sessions,
         }, CancellationToken.None);
     }
 
@@ -171,6 +175,88 @@ public sealed class SchedulerTests : IDisposable
         Assert.Equal(120, runner.Reads);
         Assert.Equal(3, report.Cost.Sessions);
         Assert.Contains(report.Manifest.Notes, n => n.Contains("3 session(s) opened on 3 host(s)", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task The_systems_of_one_run_share_a_host_s_session()
+    {
+        var runner = new SessionRunner(_ => FailureKind.None);
+        var run = new RunSessions();
+
+        await Scan(runner, queries: 5, ThreeHosts, sessions: run);           // the baseline system
+        var second = await Scan(runner, queries: 5, ThreeHosts, sessions: run);   // the services system, same integration
+
+        Assert.Equal(3, runner.Opens);                       // one sign-in per host in the run, not per system (was 6)
+        Assert.Equal(30, runner.Reads);
+        Assert.Equal(0, runner.Closes);                      // the run keeps them until its scans are done
+        Assert.Equal(0, second.Cost.Sessions);
+        Assert.Equal(3, second.Cost.Reused);
+        Assert.Contains(second.Manifest.Notes, n => n.Contains("3 kept from this run's earlier scans", StringComparison.Ordinal));
+
+        await run.DisposeAsync();
+        Assert.Equal(3, runner.Closes);
+    }
+
+    [Fact]
+    public async Task A_scan_of_its_own_closes_its_sessions()
+    {
+        var runner = new SessionRunner(_ => FailureKind.None);
+
+        await Scan(runner, queries: 2, ThreeHosts);
+
+        Assert.Equal(3, runner.Closes);
+    }
+
+    [Fact]
+    public async Task A_session_idle_too_long_is_closed_and_signed_in_again()
+    {
+        var runner = new SessionRunner(_ => FailureKind.None);
+        var clock = new Settable();
+        await using var run = new RunSessions(clock) { MaxIdle = TimeSpan.FromMinutes(5) };
+
+        await Scan(runner, queries: 2, ["pc01.example.org"], sessions: run);
+        clock.Now += TimeSpan.FromMinutes(6);                 // a directory drops a connection idle this long
+        await Scan(runner, queries: 2, ["pc01.example.org"], sessions: run);
+
+        Assert.Equal(2, runner.Opens);
+        Assert.Equal(1, runner.Closes);                       // the stale one, before signing in again
+    }
+
+    [Fact]
+    public async Task A_session_a_read_failed_on_is_not_handed_to_the_next_system()
+    {
+        var calls = 0;
+        var runner = new SessionRunner(_ => FailureKind.None,
+            read: (_, _) => Interlocked.Increment(ref calls) == 1 ? RunnerResult.Failed("connection reset", FailureKind.Error) : null!);
+        await using var run = new RunSessions();
+
+        await Scan(runner, queries: 1, ["pc01.example.org"], sessions: run);
+        await Scan(runner, queries: 1, ["pc01.example.org"], sessions: run);
+
+        Assert.Equal(2, runner.Opens);
+        Assert.Equal(1, runner.Closes);
+    }
+
+    [Fact]
+    public async Task A_host_that_did_not_answer_is_not_asked_again_by_every_system()
+    {
+        var runner = new SessionRunner(host => host.StartsWith("pc02", StringComparison.Ordinal) ? FailureKind.Unreachable : FailureKind.None);
+        await using var run = new RunSessions();
+
+        await Scan(runner, queries: 2, ThreeHosts, sessions: run);
+        var second = await Scan(runner, queries: 2, ThreeHosts, sessions: run);
+
+        Assert.Equal(3, runner.Opens);                       // pc02 once in the run
+        var pc02 = Coverage(second).Where(c => c.Scope == "target" && c.Item.Contains("pc02", StringComparison.Ordinal)).ToList();
+        Assert.NotEmpty(pc02);
+        Assert.All(pc02, c => Assert.Equal("failed", c.State));   // still a failed read, never empty
+    }
+
+    private sealed class Settable : TimeProvider
+    {
+        public DateTimeOffset Now { get; set; } = DateTimeOffset.UnixEpoch;
+
+        public override DateTimeOffset GetUtcNow() => Now;
     }
 
     [Fact]

@@ -80,7 +80,22 @@ public static class RunVerb
             // Rules over the store (Keeper's own health, cross-system checks) read what the other scans
             // found, so those scans are loaded first. A failed scan does not stop the run - the rest still count;
             // a stage the next one depends on does.
-            Scan(external, [.. passSettings, .. scanFlags], problems);
+            // The systems scanned through one integration share its sign-in and its hosts' sessions: a Windows host the
+            // baseline, services and event-log systems all read is signed in to once in the run, not once per system.
+            // They are ended here, before loading - nothing is left signed in through load, track and rank.
+            var shared = new RunSessions();
+            RunSessions.Current = shared;
+            try
+            {
+                Scan(external, [.. passSettings, .. scanFlags], problems);
+            }
+            finally
+            {
+                RunSessions.Current = null;
+                shared.DisposeAsync().AsTask().GetAwaiter().GetResult();
+                if (shared.Reused > 0)
+                    Console.WriteLine($"Sessions reused across systems: {shared.Reused} sign-in(s) not repeated.");
+            }
             Console.WriteLine();
             if (!Stage("load", [.. passSettings], problems, tolerateNoData: true)
                 || !Stage("qm", ["run", .. passSettings], problems))

@@ -83,7 +83,14 @@ public static class ScanVerb
 
                 var test = cli.Has("test");
                 var runsDir = test ? Path.Combine(paths.DataDir, "tmp", "test-" + Iso.Stamp(DateTimeOffset.UtcNow)) : paths.Runs;
-                using var link = new IntegrationConnection(record, vault) { FreshSignIn = cli.Has("fresh-sign-in") };
+                // Inside 'keeper run' the integration's connection (its token, its signed-in vCenter session) and the
+                // hosts' sessions are the run's: the next system through this integration reuses them, and the run ends
+                // them. A connection test and a plan stay on their own.
+                var run = test || cli.Has("plan") ? null : RunSessions.Current;
+                var fresh = cli.Has("fresh-sign-in");
+                var shared = run?.Shared("integration:" + record.Id, () => new IntegrationConnection(record, vault) { FreshSignIn = fresh }, EndAsync);
+                using var own = shared is null ? new IntegrationConnection(record, vault) { FreshSignIn = fresh } : null;
+                var link = shared ?? own!;
                 var scanner = new Scanner(Keeper.Scan.Runners.Registry());
                 var started = DateTimeOffset.UtcNow;
                 var request = new ScanRequest
@@ -108,6 +115,7 @@ public static class ScanVerb
                     Guard = LogonGuard.Process,
                     TargetLimit = test ? 1 : null,
                     Log = message => Console.Error.WriteLine($"  {Redactor.Clean(message)}"),
+                    Sessions = run,
                 };
                 if (cli.Has("plan"))
                 {
@@ -151,17 +159,9 @@ public static class ScanVerb
                 {
                     request.Guard.OnRefused = null;
                     // vCenter and session-login products cap open sessions: the scan's is ended, not left to time out.
-                    // Best effort: the run is written by now, and a sign-out that fails must not replace its result.
-                    try
-                    {
-                        await link.SignOutAsync(CancellationToken.None);
-                    }
-#pragma warning disable CA1031 // Ending the session is a courtesy; its failure is said and the scan's own result stands.
-                    catch (Exception ex)
-#pragma warning restore CA1031
-                    {
-                        Console.Error.WriteLine($"  warning: the session was not ended ({Redactor.Clean(ex.Message)}); it ends at its idle timeout");
-                    }
+                    // Inside 'keeper run' the run ends it after its last scan.
+                    if (own is not null)
+                        await SignOutAsync(own);
                 }
                 // A credential that read data in this scan and was not refused works: an old record of it is gone.
                 if (LogonGuard.PresentsSecret(link) && request.Guard.Refusal(link) is null && request.Guard.Proven(link))
@@ -209,6 +209,31 @@ public static class ScanVerb
             Console.Error.WriteLine(Redactor.Clean(ex.Message));
             return ExitCodes.Failed;
         }
+    }
+
+    /// <summary>
+    /// Ends an integration's signed-in session. Best effort: the run is written by now, and a sign-out that fails must
+    /// not replace its result.
+    /// </summary>
+    private static async Task SignOutAsync(IntegrationConnection link)
+    {
+        try
+        {
+            await link.SignOutAsync(CancellationToken.None);
+        }
+#pragma warning disable CA1031 // Ending the session is a courtesy; its failure is said and the scan's own result stands.
+        catch (Exception ex)
+#pragma warning restore CA1031
+        {
+            Console.Error.WriteLine($"  warning: the session of {link.Instance} was not ended ({Redactor.Clean(ex.Message)}); it ends at its idle timeout");
+        }
+    }
+
+    /// <summary>The end of a connection the run kept: signed out, then released.</summary>
+    private static async ValueTask EndAsync(IntegrationConnection link)
+    {
+        await SignOutAsync(link);
+        link.Dispose();
     }
 
     /// <summary>

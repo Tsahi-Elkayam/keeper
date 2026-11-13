@@ -67,6 +67,12 @@ public sealed record ScanRequest
     public LogonGuard Guard { get; init; } = new();
 
     public Action<string> Log { get; init; } = _ => { };
+
+    /// <summary>
+    /// The sessions the <c>keeper run</c> around this scan shares between its scans: taken from it before signing in,
+    /// handed back instead of closed. Null for a scan of its own: its sessions close when its hosts are done.
+    /// </summary>
+    public RunSessions? Sessions { get; init; }
 }
 
 /// <summary>What a scan would cost one host.</summary>
@@ -77,7 +83,7 @@ public sealed record ScanPlan(PaceProfile Pace, IReadOnlyList<HostPlan> Hosts, i
     TimeSpan Time, IReadOnlyList<string> Problems);
 
 /// <summary>What the scan cost the estate: sessions (logons) opened, per host.</summary>
-public sealed record ScanCost(int Sessions, int Hosts, int Reads, int MergedAway);
+public sealed record ScanCost(int Sessions, int Hosts, int Reads, int MergedAway, int Reused = 0);
 
 public sealed record ScanReport(RunManifest Manifest, int Rules, int Queries, int Rows, int Findings, int FailedQueries)
 {
@@ -344,6 +350,7 @@ public sealed class Scanner(RunnerRegistry registry, TimeProvider? clock = null)
         var merged = Merge(reads);
         var results = new System.Collections.Concurrent.ConcurrentDictionary<(string Id, string? Target), RunnerResult>();
         var sessions = 0;
+        var reused = 0;
         var lanes = merged.GroupBy(r => r.Lane, StringComparer.OrdinalIgnoreCase).ToList();
         using var gate = new SemaphoreSlim(Math.Max(1, profile.Hosts));
         await Task.WhenAll(lanes.Select(async lane =>
@@ -351,8 +358,9 @@ public sealed class Scanner(RunnerRegistry registry, TimeProvider? clock = null)
             await gate.WaitAsync(cancellationToken).ConfigureAwait(false);
             try
             {
-                var opened = await ReadLane(lane.Key.Length == 0 ? endpointHost : lane.Key, [.. lane], request, pacer, results, cancellationToken).ConfigureAwait(false);
+                var (opened, taken) = await ReadLane(lane.Key.Length == 0 ? endpointHost : lane.Key, [.. lane], request, pacer, results, cancellationToken).ConfigureAwait(false);
                 Interlocked.Add(ref sessions, opened);
+                Interlocked.Add(ref reused, taken);
             }
             finally
             {
@@ -375,12 +383,13 @@ public sealed class Scanner(RunnerRegistry registry, TimeProvider? clock = null)
         var remote = reads.Any(r => r.Runner.IsRemote(connection));
         if (remote)
             notes.Add($"pace: {profile}; {sessions} session(s) opened on {lanes.Count} host(s) for {merged.Count} read(s)" +
+                      (reused > 0 ? $", {reused} kept from this run's earlier scans" : "") +
                       (reads.Count > merged.Count ? $" ({reads.Count - merged.Count} merged into others)" : ""));
         foreach (var (host, signals, stopped) in pacer.PushedBack())
             notes.Add(stopped ? pacer.Stopped(host)! : $"{host} pushed back {signals} time(s); Keeper slowed down for it");
         if (request.Guard.Refusal(connection) is { } refusal)
             notes.Add(refusal);
-        return (outcomes, new ScanCost(sessions, lanes.Count, merged.Count, reads.Count - merged.Count), notes);
+        return (outcomes, new ScanCost(sessions, lanes.Count, merged.Count, reads.Count - merged.Count, reused), notes);
     }
 
     private static PaceProfile Profile(ScanRequest request) =>
@@ -551,14 +560,20 @@ public sealed class Scanner(RunnerRegistry registry, TimeProvider? clock = null)
         return result;
     }
 
-    /// <summary>One host's reads, one at a time; its sessions are closed when they are done. Returns the sessions opened.</summary>
-    private async Task<int> ReadLane(string host, List<Read> reads, ScanRequest request, Pacer pacer,
+    /// <summary>
+    /// One host's reads, one at a time; its sessions are closed when they are done, or handed back to the run's
+    /// <see cref="ScanRequest.Sessions"/>. Returns the sessions opened and the sessions taken from the run.
+    /// </summary>
+    private async Task<(int Opened, int Taken)> ReadLane(string host, List<Read> reads, ScanRequest request, Pacer pacer,
         System.Collections.Concurrent.ConcurrentDictionary<(string Id, string? Target), RunnerResult> results, CancellationToken cancellationToken)
     {
         var connection = request.Connection;
         var pace = pacer.For(host);
         var sessions = new Dictionary<string, (IRunnerSession? Session, RunnerResult? Failure)>(StringComparer.Ordinal);
+        var unhealthy = new HashSet<string>(StringComparer.Ordinal);   // families a read failed on: not handed on
+        var fromRun = new HashSet<string>(StringComparer.Ordinal);     // failures an earlier scan met: already learned from
         var opened = 0;
+        var taken = 0;
         string? deniedHere = null;
         try
         {
@@ -595,12 +610,24 @@ public sealed class Scanner(RunnerRegistry registry, TimeProvider? clock = null)
                         }
                         else if (read.Runner is ISessionRunner sessionRunner)
                         {
-                            var isNew = !sessions.TryGetValue(sessionRunner.SessionFamily, out var session);
-                            if (isNew)
+                            var family = sessionRunner.SessionFamily;
+                            var isNew = !sessions.TryGetValue(family, out var session);
+                            if (isNew && request.Sessions is { } run
+                                && await run.TakeAsync(connection, host, family).ConfigureAwait(false) is { } kept)
+                            {
+                                // An earlier scan of this run signed in here (or met this failure): no new sign-in.
+                                session = kept;
+                                sessions[family] = session;
+                                taken++;
+                                if (kept.Failure is not null)
+                                    fromRun.Add(family);
+                                isNew = false;
+                            }
+                            else if (isNew)
                             {
                                 await pacer.WaitSessionAsync(cancellationToken).ConfigureAwait(false);
                                 session = await Open(sessionRunner, context, cancellationToken).ConfigureAwait(false);
-                                sessions[sessionRunner.SessionFamily] = session;
+                                sessions[family] = session;
                                 opened++;
                             }
                             if (session.Failure is { } failedOpen)
@@ -614,6 +641,8 @@ public sealed class Scanner(RunnerRegistry registry, TimeProvider? clock = null)
                             {
                                 await pacer.WaitAsync(host, cancellationToken).ConfigureAwait(false);   // the scanner checked Stopped before this read
                                 result = await Safe(read.Runner.Protocol, () => sessionRunner.RunAsync(session.Session!, read.Query, context, cancellationToken), cancellationToken).ConfigureAwait(false);
+                                if (result.Failure is FailureKind.Unreachable or FailureKind.Throttled or FailureKind.Timeout or FailureKind.Error)
+                                    unhealthy.Add(family);
                             }
                         }
                         else
@@ -637,6 +666,17 @@ public sealed class Scanner(RunnerRegistry registry, TimeProvider? clock = null)
         }
         finally
         {
+            if (request.Sessions is { } run)
+            {
+                // Handed back, not closed: the run's next scan through this integration reads this host over them. A
+                // failure an earlier scan met is still in the run; a session a read failed on is closed by the run.
+                foreach (var (family, (session, failure)) in sessions)
+                {
+                    if (!fromRun.Contains(family))
+                        await run.ReturnAsync(connection, host, family, session, failure, healthy: !unhealthy.Contains(family)).ConfigureAwait(false);
+                }
+                sessions.Clear();
+            }
             foreach (var (session, _) in sessions.Values)
             {
                 if (session is null)
@@ -652,7 +692,7 @@ public sealed class Scanner(RunnerRegistry registry, TimeProvider? clock = null)
                 }
             }
         }
-        return opened;
+        return (opened, taken);
     }
 
     /// <summary>One sign-in at a time while the credential is unproven.</summary>

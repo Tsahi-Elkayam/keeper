@@ -261,9 +261,21 @@ override satisfies every required setting. (All done: sections 10 and 11.)
 - Not covered by tests: the LDAP range cap needs a directory server; a registry `_unread` that is not merged runs
   on Windows only. The B6 note shows in every scan of an AD estate with computer objects that never signed in.
 
+### 13. Sessions shared across one `keeper run` (2026-11-13)
+
+- `RunSessions` (Keeper.Scan): `keeper run` sets `RunSessions.Current` around its external scans and disposes it
+  before `load`. `keeper scan` inside it takes the integration's connection from it (`Shared`, keyed by integration
+  id; the run signs it out at the end) and passes it as `ScanRequest.Sessions`.
+- A lane takes a session for (integration, host, family) from the run before opening one, and hands its sessions
+  back instead of closing them. A session is taken out while in use, so two lanes never share one.
+- Closed instead of reused: idle more than `MaxIdle` (5 min), or a read over it failed with Unreachable, Throttled,
+  Timeout or Error. A failed sign-in is remembered for `MaxIdle` and given to the next system as its failure,
+  without a new attempt and without being learned from again.
+- Not shared: a connection test and a plan; a scan run on its own closes its sessions and signs out as before.
+
 ## Not in this change
 
-Sharing sessions across the systems of one `keeper run`; scan windows (only at night); reading the account's lockout policy
+Scan windows (only at night); reading the account's lockout policy
 before scanning; moving integration types from code to data. Recorded as follow-ups.
 
 ## Tests
