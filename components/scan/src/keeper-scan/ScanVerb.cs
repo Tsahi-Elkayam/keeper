@@ -5,6 +5,7 @@ using Keeper.Integrations;
 using Keeper.Queue;
 using Keeper.Review;
 using Keeper.Rules;
+using Keeper.Runners;
 using Keeper.Scan;
 using Keeper.Store;
 using Keeper.Vault;
@@ -20,18 +21,30 @@ public static class ScanVerb
     {
         try
         {
-            var cli = new CliArgs(args, flags: ["test", "list", "fresh-sign-in"]);
+            var cli = new CliArgs(args, flags: ["test", "list", "fresh-sign-in", "plan", "retry-sign-in"]);
             if (cli.Help)
                 return CliUsage.Print("""
                     keeper scan - run one system's rules through its integration and write a run folder (read-only towards the system)
 
                       keeper scan --list                    the systems there are rules for, and the integration each needs
                       keeper scan <system>                  scan it through its enabled integration
-                      keeper scan <system> --test           connection test: the first rule only, no run kept; the result is
-                                                            recorded on the integration ('keeper integrations' shows it)
+                      keeper scan <system> --test           connection test: the first rule on the first host only, no run kept;
+                                                            the result is recorded on the integration ('keeper integrations' shows it)
+                      keeper scan <system> --plan           what the scan would cost each host (reads, sign-ins, time at the
+                                                            pace) - nothing is sent anywhere
                         --integration <id>   which one, when there are several of the type
                         --fresh-sign-in      take a new token (Entra): right after activating a PIM role, so the role is in it
-                        --timeout 60         seconds per request     --parallel 8   requests at once
+                        --timeout 60         seconds per request
+                        --pace gentle        how hard to read: gentle (default: 4 hosts at once, 1 new session/s, 10 requests/s
+                                             per host), normal or fast; the integration option 'pace' sets it per integration,
+                                             and pace.hosts / pace.sessionsPerSecond / pace.requestsPerSecond / pace.stopAfter
+                                             change one number of it
+                        --parallel <n>       hosts at once (overrides the pace's)
+                        --retry-sign-in      sign in again although this credential was refused before (after the
+                                             account was unlocked); setting the secret again does the same
+                    Keeper opens one session per host and reuses it, slows down for a host that pushes back (timeouts, 429/503,
+                    busy) and stops reading it after a few times, and never presents a credential again after it was refused -
+                    for the rest of the scan and of 'keeper run' - so an account is not locked out.
                     """, asked: true);
             var (_, paths) = KeeperContext.Load(cli);
             var rules = RuleSources.Load(paths.TenantRules);
@@ -89,13 +102,40 @@ public static class ScanVerb
                     PreviousRows = test ? _ => null : item => previous.GetValueOrDefault(item),
                     LastCleanRows = test ? _ => new Dictionary<string, CleanRead>() : query => inputs.LastCleanRows(record.Id, systemName, query),
                     Timeout = TimeSpan.FromSeconds(int.TryParse(cli.Get("timeout"), NumberStyles.None, CultureInfo.InvariantCulture, out var t) ? t : 60),
-                    Parallelism = int.TryParse(cli.Get("parallel"), NumberStyles.None, CultureInfo.InvariantCulture, out var p) ? p : 8,
+                    Pace = PaceProfile.From(record.Options, cli.Get("pace")),
+                    Parallelism = int.TryParse(cli.Get("parallel"), NumberStyles.None, CultureInfo.InvariantCulture, out var p) ? p : null,
+                    Guard = LogonGuard.Process,
+                    TargetLimit = test ? 1 : null,
                     Log = message => Console.Error.WriteLine($"  {Redactor.Clean(message)}"),
                 };
+                if (cli.Has("plan"))
+                {
+                    PrintPlan(systemName, record.Id, scanner.Plan(request));
+                    return ExitCodes.Ok;
+                }
                 Directory.CreateDirectory(runsDir);
+
+                // A refusal outlives the process: separate scans must not each present a refused password once more.
+                var refusals = new SignInRefusals(Path.Combine(paths.DataDir, "state", "sign-in-refusals.json"));
+                var credential = SignInRefusals.Fingerprint(record.Id, record.Identity, record.Endpoint, record.AuthKind,
+                    record.Secrets.Values.Select(v => $"{v.Name}={v.SetAt}"));
+                if (cli.Has("retry-sign-in"))
+                    refusals.Clear(link);
+                else if (refusals.Find(link, credential) is { } recorded)
+                    request.Guard.Restore(link, recorded);
+                // Kept the moment it happens: a scan stopped half-way (Ctrl-C, a crash) must not forget it.
+                request.Guard.OnRefused = (refusedConnection, text) =>
+                {
+                    if (refusedConnection.Instance == link.Instance && refusals.Find(link, credential) is null)
+                        refusals.Record(link, credential, text, DateTimeOffset.UtcNow);
+                };
 
                 Console.WriteLine($"Scanning {systemName} through {record.Id} ({record.Type}){(test ? " - connection test" : "")}...");
                 var report = await scanner.RunAsync(request, CancellationToken.None);
+                request.Guard.OnRefused = null;
+                // A credential that read data in this scan and was not refused works: an old record of it is gone.
+                if (request.Guard.Refusal(link) is null && request.Guard.Proven(link))
+                    refusals.Clear(link);
 
                 Console.WriteLine($"{report.Manifest.Status}: {report.Rules} rules, {report.Queries} queries, {report.Rows} rows, " +
                                   $"{report.Findings} findings, {report.FailedQueries} failed queries." +
@@ -140,4 +180,21 @@ public static class ScanVerb
             return ExitCodes.Failed;
         }
     }
+
+    private static void PrintPlan(string system, string integration, ScanPlan plan)
+    {
+        Console.WriteLine($"Plan for {system} through {integration} - nothing was sent.");
+        Console.WriteLine($"  pace: {plan.Pace}");
+        Console.WriteLine($"  {plan.Queries} queries -> {plan.UnmergedReads} reads on {plan.Hosts.Count} host(s); {plan.Reads} after merging; " +
+                          $"{plan.Sessions} sign-in(s) in all; at least {Duration(plan.Time)}");
+        foreach (var host in plan.Hosts.Take(50))
+            Console.WriteLine($"  {host.Host,-40} {host.Queries,5} queries {host.Reads,5} reads {host.Sessions,2} sign-in(s)  {Duration(host.Time)}");
+        if (plan.Hosts.Count > 50)
+            Console.WriteLine($"  ... and {plan.Hosts.Count - 50} more hosts");
+        foreach (var problem in plan.Problems.Take(10))
+            Console.WriteLine($"  will fail: {problem}");
+    }
+
+    private static string Duration(TimeSpan time) =>
+        time.TotalHours >= 1 ? $"{time.TotalHours:0.#} h" : time.TotalMinutes >= 1 ? $"{time.TotalMinutes:0.#} min" : $"{time.TotalSeconds:0} s";
 }

@@ -7,11 +7,17 @@ namespace Keeper.Runners;
 /// <summary>What one query returned: rows, and whether the runner could see everything it asked for.</summary>
 public sealed record RunnerResult(IReadOnlyList<JsonObject> Rows, string State, string? Reason)
 {
+    /// <summary>For a failed read: what kind of failure, so the scan can slow down, skip a host or stop using a credential.</summary>
+    public FailureKind Failure { get; init; }
+
     public static RunnerResult Ok(IReadOnlyList<JsonObject> rows) => new(rows, "ok", null);
 
     public static RunnerResult Partial(IReadOnlyList<JsonObject> rows, string reason) => new(rows, "partial", reason);
 
-    public static RunnerResult Failed(string reason) => new([], "failed", reason);
+    public static RunnerResult Failed(string reason, FailureKind failure = FailureKind.Error) => new([], "failed", reason) { Failure = failure };
+
+    /// <summary>A failed read whose kind is read from the exception that caused it.</summary>
+    public static RunnerResult Failed(string reason, Exception cause) => Failed(reason, Failures.Classify(cause));
 
     /// <summary>The note on an ok answer that was a 404 under missing: empty; for_each counts them.</summary>
     public const string NotFound = "not found (404)";
@@ -110,6 +116,9 @@ public sealed record RunnerContext(
 {
     /// <summary>A tenant threshold by name (setting threshold.&lt;name&gt;), for requests that name one: {DAYS_AGO:threshold.x|90}.</summary>
     public Func<string, string?> Threshold { get; init; } = _ => null;
+
+    /// <summary>The host's pace: await it before each network request, and signal what answers said. No pacing outside a scan.</summary>
+    public IPace Pace { get; init; } = NoPace.Instance;
 }
 
 /// <summary>A read-only way to get rows from one kind of system. Runners never write.</summary>
@@ -122,6 +131,9 @@ public interface IRunner
 
     /// <summary>Whether a query through this integration reads one host at a time; usually what <see cref="PerTarget"/> says.</summary>
     bool IsPerTarget(IConnection connection) => PerTarget;
+
+    /// <summary>Whether a query through this integration goes over the network, so the scan's pace applies. False for local files and the store.</summary>
+    bool IsRemote(IConnection connection) => true;
 
     /// <summary>Checks a query's protocol-specific fields when the rule file is loaded.</summary>
     IEnumerable<string> Validate(QuerySpec query);

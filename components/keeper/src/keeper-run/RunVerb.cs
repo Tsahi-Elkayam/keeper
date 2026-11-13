@@ -16,7 +16,7 @@ public static class RunVerb
     {
         try
         {
-            var cli = new CliArgs(args, flags: ["scan-all", "no-scan", "dry-run", "fresh-sign-in", "discover"]);
+            var cli = new CliArgs(args, flags: ["scan-all", "no-scan", "dry-run", "fresh-sign-in", "discover", "retry-sign-in"]);
             if (cli.Help)
                 return CliUsage.Print("""
                     keeper run - the daily pipeline: load rules, scan, load, track, rank, then today's list
@@ -25,12 +25,16 @@ public static class RunVerb
                       keeper run --discover           run 'keeper discover' first (when settings\discovery.yaml exists), then scan
                       keeper run --scan entra,intune  only these systems; each needs an enabled integration
                       keeper run --no-scan            no scans: load, track and rank what is already there
-                      keeper run --dry-run            show which scans would run, and run nothing
+                      keeper run --dry-run            show which scans would run and what each would cost every host, and run nothing
                       keeper run --fresh-sign-in      new Entra tokens for every scan: right after activating a PIM role
+                      keeper run --pace gentle        how hard every scan reads (gentle, normal, fast; see 'keeper scan --help')
+                      keeper run --retry-sign-in      sign in again with credentials refused before (after an account was unlocked)
                     """, asked: true);
             var (_, paths) = KeeperContext.Load(cli);
             var passSettings = cli.Get("settings") is { } s ? new[] { "--settings", Path.GetFullPath(s) } : [];
-            string[] scanFlags = cli.Has("fresh-sign-in") ? ["--fresh-sign-in"] : [];
+            string[] scanFlags = [.. cli.Has("fresh-sign-in") ? ["--fresh-sign-in"] : Array.Empty<string>(),
+                .. cli.Has("retry-sign-in") ? ["--retry-sign-in"] : Array.Empty<string>(),
+                .. cli.Get("pace") is { } pace ? ["--pace", pace] : Array.Empty<string>()];
             var build = Iso.Stamp(DateTimeOffset.UtcNow);
 
             var scans = cli.Has("no-scan") ? [] : Plan(paths, cli);
@@ -41,6 +45,15 @@ public static class RunVerb
                 : $"Scans: {string.Join(", ", scans.Select(p => p.Integration is null ? p.System : $"{p.System} via {p.Integration}"))}");
             if (cli.Has("dry-run"))
             {
+                // What each scan would cost the estate, read from the rules and the store only: nothing is sent.
+                foreach (var (system, integration, _) in external)
+                {
+                    Console.WriteLine();
+                    Commands.Run("scan", integration is null
+                        ? [system, "--plan", .. passSettings, .. scanFlags]
+                        : [system, "--integration", integration, "--plan", .. passSettings, .. scanFlags]);
+                }
+                Console.WriteLine();
                 Console.WriteLine("Dry run: then load, track, rank and today. Nothing ran.");
                 return ExitCodes.Ok;
             }

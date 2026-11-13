@@ -155,6 +155,8 @@ public static class CertsVerb
                 ImportsDir = paths?.Imports ?? runsDir,
                 StoreFile = paths?.Database,
                 Timeout = timeout,
+                // Handshakes with no credential: the normal pace, with as many hosts at once as asked.
+                Pace = Keeper.Runners.PaceProfile.Normal,
                 Parallelism = parallel,
             }, CancellationToken.None);
         }

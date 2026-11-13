@@ -46,11 +46,39 @@ public sealed record ScanRequest
     public Func<string, IReadOnlyDictionary<string, CleanRead>> LastCleanRows { get; init; } = _ => new Dictionary<string, CleanRead>();
 
     public TimeSpan Timeout { get; init; } = TimeSpan.FromSeconds(60);
-    public int Parallelism { get; init; } = 8;
+
+    /// <summary>
+    /// How hard the estate is read: hosts at once, new sessions per second, requests per second per host, when to stop a
+    /// host. Unlimited unless set - the verbs always set it (<c>keeper scan</c>: the integration's profile, gentle by default).
+    /// </summary>
+    public PaceProfile Pace { get; init; } = PaceProfile.Unlimited;
+
+    /// <summary>Hosts read at once, when set: overrides the pace profile's (the old --parallel).</summary>
+    public int? Parallelism { get; init; }
+
+    /// <summary>Read at most this many hosts per query (a connection test reads one), or every host when null.</summary>
+    public int? TargetLimit { get; init; }
+
+    /// <summary>Credentials refused so far. <see cref="LogonGuard.Process"/> in the binary, so a refusal holds for every system of a run.</summary>
+    public LogonGuard Guard { get; init; } = new();
+
     public Action<string> Log { get; init; } = _ => { };
 }
 
-public sealed record ScanReport(RunManifest Manifest, int Rules, int Queries, int Rows, int Findings, int FailedQueries);
+/// <summary>What a scan would cost one host.</summary>
+public sealed record HostPlan(string Host, int Queries, int Reads, int Sessions, TimeSpan Time);
+
+/// <summary>What a scan would cost the estate, before it runs.</summary>
+public sealed record ScanPlan(PaceProfile Pace, IReadOnlyList<HostPlan> Hosts, int Queries, int UnmergedReads, int Reads, int Sessions,
+    TimeSpan Time, IReadOnlyList<string> Problems);
+
+/// <summary>What the scan cost the estate: sessions (logons) opened, per host.</summary>
+public sealed record ScanCost(int Sessions, int Hosts, int Reads, int MergedAway);
+
+public sealed record ScanReport(RunManifest Manifest, int Rules, int Queries, int Rows, int Findings, int FailedQueries)
+{
+    public ScanCost Cost { get; init; } = new(0, 0, 0, 0);
+}
 
 /// <summary>
 /// Runs one system's rules through one integration: every distinct query once (per target for per-host
@@ -89,10 +117,11 @@ public sealed class Scanner(RunnerRegistry registry, TimeProvider? clock = null)
             System.Globalization.CultureInfo.InvariantCulture, out var confirm) && confirm >= 1 ? confirm : DefaultDropConfirmScans;
         var confirmAge = TimeSpan.FromDays(double.TryParse(request.Threshold("scan.drop-confirm-days"), System.Globalization.NumberStyles.Float,
             System.Globalization.CultureInfo.InvariantCulture, out var days) && days >= 0 ? days : DefaultDropConfirmDays);
+        var (fetched, cost, paceNotes) = await FetchAll(queries, request, cancellationToken).ConfigureAwait(false);
         foreach (var group in queries)
         {
-            var (rule, file) = group.First();
-            var outcome = await RunQuery(rule.Query, file, request, cancellationToken).ConfigureAwait(false);
+            var (rule, _) = group.First();
+            var outcome = fetched[group.Key];
             // Keeper's own store and other tools' files cannot lose sight of rows, so only their min_rows applies.
             var dropCheck = rule.Query.Protocol is not ("store" or "file");
             Distrust(outcome, group.Key, group.Max(g => g.Rule.Query.MinRows), dropCheck ? request.PreviousRows : _ => null, dropRatio,
@@ -153,9 +182,10 @@ public sealed class Scanner(RunnerRegistry registry, TimeProvider? clock = null)
 
         var states = outcomes.Values.Select(o => o.State).ToList();
         var status = states.All(s => s == "ok") ? "ok" : states.Any(s => s is "ok" or "partial") ? "partial" : "failed";
+        notes.AddRange(paceNotes);
         var manifest = run.Complete(status, _clock.GetUtcNow(), request.Connection.SignedInAs ?? request.Connection.Identity, notes);
         return new ScanReport(manifest, rules.Count, queries.Count, outcomes.Values.Sum(o => o.Rows.Count), findings,
-            states.Count(s => s == "failed"));
+            states.Count(s => s == "failed")) { Cost = cost };
     }
 
     /// <summary>A read that returns less than this share of its last clean read's rows is not trusted yet.</summary>
@@ -259,54 +289,364 @@ public sealed class Scanner(RunnerRegistry registry, TimeProvider? clock = null)
         public string? Reason => string.Join("; ", Targets.Where(t => t.Reason is not null).Select(t => t.Target is null ? t.Reason : $"{t.Target}: {t.Reason}").Take(5));
     }
 
-    private async Task<QueryOutcome> RunQuery(QuerySpec query, RuleFile file, ScanRequest request, CancellationToken cancellationToken)
+    /// <summary>One read the scan makes: one query (or several merged into one) on one host - or on the integration's endpoint.</summary>
+    private sealed record Read(IReadOnlyList<(string Id, QuerySpec Query, string? Target)> Members, QuerySpec Query, IRunner Runner, string? Target, string Lane);
+
+    /// <summary>
+    /// Reads every query of the scan, host by host: up to the pace's number of hosts at once; on one host one read at a
+    /// time over one session per runner family; a host that pushes back is slowed and then stopped; a refused credential
+    /// is never presented again. The outcomes are then assembled per query - groups in order, hosts in list order -
+    /// exactly as reading query by query gave them.
+    /// </summary>
+    private async Task<(Dictionary<string, QueryOutcome> Outcomes, ScanCost Cost, List<string> Notes)> FetchAll(
+        List<IGrouping<string, (Rule Rule, RuleFile File)>> queries, ScanRequest request, CancellationToken cancellationToken)
     {
-        var runner = registry.Get(query.Protocol);
-        var outcome = new QueryOutcome([], []);
+        var connection = request.Connection;
+        var profile = Profile(request);
+        var pacer = new Pacer(profile, _clock);
+        var endpointHost = EndpointHost(connection.Endpoint);
+        var (outcomes, plans, reads) = BuildPlan(queries, request);
 
-        if (!runner.IsPerTarget(request.Connection))
-        {
-            var result = await Safe(runner, query, Context(request, null), cancellationToken).ConfigureAwait(false);
-            outcome.Rows.AddRange(result.Rows.Select(r => (r, (string?)null)));
-            outcome.Targets.Add(new TargetOutcome(null, result.State, result.Reason, result.Rows.Count));
-            return outcome;
-        }
-
-        var (targets, targetsProblem) = ResolveTargets(file, request);
-        if (targets.Count == 0)
-        {
-            outcome.Targets.Add(new TargetOutcome(null, "failed", targetsProblem ?? "no targets: set the file's targets or the integration's targets option (or targetsFrom=discovery)", 0));
-            return outcome;
-        }
-        // Discovery supplied the list and it may be short: said, so the scan is partial and not quietly smaller.
-        if (targetsProblem is not null)
-            outcome.Targets.Add(new TargetOutcome(null, "partial", targetsProblem, 0));
-        // A query-wide record beside the hosts' own: it tells the tracker that a host missing from this read may
-        // simply be missing from the list, not retired.
-        if (file.Targets is { List.Count: 0 } spec && request.Connection.Options["targets"] is not JsonArray && request.TargetsIncomplete(spec) is { } incomplete)
-            outcome.Targets.Add(new TargetOutcome(null, "partial", incomplete, 0));
-
-        using var gate = new SemaphoreSlim(Math.Max(1, request.Parallelism));
-        var tasks = targets.Select(async target =>
+        var merged = Merge(reads);
+        var results = new System.Collections.Concurrent.ConcurrentDictionary<(string Id, string? Target), RunnerResult>();
+        var sessions = 0;
+        var lanes = merged.GroupBy(r => r.Lane, StringComparer.OrdinalIgnoreCase).ToList();
+        using var gate = new SemaphoreSlim(Math.Max(1, profile.Hosts));
+        await Task.WhenAll(lanes.Select(async lane =>
         {
             await gate.WaitAsync(cancellationToken).ConfigureAwait(false);
             try
             {
-                return (Target: target, Result: await Safe(runner, query, Context(request, target), cancellationToken).ConfigureAwait(false));
+                var opened = await ReadLane(lane.Key.Length == 0 ? endpointHost : lane.Key, [.. lane], request, pacer, results, cancellationToken).ConfigureAwait(false);
+                Interlocked.Add(ref sessions, opened);
             }
             finally
             {
                 gate.Release();
             }
-        }).ToList();
+        })).ConfigureAwait(false);
 
-        foreach (var (target, result) in await Task.WhenAll(tasks).ConfigureAwait(false))
+        foreach (var (id, targets) in plans)
         {
-            outcome.Rows.AddRange(result.Rows.Select(r => (r, (string?)target)));
-            outcome.Targets.Add(new TargetOutcome(target, result.State, result.Reason, result.Rows.Count));
+            var outcome = outcomes[id];
+            foreach (var target in targets)
+            {
+                var result = results[(id, target)];
+                outcome.Rows.AddRange(result.Rows.Select(r => (r, target)));
+                outcome.Targets.Add(new TargetOutcome(target, result.State, result.Reason, result.Rows.Count));
+            }
         }
-        return outcome;
+
+        var notes = new List<string>();
+        var remote = reads.Any(r => r.Runner.IsRemote(connection));
+        if (remote)
+            notes.Add($"pace: {profile}; {sessions} session(s) opened on {lanes.Count} host(s) for {merged.Count} read(s)" +
+                      (reads.Count > merged.Count ? $" ({reads.Count - merged.Count} merged into others)" : ""));
+        foreach (var (host, signals, stopped) in pacer.PushedBack())
+            notes.Add(stopped ? pacer.Stopped(host)! : $"{host} pushed back {signals} time(s); Keeper slowed down for it");
+        if (request.Guard.Refusal(connection) is { } refusal)
+            notes.Add(refusal);
+        return (outcomes, new ScanCost(sessions, lanes.Count, merged.Count, reads.Count - merged.Count), notes);
     }
+
+    private static PaceProfile Profile(ScanRequest request) =>
+        request.Parallelism is { } hosts ? request.Pace with { Hosts = Math.Max(1, hosts) } : request.Pace;
+
+    /// <summary>Every read the scan will make (before merging), and each query's outcome with its query-wide records already in.</summary>
+    private (Dictionary<string, QueryOutcome> Outcomes, List<(string Id, IReadOnlyList<string?> Targets)> Plans, List<Read> Reads) BuildPlan(
+        List<IGrouping<string, (Rule Rule, RuleFile File)>> queries, ScanRequest request)
+    {
+        var connection = request.Connection;
+
+        var outcomes = new Dictionary<string, QueryOutcome>(StringComparer.Ordinal);
+        var plans = new List<(string Id, IReadOnlyList<string?> Targets)>();
+        var reads = new List<Read>();
+        foreach (var group in queries)
+        {
+            var (rule, file) = group.First();
+            var runner = registry.Get(rule.Query.Protocol);
+            var outcome = new QueryOutcome([], []);
+            outcomes[group.Key] = outcome;
+            if (!runner.IsPerTarget(connection))
+            {
+                plans.Add((group.Key, [null]));
+                reads.Add(new Read([(group.Key, rule.Query, null)], rule.Query, runner, null, ""));
+                continue;
+            }
+
+            var (targets, targetsProblem) = ResolveTargets(file, request);
+            if (targets.Count == 0)
+            {
+                outcome.Targets.Add(new TargetOutcome(null, "failed", targetsProblem ?? "no targets: set the file's targets or the integration's targets option (or targetsFrom=discovery)", 0));
+                continue;
+            }
+            // Discovery supplied the list and it may be short: said, so the scan is partial and not quietly smaller.
+            if (targetsProblem is not null)
+                outcome.Targets.Add(new TargetOutcome(null, "partial", targetsProblem, 0));
+            // A query-wide record beside the hosts' own: it tells the tracker that a host missing from this read may
+            // simply be missing from the list, not retired.
+            if (file.Targets is { List.Count: 0 } spec && connection.Options["targets"] is not JsonArray && request.TargetsIncomplete(spec) is { } incomplete)
+                outcome.Targets.Add(new TargetOutcome(null, "partial", incomplete, 0));
+
+            // A host listed twice is read once (its rows would count twice).
+            var unique = targets.Where(t => !string.IsNullOrWhiteSpace(t)).Distinct(StringComparer.OrdinalIgnoreCase)
+                .Take(request.TargetLimit ?? int.MaxValue).ToList();
+            if (unique.Count == 0)
+            {
+                outcome.Targets.Add(new TargetOutcome(null, "failed", "no targets: every listed target was blank", 0));
+                continue;
+            }
+            plans.Add((group.Key, unique));
+            reads.AddRange(unique.Select(target => new Read([(group.Key, rule.Query, target)], rule.Query, runner, target, target)));
+        }
+        return (outcomes, plans, reads);
+    }
+
+    /// <summary>
+    /// What a scan would cost each host, with no network traffic: its queries, the reads left after merging, the
+    /// sessions (sign-ins) it opens, and the time at the pace - at least, since a read may make several requests.
+    /// </summary>
+    public ScanPlan Plan(ScanRequest request)
+    {
+        var queries = request.Files.SelectMany(f => f.Rules.Select(r => (Rule: r, File: f))).GroupBy(r => r.Rule.Query.Id).ToList();
+        var (outcomes, _, reads) = BuildPlan(queries, request);
+        var profile = Profile(request);
+        var endpointHost = EndpointHost(request.Connection.Endpoint);
+        var merged = Merge(reads);
+        var hosts = merged.GroupBy(r => r.Lane, StringComparer.OrdinalIgnoreCase).Select(lane =>
+        {
+            var remote = lane.Where(r => r.Runner.IsRemote(request.Connection)).ToList();
+            var sessions = remote.Select(r => r.Runner).OfType<ISessionRunner>().Select(r => r.SessionFamily).Distinct(StringComparer.Ordinal).Count();
+            var seconds = profile.RequestsPerSecond > 0 ? remote.Count / profile.RequestsPerSecond : 0;
+            return new HostPlan(lane.Key.Length == 0 ? endpointHost : lane.Key, lane.Sum(r => r.Members.Count), lane.Count(), sessions, TimeSpan.FromSeconds(seconds));
+        }).OrderBy(h => h.Host, StringComparer.OrdinalIgnoreCase).ToList();
+        var totalSessions = hosts.Sum(h => h.Sessions);
+        var sessionTime = profile.SessionsPerSecond > 0 ? totalSessions / profile.SessionsPerSecond : 0;
+        var readTime = hosts.Count == 0 ? 0 : Math.Max(hosts.Max(h => h.Time.TotalSeconds), hosts.Sum(h => h.Time.TotalSeconds) / Math.Max(1, profile.Hosts));
+        var problems = outcomes.Where(o => o.Value.Targets.Any(t => t.State == "failed")).Select(o => $"{o.Key}: {o.Value.Targets.First(t => t.State == "failed").Reason}").ToList();
+        return new ScanPlan(profile, hosts, queries.Count, reads.Count, merged.Count, totalSessions, TimeSpan.FromSeconds(Math.Max(readTime, sessionTime)), problems);
+    }
+
+    /// <summary>Reads of one host that a runner can serve with one read (registry values under one key) become that one read.</summary>
+    private static List<Read> Merge(List<Read> reads)
+    {
+        var result = new List<Read>(reads.Count);
+        var groups = new Dictionary<(string Lane, string Protocol, string Key), List<Read>>();
+        foreach (var read in reads)
+        {
+            if (read.Runner is IQueryMerger merger && merger.MergeKey(read.Query) is { } key)
+            {
+                var slot = (read.Lane.ToLowerInvariant(), read.Query.Protocol, key);
+                if (!groups.TryGetValue(slot, out var list))
+                {
+                    groups[slot] = list = [];
+                    result.Add(read);   // a placeholder in the first member's place, replaced below
+                }
+                list.Add(read);
+                continue;
+            }
+            result.Add(read);
+        }
+        foreach (var list in groups.Values)
+        {
+            var at = result.IndexOf(list[0]);
+            if (list.Count == 1)
+                continue;
+            QuerySpec merged;
+            try
+            {
+                merged = ((IQueryMerger)list[0].Runner).Merge([.. list.Select(r => r.Query)]);
+            }
+#pragma warning disable CA1031 // A merge that cannot be made leaves the reads as they were.
+            catch (Exception)
+#pragma warning restore CA1031
+            {
+                result.InsertRange(at + 1, list.Skip(1));
+                continue;
+            }
+            result[at] = new Read([.. list.SelectMany(r => r.Members)], merged, list[0].Runner, list[0].Target, list[0].Lane);
+        }
+        return result;
+    }
+
+    /// <summary>One host's reads, one at a time; its sessions are closed when they are done. Returns the sessions opened.</summary>
+    private async Task<int> ReadLane(string host, List<Read> reads, ScanRequest request, Pacer pacer,
+        System.Collections.Concurrent.ConcurrentDictionary<(string Id, string? Target), RunnerResult> results, CancellationToken cancellationToken)
+    {
+        var connection = request.Connection;
+        var pace = pacer.For(host);
+        var sessions = new Dictionary<string, (IRunnerSession? Session, RunnerResult? Failure)>(StringComparer.Ordinal);
+        var opened = 0;
+        string? deniedHere = null;
+        try
+        {
+            foreach (var read in reads)
+            {
+                var remote = read.Runner.IsRemote(connection);
+                var context = Context(request, read.Target) with { Pace = remote ? pace : NoPace.Instance };
+                RunnerResult result;
+                if (remote && request.Guard.Refusal(connection) is { } refused)
+                    result = RunnerResult.Failed(refused, FailureKind.Refused);
+                else if (remote && pacer.Stopped(host) is { } stopped)
+                    result = RunnerResult.Failed($"not read: {stopped}", FailureKind.Throttled);
+                else if (remote && deniedHere is not null)
+                    result = RunnerResult.Failed(deniedHere, FailureKind.Denied);
+                else if (!remote)
+                    result = await Safe(read.Runner.Protocol, () => read.Runner.RunAsync(read.Query, context, cancellationToken), cancellationToken).ConfigureAwait(false);
+                else
+                {
+                    // Until the credential has been accepted once - a read that came back with data - credentialed work goes
+                    // one host at a time across the scan: a wrong password meets one host, not every host the pace lets in.
+                    // Opening a session is not proof: some runners sign in only on their first read.
+                    // An integration with no credential (auth none: TLS handshakes, open printers) has no account to lock.
+                    var proving = connection.AuthKind != "none" && !request.Guard.Proven(connection);
+                    if (proving)
+                        await _proving.WaitAsync(cancellationToken).ConfigureAwait(false);
+                    try
+                    {
+                        var fresh = true;
+                        if (proving && request.Guard.Refusal(connection) is { } refusedMeanwhile)
+                        {
+                            result = RunnerResult.Failed(refusedMeanwhile, FailureKind.Refused);
+                            fresh = false;
+                        }
+                        else if (read.Runner is ISessionRunner sessionRunner)
+                        {
+                            var isNew = !sessions.TryGetValue(sessionRunner.SessionFamily, out var session);
+                            if (isNew)
+                            {
+                                await pacer.WaitSessionAsync(cancellationToken).ConfigureAwait(false);
+                                session = await Open(sessionRunner, context, cancellationToken).ConfigureAwait(false);
+                                sessions[sessionRunner.SessionFamily] = session;
+                                opened++;
+                            }
+                            if (session.Failure is { } failedOpen)
+                            {
+                                // One sign-in per host and family per scan: a session that could not be opened is not tried
+                                // again, and only its first failure says anything about the credential.
+                                result = failedOpen;
+                                fresh = isNew;
+                            }
+                            else
+                            {
+                                await pace.WaitAsync(cancellationToken).ConfigureAwait(false);
+                                result = await Safe(read.Runner.Protocol, () => sessionRunner.RunAsync(session.Session!, read.Query, context, cancellationToken), cancellationToken).ConfigureAwait(false);
+                            }
+                        }
+                        else
+                        {
+                            await pace.WaitAsync(cancellationToken).ConfigureAwait(false);
+                            result = await Safe(read.Runner.Protocol, () => read.Runner.RunAsync(read.Query, context, cancellationToken), cancellationToken).ConfigureAwait(false);
+                        }
+                        if (fresh)
+                            deniedHere = Learn(request, pacer, host, read.Target, result) ?? deniedHere;
+                    }
+                    finally
+                    {
+                        if (proving)
+                            _proving.Release();
+                    }
+                }
+
+                foreach (var (id, original, target) in read.Members)
+                    results[(id, target)] = read.Members.Count == 1 ? result : Split((IQueryMerger)read.Runner, original, result);
+            }
+        }
+        finally
+        {
+            foreach (var (session, _) in sessions.Values)
+            {
+                if (session is null)
+                    continue;
+                try
+                {
+                    await session.DisposeAsync().ConfigureAwait(false);
+                }
+#pragma warning disable CA1031 // Closing a session that already broke is not a failure of the scan.
+                catch (Exception)
+#pragma warning restore CA1031
+                {
+                }
+            }
+        }
+        return opened;
+    }
+
+    /// <summary>One sign-in at a time while the credential is unproven.</summary>
+    private readonly SemaphoreSlim _proving = new(1, 1);
+
+    /// <summary>An original query's part of a merged read; a split that throws is a failed read of that query, not a crashed scan.</summary>
+    private static RunnerResult Split(IQueryMerger merger, QuerySpec original, RunnerResult merged)
+    {
+        try
+        {
+            return merger.Split(original, merged);
+        }
+#pragma warning disable CA1031 // A runner's failure is data: it becomes a failed coverage record.
+        catch (Exception ex)
+#pragma warning restore CA1031
+        {
+            return RunnerResult.Failed($"{original.Protocol}: the merged read could not be split: {ex.Message}", FailureKind.Error);
+        }
+    }
+
+    private static async Task<(IRunnerSession? Session, RunnerResult? Failure)> Open(ISessionRunner runner, RunnerContext context, CancellationToken cancellationToken)
+    {
+        try
+        {
+            return (await runner.OpenAsync(context, cancellationToken).ConfigureAwait(false), null);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+#pragma warning disable CA1031 // A session that cannot be opened is a failed read of every query of that host and family.
+        catch (Exception ex)
+#pragma warning restore CA1031
+        {
+            return (null, RunnerResult.Failed($"{runner.Protocol}: {ex.Message}", Failures.Classify(ex)));
+        }
+    }
+
+    /// <summary>
+    /// What a read (or a sign-in) said about the credential and the host. A refusal stops the credential. Data coming
+    /// back proves it. While it is unproven, "access denied" is ambiguous - over DCOM a wrong password says just that -
+    /// so it counts towards a refusal and the rest of this host is not tried: returns why, for the lane.
+    /// A push-back slows the host and, in a row, stops it.
+    /// </summary>
+    private static string? Learn(ScanRequest request, Pacer pacer, string host, string? target, RunnerResult result)
+    {
+        var connection = request.Connection;
+        string? deniedHere = null;
+        switch (result.Failure)
+        {
+            case FailureKind.Refused:
+                request.Guard.Refuse(connection, target ?? host, Redactor.Clean(result.Reason) ?? "refused");
+                break;
+            case FailureKind.Denied when connection.AuthKind != "none" && !request.Guard.Proven(connection):
+                var reason = Redactor.Clean(result.Reason) ?? "access denied";
+                request.Guard.DeniedAtSignIn(connection, target ?? host, reason);
+                deniedHere = $"not tried: {target ?? host} denied {connection.Identity ?? "the current user"} before any host accepted it ({reason}) - " +
+                             "the rest of this host is skipped so a wrong password is not presented again";
+                break;
+            case FailureKind.Throttled or FailureKind.Timeout:
+                pacer.Signal(host, result.Failure);
+                break;
+        }
+        if (result.State is "ok" or "partial" && result.Failure is not (FailureKind.Refused or FailureKind.Denied))
+        {
+            request.Guard.Accepted(connection);
+            if (result.Failure is not (FailureKind.Throttled or FailureKind.Timeout))
+                pacer.Signal(host, FailureKind.None);
+        }
+        return deniedHere;
+    }
+
+    /// <summary>The host of an endpoint: a URL's host, or the endpoint itself (a host or a domain name).</summary>
+    private static string EndpointHost(string? endpoint) =>
+        string.IsNullOrWhiteSpace(endpoint) ? "(integration)"
+        : Uri.TryCreate(endpoint, UriKind.Absolute, out var uri) && !string.IsNullOrEmpty(uri.Host) ? uri.Host
+        : endpoint.Split(':')[0];
 
     private (IReadOnlyList<string> Targets, string? Problem) ResolveTargets(RuleFile file, ScanRequest request)
     {
@@ -335,11 +675,11 @@ public sealed class Scanner(RunnerRegistry registry, TimeProvider? clock = null)
         };
 
     /// <summary>A runner that throws is a failed query, never a crashed scan.</summary>
-    private static async Task<RunnerResult> Safe(IRunner runner, QuerySpec query, RunnerContext context, CancellationToken cancellationToken)
+    private static async Task<RunnerResult> Safe(string protocol, Func<Task<RunnerResult>> read, CancellationToken cancellationToken)
     {
         try
         {
-            return await runner.RunAsync(query, context, cancellationToken).ConfigureAwait(false);
+            return await read().ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -349,7 +689,7 @@ public sealed class Scanner(RunnerRegistry registry, TimeProvider? clock = null)
         catch (Exception ex)
 #pragma warning restore CA1031
         {
-            return RunnerResult.Failed($"{runner.Protocol} runner error: {ex.Message}");
+            return RunnerResult.Failed($"{protocol} runner error: {ex.Message}", ex);
         }
     }
 
