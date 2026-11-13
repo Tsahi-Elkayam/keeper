@@ -25,8 +25,11 @@ public static class KeeperHome
             return Path.GetFullPath(fromEnvironment);
         if (SourceTreeAbove(AppContext.BaseDirectory) is { } tree)
             return Path.Combine(tree, TenantFolders[0]);
-        return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Keeper");
+        return DefaultHome;
     }
+
+    /// <summary>The home outside any source tree: %LOCALAPPDATA%\Keeper, or ~/Library/Application Support/Keeper on macOS.</summary>
+    public static string DefaultHome => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Keeper");
 
     /// <summary>Throws when a tenant path sits where it could be committed or shipped with the binaries.</summary>
     public static void EnsureOutsideCode(string path, string what)
@@ -41,8 +44,9 @@ public static class KeeperHome
         var tree = SourceTreeAbove(full);
         if (tree is not null && !InIgnoredTenantFolder(tree, full))
             throw new SettingsException(
-                $"{what} is inside a source tree ({tree}): {full}. Tenant files belong in the Keeper home " +
-                $"({Resolve()}) or the tree's {string.Join(" or ", TenantFolders.Select(f => f + "\\"))} folder, listed in its .gitignore.");
+                $"{what} is inside a source tree ({tree}): {full}. Tenant files must stay where they cannot be committed: " +
+                $"set {EnvironmentVariable} to a folder outside any repository (for example {DefaultHome}), or use the tree's " +
+                $"{string.Join(" or ", TenantFolders.Select(f => f + Path.DirectorySeparatorChar))} folder, listed in its .gitignore.");
     }
 
     /// <summary>Under the tree's home\ or demo\ folder, and the tree's .gitignore lists that folder as /home/ or /demo/.</summary>

@@ -127,16 +127,18 @@ static int Setup(CliArgs cli)
         .Where(f => Directory.Exists(f) && HomeSecurity.Problem(f) is not null).ToList();
 
     Console.WriteLine($"Keeper home: {home}");
-    Console.WriteLine(exists ? $"  settings.json exists (tenant '{tenant}'); left as it is." : $"  writes settings\\settings.json for tenant '{tenant}'");
+    Console.WriteLine(exists ? $"  settings.json exists (tenant '{tenant}'); left as it is." : $"  writes {Path.Combine("settings", "settings.json")} for tenant '{tenant}'");
     foreach (var folder in folders.Where(f => !Directory.Exists(f)))
-        Console.WriteLine(folder == home ? "  creates the home folder" : $"  creates {Path.GetRelativePath(home, folder)}\\");
+        Console.WriteLine(folder == home ? "  creates the home folder" : $"  creates {Path.GetRelativePath(home, folder)}{Path.DirectorySeparatorChar}");
     foreach (var folder in notPrivate)
         Console.WriteLine($"  makes {folder} private: {HomeSecurity.Problem(folder)}");
     if (!Directory.Exists(home) || notPrivate.Count > 0)
-        Console.WriteLine("  access: you, SYSTEM and Administrators only; inheritance off");
+        Console.WriteLine(OperatingSystem.IsWindows()
+            ? "  access: you, SYSTEM and Administrators only; inheritance off"
+            : "  access: you only (mode 700)");
     var denyList = Path.Combine(home, "settings", "denylist.txt");
     if (!File.Exists(denyList))
-        Console.WriteLine("  writes settings\\denylist.txt: a template for build.ps1's leak check");
+        Console.WriteLine($"  writes {Path.Combine("settings", "denylist.txt")}: a template for build.ps1's leak check");
     Console.WriteLine("  then: keeper db init --apply (or migrate --apply when the store exists)");
 
     if (!apply)

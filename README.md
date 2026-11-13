@@ -45,8 +45,8 @@ Then you decide (`keeper decide`), hand things off (`keeper push`), and the next
 ## Trying it
 
 ```powershell
-.\build.ps1 -Test                                   # build\win-x64\, with the rules
-$k = '.\build\win-x64\keeper.exe'
+.\build.ps1 -Test                                   # build\<this machine's runtime>\: one self-contained file, with the rules
+$k = '.\build\win-x64\keeper.exe'                    # build/osx-arm64/keeper on a Mac; needs no .NET installed
 & $k setup --tenant <name>                          # dry run: shows what it would create
 & $k setup --tenant <name> --apply                  # private Keeper home + the store
 
@@ -57,6 +57,12 @@ $k = '.\build\win-x64\keeper.exe'
 & $k run                                            # the whole loop
 & $k today
 ```
+
+A first `keeper run` reads only what is set up. A tool's report pack (PingCastle, Prowler, ScubaGear, Maester,
+device configuration backups) runs once its folder exists under `data\imports\`; a pack whose hosts come from another
+scan (domain-controller certificates) runs once that scan has listed them; the recurring-obligations pack runs after
+`keeper decide setting obligations.enabled true`. `keeper run` names what it left out, one line per reason, and
+`keeper today` lists the system types no scan has reached yet, once, under blind spots.
 
 A scan reads; it never changes the system it reads. Keeper writes only its own store, through
 `keeper qm`, and every write carries a reason.
@@ -154,14 +160,18 @@ One home per tenant. `keeper setup` creates it readable by you, SYSTEM and Admin
 ## Build
 
 Needs the .NET 10 SDK; packages restore from nuget.org only (`nuget.config`, with package source mapping).
+`build.ps1` runs in Windows PowerShell 5.1, and in PowerShell 7 (`pwsh ./build.ps1`) on macOS and Linux.
 
 ```powershell
 .\build.ps1 -Test                 # leak check, rule validation, tests, publish to build\win-x64\
-.\build.ps1 -Runtime osx-arm64    # Apple Silicon -> build\osx-arm64\
+.\build.ps1 -Runtime linux-x64    # another platform -> build\linux-x64\ (also win-x64, win-arm64, osx-arm64, osx-x64, linux-arm64)
 ```
 
-`build\<runtime>\` is disposable. Builds are framework-dependent: the machine that runs them needs the
-.NET 10 runtime. A macOS build made on Windows is unsigned; on the Mac, `codesign --force --sign - <binary>`.
+`build\<runtime>\` is disposable. The default runtime is the building machine's. A build is one self-contained file
+(about 45 MB) that runs where no .NET is installed; `-FrameworkDependent` makes a small one that needs the .NET 10
+runtime. On a Mac `build.ps1` signs the binary ad hoc; a macOS build made on Windows or Linux is unsigned, so on the
+Mac run `codesign --force --sign - <binary>`. `dotnet build` and `dotnet run` also put the repo's rules beside the
+binary they build.
 
 ### Leak check
 

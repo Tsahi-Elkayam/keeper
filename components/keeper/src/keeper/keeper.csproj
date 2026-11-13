@@ -28,4 +28,16 @@
     <ProjectReference Include="..\..\..\push\src\keeper-push\keeper-push.csproj" />
     <ProjectReference Include="..\..\..\integrations\src\keeper-integration\keeper-integration.csproj" />
   </ItemGroup>
+  <!-- The repo's rules beside every build (dotnet build / dotnet run), replaced each time so a removed or renamed
+       rule file does not linger; build.ps1 does the same for what it publishes. -->
+  <Target Name="CopyRepoRules" AfterTargets="Build">
+    <PropertyGroup>
+      <KeeperRulesSource>$(MSBuildThisFileDirectory)..\..\..\..\rules</KeeperRulesSource>
+    </PropertyGroup>
+    <ItemGroup>
+      <KeeperRuleFile Include="$(KeeperRulesSource)\*.yaml" />
+    </ItemGroup>
+    <RemoveDir Directories="$(OutDir)rules" />
+    <Copy SourceFiles="@(KeeperRuleFile)" DestinationFolder="$(OutDir)rules" />
+  </Target>
 </Project>

@@ -22,16 +22,20 @@
     3. Validates every rule file in rules\.
     4. With -Test, runs the unit tests.
     5. Publishes keeper (components\keeper\src\keeper; every verb is a library it runs in-process)
-       into .\build\<runtime> (framework-dependent: needs the .NET 10 runtime where it runs), removes
-       the keeper-* binaries an older build left there, and replaces .\build\<runtime>\rules with the
-       repo's rules\.
+       into .\build\<runtime> as one self-contained file (the machine that runs it needs no .NET; with
+       -FrameworkDependent it needs the .NET 10 runtime instead), removes the keeper-* binaries an older
+       build left there, and replaces .\build\<runtime>\rules with the repo's rules\. On macOS the
+       binary is signed ad hoc, as Apple Silicon requires.
 
     Writes only to .\build\<runtime>. Never touches the Keeper home: 'keeper setup --apply' creates it.
     Runs on Windows PowerShell 5.1.
 
 .PARAMETER Runtime
-    Target platform. win-x64 (default), win-arm64, osx-arm64 (Apple Silicon), osx-x64, linux-x64.
-    A macOS build made on Windows is unsigned - see README.
+    Target platform: win-x64, win-arm64, osx-arm64 (Apple Silicon), osx-x64, linux-x64, linux-arm64.
+    Default: the machine building. A macOS build made on Windows or Linux is unsigned - see README.
+
+.PARAMETER FrameworkDependent
+    A smaller build that needs the .NET 10 runtime installed where it runs (the default needs nothing).
 
 .EXAMPLE
     .\build.ps1 -Test
@@ -44,14 +48,24 @@ param(
     [ValidateSet('Release', 'Debug')]
     [string]$Configuration = 'Release',
 
-    [ValidateSet('win-x64', 'win-arm64', 'osx-arm64', 'osx-x64', 'linux-x64')]
-    [string]$Runtime = 'win-x64',
+    [ValidateSet('win-x64', 'win-arm64', 'osx-arm64', 'osx-x64', 'linux-x64', 'linux-arm64')]
+    [string]$Runtime,
+
+    [switch]$FrameworkDependent,
 
     [switch]$Test
 )
 
 $ErrorActionPreference = 'Stop'
 $repo = $PSScriptRoot
+# Windows PowerShell 5.1 has no $IsWindows/$IsMacOS: there it is always Windows.
+$onWindows = $PSVersionTable.PSEdition -ne 'Core' -or $IsWindows
+$onMac = -not $onWindows -and $IsMacOS
+if (-not $Runtime) {
+    $arch = if ([Runtime.InteropServices.RuntimeInformation]::OSArchitecture -eq 'Arm64') { 'arm64' } else { 'x64' }
+    $os = if ($onWindows) { 'win' } elseif ($onMac) { 'osx' } else { 'linux' }
+    $Runtime = "$os-$arch"
+}
 $out  = Join-Path (Join-Path $repo 'build') $Runtime
 
 # $keeperHome, never $home - that is PowerShell's read-only automatic variable.
@@ -95,7 +109,8 @@ if (Test-Path $denyList) {
         Where-Object { $_ -and -not $_.StartsWith('#') })
     $plain   = @($terms | Where-Object { -not $_.StartsWith('re:') })
     $regexes = @($terms | Where-Object { $_.StartsWith('re:') } | ForEach-Object { $_.Substring(3) })
-    $skip  = '^\\(build|home|demo|clients)\\|\\(bin|obj|artifacts|\.git|\.vs|TestResults)\\'
+    # Either separator: on macOS and Linux the relative paths use '/'.
+    $skip  = '^[\\/](build|home|demo|clients)[\\/]|[\\/](bin|obj|artifacts|\.git|\.vs|TestResults)[\\/]'
     $files = @(Get-ChildItem $repo -Recurse -File -Force |
         Where-Object { $_.FullName.Substring($repo.Length) -notmatch $skip } |
         ForEach-Object { $_.FullName })
@@ -120,7 +135,7 @@ else {
 }
 
 # 3. Every rule file loads, and ids are unique across them
-$keeperProject = Join-Path $repo 'components\keeper\src\keeper\keeper.csproj'
+$keeperProject = [IO.Path]::Combine($repo, 'components', 'keeper', 'src', 'keeper', 'keeper.csproj')
 # No --nologo here: dotnet run hands options it does not know to the program, which would read it as its own.
 & dotnet run --project $keeperProject -c $Configuration -- rules validate (Join-Path $repo 'rules')
 if ($LASTEXITCODE -ne 0) { throw "Rule validation failed (exit $LASTEXITCODE): fix the file:line:col above." }
@@ -136,9 +151,23 @@ if ($Test) {
 if (Test-Path $out) {
     Get-ChildItem $out -File -Filter 'keeper-*' | Remove-Item
 }
-& dotnet publish $keeperProject -c $Configuration -r $Runtime --self-contained false -o $out --nologo -v q
+# Self-contained by default: one file that runs on a machine with no .NET at all. Native libraries (SQLite) ride
+# inside it and are unpacked on first start. No trimming: the rule loader and JSON contracts use reflection.
+$publishArgs = if ($FrameworkDependent) { @('--self-contained', 'false') }
+               else { @('--self-contained', 'true', '-p:PublishSingleFile=true', '-p:IncludeNativeLibrariesForSelfExtract=true',
+                        '-p:EnableCompressionInSingleFile=true') }
+# Symbols inside the assemblies: stack traces keep their line numbers and the build folder holds no .pdb files.
+$publishArgs += '-p:DebugType=embedded'
+Get-ChildItem $out -File -Filter '*.pdb' -ErrorAction SilentlyContinue | Remove-Item
+& dotnet publish $keeperProject -c $Configuration -r $Runtime @publishArgs -o $out --nologo -v q
 if ($LASTEXITCODE -ne 0) {
     throw "dotnet publish of keeper for $Runtime failed (exit $LASTEXITCODE). Needs the .NET 10 SDK."
+}
+$binary = Join-Path $out $(if ($Runtime -like 'win-*') { 'keeper.exe' } else { 'keeper' })
+if ($onMac -and $Runtime -like 'osx-*') {
+    # Apple Silicon runs only signed code; an ad hoc signature is enough on the machine that built it.
+    & codesign --force --sign - $binary
+    if ($LASTEXITCODE -ne 0) { throw "codesign of $binary failed (exit $LASTEXITCODE)." }
 }
 
 # The build output is disposable: its rules\ is replaced, so a rule removed from the repo is gone here too.
@@ -146,8 +175,8 @@ $rulesOut = Join-Path $out 'rules'
 if (Test-Path $rulesOut) { Remove-Item $rulesOut -Recurse }
 Copy-Item (Join-Path $repo 'rules') $rulesOut -Recurse
 
-Write-Host "Built into ${out}: keeper"
+Write-Host "Built into ${out}: $(Split-Path $binary -Leaf) ($(if ($FrameworkDependent) { 'needs the .NET 10 runtime' } else { 'self-contained' }))"
 Write-Host "Keeper home: $keeperHome"
 if (-not (Test-Path (Join-Path (Join-Path $keeperHome 'settings') 'settings.json'))) {
-    Write-Host "No Keeper home yet. Next: & '$out\keeper.exe' setup --tenant <name>   (dry run; add --apply)"
+    Write-Host "No Keeper home yet. Next: & '$binary' setup --tenant <name>   (dry run; add --apply)"
 }

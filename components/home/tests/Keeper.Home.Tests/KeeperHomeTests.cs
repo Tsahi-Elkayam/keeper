@@ -22,6 +22,20 @@ public sealed class KeeperHomeTests : IDisposable
     }
 
     [Fact]
+    public void The_refusal_points_outside_the_tree_not_back_at_the_refused_folder()
+    {
+        // KEEPER_HOME set to a folder inside a repository: the message must not name that same folder as the place to use.
+        Directory.CreateDirectory(Path.Combine(_dir, ".git"));
+        var refused = Path.Combine(_dir, "scratch", "home");
+
+        var ex = Assert.Throws<SettingsException>(() => KeeperHome.EnsureOutsideCode(refused, "The Keeper home"));
+
+        Assert.Contains("KEEPER_HOME", ex.Message, StringComparison.Ordinal);
+        Assert.Contains(KeeperHome.DefaultHome, ex.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("belong in the Keeper home (" + refused, ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void Rejects_a_folder_inside_the_keeper_solution()
     {
         File.WriteAllText(Path.Combine(_dir, "Keeper.slnx"), "<Solution />");
