@@ -144,6 +144,7 @@ public sealed class Scanner(RunnerRegistry registry, TimeProvider? clock = null)
             Distrust(outcome, group.Key, group.Max(g => g.Rule.Query.MinRows), dropCheck ? request.PreviousRows : _ => null, dropRatio,
                 confirmScans, confirmAge, started);
             outcomes[group.Key] = outcome;
+            AssignKeyless(outcome, rule.Query);
             // A field any rule of the query masks is masked in every row the scan keeps; conditions read the real value.
             outcome.Mask = [.. group.SelectMany(g => g.Rule.Mask).Distinct(StringComparer.OrdinalIgnoreCase)];
 
@@ -720,6 +721,49 @@ public sealed class Scanner(RunnerRegistry registry, TimeProvider? clock = null)
         return name => overrides.Select(value => rule.OverrideFor(name, value)).FirstOrDefault(v => v is not null) ?? request.Threshold(name);
     }
 
+    /// <summary>The row's own key, or null when the key field (or a part of a key template) is empty.</summary>
+    private static string? OwnKey(QuerySpec query, JsonObject row)
+    {
+        if (!query.Key.Contains('{', StringComparison.Ordinal))
+            return Values.Text(FieldPath.First(row, query.Key)) is { Length: > 0 } key ? key : null;
+        // A template with an empty part ("{host}|{name}" with no name) would give every such row one key.
+        return Templates.Placeholders(query.Key).All(p => Values.Text(FieldPath.First(row, p)) is { Length: > 0 })
+            ? Templates.Render(query.Key, row) : null;
+    }
+
+    /// <summary>Keys given to rows without their own, by row: see <see cref="AssignKeyless"/>.</summary>
+    private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<JsonObject, string> Keyless = [];
+
+    /// <summary>
+    /// Rows of one read and host that have no key of their own would all be one entity (the host, or "-"): five
+    /// unnamed services one finding. When there are several, each gets the host and a hash of its content - the same
+    /// while the row is the same. A single keyless row keeps the host as its key, as a singleton read always has.
+    /// </summary>
+    private static void AssignKeyless(QueryOutcome outcome, QuerySpec query)
+    {
+        foreach (var group in outcome.Rows.Where(r => OwnKey(query, r.Row) is null).GroupBy(r => r.Target ?? "", StringComparer.OrdinalIgnoreCase))
+        {
+            if (group.Count() < 2)
+                continue;
+            foreach (var (row, target) in group)
+            {
+                var content = Convert.ToHexStringLower(System.Security.Cryptography.SHA256.HashData(
+                    System.Text.Encoding.UTF8.GetBytes(CanonicalJson(row))))[..10];
+                var name = $"(no {query.Key}: {content})";
+                Keyless.AddOrUpdate(row, target is null ? name : $"{target}|{name}");
+            }
+        }
+    }
+
+    private static string CanonicalJson(JsonNode? node) => node switch
+    {
+        JsonObject o => "{" + string.Join(",", o.Where(p => !p.Key.StartsWith("_previous", StringComparison.Ordinal) && p.Key != "_new")
+            .OrderBy(p => p.Key, StringComparer.Ordinal).Select(p => $"{p.Key}:{CanonicalJson(p.Value)}")) + "}",
+        JsonArray a => "[" + string.Join(",", a.Select(CanonicalJson)) + "]",
+        null => "null",
+        _ => node.ToJsonString(),
+    };
+
     /// <summary>The host of an endpoint: a URL's host, or the endpoint itself (a host or a domain name).</summary>
     private static string EndpointHost(string? endpoint) =>
         string.IsNullOrWhiteSpace(endpoint) ? "(integration)"
@@ -777,6 +821,8 @@ public sealed class Scanner(RunnerRegistry registry, TimeProvider? clock = null)
     /// </summary>
     private static string KeyOf(QuerySpec query, JsonObject row, string? target)
     {
+        if (Keyless.TryGetValue(row, out var assigned))
+            return assigned;
         var key = query.Key.Contains('{', StringComparison.Ordinal)
             ? Templates.Render(query.Key, row)
             : Values.Text(FieldPath.First(row, query.Key));

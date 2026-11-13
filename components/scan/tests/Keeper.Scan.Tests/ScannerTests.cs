@@ -720,6 +720,50 @@ public sealed class ScannerTests : IDisposable
         Assert.Single(report.Manifest.Notes, n => n.Contains("could not judge", StringComparison.Ordinal));
     }
 
+    private sealed class KeylessRunner(params JsonObject[] rows) : IRunner
+    {
+        public string Protocol => "fake";
+        public bool PerTarget => true;
+        public IEnumerable<string> Validate(QuerySpec query) => [];
+
+        public Task<RunnerResult> RunAsync(QuerySpec query, RunnerContext context, CancellationToken cancellationToken) =>
+            Task.FromResult(RunnerResult.Ok([.. rows.Select(r => (JsonObject)r.DeepClone())]));
+    }
+
+    [Theory]
+    [InlineData(3, 3)]   // three services with no name are three entities, not one
+    [InlineData(1, 1)]   // a single keyless row keeps the host as its key, as before
+    public async Task Rows_without_a_key_are_not_folded_into_one_entity(int rows, int keys)
+    {
+        var registry = new RunnerRegistry([new KeylessRunner([.. Enumerable.Range(1, rows).Select(i => new JsonObject { ["state"] = $"s{i}" })])]);
+        var file = FakeFile("keyless.yaml", """
+            schema: keeper.rules/1
+            system: example
+            integration: files
+            targets: { list: [pc01] }
+            defaults: { lens: both, refresh: 1d, category: IAM, kind: misconfigured, severity: low, entity: service }
+            rules:
+              - id: EX-SERVICE
+                title: Service
+                query: { protocol: fake, key: name }
+                each: any
+            """);
+
+        var run = async () => await new Scanner(registry, new Clock(Now)).RunAsync(new ScanRequest
+        {
+            Files = [file], Connection = new FilesConnection(), RunsDir = Runs, ImportsDir = Imports,
+        }, CancellationToken.None);
+        var first = Read<FindingRecord>(await run(), RunFolder.Findings).Select(f => f.Target).Order(StringComparer.Ordinal).ToList();
+        var second = Read<FindingRecord>(await run(), RunFolder.Findings).Select(f => f.Target).Order(StringComparer.Ordinal).ToList();
+
+        Assert.Equal(keys, first.Distinct().Count());
+        Assert.Equal(first, second);                                   // the same rows get the same keys next scan
+        if (rows == 1)
+            Assert.Equal(["pc01"], first);
+        else
+            Assert.All(first, k => Assert.StartsWith("pc01|(no name: ", k, StringComparison.Ordinal));
+    }
+
     [Fact]
     public async Task A_field_one_rule_masks_does_not_leak_through_another_rule_s_name()
     {

@@ -237,6 +237,7 @@ public sealed class DiscovererAndSnmpTests : IDisposable
                 loaded_at TEXT NOT NULL
             );
             CREATE TABLE latest_run (
+                started_at TEXT NOT NULL DEFAULT '',
                 instance TEXT NOT NULL,
                 system TEXT NOT NULL,
                 run_id TEXT NOT NULL,
