@@ -134,6 +134,9 @@ public sealed class Scanner(RunnerRegistry registry, TimeProvider? clock = null)
             outcome.Mask = [.. group.SelectMany(g => g.Rule.Mask).Distinct(StringComparer.OrdinalIgnoreCase)];
 
             foreach (var (row, target) in outcome.Rows)
+            {
+                // Another rule of the query may mask what this one names the entity by: the name is read from the row as kept.
+                var kept = outcome.Masked(row);
                 run.Row(new RowRecord
                 {
                     Instance = instance,
@@ -141,11 +144,12 @@ public sealed class Scanner(RunnerRegistry registry, TimeProvider? clock = null)
                     Query = group.Key,
                     EntityType = rule.EntityType,
                     EntityKey = KeyOf(rule.Query, row, target),
-                    EntityName = nameField is not null ? Values.Text(FieldPath.First(row, nameField)) : null,
+                    EntityName = nameField is not null ? Values.Text(FieldPath.First(kept, nameField)) : null,
                     Target = target,
-                    Attrs = outcome.Masked(row),
+                    Attrs = kept,
                     ObservedAt = observedAt,
                 });
+            }
             // Rows are written as read; a rule that compares with the last read sees that read beside each row.
             if (group.Any(g => g.Rule.ComparesWithPrevious))
                 AddLastRead(outcome, group.Key, rule.Query, request.LastCleanRows(group.Key));
@@ -877,7 +881,7 @@ public sealed class Scanner(RunnerRegistry registry, TimeProvider? clock = null)
 
                 // Evidence, titles and check ids are written from the row as the scan keeps it, masked fields masked.
                 var kept = outcome.Masked(row);
-                var name = rule.Query.Name is { } nameField ? Values.Text(FieldPath.First(row, nameField)) : null;
+                var name = rule.Query.Name is { } nameField ? Values.Text(FieldPath.First(kept, nameField)) : null;
                 var evidence = rule.Evidence is not null ? Templates.Render(rule.Evidence, kept)
                     : verdict.Value is null ? null
                     : hide ? "the value is masked"

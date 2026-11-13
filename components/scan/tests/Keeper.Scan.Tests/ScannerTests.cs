@@ -678,6 +678,37 @@ public sealed class ScannerTests : IDisposable
     }
 
     [Fact]
+    public async Task A_field_one_rule_masks_does_not_leak_through_another_rule_s_name()
+    {
+        var registry = new RunnerRegistry([new FakeRunner(false, new() { ["-"] = 1 })]);
+        var file = FakeFile("mask.yaml", """
+            schema: keeper.rules/1
+            system: example
+            integration: files
+            defaults: { lens: both, refresh: 1d, category: IAM, kind: misconfigured, severity: low, entity: member }
+            rules:
+              - id: EX-MASKS
+                title: Masks the name field
+                query: { protocol: fake, key: id }
+                mask: [name]
+                each: any
+              - id: EX-NAMES
+                title: Names the entity by it
+                query: { protocol: fake, key: id, name: name }
+                each: any
+            """);
+
+        var report = await new Scanner(registry, new Clock(Now)).RunAsync(new ScanRequest
+        {
+            Files = [file], Connection = new FilesConnection(), RunsDir = Runs, ImportsDir = Imports,
+        }, CancellationToken.None);
+
+        var everything = string.Join("\n", Directory.EnumerateFiles(Path.Combine(Runs, report.Manifest.RunId)).Select(File.ReadAllText));
+        Assert.DoesNotContain("-|admin1", everything, StringComparison.Ordinal);
+        Assert.Contains(Read<FindingRecord>(report, RunFolder.Findings), f => f.RuleId == "EX-NAMES");
+    }
+
+    [Fact]
     public async Task One_query_in_files_with_different_targets_reads_each_file_s_own_hosts()
     {
         var registry = new RunnerRegistry([new FakeRunner(true, new() { ["pc01"] = 1, ["pc02"] = 1 })]);
